@@ -127,9 +127,15 @@ the invalid-operation exception for every NaN; `==`, `!=`, and the truth value
 of a floating operand use `ucomiss`, `ucomisd`, and `fucomip`, which raise it
 only for a signaling NaN. An invalid operation produces a negative quiet NaN,
 as SSE and the x87 unit do: 0xffc00000 for `f32`, 0xfff8000000000000 for
-`f64`, and likewise for `f80` and `f128`; compile-time evaluation produces
-the same NaN. FTZ does not apply to `f80` and `f128` results, and `f128`
-operations raise no exceptions.
+`f64`, and likewise for `f80` and `f128`. An operation or conversion with a
+NaN operand produces that NaN, quieted, with its sign and the leading bits of
+its payload. With two NaN operands, `f80` operations take a quiet NaN before
+a signaling one, then the larger significand, then the positive one; `f128`
+operations and `f32` and `f64` subtraction and division take the left one,
+and `f32` and `f64` `+` and `*` either one, because the compiler may swap
+their operands. Compile-time evaluation produces the same NaNs, taking the
+left operand of `+` and `*`. FTZ does not apply to `f80` and `f128` results,
+and `f128` operations raise no exceptions.
 
 The floating intrinsics use SSE for `f32` and `f64` and the x87 unit for
 `f80`; `$::fmin` and `$::fmax` are `minss`/`maxss` (`minsd`/`maxsd`) with an
@@ -204,15 +210,24 @@ declares.
 
 Without `-mnan2008`, MIPS FPUs use the legacy NaN encoding: a set most
 significant fraction bit marks a signaling NaN, and an invalid operation
-produces the NaN 0x7fbfffff (`f32`) or 0x7ff7ffffffffffff (`f64`).
-Compile-time evaluation follows the selected encoding.
+produces the NaN 0x7fbfffff (`f32`) or 0x7ff7ffffffffffff (`f64`), as does
+an arithmetic operation whose NaN operands are all signaling. An arithmetic
+operation or square root with a quiet NaN operand and a conversion of a NaN
+may trap: R4000-class FPUs, the VR4300 among them, take an
+unimplemented-operation exception that no FCSR bit masks, and other FPUs
+choose the result. Compile-time evaluation does not evaluate such an
+operation, so a constant expression that needs one is an error. With
+`-mnan2008`, an operation or conversion with a NaN operand produces the first
+signaling NaN operand, otherwise the first NaN operand, quieted, with its
+sign and the leading bits of its payload. Compile-time evaluation follows
+the selected encoding.
 
 `neg.s` and `neg.d` are arithmetic on these FPUs: they raise the
 invalid-operation exception for a signaling NaN, need not keep a NaN's sign
-and payload, and trap on a VR4300 for a denormal operand. Unary `-` uses them
-only under a profile that traps neither the invalid-operation exception nor
-denormal operands and keeps denormal results; otherwise it flips the sign bit
-in general registers, as `$::fabs` does.
+and payload, and trap on a VR4300 for a denormal or quiet NaN operand. Unary
+`-` uses them only under a profile that traps neither the invalid-operation
+exception nor denormal operands and keeps denormal results; otherwise it
+flips the sign bit in general registers, as `$::fabs` does.
 
 ABIs:
 

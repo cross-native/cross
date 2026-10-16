@@ -97,6 +97,11 @@ check_resource(bytes "${storage}" "resource_storage(7u32)" resource_storage
 set(recursion "${helper_attributes} global u32 resource_recursive(in u32 value) { if (value == 0u32) return 5u32; return resource_recursive(value - 1u32) + 1u32; }")
 check_resource(depth "${recursion}" "resource_recursive(3u32)" resource_recursive
     "recursion depth exceeded 1" -feval-depth-limit=1)
+# An opportunistic attempt stops at its own smaller step budget and leaves
+# the call to run time; required evaluation keeps the whole step budget.
+set(loop "${helper_attributes} global u32 resource_loop(in u32 value) { u32 total = value; for (u32 i = 0u32; i < 1000u32; ++i) total += 1u32; return total - 999u32; }")
+check_resource(opportunistic_steps "${loop}" "resource_loop(7u32)" resource_loop
+    pass -feval-opportunistic-step-limit=100)
 
 # Automatic bounds are required proofs even when optional call folding is off.
 file(WRITE "${OUTPUT}/automatic.x" "static u32 bound() { return 4u32; } static void local() { u8 value[bound()]; } global u32 entry() { return 0u32; }\n")

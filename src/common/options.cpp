@@ -542,6 +542,10 @@ std::span<const OptionDefinition> common_option_definitions() {
          std::uint64_t{1000000}, {}, 1, 100000000,
          OptionCategory::Semantic, false, OptionImplementation::Implemented,
          "maximum evaluator instructions per evaluation"},
+        {"f.eval-opportunistic-step-limit", {}, OptionValueKind::Unsigned,
+         std::uint64_t{100000}, {}, 1, 100000000,
+         OptionCategory::Semantic, false, OptionImplementation::Implemented,
+         "maximum evaluator instructions per opportunistic evaluation"},
         {"f.eval-depth-limit", {}, OptionValueKind::Unsigned,
          std::uint64_t{256}, {}, 1, 512,
          OptionCategory::Semantic, false, OptionImplementation::Implemented,
@@ -898,6 +902,8 @@ bool resolve_registered_options(
     options.eval_byte_limit = resolved_unsigned(options, "f.eval-byte-limit", 16 * 1024 * 1024);
     options.eval_memory_limit = resolved_unsigned(options, "f.eval-memory-limit", 64 * 1024 * 1024);
     options.eval_step_limit = resolved_unsigned(options, "f.eval-step-limit", 1000000);
+    options.eval_opportunistic_step_limit =
+        resolved_unsigned(options, "f.eval-opportunistic-step-limit", 100000);
     options.eval_depth_limit = static_cast<unsigned>(resolved_unsigned(options, "f.eval-depth-limit", 256));
     options.generic_instance_limit =
         resolved_unsigned(options, "f.generic-instance-limit", 4096);
@@ -1151,6 +1157,10 @@ bool parse_cc_options(int argc, char** argv, CompilerOptions& options,
          options.dependency_phony_targets))
         diagnostics.command_error(
             "-MF, -MP, -MT, and -MQ require -M, -MM, -MD, or -MMD");
+    if (options.emit == EmitKind::Object && options.output && *options.output == "-" &&
+        options.dependency_mode != DependencyMode::Only)
+        diagnostics.command_error(
+            "an object file cannot be written to standard output ('-o -'); use -S for assembly");
     return diagnostics.errors() == 0;
 }
 
@@ -1197,13 +1207,13 @@ void print_cc_help() {
   -emit-llvm            serialize optional debug/compatibility LLVM IR
   -emit-gimple          serialize GCC GIMPLE SSA for GIMPLE + RTL passes
   -emit-gimple=rtl      serialize optimized GIMPLE SSA for GCC RTL passes
-  -o FILE               write output to FILE
+  -o FILE               write output to FILE (- for standard output)
   -I DIR/-isystem DIR   add ordered source search directories
   -include FILE         process FILE before each input
   -imacros FILE         keep only the macros FILE defines
   -M/-MM                emit Make dependencies instead of source
   -MD/-MMD              emit source and a Make dependency file
-  -MF FILE              set dependency output path
+  -MF FILE              set dependency output path (- for standard output)
   -MT TARGET/-MQ TARGET set dependency target (raw/Make-escaped)
   -MP                   add a phony target for each included or embedded file
   -O0/-Og/-O1/-O2/-O3/-Os/-Oz
@@ -1257,7 +1267,7 @@ void print_cpp_help() {
   -imacros FILE         keep only the macros FILE defines
   -M/-MM                emit Make dependencies instead of source
   -MD/-MMD              emit source and a Make dependency file
-  -MF FILE              set dependency output path
+  -MF FILE              set dependency output path (- for standard output)
   -MT TARGET/-MQ TARGET set dependency target (raw/Make-escaped)
   -MP                   add a phony target for each included or embedded file
   -ffile-prefix-map=OLD=NEW
@@ -1271,7 +1281,7 @@ void print_cpp_help() {
   -mprofile=NAME        select a model profile
   --model=FILE          load a named compiler-definition file
   --model-path=DIR      add a compiler-definition search directory
-  -o FILE               write canonical Cross to FILE
+  -o FILE               write canonical Cross to FILE (- for standard output)
 )";
 }
 

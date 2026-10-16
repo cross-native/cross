@@ -177,6 +177,76 @@ int main() {
     raised = 0;
     if (convert(signaling_nan, f64, legacy, &raised).bits !=
             UInt128{0x7ff7ffffffffffffULL} || raised != 0) return 66;
+    // NaN operands propagate as the target says: quieted, keeping the sign and
+    // the leading payload bits. The x86 results are those of SSE and the x87
+    // unit; the MIPS ones those of IEEE 754-2008 and R4000-class FPUs.
+    {
+        using enum NanPropagation;
+        const auto sse = NanEncoding{.negative_default = true,
+                                     .propagation = {First, First, LargerSignificand, First}};
+        const auto mips2008 = NanEncoding{
+            .propagation = {FirstSignaling, FirstSignaling, FirstSignaling, FirstSignaling}};
+        const auto r4000 = NanEncoding{
+            .legacy = true,
+            .propagation = {Unimplemented, Unimplemented, Unimplemented, Unimplemented}};
+        const auto q = f32_bits(0x7fc00001);
+        const auto nq = f32_bits(0xffc12345);
+        const auto s = f32_bits(0xff800003);
+        raised = 0;
+        if (binary(Operation::Add, q, nq, f32, sse, &raised).bits != q.bits ||
+            binary(Operation::Add, nq, q, f32, sse).bits != nq.bits ||
+            binary(Operation::Divide, q, s, f32, sse, &raised).bits != q.bits ||
+            binary(Operation::Multiply, s, q, f32, sse).bits != UInt128{0xffc00003} ||
+            binary(Operation::Subtract, one, nq, f32, sse).bits != nq.bits ||
+            square_root(s, sse).bits != UInt128{0xffc00003} || raised != invalid_flag) return 70;
+        if (convert(s, f64, sse).bits != UInt128{0xfff8000060000000ULL} ||
+            convert(f32_bits(0xffc00002), f80, sse).bits !=
+                UInt128{0xc000020000000000ULL, 0xffff} ||
+            convert(Value{UInt128{0x7ff0000020000000ULL}, f64}, f32, sse).bits !=
+                UInt128{0x7fc00001} ||
+            convert(Value{UInt128{0xc000000000000002ULL, 0xffff}, f80}, f32, sse).bits !=
+                UInt128{0xffc00000} ||
+            convert(s, f128, sse).bits != UInt128{0, 0xffff800006000000ULL}) return 71;
+        // The x87 unit prefers a quiet NaN, then the larger significand, then
+        // the positive sign.
+        const Value q80{UInt128{0xc000000000000001ULL, 0x7fff}, f80};
+        const Value nq80{UInt128{0xc000000000000002ULL, 0xffff}, f80};
+        const Value s80{UInt128{0xbfffffffffffffffULL, 0x7fff}, f80};
+        const Value s80_small{UInt128{0x8000000000000005ULL, 0xffff}, f80};
+        if (binary(Operation::Add, q80, nq80, f80, sse).bits != nq80.bits ||
+            binary(Operation::Add, nq80, q80, f80, sse).bits != nq80.bits ||
+            binary(Operation::Add, s80, q80, f80, sse).bits != q80.bits ||
+            binary(Operation::Add, s80_small, s80, f80, sse).bits !=
+                UInt128{0xffffffffffffffffULL, 0x7fff} ||
+            binary(Operation::Add, Value{UInt128{q80.bits.low, 0xffff}, f80}, q80, f80, sse).bits !=
+                q80.bits) return 72;
+        if (binary(Operation::Divide, q, s, f32, mips2008).bits != UInt128{0xffc00003} ||
+            binary(Operation::Divide, s, q, f32, mips2008).bits != UInt128{0xffc00003} ||
+            binary(Operation::Add, q, nq, f32, mips2008).bits != q.bits) return 73;
+        // The legacy encoding quiets a NaN by clearing the bit, keeping a
+        // nonzero payload.
+        const auto legacy_first = NanEncoding{.legacy = true,
+                                              .propagation = {First, First, First, First}};
+        if (binary(Operation::Add, f32_bits(0x7fc00000), one, f32, legacy_first).bits !=
+            UInt128{0x7fa00000}) return 74;
+        // R4000-class FPUs trap on a quiet NaN operand of arithmetic and on
+        // any NaN operand of a conversion, in every environment.
+        const auto unimplemented_flag = exception_set(Exception::Unimplemented);
+        raised = 0;
+        (void)binary(Operation::Add, f32_bits(0x7fa00000), one, f32, r4000, &raised);
+        if (raised != unimplemented_flag ||
+            trap(Environment{}, raised) != Exception::Unimplemented) return 75;
+        raised = 0;
+        (void)square_root(f32_bits(0x7fa00000), r4000, &raised);
+        if (raised != unimplemented_flag) return 75;
+        raised = 0;
+        if (binary(Operation::Add, f32_bits(0x7fc00000), one, f32, r4000, &raised).bits !=
+                UInt128{0x7fbfffff} || raised != invalid_flag) return 76;
+        raised = 0;
+        (void)convert(f32_bits(0x7fc00000), f64, r4000, &raised);
+        if ((raised & unimplemented_flag) == 0 || exception_name(Exception::Unimplemented) !=
+            "unimplemented") return 77;
+    }
     // minNum/maxNum raise invalid for a signaling NaN and a denormal operand
     // exception for a denormal, whichever operand they select.
     raised = 0;

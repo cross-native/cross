@@ -963,8 +963,15 @@ const TargetInfo target = with_instruction_costs({
      BitFieldOrder::LeastSignificantFirst,
      BitFieldUnitSharing::SameStorageSize,
      BitFieldPlacement::NextAvailableBit, CodeAddressRepresentation::Flat,
-     // SSE and the x87 unit produce a negative default NaN.
-     floating::NanEncoding{.negative_default = true}},
+     // SSE and the x87 unit produce a negative default NaN. SSE and the
+     // binary128 sequences propagate the first NaN operand; the x87 unit
+     // prefers a quiet one, then the larger significand.
+     floating::NanEncoding{
+         .negative_default = true,
+         .propagation = {floating::NanPropagation::First,
+                         floating::NanPropagation::First,
+                         floating::NanPropagation::LargerSignificand,
+                         floating::NanPropagation::First}}},
     target_registers(),
     {
         {"i8", 8, "x86-64", PatchAddressRepresentation::FlatUptr, false, true},

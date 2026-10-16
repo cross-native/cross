@@ -634,6 +634,9 @@ struct EvaluationLimits {
     unsigned depth{256};
     std::uint64_t generic_instances{4096};
     unsigned generic_depth{128};
+    // The step budget of an opportunistic attempt, which then defers to
+    // run time.
+    std::uint64_t opportunistic_steps{100000};
 };
 
 enum class EvaluationByteOrder { Little, Big };

@@ -4,6 +4,7 @@
 
 #include "common/uint128.hpp"
 
+#include <array>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -22,7 +23,8 @@ struct Value {
 };
 
 // The IEC 60559 exceptions and a denormal operand, which some FPUs trap on,
-// as bits of an ExceptionSet.
+// as bits of an ExceptionSet. Unimplemented marks an operation that the FPU
+// leaves to software: it traps in every environment.
 enum class Exception : unsigned {
     Invalid = 1U << 0U,
     DivideByZero = 1U << 1U,
@@ -30,6 +32,7 @@ enum class Exception : unsigned {
     Underflow = 1U << 3U,
     Inexact = 1U << 4U,
     DenormalOperand = 1U << 5U,
+    Unimplemented = 1U << 6U,
 };
 using ExceptionSet = unsigned;
 
@@ -37,7 +40,7 @@ using ExceptionSet = unsigned;
     return static_cast<ExceptionSet>(exception);
 }
 // The models.md spelling: "invalid", "divide-by-zero", "overflow",
-// "underflow", "inexact", or "denormal-operand".
+// "underflow", "inexact", or "denormal-operand"; "unimplemented" otherwise.
 [[nodiscard]] std::string_view exception_name(Exception exception);
 
 // The environment of a profile (models.md "Profiles"): the exceptions that
@@ -48,15 +51,36 @@ struct Environment {
     friend bool operator==(const Environment&, const Environment&) = default;
 };
 
-// How a target encodes NaNs. In the IEEE 754-2008 encoding a set most
-// significant fraction bit marks a quiet NaN, and the default NaN that an
-// invalid operation produces sets only that bit. In the legacy MIPS encoding
-// that bit marks a signaling NaN, and the default NaN sets every other
-// fraction bit. The target also chooses the default NaN's sign: x86 FPUs
-// set it.
+// The NaN that an operation or conversion with a NaN operand produces. A
+// propagated NaN keeps its sign and the leading bits of its payload (the
+// fraction below the explicit integer bit), filled with zeros or truncated to
+// the result format, and is quieted.
+enum class NanPropagation : unsigned char {
+    // The default NaN.
+    Default,
+    // The first NaN operand (SSE).
+    First,
+    // The first signaling NaN operand, otherwise the first one.
+    FirstSignaling,
+    // A quiet NaN operand before a signaling one, then the larger
+    // significand, then the positive sign (x87).
+    LargerSignificand,
+    // A quiet NaN operand of an arithmetic operation or square root, or any
+    // NaN operand of a conversion, raises Unimplemented, as R4000-class MIPS
+    // FPUs do; signaling NaN operands alone produce the default NaN.
+    Unimplemented,
+};
+
+// How a target encodes and produces NaNs. In the IEEE 754-2008 encoding a
+// set most significant fraction bit marks a quiet NaN, and the default NaN
+// that an invalid operation produces sets only that bit. In the legacy MIPS
+// encoding that bit marks a signaling NaN, and the default NaN sets every
+// other fraction bit. The target also chooses the default NaN's sign (x86
+// FPUs set it) and, by result format in Format order, the propagation rule.
 struct NanEncoding {
     bool legacy{};
     bool negative_default{};
+    std::array<NanPropagation, 4> propagation{};
 };
 
 // Whether a rewrite may create floating intermediate results that the source
@@ -74,9 +98,9 @@ struct NanEncoding {
 //
 // An operation adds the exceptions it raises to `*raised` when given one.
 // Underflow means a tiny nonzero result, detected before rounding, which an
-// enabled underflow trap takes even when the result is exact. A NaN result
-// is the default NaN of `encoding`, which also tells signaling NaNs apart.
-// Negation and the sign operations raise nothing.
+// enabled underflow trap takes even when the result is exact. `encoding`
+// tells signaling NaNs apart and gives the NaN that an invalid operation and
+// a NaN operand produce. Negation and the sign operations raise nothing.
 [[nodiscard]] std::optional<Value> parse(std::string text, Format format);
 [[nodiscard]] Value convert(Value value, Format format, NanEncoding encoding,
                             ExceptionSet* raised = nullptr);
@@ -119,7 +143,8 @@ struct NanEncoding {
 // Applies `environment` to an operation that raised `raised` and produced
 // `*result`: a denormal result flushes to a zero of its sign where the
 // environment says so, which raises underflow and inexact. Returns the first
-// raised exception that the environment traps, if any.
+// raised exception that the environment traps, if any; Unimplemented always
+// traps.
 [[nodiscard]] std::optional<Exception> trap(const Environment& environment,
                                             ExceptionSet raised,
                                             Value* result = nullptr);

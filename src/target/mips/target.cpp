@@ -563,7 +563,21 @@ TargetInfo make_target(ByteOrder order,
              : BitFieldOrder::LeastSignificantFirst,
          BitFieldUnitSharing::SameUnqualifiedBase,
          BitFieldPlacement::AlignedUnits, CodeAddressRepresentation::Flat,
-         floating::NanEncoding{.legacy = true}, "nan2008"},
+         // R4000-class FPUs, the VR4300 among them, trap on a quiet NaN
+         // operand, and other legacy FPUs choose their own result; FPUs with
+         // the 2008 encoding propagate a NaN operand.
+         floating::NanEncoding{
+             .legacy = true,
+             .propagation = {floating::NanPropagation::Unimplemented,
+                             floating::NanPropagation::Unimplemented,
+                             floating::NanPropagation::Unimplemented,
+                             floating::NanPropagation::Unimplemented}},
+         "nan2008",
+         floating::NanEncoding{
+             .propagation = {floating::NanPropagation::FirstSignaling,
+                             floating::NanPropagation::FirstSignaling,
+                             floating::NanPropagation::FirstSignaling,
+                             floating::NanPropagation::FirstSignaling}}},
         target_registers(),
         {
             {"i8", 8, "mips1", PatchAddressRepresentation::FlatUptr, false, true},

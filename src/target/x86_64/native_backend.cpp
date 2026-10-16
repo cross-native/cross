@@ -15563,6 +15563,8 @@ private:
         output_ << nan_b << ":\n";
         instruction("movq", "%r10, %rax");
         instruction("movq", "%r11, %rdx");
+        // A NaN subtrahend keeps its sign.
+        if (value.opcode == Opcode::Fsub) instruction("btcq", "$63, %rdx");
         instruction("btsq", "$47, %rdx");
         store(function, target, "rax", "rdx");
         instruction("jmp", done);
@@ -16714,12 +16716,11 @@ private:
         instruction("orq", "%r11, %rdx");
         store(function, target, "rax", "rdx");
         instruction("jmp", done);
+        // A NaN keeps its payload, quieted.
         output_ << nan << ":\n";
-        instruction("xorq", "%rax, %rax");
-        instruction("movabsq", "$9223231299366420480, %rdx");
-        instruction("orq", "%r11, %rdx");
-        store(function, target, "rax", "rdx");
-        instruction("jmp", done);
+        instruction("btsq", "$" + std::to_string(fraction_bits - 1U) + ", %r8");
+        instruction("movl", "$16384, %ecx");
+        instruction("jmp", normalize);
         output_ << zero << ":\n";
         instruction("xorq", "%rax, %rax");
         instruction("movq", "%r11, %rdx");
@@ -16828,10 +16829,16 @@ private:
         instruction("xorq", "%rax, %rax");
         instruction("movl", "$" + std::to_string(exponent_max) + ", %ecx");
         instruction("jmp", done);
+        // A NaN keeps the leading bits of its payload, quieted.
         output_ << nan << ":\n";
-        instruction("movq", "$" + std::to_string(
-                                    std::uint64_t{1} << (fraction_bits - 1U)) +
-                                ", %rax");
+        if (target_bits == 32) {
+            instruction("movq", "%rdx, %rax");
+            instruction("shrq", "$25, %rax");
+        } else {
+            instruction("shldq", "$4, %rax, %rdx");
+            instruction("movq", "%rdx, %rax");
+        }
+        instruction("btsq", "$" + std::to_string(fraction_bits - 1U) + ", %rax");
         instruction("movl", "$" + std::to_string(exponent_max) + ", %ecx");
         instruction("jmp", done);
         output_ << zero << ":\n";
@@ -16910,12 +16917,11 @@ private:
         instruction("orq", "%r11, %rdx");
         store(function, target, "rax", "rdx");
         instruction("jmp", done);
+        // A NaN keeps its payload, quieted.
         output_ << nan << ":\n";
-        instruction("xorq", "%rax, %rax");
-        instruction("movabsq", "$9223231299366420480, %rdx");
-        instruction("orq", "%r11, %rdx");
-        store(function, target, "rax", "rdx");
-        instruction("jmp", done);
+        instruction("btsq", "$62, %r8");
+        instruction("movl", "$16384, %ecx");
+        instruction("jmp", normalize);
         output_ << zero << ":\n";
         instruction("xorq", "%rax, %rax");
         instruction("movq", "%r11, %rdx");
@@ -17016,8 +17022,12 @@ private:
         instruction("movabsq", "$-9223372036854775808, %rax");
         instruction("movl", "$32767, %edx");
         instruction("jmp", done);
+        // A NaN keeps the leading bits of its payload, quieted.
         output_ << nan << ":\n";
-        instruction("movabsq", "$-4611686018427387904, %rax");
+        instruction("shldq", "$15, %rax, %rdx");
+        instruction("movq", "%rdx, %rax");
+        instruction("btsq", "$63, %rax");
+        instruction("btsq", "$62, %rax");
         instruction("movl", "$32767, %edx");
         instruction("jmp", done);
         output_ << zero << ":\n";

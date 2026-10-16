@@ -62,3 +62,22 @@ global void mixed_float(in f32 value "xmm4", out f64 result "xmm5") {
     result = unsupported_float_conversion(value);
     $::_ret();
 }
+
+// x86-64 naked code lowers a $::patch value only as the operand of a
+// patchable instruction, and no value-producing compiler built-in.
+[[raw_inline]]
+static u64 patched() {
+    return $::patch(7u64);
+}
+
+[[naked]]
+global void inlined_patch(out u64 result "r8") {
+    result = patched();
+    $::_ret();
+}
+
+[[naked]]
+global void builtin_value(in u64 value "r9", out u64 result "r8") {
+    result = $::popcount(value);
+    $::_ret();
+}

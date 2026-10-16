@@ -13,6 +13,12 @@ static f128 f128_ms_roundtrip(in f128 value) {
     return value + 0.5f128;
 }
 
+// A subtraction of run-time operands negates the subtrahend inline.
+[[noinline]]
+static f128 f128_difference(in f128 a, in f128 b) {
+    return a - b;
+}
+
 global i32 f128_entry() {
     f128 positive = 1.5f128;
     f128 same = 0x1.8p0f128;
@@ -51,6 +57,7 @@ global i32 f128_entry() {
     f32 narrowed_f32 = thirds;
     f80 narrowed_f80 = thirds;
     f64 tie_f64 = 1.0f128 + 0x1p-53f128;
+    f128 runtime_difference = $::runtime(f128_difference(5.0f128, 7.0f128));
     return positive == same &&
            positive != negative &&
            negative < positive_zero &&
@@ -60,6 +67,7 @@ global i32 f128_entry() {
            !positive_zero &&
            sum == 3.75f128 &&
            difference == -2.0f128 &&
+           runtime_difference == -2.0f128 &&
            cancellation == positive_zero &&
            product == 3.0f128 &&
            quotient == positive &&

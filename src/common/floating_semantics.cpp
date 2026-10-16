@@ -300,6 +300,65 @@ bool magnitude_less(const Number& a, const Number& b) {
         b.significand.shifted(static_cast<unsigned>(b.scale - scale))) < 0;
 }
 
+// The NaN `value` in `format`, quieted, with its sign and the leading bits of
+// its payload.
+Value propagated(Value value, Format format, NanEncoding encoding) {
+    const auto from = spec(value.format);
+    const auto to = spec(format);
+    auto payload = mask_to(value.bits, from.precision - 1);
+    payload = to.precision >= from.precision
+        ? shift_left(payload, to.precision - from.precision)
+        : shift_right(payload, from.precision - to.precision);
+    const auto quiet = shift_left(UInt128{1}, to.precision - 2);
+    if (encoding.legacy) {
+        payload = bit_and(payload, bit_not(quiet));
+        if (payload == UInt128{}) payload = shift_right(quiet, 1);
+    } else {
+        payload = bit_or(payload, quiet);
+    }
+    if (to.explicit_bit) payload = bit_or(payload, shift_left(UInt128{1}, 63));
+    return encoded(format, bit(value.bits, from.sign_bit()), to.max_field(), payload);
+}
+
+NanPropagation propagation(NanEncoding encoding, Format format) {
+    return encoding.propagation[static_cast<std::size_t>(format)];
+}
+
+// The result of an arithmetic operation in `format` with a NaN operand;
+// `right` is null for a square root.
+Value nan_operation(const Value& left, const Value* right, Format format,
+                    NanEncoding encoding, ExceptionSet* raised) {
+    const bool nan_left = is_nan(left);
+    const bool nan_right = right && is_nan(*right);
+    const bool signaling_left = signaling(left, encoding);
+    const bool signaling_right = right && signaling(*right, encoding);
+    const Value* chosen = nan_left ? &left : right;
+    switch (propagation(encoding, format)) {
+    case NanPropagation::Default: return nan(format, encoding);
+    case NanPropagation::Unimplemented:
+        if ((nan_left && !signaling_left) || (nan_right && !signaling_right))
+            raise(raised, Exception::Unimplemented);
+        return nan(format, encoding);
+    case NanPropagation::First: break;
+    case NanPropagation::FirstSignaling:
+        if (!signaling_left && signaling_right) chosen = right;
+        break;
+    case NanPropagation::LargerSignificand:
+        if (nan_left && nan_right) {
+            const auto info = spec(format);
+            const auto a = mask_to(left.bits, info.precision - 1);
+            const auto b = mask_to(right->bits, info.precision - 1);
+            if (signaling_left != signaling_right) {
+                if (signaling_left) chosen = right;
+            } else if (a < b || (a == b && bit(left.bits, info.sign_bit()))) {
+                chosen = right;
+            }
+        }
+        break;
+    }
+    return propagated(*chosen, format, encoding);
+}
+
 } // namespace
 
 std::optional<Value> parse(std::string text, Format format) {
@@ -365,7 +424,15 @@ Value convert(Value value, Format format, NanEncoding encoding,
     if (denormal(value)) raise(raised, Exception::DenormalOperand);
     if (signaling(value, encoding)) raise(raised, Exception::Invalid);
     const auto number = decode(value);
-    if (number.kind == Class::NaN) return nan(format, encoding);
+    if (number.kind == Class::NaN) {
+        switch (propagation(encoding, format)) {
+        case NanPropagation::Default: return nan(format, encoding);
+        case NanPropagation::Unimplemented:
+            raise(raised, Exception::Unimplemented);
+            return nan(format, encoding);
+        default: return propagated(value, format, encoding);
+        }
+    }
     if (number.kind == Class::Infinity) return infinity(format, number.negative);
     return round_rational(format, number.negative, number.significand,
                           BigUnsigned{UInt128{1}}, number.scale, raised);
@@ -414,7 +481,8 @@ Value square_root(Value value, NanEncoding encoding, ExceptionSet* raised) {
     if (denormal(value)) raise(raised, Exception::DenormalOperand);
     if (signaling(value, encoding)) raise(raised, Exception::Invalid);
     const auto number = decode(value);
-    if (number.kind == Class::NaN) return nan(value.format, encoding);
+    if (number.kind == Class::NaN)
+        return nan_operation(value, nullptr, value.format, encoding, raised);
     if (number.kind == Class::Zero) return value;
     if (number.negative) {
         raise(raised, Exception::Invalid);
@@ -454,7 +522,8 @@ Value binary(Operation operation, Value left, Value right, Format format,
     const auto a = decode(left);
     auto b = decode(right);
     if (operation == Operation::Subtract) b.negative = !b.negative;
-    if (a.kind == Class::NaN || b.kind == Class::NaN) return nan(format, encoding);
+    if (a.kind == Class::NaN || b.kind == Class::NaN)
+        return nan_operation(left, &right, format, encoding, raised);
     const auto invalid = [&] {
         raise(raised, Exception::Invalid);
         return nan(format, encoding);
@@ -614,6 +683,7 @@ std::string_view exception_name(Exception exception) {
     case Exception::Underflow: return "underflow";
     case Exception::Inexact: return "inexact";
     case Exception::DenormalOperand: return "denormal-operand";
+    case Exception::Unimplemented: return "unimplemented";
     }
     return {};
 }
@@ -635,12 +705,12 @@ std::optional<Exception> trap(const Environment& environment,
         raised |= exception_set(Exception::Underflow) |
                   exception_set(Exception::Inexact);
     }
+    const auto traps = environment.traps | exception_set(Exception::Unimplemented);
     for (const auto exception :
-         {Exception::DenormalOperand, Exception::Invalid,
-          Exception::DivideByZero, Exception::Overflow, Exception::Underflow,
-          Exception::Inexact}) {
-        if ((raised & environment.traps & exception_set(exception)) != 0)
-            return exception;
+         {Exception::Unimplemented, Exception::DenormalOperand,
+          Exception::Invalid, Exception::DivideByZero, Exception::Overflow,
+          Exception::Underflow, Exception::Inexact}) {
+        if ((raised & traps & exception_set(exception)) != 0) return exception;
     }
     return std::nullopt;
 }

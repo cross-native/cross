@@ -523,8 +523,8 @@ struct TargetDataLayout {
         BitFieldUnitSharing::SameUnqualifiedBase};
     BitFieldPlacement bit_field_placement{BitFieldPlacement::AlignedUnits};
     CodeAddressRepresentation code_addresses{CodeAddressRepresentation::Opaque};
-    // The NaN encoding, unless the resolved subtarget has `nan2008_feature`,
-    // which selects `nan2008_encoding`.
+    // The NaN encoding and propagation, unless the resolved subtarget has
+    // `nan2008_feature`, which selects `nan2008_encoding`.
     floating::NanEncoding nan_encoding{};
     std::string_view nan2008_feature{};
     floating::NanEncoding nan2008_encoding{};

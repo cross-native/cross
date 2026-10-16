@@ -47,6 +47,11 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#if defined(_WIN32)
+#include <fcntl.h>
+#include <io.h>
+#endif
+
 namespace cross {
 namespace {
 
@@ -561,6 +566,32 @@ std::filesystem::path default_output(const CompilerOptions& options) {
     return output;
 }
 
+// An output path "-" names standard output.
+bool standard_output(const std::optional<std::filesystem::path>& path) {
+    return path && *path == "-";
+}
+
+bool write_output(const std::filesystem::path& path, std::string_view text,
+                  std::string& error) {
+    if (path != "-") return write_file(path, text, error);
+#if defined(_WIN32)
+    // Standard output keeps the bytes, as a file does.
+    _setmode(_fileno(stdout), _O_BINARY);
+#endif
+    std::cout.write(text.data(), static_cast<std::streamsize>(text.size()));
+    std::cout.flush();
+    if (std::cout) return true;
+    error = "cannot write to standard output";
+    return false;
+}
+
+// The output named by -o, unless that is standard output, where files
+// written beside it take the name the output would have without -o.
+std::filesystem::path output_file(const CompilerOptions& options) {
+    return options.output && !standard_output(options.output)
+        ? *options.output : default_output(options);
+}
+
 const VariableDecl* scalable_local(const Statement& statement) {
     if (statement.declaration && statement.declaration->type &&
         statement.declaration->type->kind == Type::Kind::Vector &&
@@ -873,7 +904,8 @@ std::string dependency_text(
             auto target = options.inputs[index].stem();
             target += ".o";
             if (compiler && options.dependency_mode == DependencyMode::Alongside &&
-                options.output && options.emit != EmitKind::Preprocess)
+                options.output && !standard_output(options.output) &&
+                options.emit != EmitKind::Preprocess)
                 target = *options.output;
             output << make_escape(target.generic_string());
         }
@@ -903,7 +935,7 @@ bool emit_dependencies(
     if (!path && options.dependency_mode == DependencyMode::Only)
         path = options.output;
     if (!path && options.dependency_mode == DependencyMode::Alongside) {
-        if (options.output) path = *options.output;
+        if (options.output && !standard_output(options.output)) path = *options.output;
         else path = options.inputs.front().stem();
         path->replace_extension(".d");
     }
@@ -921,12 +953,9 @@ bool emit_dependencies(
             return false;
         }
     }
-    if (!path) {
-        std::cout << content;
-        return true;
-    }
+    if (!path) path = "-";
     std::string error;
-    if (!write_file(*path, content, error)) {
+    if (!write_output(*path, content, error)) {
         diagnostics.command_error(error);
         return false;
     }
@@ -956,14 +985,10 @@ int cpp_main(int argc, char** argv) {
     if (options.dependency_mode == DependencyMode::Only) return 0;
     std::ostringstream joined;
     for (const auto& output : outputs) joined << output;
-    if (options.output) {
-        std::string error;
-        if (!write_file(*options.output, joined.str(), error)) {
-            diagnostics.command_error(error);
-            return 1;
-        }
-    } else {
-        std::cout << joined.str();
+    std::string error;
+    if (!write_output(options.output.value_or("-"), joined.str(), error)) {
+        diagnostics.command_error(error);
+        return 1;
     }
     return 0;
 }
@@ -1027,7 +1052,7 @@ int cc_main(int argc, char** argv) {
         for (const auto& source : preprocessed) joined << source;
         const auto output = options.output.value_or(default_output(options));
         std::string error;
-        if (!write_file(output, joined.str(), error)) diagnostics.command_error(error);
+        if (!write_output(output, joined.str(), error)) diagnostics.command_error(error);
         return diagnostics.errors() == 0 ? 0 : 1;
     }
 
@@ -1057,7 +1082,8 @@ int cc_main(int argc, char** argv) {
     program.evaluation_limits = {
         options.eval_byte_limit, options.eval_memory_limit,
         options.eval_step_limit, options.eval_depth_limit,
-        options.generic_instance_limit, options.generic_depth_limit};
+        options.generic_instance_limit, options.generic_depth_limit,
+        options.eval_opportunistic_step_limit};
     program.evaluation_layout = {
         target->data_layout.byte_order == ByteOrder::Big
             ? EvaluationByteOrder::Big : EvaluationByteOrder::Little,
@@ -1254,7 +1280,7 @@ int cc_main(int argc, char** argv) {
         const auto ir = serializer.serialize(codegen_module);
         if (diagnostics.errors() != 0) return 1;
         std::string error;
-        if (!write_file(output, ir, error)) diagnostics.command_error(error);
+        if (!write_output(output, ir, error)) diagnostics.command_error(error);
 #else
         diagnostics.command_error(
             "LLVM text serialization is unavailable in this build; "
@@ -1273,7 +1299,7 @@ int cc_main(int argc, char** argv) {
         const auto source = serializer.serialize(codegen_module);
         if (diagnostics.errors() != 0) return 1;
         std::string error;
-        if (!write_file(output, source, error)) diagnostics.command_error(error);
+        if (!write_output(output, source, error)) diagnostics.command_error(error);
 #else
         diagnostics.command_error(
             "GCC GIMPLE serialization is unavailable in this build; "
@@ -1291,7 +1317,7 @@ int cc_main(int argc, char** argv) {
                          raw_assembly.functions.end());
         if (options.stack_usage && diagnostics.errors() == 0) {
             std::string error;
-            if (!write_file(std::filesystem::path(output).replace_extension(".su"),
+            if (!write_file(output_file(options).replace_extension(".su"),
                             native::stack_usage_report(hir_module, options, functions),
                             error)) {
                 diagnostics.command_error(error);
@@ -1307,7 +1333,7 @@ int cc_main(int argc, char** argv) {
         if (diagnostics.errors() != 0) return 1;
         if (options.emit == EmitKind::Assembly) {
             std::string error;
-            if (!write_file(output, assembly, error)) {
+            if (!write_output(output, assembly, error)) {
                 diagnostics.command_error(error);
             }
         } else {

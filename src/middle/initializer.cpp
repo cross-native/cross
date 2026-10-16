@@ -44,6 +44,67 @@ bool aggregate(const hir::Module& module, hir::TypeId type) {
            kind == hir::Type::Kind::Record;
 }
 
+// The destinations of one brace list's entries as a prefix tree of the path
+// steps below the list's own destination. An entry overlaps an earlier one
+// when either path is a prefix of the other or the two diverge at a member
+// of one union.
+class Destinations {
+public:
+    enum class Result { Added, Duplicate, Overlap };
+
+    // Adds the steps of `path` from `depth` on; `unions[i]` tells whether
+    // step i selects a union member.
+    Result add(const Path& path, const std::vector<bool>& unions, std::size_t depth) {
+        std::uint32_t node = 0;
+        for (auto index = depth; index < path.size(); ++index) {
+            if (nodes_[node].terminal) return Result::Overlap;
+            const auto found = edges_.find(edge(node, path[index]));
+            const unsigned same = found != edges_.end() ? 1U : 0U;
+            if (unions[index] && nodes_[node].children > same) return Result::Overlap;
+            if (found == edges_.end()) {
+                for (; index < path.size(); ++index) {
+                    const auto child = static_cast<std::uint32_t>(nodes_.size());
+                    nodes_.push_back({});
+                    ++nodes_[node].children;
+                    edges_.emplace(edge(node, path[index]), child);
+                    node = child;
+                }
+                nodes_[node].terminal = true;
+                return Result::Added;
+            }
+            node = found->second;
+        }
+        return nodes_[node].terminal ? Result::Duplicate : Result::Overlap;
+    }
+
+private:
+    struct Node {
+        bool terminal{};
+        unsigned children{};
+    };
+    struct Edge {
+        std::uint32_t parent{};
+        std::uint64_t value{};
+        const Expr* origin{};
+        bool operator==(const Edge&) const = default;
+    };
+    struct EdgeHash {
+        std::size_t operator()(const Edge& edge) const {
+            return std::hash<std::uint64_t>{}(
+                       (edge.value * 0x9e3779b97f4a7c15ULL) ^ edge.parent) ^
+                   std::hash<const Expr*>{}(edge.origin);
+        }
+    };
+    static Edge edge(std::uint32_t parent, const Position& position) {
+        if (const auto* value = std::get_if<std::uint64_t>(&position)) return {parent, *value, nullptr};
+        const auto& deferred = std::get<DeferredPosition>(position);
+        return {parent, deferred.displacement, deferred.origin};
+    }
+
+    std::vector<Node> nodes_{Node{}};
+    std::unordered_map<Edge, std::uint32_t, EdgeHash> edges_;
+};
+
 unsigned offset_alignment(unsigned natural, std::uint64_t offset) {
     if (offset == 0) return natural;
     unsigned actual = 1;
@@ -277,26 +338,17 @@ private:
     }
 
     // An entry may not initialize an object, or part of one, that an
-    // earlier entry initialized: a destination covers its subobjects, and
-    // one member of a union covers the others. Only the entries of the
-    // current list can lie inside its destination.
-    bool overlaps(const Path& path, SourceLocation location) {
-        const auto unions = union_steps(path);
-        for (auto prior = destinations_.begin() +
-                          static_cast<std::ptrdiff_t>(list_begin_);
-             prior != destinations_.end(); ++prior) {
-            const auto [mine, theirs] = std::mismatch(
-                path.begin(), path.end(), prior->begin(), prior->end());
-            if (mine != path.end() && theirs != prior->end() &&
-                !unions[static_cast<std::size_t>(mine - path.begin())]) {
-                continue;
-            }
-            error(location, path == *prior
-                ? "duplicate destination in aggregate initializer"
-                : "aggregate initializer entry overlaps the destination of an earlier entry");
-            return true;
-        }
-        return false;
+    // earlier entry of its list initialized: a destination covers its
+    // subobjects, and one member of a union covers the others. A list at
+    // `depth` path steps holds the destinations of its entries.
+    bool overlaps(Destinations& destinations, std::size_t depth, const Path& path,
+                  SourceLocation location) {
+        const auto result = destinations.add(path, union_steps(path), depth);
+        if (result == Destinations::Result::Added) return false;
+        error(location, result == Destinations::Result::Duplicate
+            ? "duplicate destination in aggregate initializer"
+            : "aggregate initializer entry overlaps the destination of an earlier entry");
+        return true;
     }
 
     void list(const Expr& source, hir::TypeId type, std::optional<std::uint64_t> offset,
@@ -318,6 +370,7 @@ private:
             if (record.definition && record.definition->attribute("exhaustive")) exhaustive = &record;
         }
         std::vector<bool> named(exhaustive ? exhaustive->members.size() : 0);
+        Destinations destinations;
         Position cursor{std::uint64_t{0}};
         bool union_entry{};
         for (const auto& entry : source.initializer_entries) {
@@ -351,19 +404,14 @@ private:
                                       entry.designators[index]);
             }
             if (!selection) continue;
-            if (overlaps(selection->path, entry.location)) continue;
+            if (overlaps(destinations, path.size(), selection->path, entry.location)) continue;
             if (entry.value->kind == Expr::Kind::AggregateInitializer) {
                 // The nested list initializes its whole destination, so its
                 // own entries need only be distinct from each other.
-                const auto enclosing = std::exchange(list_begin_, destinations_.size());
                 list(*entry.value, selection->type, selection->offset,
                      selection->path);
-                destinations_.resize(list_begin_);
-                list_begin_ = enclosing;
-                destinations_.push_back(std::move(selection->path));
                 continue;
             }
-            destinations_.push_back(selection->path);
             if (types_only_ || !deferred_indices_.empty())
                 result_.type_items.emplace_back(entry.value.get(), selection->type);
             if (!selection->offset) continue;
@@ -394,10 +442,6 @@ private:
     Diagnostics& diagnostics_;
     Plan result_;
     hir::TypeId root_;
-    // The destinations of the entries applied so far, and where those of
-    // the list being planned begin.
-    std::vector<Path> destinations_;
-    std::size_t list_begin_{};
     bool dynamic_outer_{};
     std::span<const Expr* const> deferred_indices_;
     bool types_only_{};

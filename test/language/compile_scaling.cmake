@@ -134,3 +134,8 @@ endforeach()
 compile(local_layout_chain -O0 "[[eval_only]] static uptr chain_size() {\n\
 ${levels}    struct C4000 { uptr value; };\n    return sizeof(struct C0);\n}\n\
 $::static_assert($::eval(chain_size()) == sizeof(uptr), \"local layout chain\");\n")
+
+# The overlap check of a flat brace list looks each destination up instead
+# of comparing it with every earlier entry.
+string(REPEAT "1u8, " 199999 bytes)
+compile(flat_initializer -O0 "global u8 bytes[200000] = {${bytes}1u8};\n")

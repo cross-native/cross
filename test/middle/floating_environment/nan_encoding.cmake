@@ -5,7 +5,8 @@
 # treat a set most significant fraction bit as signaling; -mnan2008 and
 # x86-64 use the IEEE 754-2008 encoding, whose default NaN x86-64 makes
 # negative. Evaluated initializers and the exceptions a trapping profile
-# reports follow the selected encoding.
+# reports follow the selected encoding, and so do the NaNs that NaN operands
+# produce.
 
 foreach(required CC SOURCE MODEL OUTPUT)
     if(NOT DEFINED ${required} OR "${${required}}" STREQUAL "")
@@ -57,7 +58,8 @@ foreach(case "vr4300|2143289343|9221120237041090559"
 endforeach()
 
 # Under a profile trapping invalid, the square root of a signaling NaN is not
-# evaluated; that of a quiet NaN is.
+# evaluated; that of a quiet NaN is, except on a legacy MIPS FPU, which may
+# trap on it.
 set(trapping "--model=${MODEL}" -mprofile=trapping-fp)
 foreach(case "legacy|QUIET_BIT_SET" "nan2008|QUIET_BIT_CLEAR" "x86|QUIET_BIT_CLEAR")
     string(REPLACE "|" ";" fields "${case}")
@@ -70,8 +72,50 @@ foreach(case "legacy|QUIET_BIT_SET" "nan2008|QUIET_BIT_CLEAR" "x86|QUIET_BIT_CLE
                "nan_encoding[.]x:[0-9]+:[0-9]+: error: floating-point operation raises the enabled 'invalid' exception during translation-time evaluation")
                 message(FATAL_ERROR "${encoding}: ${quiet_bit} is not signaling\n${stderr}")
             endif()
+        elseif(encoding STREQUAL "legacy")
+            if(status EQUAL 0 OR NOT stderr MATCHES
+               "nan_encoding[.]x:[0-9]+:[0-9]+: error: floating-point operation with a NaN operand may trap on the target FPU during translation-time evaluation")
+                message(FATAL_ERROR "legacy: the square root of a quiet NaN is evaluated\n${stderr}")
+            endif()
         elseif(NOT status EQUAL 0)
             message(FATAL_ERROR "${encoding}: ${quiet_bit} is not quiet\n${stderr}")
         endif()
     endforeach()
 endforeach()
+
+# encoding, the quotient of a quiet by a signaling NaN, their widened
+# signaling NaN
+foreach(case "nan2008|2145386498" "x86|2143289345")
+    string(REPLACE "|" ";" fields "${case}")
+    list(GET fields 0 encoding)
+    list(GET fields 1 quotient)
+    compile(${encoding}-propagation ${${encoding}} -DPROPAGATION)
+    if(NOT status EQUAL 0 OR
+       NOT assembly MATCHES "\npropagated:\n\t[.]long ${quotient}\n" OR
+       NOT assembly MATCHES "\nwidened:\n\t[.]quad 9222246138021675008\n")
+        message(FATAL_ERROR "${encoding}: NaN operands do not propagate\n${stderr}\n${assembly}")
+    endif()
+endforeach()
+
+# A legacy MIPS FPU produces the default NaN for a signaling NaN operand
+# alone, but a quiet NaN operand of an arithmetic operation or any NaN
+# operand of a conversion may trap, so only optional evaluation, which
+# leaves the operation to run time, accepts one.
+compile(legacy-signaling ${legacy} -DLEGACY_SIGNALING)
+if(NOT status EQUAL 0 OR NOT assembly MATCHES "\nsignaling_sum:\n\t[.]long 2143289343\n")
+    message(FATAL_ERROR "legacy: a signaling NaN operand does not produce the default NaN\n${stderr}")
+endif()
+foreach(case "QUIET|21:49" "CONVERSION|23:22")
+    string(REPLACE "|" ";" fields "${case}")
+    list(GET fields 0 kind)
+    list(GET fields 1 position)
+    compile(legacy-${kind} ${legacy} -DLEGACY_${kind})
+    if(status EQUAL 0 OR NOT stderr MATCHES
+       "nan_encoding[.]x:${position}: error: floating-point operation with a NaN operand may trap on the target FPU during translation-time evaluation")
+        message(FATAL_ERROR "legacy ${kind}: a NaN operand is evaluated\n${stderr}")
+    endif()
+endforeach()
+compile(legacy-runtime ${legacy} -DLEGACY_RUNTIME)
+if(NOT status EQUAL 0 OR NOT assembly MATCHES "add[.]s")
+    message(FATAL_ERROR "legacy: optional evaluation does not leave the NaN operand to run time\n${stderr}\n${assembly}")
+endif()

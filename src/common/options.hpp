@@ -167,6 +167,7 @@ struct CompilerOptions {
     std::uint64_t eval_byte_limit{16 * 1024 * 1024};
     std::uint64_t eval_memory_limit{64 * 1024 * 1024};
     std::uint64_t eval_step_limit{1000000};
+    std::uint64_t eval_opportunistic_step_limit{100000};
     unsigned eval_depth_limit{256};
     std::uint64_t generic_instance_limit{4096};
     unsigned generic_depth_limit{128};

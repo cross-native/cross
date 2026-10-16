@@ -21,8 +21,11 @@ it joined or separate (`-oout.s`, `-o out.s`).
 | `-emit-gimple`, `-emit-gimple=rtl` | GCC GIMPLE text, for comparison with GCC's back end | `input.gimple.c` |
 | `-fstack-usage` | With `-S` or `-c`, also the stack each function uses, in GCC's format | the output's name with `.su` |
 
-`-o FILE` names the output. `-c` runs `llvm-mc` from `PATH` as the assembler;
-`cc` never calls a C compiler, LLVM's code generator, or a linker.
+`-o FILE` names the output, and `-o -` writes it to standard output, which an
+object file (`-c`) cannot use; files written beside the output, such as those
+of `-fstack-usage` and `-MD`, then take the names they have without `-o`.
+`-c` runs `llvm-mc` from `PATH` as the assembler; `cc` never calls a C
+compiler, LLVM's code generator, or a linker.
 
 `-fstack-usage` writes one line per emitted function, in output order:
 `FILE:LINE:COLUMN:NAME`, a tab, the bytes, a tab, and `static` or `dynamic`.
@@ -107,6 +110,7 @@ preset, profile, or command line), and whether it is `implemented` or only
 | `-fwrapv` | Make signed `+`, `-`, `*`, and `<<` wrap modulo 2^N, at run time and in compile-time evaluation alike. Division of the minimum value by -1 and invalid shift counts stay undefined. No preset sets it. |
 | `-fbounds-trap` | Check every subscript of an array whose bound is known, fixed or variable-length, and execute the inline `$::trap()` sequence when the index is outside the array; `&a[n]` may still form the address one past the end. No helper is called and no preset sets it. Functions with `[[naked]]` or `[[no_sanitize("bounds")]]` are not checked. |
 | `-feval-step-limit=N`, `-feval-depth-limit=N`, `-feval-memory-limit=N`, `-feval-byte-limit=N` | Limits for compile-time evaluation and macro expansion. |
+| `-feval-opportunistic-step-limit=N` | Evaluated instructions after which compile-time evaluation that nothing requires, such as of a call with constant arguments, gives up and leaves the code to run time (default 100000). |
 | `-fgeneric-instance-limit=N`, `-fgeneric-depth-limit=N` | Limits for generic instances per compilation (default 4096) and nested instantiation (default 128). |
 | `-fzero-init-in-data` | Put zero-valued static objects with the initialized data instead of zero-filled storage such as `.bss`, so that an image patcher can change them; reads of such an object keep reading memory even when it is `const`. |
 | `-ffile-prefix-map=OLD=NEW` | Spell source paths that start with `OLD` as `NEW` in `$::source::file`, internal symbol names, and debugging information; line markers, dependency files, and diagnostics keep the real paths. Repeatable; the last matching mapping applies. |
@@ -153,10 +157,11 @@ and `-isystem`. There are no implicit include directories. `-include` and
 `-imacros` files are looked up relative to the current directory first and
 apply to every input; all `-imacros` files are processed before the `-include`
 files. `-M`, `-MM`, `-MD`, `-MMD`, `-MF`, `-MT`, and `-MQ` write Make
-dependencies, including files read by `$::embed`. `cpp` writes one rule per
-input and `cc` one rule for its output, whose prerequisites are the files of
-every input. `-MP` adds an empty rule for each prerequisite other than an
-input, so that Make does not fail when a header is deleted.
+dependencies, including files read by `$::embed`; `-MF -` writes them to
+standard output. `cpp` writes one rule per input and `cc` one rule for its
+output, whose prerequisites are the files of every input. `-MP` adds an
+empty rule for each prerequisite other than an input, so that Make does not
+fail when a header is deleted.
 
 ## Inspecting the compiler
 

@@ -14,12 +14,16 @@ union bits64 { f64 value; u64 bits; };
 static u32 b32(in f32 value) { union bits32 cell; cell.value = value; return cell.bits; }
 static u64 b64(in f64 value) { union bits64 cell; cell.value = value; return cell.bits; }
 static f32 f32_of(in u32 bits) { union bits32 cell; cell.bits = bits; return cell.value; }
+static f64 f64_of(in u64 bits) { union bits64 cell; cell.bits = bits; return cell.value; }
 
 [[noinline]] global f32 add32(in f32 a, in f32 b) { return a + b; }
 [[noinline]] global f32 sub32(in f32 a, in f32 b) { return a - b; }
 [[noinline]] global f32 mul32(in f32 a, in f32 b) { return a * b; }
 [[noinline]] global f32 div32(in f32 a, in f32 b) { return a / b; }
 [[noinline]] global f64 add64(in f64 a, in f64 b) { return a + b; }
+[[noinline]] global f64 sub64(in f64 a, in f64 b) { return a - b; }
+[[noinline]] global f32 neg32(in f32 a) { return -a; }
+[[noinline]] global f64 neg64(in f64 a) { return -a; }
 [[noinline]] global f64 mul64(in f64 a, in f64 b) { return a * b; }
 [[noinline]] global f64 div64(in f64 a, in f64 b) { return a / b; }
 [[noinline]] global f64 widen(in f32 a) { return (f64)a; }
@@ -92,5 +96,33 @@ global u32 test_entry() {
     // 2^-1023 is denormal, and 1/3 is inexact: both stay divisions.
     if (b64($::runtime(scaled_down(1.0))) != 0x0008000000000000u64) return 33u32;
     if (b64($::runtime(third(1.0))) != 0x3fd5555555555555u64) return 34u32;
+    // A NaN operand and an invalid operation produce the NaN that the
+    // target does at run time; legacy MIPS FPUs leave a quiet NaN operand to
+    // run time.
+    if (b32(f32_of(0x7fc00001u32) + 1.0f32) !=
+        b32($::runtime(add32(f32_of(0x7fc00001u32), 1.0f32)))) return 35u32;
+    if (b32(1.0f32 - f32_of(0xff800003u32)) !=
+        b32($::runtime(sub32(1.0f32, f32_of(0xff800003u32))))) return 36u32;
+    if (b32(f32_of(0xffc12345u32) * 2.0f32) !=
+        b32($::runtime(mul32(f32_of(0xffc12345u32), 2.0f32)))) return 37u32;
+    if (b64((f64)f32_of(0xff800003u32)) !=
+        b64($::runtime(widen(f32_of(0xff800003u32))))) return 38u32;
+    if (b32((f32)f64_of(0xfff4000000000001u64)) !=
+        b32($::runtime(narrow(f64_of(0xfff4000000000001u64))))) return 39u32;
+    if (b32($::sqrt(f32_of(0xffc12345u32))) !=
+        b32($::runtime(root32(f32_of(0xffc12345u32))))) return 40u32;
+    if (b64(f64_of(0x7ff0000000000001u64) - 1.0) !=
+        b64($::runtime(sub64(f64_of(0x7ff0000000000001u64), 1.0)))) return 41u32;
+    if (b32(f32_of(0x7f800000u32) - f32_of(0x7f800000u32)) !=
+        b32($::runtime(sub32(f32_of(0x7f800000u32), f32_of(0x7f800000u32))))) return 42u32;
+    if (b64($::sqrt(-1.0)) != b64($::runtime(root64(-1.0)))) return 43u32;
+    // The optimizer folds an invalid operation and then operations on its
+    // negated NaN, which is not the default NaN.
+    if (b32(-(0.0f32 / 0.0f32) + 1.0f32) != b32($::runtime(add32(
+            $::runtime(neg32($::runtime(div32(0.0f32, 0.0f32)))), 1.0f32)))) return 44u32;
+    if (b64($::sqrt(-(0.0 / 0.0))) != b64($::runtime(root64(
+            $::runtime(neg64($::runtime(div64(0.0, 0.0)))))))) return 45u32;
+    if (b64((f64)-(0.0f32 / 0.0f32)) != b64($::runtime(widen(
+            $::runtime(neg32($::runtime(div32(0.0f32, 0.0f32)))))))) return 46u32;
     return 0u32;
 }

@@ -18303,9 +18303,9 @@ bool vectorize_early_exit_loops(ManagedFunction& function,
 // Folds a floating operation on constants with the evaluator that
 // translation-time evaluation uses, so that the constant is the run-time
 // value. The operation stays when the environment traps an exception it
-// raises, when it produces a NaN, whose payload the target chooses, and,
-// under flushing, when its result is tiny: targets detect tininess before
-// or after rounding.
+// raises, when both operands are NaNs (selection may commute an instruction
+// whose NaN result follows operand order), and, under flushing, when its
+// result is tiny: targets detect tininess before or after rounding.
 bool fold_floating_operation(ManagedValue& value,
                              const ManagedFunction& function,
                              const hir::Module& hir_module,
@@ -18319,7 +18319,7 @@ bool fold_floating_operation(ManagedValue& value,
                !floating::trap(environment, raised);
     };
     const auto fold_floating = [&](floating::Value result) {
-        if (floating::is_nan(result) || !exact()) return false;
+        if (!exact()) return false;
         make_floating_constant(value, result);
         return true;
     };
@@ -18391,7 +18391,10 @@ bool fold_floating_operation(ManagedValue& value,
                 floating::compare(*comparison, *x, *y, encoding, &raised)
                     ? 1U : 0U});
         }
-        if (format != x->format) return false;
+        if (format != x->format ||
+            (floating::is_nan(*x) && floating::is_nan(*y))) {
+            return false;
+        }
         return fold_floating(floating::binary(*arithmetic, *x, *y, *format,
                                               encoding, &raised));
     }

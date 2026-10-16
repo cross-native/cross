@@ -731,7 +731,9 @@ operand such as unary `-` and `$::fmin`, and whether tininess is detected
 before or after rounding is target-defined. Which NaNs are signaling, the NaN
 that an invalid operation produces, and the NaN that an operation or
 conversion with a NaN operand produces are target-defined; translation-time
-evaluation uses the target's rules. Machine operations that change x87 precision,
+evaluation uses the target's rules. Where a target's FPU may trap on a NaN operand or
+leaves the result to the implementation, translation-time evaluation does not
+evaluate the operation, so a mandatory evaluation of it is diagnosed. Machine operations that change x87 precision,
 rounding, or control state must restore the target default before ordinary
 floating code or a managed call. Cross never inserts a hidden
 floating-environment helper.
@@ -1633,7 +1635,9 @@ Recursion and loops are permitted within documented, adjustable budgets:
 provenance, original macro input, embedded file backing, buffers, and
 constructed output count toward the memory bound without depending on host
 object sizes. Exceeding a budget in a mandatory evaluation or procedural
-expansion is an error; an opportunistic attempt may defer to runtime.
+expansion is an error; an opportunistic attempt may defer to runtime, and it
+does after `-feval-opportunistic-step-limit=N` evaluated instructions (default
+100000) when that is smaller than the step budget.
 `-fno-eval-calls` disables only opportunistic ordinary-call evaluation.
 
 ### Contexts, hygiene, and identities

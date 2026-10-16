@@ -2596,6 +2596,21 @@ private:
                (statement.second && raw_parameter_written(*statement.second, parameter));
     }
 
+    // Diagnoses a call of `name`, which is neither a raw_inline function nor
+    // a machine instruction, in a naked function or a raw_inline body.
+    void naked_call_error(const Expr& expression, const std::string& name,
+                          std::string_view ordinary) {
+        diagnostics_.error(expression.location,
+            name == "$::patch"
+                ? std::string("x86-64 naked functions implement a $::patch value only as the "
+                              "complete operand of a patchable instruction, such as $::_movabs")
+            : name.starts_with("$::") && !name.starts_with("$::_")
+                ? "built-in '" + name + "' is not implemented in an x86-64 naked function"
+                : std::string(ordinary));
+        for (auto frame = inline_frames_.rbegin(); frame != inline_frames_.rend(); ++frame)
+            diagnostics_.note(frame->call, "inlined here");
+    }
+
     bool lower_raw_inline_call(const Expr& expression,
                                const RegisterEntry* destination) {
         if (!expression.left || expression.left->kind != Expr::Kind::Name) {
@@ -2605,8 +2620,7 @@ private:
         }
         const auto* callee = raw_inline_function(expression.left->text);
         if (!callee || !callee->definition || !callee->definition->body) {
-            diagnostics_.error(
-                expression.location,
+            naked_call_error(expression, expression.left->text,
                 "ordinary or indirect calls are not permitted in a naked function");
             return false;
         }
@@ -2714,7 +2728,7 @@ private:
         inline_frames_.push_back(
             {callee, destination, result_type, continuation,
              std::move(owned), std::move(readonly_names), loops_.size(),
-             break_targets_.size(), false});
+             break_targets_.size(), false, expression.location});
         lower_statement(*callee->definition->body);
         auto frame = std::move(inline_frames_.back());
         inline_frames_.pop_back();
@@ -2814,8 +2828,8 @@ private:
         }
         const auto& name = expression.left->text;
         if (!target_has_instruction(target_, name)) {
-            diagnostics_.error(expression.location,
-                               "ordinary calls are not permitted in a naked function");
+            naked_call_error(expression, name,
+                "ordinary calls are not permitted in a naked function");
             return;
         }
         const auto* form = select_instruction(name, expression.arguments,
@@ -3642,6 +3656,7 @@ private:
         std::size_t loop_base{};
         std::size_t break_base{};
         bool saw_return{};
+        SourceLocation call;
     };
 
     struct RawState {

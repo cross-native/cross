@@ -3,11 +3,51 @@
 #pragma once
 
 #include <coroutine>
+#include <cstddef>
 #include <exception>
+#include <new>
 #include <optional>
 #include <utility>
 
 namespace cross {
+
+// Continuation frames come and go in nearly LIFO order, and evaluator frames
+// are tens of kilobytes. A per-thread cache of freed frames by size, up to
+// `capacity` bytes, keeps the general allocator from trimming and refaulting
+// its heap at every evaluation step. Frames cached when a thread ends stay
+// allocated.
+namespace continuation_frames {
+inline constexpr std::size_t granule = 64;
+inline constexpr std::size_t classes = 1024;
+inline constexpr std::size_t capacity = std::size_t{16} << 20;
+struct Cache {
+    void* free[classes];
+    std::size_t bytes;
+};
+inline thread_local Cache cache{};
+
+inline void* allocate(std::size_t size) {
+    const auto index = (size + granule - 1) / granule;
+    if (index >= classes) return ::operator new(size);
+    if (void* frame = cache.free[index]) {
+        cache.free[index] = *static_cast<void**>(frame);
+        cache.bytes -= index * granule;
+        return frame;
+    }
+    return ::operator new(index * granule);
+}
+
+inline void release(void* frame, std::size_t size) noexcept {
+    const auto index = (size + granule - 1) / granule;
+    if (index >= classes || cache.bytes + index * granule > capacity) {
+        ::operator delete(frame);
+        return;
+    }
+    *static_cast<void**>(frame) = cache.free[index];
+    cache.free[index] = frame;
+    cache.bytes += index * granule;
+}
+} // namespace continuation_frames
 
 // A compiler-host continuation, not a concurrent or emitted runtime task.
 // Resumption always goes through the outer pump: neither awaiting a child nor
@@ -47,6 +87,13 @@ public:
         ContinuationSchedule* schedule{};
         std::coroutine_handle<> continuation;
         std::exception_ptr failure;
+
+        static void* operator new(std::size_t size) {
+            return continuation_frames::allocate(size);
+        }
+        static void operator delete(void* frame, std::size_t size) noexcept {
+            continuation_frames::release(frame, size);
+        }
 
         ContinuationTask get_return_object() noexcept {
             return ContinuationTask(std::coroutine_handle<promise_type>::from_promise(*this));

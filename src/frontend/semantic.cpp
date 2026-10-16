@@ -10575,11 +10575,12 @@ private:
                 return cell->value.type;
             }
             if (current_function_) {
+                const auto key = name_key(expression);
                 for (const auto& parameter : current_function_->parameters)
-                    if (name_key(parameter) == name_key(expression)) return parameter.type;
+                    if (name_key(parameter) == key) return parameter.type;
                 for (const auto& attribute : current_function_->attributes)
                     for (const auto& binding : attribute.variadic_bindings)
-                        if (name_key(binding) == name_key(expression)) return binding.type;
+                        if (name_key(binding) == key) return binding.type;
             }
             if (const auto* object = resolve_object(program_, current_function_, expression)) {
                 if (pointer_resolver_ && decay && object->type->kind == Type::Kind::Array)
@@ -11502,6 +11503,8 @@ private:
         if (!trapped) return true;
         fail(location, *trapped == floating::Exception::DenormalOperand
             ? std::string("floating-point operation traps on a denormal operand during translation-time evaluation")
+            : *trapped == floating::Exception::Unimplemented
+            ? std::string("floating-point operation with a NaN operand may trap on the target FPU during translation-time evaluation")
             : "floating-point operation raises the enabled '" +
                   std::string(floating::exception_name(*trapped)) +
                   "' exception during translation-time evaluation");
@@ -11561,9 +11564,17 @@ private:
         fail(location, "meta operation requires an active expansion context");
     }
 
+    // An opportunistic attempt gives up sooner and leaves the expression to
+    // run time.
+    std::uint64_t step_limit() const {
+        const auto& limits = program_.evaluation_limits;
+        return resource_reporting_ == ResourceReporting::Speculative
+            ? std::min(limits.steps, limits.opportunistic_steps) : limits.steps;
+    }
+
     bool step(SourceLocation location, std::uint64_t amount = 1) {
         if (resource_exhausted_) return false;
-        const auto limit = program_.evaluation_limits.steps;
+        const auto limit = step_limit();
         if (amount <= limit - std::min(steps_, limit)) {
             steps_ += amount;
             return true;
@@ -11571,17 +11582,18 @@ private:
         steps_ = limit;
         if (!budget_diagnosed_) {
             fail_resource(location,
-                 "translation-time instruction budget exceeded " +
-                     std::to_string(program_.evaluation_limits.steps));
+                 "translation-time instruction budget exceeded " + std::to_string(limit));
             budget_diagnosed_ = true;
         }
         return false;
     }
 
     Cell* lookup_mutable(const Expr& expression) {
+        if (scopes_.size() <= frame_base_) return nullptr;
+        const auto key = name_key(expression);
         for (auto index = scopes_.size(); index > frame_base_;) {
             auto& scope = scopes_[--index];
-            const auto found = scope.find(name_key(expression));
+            const auto found = scope.find(key);
             if (found != scope.end()) return &found->second;
         }
         return nullptr;
@@ -13823,7 +13835,7 @@ private:
             }
             std::string error;
             auto limits = program_.evaluation_limits;
-            limits.steps -= std::min(steps_, limits.steps);
+            limits.steps = step_limit() - std::min(steps_, step_limit());
             std::uint64_t validation_work{};
             auto replaced = syntax_replace_child(node,
                 static_cast<std::size_t>(argument->integer.low),
@@ -16743,9 +16755,10 @@ EvaluationTask<bool> expand_evaluation_impl_async(Program& program, Diagnostics&
                 pending.pop_back();
                 if (!expression) continue;
                 if (expression->kind == Expr::Kind::Name && !direct_callee &&
-                    std::none_of(scopes.rbegin(), scopes.rend(), [&](const auto& scope) {
-                        return scope.contains(name_key(*expression));
-                    }) && !resolve_object(program, function, *expression)) {
+                    std::none_of(scopes.rbegin(), scopes.rend(),
+                        [key = name_key(*expression)](const auto& scope) {
+                            return scope.contains(key);
+                        }) && !resolve_object(program, function, *expression)) {
                     if (const auto* target = resolve_function(program, function, *expression,
                             [](const FunctionDecl& candidate) { return evaluation_only(candidate); }))
                         diagnostics.error(expression->location,

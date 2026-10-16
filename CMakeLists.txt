@@ -3551,6 +3551,15 @@ if(BUILD_TESTING)
             -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
         set_tests_properties(cross_runtime_floating_nan_x86_64_${level} PROPERTIES
             LABELS "check.runtime;arch.x86_64;backend.native;frontend;feature.floating;feature.evaluation;opt.${level}")
+        add_test(NAME cross_runtime_floating_nan_propagation_x86_64_${level} COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+            -DSOURCE=${floating_environment}/nan_propagation.x
+            -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-floating-nan-propagation-x86-64-${level}
+            -DENTRY=test_entry -DEXPECTED=0 "-DCC_FLAGS=-${level}"
+            -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_floating_nan_propagation_x86_64_${level} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;frontend;feature.floating;feature.evaluation;opt.${level}")
     endforeach()
     add_test(NAME cross_runtime_floating_nan_mips
         COMMAND "${CMAKE_COMMAND}"
@@ -3562,6 +3571,17 @@ if(BUILD_TESTING)
             -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
     set_tests_properties(cross_runtime_floating_nan_mips PROPERTIES
         LABELS "check.runtime;arch.mips;backend.native;frontend;feature.floating;feature.evaluation;isa.vr4300;endian.big;endian.little;opt.O2"
+        SKIP_REGULAR_EXPRESSION "skipping MIPS")
+    add_test(NAME cross_runtime_floating_nan_propagation_mips_nan2008
+        COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${floating_environment}/nan_propagation_mips.x
+            -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
+            -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare.ld
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-floating-nan-propagation-mips
+            -P "${floating_environment}/nan_propagation_mips.cmake")
+    set_tests_properties(cross_runtime_floating_nan_propagation_mips_nan2008 PROPERTIES
+        LABELS "check.runtime;arch.mips;backend.native;frontend;middle;feature.floating;feature.evaluation;isa.mips32r2;endian.big;endian.little;opt.O2"
         SKIP_REGULAR_EXPRESSION "skipping MIPS")
     add_test(NAME cross_floating_environment_lowering
         COMMAND "${CMAKE_COMMAND}"
@@ -6103,6 +6123,14 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/frontend/preprocessor_dependencies.cmake")
     set_tests_properties(cross_preprocessor_dependencies PROPERTIES
         LABELS "check.compile;arch.x86_64;frontend;feature.preprocessor")
+    add_test(NAME cross_standard_output
+        COMMAND "${CMAKE_COMMAND}"
+                -DCPP=$<TARGET_FILE:cross_cpp>
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/standard-output
+                -P "${CMAKE_SOURCE_DIR}/test/frontend/standard_output.cmake")
+    set_tests_properties(cross_standard_output PROPERTIES
+        LABELS "check.compile;arch.x86_64;frontend;feature.driver;feature.preprocessor")
     add_test(NAME cross_forced_includes
         COMMAND "${CMAKE_COMMAND}"
                 -DCPP=$<TARGET_FILE:cross_cpp>
