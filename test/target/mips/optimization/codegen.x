@@ -471,3 +471,141 @@ global u8 mips_byte_result(in u32 index) {
 global u32 mips_swap_call(in u32 left, in u32 right) {
     return mips_quality_counter + mips_global_index(right) * left;
 }
+
+global i32 mips_ring[55];
+
+// One-operation arms run in branch-likely delay slots: the wrap of each
+// ring index and of a negative difference.
+[[abi("o32"), noinline]]
+global u32 mips_ring_step(in u32 count) {
+    u32 first = 0u32;
+    u32 second = 31u32;
+    u32 bits = 0u32;
+    for (u32 n = 0u32; n < count; n = n + 1u32) {
+        first = first == 0u32 ? 54u32 : first - 1u32;
+        second = second == 0u32 ? 54u32 : second - 1u32;
+        i32 value = mips_ring[first] - mips_ring[second];
+        if (value < 0i32) {
+            value = value + 2147483647i32;
+        }
+        mips_ring[first] = value;
+        bits = bits ^ (u32)value;
+    }
+    return bits;
+}
+
+// The loop's comparison constant and floating zero are materialized once
+// before it.
+[[abi("o32"), noinline]]
+global u32 mips_constant_loop(in f32 *values, in u32 count) {
+    u32 hits = 0u32;
+    for (u32 index = 0u32; index < count; index = index + 1u32) {
+        f32 value = values[index];
+        if (value < 0.0f32) {
+            hits = hits + 1u32;
+        }
+        if ((hits & 255u32) == 200u32) {
+            hits = hits + 3u32;
+        }
+    }
+    return hits;
+}
+
+global u16 mips_halves[8];
+global i8 mips_bytes[8];
+
+// LHU and LB already extend, and SLLV reads only the low five bits of its
+// amount.
+[[abi("o32"), noinline]]
+global u32 mips_narrow_sum(in u32 first, in u32 second) {
+    u32 half = mips_halves[first & 7u32];
+    i32 byte = mips_bytes[second & 7u32];
+    return half + (u32)byte + (1u32 << (half & 31u32));
+}
+
+// Neighboring elements share one address.
+[[abi("o32"), noinline]]
+global i32 mips_neighbors(in i32 *line, in u32 index) {
+    return line[index] - line[index + 1u32] + line[index + 2u32];
+}
+
+// A trapping floating comparison still branches directly.
+[[abi("o32"), noinline]]
+global u32 mips_trapping_compare(in f32 left, in f32 right, in u32 value) {
+    if (left < right) {
+        value = value * 5u32;
+    }
+    return value + 1u32;
+}
+
+// A floating addition fills an integer branch's delay slot under the
+// console profile, but stays ahead of a comparison that may trap.
+[[abi("o32"), noinline]]
+global f32 mips_trap_order(in f32 x, in f32 y, in u32 flag) {
+    f32 sum = x + y;
+    if (flag != 0u32) {
+        sum = sum - y;
+    }
+    f32 product = sum + x;
+    if (product < y) {
+        product = product - x;
+    }
+    return product;
+}
+
+// A test of one value against both ends of a range is one unsigned
+// comparison of its offset, and a subtraction from zero is a negation.
+[[abi("o32"), noinline]]
+global i32 mips_range_test(in i32 value, in i32 other) {
+    if (value < -1048576i32 || value > 1048576i32) {
+        other = 0i32 - other;
+    }
+    return other;
+}
+
+// The unrolled loop's latch branches back with the body's first load in a
+// branch-likely slot; its exit to the remainder loop follows the slot.
+[[abi("o32"), noinline]]
+global u32 mips_rounds_sum(in const u32 *data, in u32 count, in u32 rounds) {
+    u32 result = 0u32;
+    for (u32 round = 0u32; round < rounds; round = round + 1u32) {
+        u32 sum = 0u32;
+        for (u32 index = 0u32; index < count; index = index + 1u32) {
+            sum = sum + data[index];
+        }
+        result = result + (sum ^ round);
+    }
+    return result;
+}
+
+// As above, where the exit edge also copies the sum.
+[[abi("o32"), noinline]]
+global u64 mips_rounds_sum64(in const u64 *data, in u32 count,
+                             in u32 rounds) {
+    u64 result = 0u64;
+    for (u32 round = 0u32; round < rounds; round = round + 1u32) {
+        u64 sum = 0u64;
+        for (u32 index = 0u32; index < count; index = index + 1u32) {
+            sum = sum + data[index];
+        }
+        result = result + (sum ^ (u64)round);
+    }
+    return result;
+}
+
+// A row's four elements are displacements from one pointer that advances
+// by a row per iteration.
+[[abi("o32"), noinline]]
+global void mips_matrix_rows(in const i32 *matrix, in i32 *sums,
+                             in u32 rows) {
+    for (u32 row = 0u32; row < rows; ++row) {
+        sums[row] = matrix[row * 4u32] - matrix[row * 4u32 + 1u32] +
+                    (matrix[row * 4u32 + 2u32] ^ matrix[row * 4u32 + 3u32]);
+    }
+}
+
+// A low-word mask and a shifted run of ones start from ADDIU -1.
+[[abi("o32"), noinline]]
+global u64 mips_wide_masks(in u64 x) {
+    return (x & 0x00000000ffffffffu64) ^ (x + 0x0fffffffff000000u64);
+}

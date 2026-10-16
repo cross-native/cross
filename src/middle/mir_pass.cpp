@@ -25,6 +25,7 @@ std::string_view pass_name(PassId pass) {
     case PassId::TailMerging: return "tail-merging";
     case PassId::ConditionalReplacement: return "conditional-replacement";
     case PassId::IfConversion: return "if-conversion";
+    case PassId::RangeTestCombining: return "range-test-combining";
     case PassId::SelectFactoring: return "select-factoring";
     case PassId::RedundantExpressionElimination:
         return "redundant-expression-elimination";
@@ -45,6 +46,7 @@ std::string_view pass_name(PassId pass) {
     case PassId::UnitRecurrenceReassociation:
         return "unit-recurrence-reassociation";
     case PassId::RecurrenceRebalancing: return "recurrence-rebalancing";
+    case PassId::AddressIndexSplitting: return "address-index-splitting";
     case PassId::StraightLineStrengthReduction:
         return "straight-line-strength-reduction";
     case PassId::DivisionByConstant: return "division-by-constant";

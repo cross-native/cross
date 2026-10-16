@@ -358,3 +358,194 @@ global u32 k_q_booleans(in u32 a, in u32 b, in u32 c) {
         narrowed * 32u32 + (c & 7u32) * 64u32 + less_low * 512u32 +
         less_high * 1024u32;
 }
+
+// One-operation arms of selects and conditional updates, which a
+// branch-likely delay slot can execute on its taken edge, inside a loop
+// whose latch branches back to its header.
+global i32 q_ring[16] = {
+    11i32, 70000i32, 3i32, 900i32, 123456i32, 77i32, 5i32, 1000000i32,
+    42i32, 8i32, 65535i32, 31i32, 2000i32, 9i32, 400000i32, 1i32,
+};
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_ring_select(in u32 a, in u32 b, in u32 c) {
+    u32 i = a & 15u32;
+    u32 j = b & 15u32;
+    u32 acc = c;
+    for (u32 n = 0u32; n < 24u32; n = n + 1u32) {
+        i = i == 0u32 ? 15u32 : i - 1u32;
+        j = j == 0u32 ? 15u32 : j - 1u32;
+        i32 v = q_ring[i] - q_ring[j];
+        if (v < 0i32) {
+            v = v + 1073741824i32;
+        }
+        q_ring[i] = v;
+        acc = acc ^ (u32)v;
+    }
+    return acc;
+}
+
+// Floating diamonds and triangles with one-operation arms, and loop
+// comparisons against constants, including floating zero.
+[[abi("@ABI@"), noinline]]
+global u32 k_q_float_arms(in u32 a, in u32 b, in u32 c) {
+    f32 x = (f32)(a & 255u32) * 0.25f32;
+    f32 y = (f32)(b & 63u32) * 0.5f32 - 8.0f32;
+    u32 contacts = c & 0xffu32;
+    u32 n = (c & 7u32) + 9u32;
+    for (u32 j = 0u32; j < n; j = j + 1u32) {
+        f32 p = (f32)j * 4.0f32;
+        f32 d = p > x ? p - x : x - p;
+        if (d < 8.0f32) {
+            contacts = contacts + 1u32;
+        }
+        if (x >= 32.0f32) {
+            x = x - 32.0f32;
+        }
+        if (y < 0.0f32) {
+            y = y + 16.0f32;
+        }
+        y = y - 1.5f32;
+        if (y > x) {
+            contacts = contacts + 2u32;
+        }
+    }
+    return contacts;
+}
+
+// Zero- and sign-extending loads, truncating stores, and variable shifts
+// whose masked amount the shift already reduces.
+global u16 q_halves[8] = {
+    0xfff0u16, 1u16, 0x8000u16, 300u16, 0x7fffu16, 9u16, 0xabcdu16, 64u16,
+};
+global i8 q_bytes[8] = { -1i8, 5i8, -127i8, 127i8, 0i8, -7i8, 64i8, -64i8 };
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_narrow_loads(in u32 a, in u32 b, in u32 c) {
+    u32 sum = c;
+    for (u32 i = 0u32; i < 8u32; i = i + 1u32) {
+        u32 h = q_halves[(a + i) & 7u32];
+        i32 s = q_bytes[(b + i) & 7u32];
+        sum = sum + h + (u32)s;
+        q_halves[i] = (u16)(sum >> 3);
+        sum = sum ^ (1u32 << (h & 31u32)) ^ (sum >> (b & 31u32));
+    }
+    return sum;
+}
+
+// Neighboring elements share one address and differ by displacements.
+global i32 q_line[20] = {
+    1i32, 2i32, 3i32, 5i32, 8i32, 13i32, 21i32, 34i32, 55i32, 89i32,
+    -1i32, -2i32, -3i32, -5i32, -8i32, -13i32, -21i32, -34i32, -55i32, -89i32,
+};
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_neighbors(in u32 a, in u32 b, in u32 c) {
+    u32 i = (a & 15u32) + 1u32;
+    i32 left = q_line[i];
+    i32 right = (b & 1u32) != 0u32 ? q_line[i + 1u32] : left;
+    i32 next = q_line[i + 2u32];
+    i32 before = q_line[i - 1u32];
+    q_line[i + 1u32] = (left + next) & 0xfffffi32;
+    u32 k = (c & 15u32) + 1u32;
+    return ((u32)(left - right) + (u32)q_line[k - 1u32]) ^ (u32)next ^
+        ((u32)before << 4);
+}
+
+// A search loop over an array whose result address a later store reuses,
+// and nested loops whose outer back edge swaps values.
+global u32 q_bits[8];
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_search_store(in u32 a, in u32 b, in u32 c) {
+    for (u32 w = 0u32; w < 8u32; w = w + 1u32) {
+        q_bits[w] = w < (a & 7u32) ? 0xffffffffu32 : b << w;
+    }
+    u32 w = 0u32;
+    while (w < 7u32 && q_bits[w] == 0xffffffffu32) {
+        w = w + 1u32;
+    }
+    q_bits[w] = q_bits[w] | (c & 1u32) | 2u32;
+    u32 x = a;
+    u32 y = b;
+    u32 acc = q_bits[w] + w;
+    for (u32 n = 0u32; n < 6u32; n = n + 1u32) {
+        for (u32 k = 0u32; k < (c & 3u32); k = k + 1u32) {
+            acc = acc + (x ^ k);
+        }
+        u32 t = x;
+        x = y + 1u32;
+        y = t;
+    }
+    return acc ^ x ^ y;
+}
+
+// Doubleword constants of each materialization shape: a shifted 16-bit
+// value, a shifted run of ones, a zero high word, and a general value.
+[[abi("@ABI@"), noinline]]
+global u32 k_q_wide_constants(in u32 a, in u32 b, in u32 c) {
+    u64 x = ((u64)a << 32) | b;
+    u64 r = (x + 0x0000ffff00000000u64) ^ (x + 0x00000000ffffffffu64);
+    r = r + (x ^ 0x0fffffffff000000u64) + (x | 0x0000000080001234u64);
+    r = r ^ (x + 0xffff000000000000u64) ^ (x + 0x0123456789abcdefu64);
+    r = r + (x ^ 0x00007fffffffffffu64) + (x & 0x0000000180000000u64);
+    return (u32)r ^ (u32)(r >> 32) ^ c;
+}
+
+// Tests of one value against both ends of a range, signed and unsigned,
+// as `||` and as `&&`, which combine into one unsigned comparison.
+[[abi("@ABI@"), noinline]]
+global u32 k_q_range_tests(in u32 a, in u32 b, in u32 c) {
+    i32 sa = a;
+    i32 sb = b;
+    u32 r = c & 0xffu32;
+    if (sa < -1048576i32 || sa > 1048576i32) {
+        r = r + 1u32;
+    }
+    if (sb >= -5i32 && sb <= 100i32) {
+        r = r + 2u32;
+    }
+    if (a < 10u32 || a >= 0x80000000u32) {
+        r = r + 4u32;
+    }
+    if (b > 7u32 && b < 300u32) {
+        r = r + 8u32;
+    }
+    if (sa <= -2147483647i32 || sa >= 2147483647i32) {
+        r = r + 16u32;
+    }
+    if (c >= 16u32 && c <= 33u32) {
+        r = r + 32u32;
+    }
+    return r;
+}
+
+global u32 q_rows[24];
+global u32 q_row_sums[6];
+global u16 q_triples[18];
+
+// Row elements at `row * 4 + k` and `row * 3 + k` are displacements from
+// pointers that advance by a row per iteration.
+[[abi("@ABI@"), noinline]]
+global u32 k_q_scaled_rows(in u32 a, in u32 b, in u32 c) {
+    for (u32 i = 0u32; i < 24u32; ++i) {
+        q_rows[i] = (a ^ (i * 2654435761u32)) >> (c & 7u32);
+    }
+    for (u32 i = 0u32; i < 18u32; ++i) {
+        q_triples[i] = (u16)(b + i * 40503u32);
+    }
+    u32 rows = (b & 3u32) + 3u32;
+    for (u32 row = 0u32; row < rows; ++row) {
+        q_row_sums[row] = q_rows[row * 4u32] +
+                          q_rows[row * 4u32 + 1u32] * 3u32 -
+                          q_rows[row * 4u32 + 2u32] +
+                          (q_rows[row * 4u32 + 3u32] ^ row) +
+                          (u32)q_triples[row * 3u32] -
+                          (u32)q_triples[row * 3u32 + 2u32];
+    }
+    u32 r = c;
+    for (u32 row = 0u32; row < rows; ++row) {
+        r = r * 31u32 + q_row_sums[row];
+    }
+    return r;
+}

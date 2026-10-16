@@ -191,9 +191,267 @@ std::vector<unsigned> loop_depths(const machine::Function& function) {
     return depths;
 }
 
+namespace {
+
+// The largest number of simultaneously live virtual registers of each bank
+// at any point of each block, from a backward liveness solution in which a
+// PHI's uses are live out of the predecessor they arrive from.
+std::vector<std::vector<unsigned>> block_pressure(
+    const machine::Function& function, const LoopConstantPolicy& policy) {
+    const auto count = function.blocks.size();
+    const auto banks = policy.capacity.size();
+    std::vector<std::optional<unsigned>> bank_of(
+        function.virtual_registers.size());
+    for (std::size_t id = 0; id < bank_of.size(); ++id) {
+        bank_of[id] = policy.bank(machine::Register::virtual_register(
+            {static_cast<std::uint32_t>(id)}, function.virtual_registers[id]));
+        if (bank_of[id] && *bank_of[id] >= banks) bank_of[id].reset();
+    }
+    const auto tracked = [&](const machine::Register& value) {
+        return value.kind == machine::RegisterKind::Virtual &&
+               value.id < bank_of.size() && bank_of[value.id].has_value();
+    };
+    using LiveSet = std::unordered_set<std::uint32_t>;
+    std::vector<LiveSet> uses(count), defs(count), live_in(count),
+        live_out(count);
+    // Values each block's PHIs take from a predecessor, by predecessor.
+    std::vector<std::unordered_map<std::uint32_t, LiveSet>> edge_uses(count);
+    for (std::uint32_t block = 0; block < count; ++block) {
+        for (const auto& instruction : function.blocks[block].instructions) {
+            if (policy.is_phi(instruction)) {
+                for (std::size_t index = 0;
+                     index + 1 < instruction.operands.size(); index += 2) {
+                    const auto* from = std::get_if<machine::BlockOperand>(
+                        &instruction.operands[index]);
+                    const auto* value = std::get_if<machine::RegisterOperand>(
+                        &instruction.operands[index + 1]);
+                    if (from && value && tracked(value->value)) {
+                        edge_uses[block][from->target.value].insert(
+                            value->value.id);
+                    }
+                }
+            } else {
+                for (const auto& use : instruction.uses) {
+                    if (tracked(use) && !defs[block].contains(use.id)) {
+                        uses[block].insert(use.id);
+                    }
+                }
+            }
+            for (const auto& definition : instruction.defs) {
+                if (tracked(definition)) defs[block].insert(definition.id);
+            }
+        }
+    }
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (std::uint32_t block = static_cast<std::uint32_t>(count);
+             block-- > 0;) {
+            LiveSet out;
+            for (const auto successor : function.blocks[block].successors) {
+                if (successor.value >= count) continue;
+                out.insert(live_in[successor.value].begin(),
+                           live_in[successor.value].end());
+                const auto& from = edge_uses[successor.value];
+                if (const auto found = from.find(block); found != from.end()) {
+                    out.insert(found->second.begin(), found->second.end());
+                }
+            }
+            LiveSet in = uses[block];
+            for (const auto id : out) {
+                if (!defs[block].contains(id)) in.insert(id);
+            }
+            if (out != live_out[block] || in != live_in[block]) {
+                live_out[block] = std::move(out);
+                live_in[block] = std::move(in);
+                changed = true;
+            }
+        }
+    }
+    std::vector<std::vector<unsigned>> pressure(
+        count, std::vector<unsigned>(banks));
+    for (std::uint32_t block = 0; block < count; ++block) {
+        auto live = live_out[block];
+        std::vector<unsigned> current(banks);
+        for (const auto id : live) ++current[*bank_of[id]];
+        auto& peak = pressure[block];
+        peak = current;
+        const auto& instructions = function.blocks[block].instructions;
+        for (auto instruction = instructions.rbegin();
+             instruction != instructions.rend(); ++instruction) {
+            // Definitions occupy colors at their instruction even when dead.
+            auto at = current;
+            for (const auto& definition : instruction->defs) {
+                if (tracked(definition) && !live.contains(definition.id)) {
+                    ++at[*bank_of[definition.id]];
+                }
+            }
+            for (const auto& definition : instruction->defs) {
+                if (tracked(definition) && live.erase(definition.id)) {
+                    --current[*bank_of[definition.id]];
+                }
+            }
+            if (!policy.is_phi(*instruction)) {
+                for (const auto& use : instruction->uses) {
+                    if (tracked(use) && live.insert(use.id).second) {
+                        ++current[*bank_of[use.id]];
+                    }
+                }
+            }
+            for (std::size_t bank = 0; bank < banks; ++bank) {
+                peak[bank] = std::max({peak[bank], at[bank], current[bank]});
+            }
+        }
+    }
+    return pressure;
+}
+
+bool control_transfer(const machine::Instruction& instruction) {
+    switch (instruction.kind) {
+    case machine::InstructionKind::Branch:
+    case machine::InstructionKind::ConditionalBranch:
+    case machine::InstructionKind::IndirectBranch:
+    case machine::InstructionKind::Return:
+    case machine::InstructionKind::Unreachable:
+    case machine::InstructionKind::Trap: return true;
+    default: return false;
+    }
+}
+
+} // namespace
+
+bool hoist_loop_constants(machine::Function& function,
+                          const LoopConstantPolicy& policy) {
+    const auto count = function.blocks.size();
+    if (count < 2 || function.entry.value >= count) return false;
+    for (std::uint32_t block = 0; block < count; ++block) {
+        if (function.blocks[block].id.value != block) return false;
+    }
+    const auto dominance = block_dominance(function);
+    auto loops = natural_loops(function, dominance);
+    std::stable_sort(loops.begin(), loops.end(),
+                     [](const NaturalLoop& left, const NaturalLoop& right) {
+                         return left.size < right.size;
+                     });
+    // A constant that only PHIs read still costs a copy on every edge.
+    std::vector<bool> operand_use(function.virtual_registers.size());
+    for (const auto& block : function.blocks) {
+        for (const auto& instruction : block.instructions) {
+            if (policy.is_phi(instruction)) continue;
+            for (const auto& use : instruction.uses) {
+                if (use.kind == machine::RegisterKind::Virtual &&
+                    use.id < operand_use.size()) {
+                    operand_use[use.id] = true;
+                }
+            }
+        }
+    }
+    const auto constant = [&](const machine::Instruction& instruction) {
+        return structurally_pure_single_definition(instruction) &&
+               instruction.uses.empty() && policy.is_constant(instruction) &&
+               instruction.defs.front().id < operand_use.size() &&
+               operand_use[instruction.defs.front().id] &&
+               policy.bank(instruction.defs.front()).has_value();
+    };
+    // Pressure only grows as constants leave inner loops; a hoisted
+    // constant counts as live in every block of the loop it left.
+    auto pressure = block_pressure(function, policy);
+    bool changed = false;
+    for (const auto& loop : loops) {
+        std::optional<std::uint32_t> preheader;
+        bool unique = true;
+        for (const auto predecessor :
+             function.blocks[loop.header].predecessors) {
+            if (predecessor.value >= count ||
+                loop.members[predecessor.value]) {
+                continue;
+            }
+            if (preheader && *preheader != predecessor.value) unique = false;
+            preheader = predecessor.value;
+        }
+        if (!preheader || !unique ||
+            function.blocks[*preheader].instructions.empty() ||
+            !control_transfer(function.blocks[*preheader].instructions.back())) {
+            continue;
+        }
+        bool calls = false;
+        bool candidates = false;
+        for (std::uint32_t block = 0; block < count; ++block) {
+            if (!loop.members[block]) continue;
+            for (const auto& instruction : function.blocks[block].instructions) {
+                calls = calls ||
+                        instruction.kind == machine::InstructionKind::Call;
+                candidates = candidates || constant(instruction);
+            }
+        }
+        if (calls || !candidates) continue;
+
+        std::vector<unsigned> peak(policy.capacity.size());
+        for (std::uint32_t block = 0; block < count; ++block) {
+            if (!loop.members[block]) continue;
+            for (std::size_t bank = 0; bank < peak.size(); ++bank) {
+                peak[bank] = std::max(peak[bank], pressure[block][bank]);
+            }
+        }
+        auto& target = function.blocks[*preheader].instructions;
+        ReplacementMap replacements;
+        std::vector<machine::Instruction> hoisted;
+        for (std::uint32_t block = 0; block < count; ++block) {
+            if (!loop.members[block]) continue;
+            auto& instructions = function.blocks[block].instructions;
+            for (auto instruction = instructions.begin();
+                 instruction != instructions.end();) {
+                if (!constant(*instruction)) {
+                    ++instruction;
+                    continue;
+                }
+                const auto equal = [&](const machine::Instruction& other) {
+                    return same_selected_expression(other, *instruction) &&
+                           policy.bank(other.defs.front()) ==
+                               policy.bank(instruction->defs.front());
+                };
+                const auto merged = std::find_if(hoisted.begin(),
+                                                 hoisted.end(), equal);
+                if (merged != hoisted.end()) {
+                    replacements[instruction->defs.front().id] =
+                        merged->defs.front();
+                    instruction = instructions.erase(instruction);
+                    continue;
+                }
+                const auto bank = *policy.bank(instruction->defs.front());
+                if (peak[bank] + 1 > policy.capacity[bank]) {
+                    ++instruction;
+                    continue;
+                }
+                ++peak[bank];
+                hoisted.push_back(std::move(*instruction));
+                instruction = instructions.erase(instruction);
+            }
+        }
+        if (hoisted.empty() && replacements.empty()) continue;
+        std::vector<unsigned> added(policy.capacity.size());
+        for (const auto& instruction : hoisted) {
+            ++added[*policy.bank(instruction.defs.front())];
+        }
+        for (std::uint32_t block = 0; block < count; ++block) {
+            if (!loop.members[block] && block != *preheader) continue;
+            for (std::size_t bank = 0; bank < added.size(); ++bank) {
+                pressure[block][bank] += added[bank];
+            }
+        }
+        target.insert(target.end() - 1,
+                      std::make_move_iterator(hoisted.begin()),
+                      std::make_move_iterator(hoisted.end()));
+        if (!replacements.empty()) apply_replacements(function, replacements);
+        changed = true;
+    }
+    return changed;
+}
+
 bool schedule_block_layout(
     machine::Function& function,
-    const MachineBlockPredicate& is_addressable) {
+    const MachineBlockPredicate& is_addressable,
+    bool late_conditional_back_edges) {
     const auto count = function.blocks.size();
     const auto entry = function.entry.value;
     if (function.layout.size() < 2 || entry >= count) return false;
@@ -341,7 +599,10 @@ bool schedule_block_layout(
     // candidates by decreasing weight and join a source that ends its chain
     // to a target that starts another. Among edges of equal weight, one that
     // would otherwise need an unconditional jump comes first, and back edges
-    // come last so a loop's chain starts at its header.
+    // come last so a loop's chain starts at its header. A late conditional
+    // back edge comes after every forward edge: as a fallthrough it would
+    // put its header in the middle of the loop's chain, so the loop's other
+    // blocks would jump back to its top instead of the latch branching once.
     struct Edge {
         std::uint32_t source{};
         std::uint32_t target{};
@@ -367,7 +628,12 @@ bool schedule_block_layout(
         }
     }
     std::stable_sort(edges.begin(), edges.end(),
-                     [](const Edge& left, const Edge& right) {
+                     [&](const Edge& left, const Edge& right) {
+                         const bool left_late = late_conditional_back_edges &&
+                             left.back && left.conditional;
+                         const bool right_late = late_conditional_back_edges &&
+                             right.back && right.conditional;
+                         if (left_late != right_late) return !left_late;
                          if (left.weight != right.weight) {
                              return left.weight > right.weight;
                          }

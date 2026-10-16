@@ -22,10 +22,15 @@ using MachineBlockPredicate = std::function<bool(machine::BlockId)>;
 
 // Forms hot fallthrough traces and rotates canonical test-first loops in
 // layout only. The CFG and SSA edges remain unchanged; targets retain control
-// over blocks whose source-visible labels make movement undesirable.
+// over blocks whose source-visible labels make movement undesirable. With
+// `late_conditional_back_edges`, a conditional back edge joins only after
+// every forward edge, so a loop's chain starts at its header and its latch
+// branches back once; a target whose emitter places a non-fallthrough
+// edge's PHI copies inline after the branch (MIPS) asks for it.
 [[nodiscard]] bool schedule_block_layout(
     machine::Function& function,
-    const MachineBlockPredicate& is_addressable = {});
+    const MachineBlockPredicate& is_addressable = {},
+    bool late_conditional_back_edges = false);
 
 // The number of natural loops that contain each block, by block id.
 [[nodiscard]] std::vector<unsigned>
@@ -63,6 +68,27 @@ std::size_t hoist_entry_captures(machine::Function& function,
 // target can keep that early, simple construction without paying frame cost.
 [[nodiscard]] bool
 elide_unused_virtual_spill_slots(machine::Function& function);
+
+// What a target tells loop-constant hoisting: which instructions
+// materialize a constant (they have no register uses), which are PHIs
+// (whose uses are live on predecessor edges), the register bank of a
+// virtual register that takes an allocatable color, and how many colors of
+// each bank the values of one loop may occupy.
+struct LoopConstantPolicy {
+    MachineInstructionPredicate is_constant;
+    MachineInstructionPredicate is_phi;
+    std::function<std::optional<unsigned>(const machine::Register&)> bank;
+    std::vector<unsigned> capacity;
+};
+
+// Moves constant materializations out of natural loops that make no calls,
+// to the end of the loop's only predecessor outside it, which dominates the
+// loop, while every point of the loop keeps its live values and the hoisted
+// constants within each bank's capacity. Inner loops come first, so a
+// constant leaves as many loops of a nest as the budget allows; equal
+// constants hoisted into one block are merged.
+[[nodiscard]] bool hoist_loop_constants(machine::Function& function,
+                                        const LoopConstantPolicy& policy);
 
 // A quotient and a remainder of the same SSA operands in one block become one
 // combined instruction at the first position, defining {quotient, remainder}.

@@ -2303,29 +2303,35 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/target/mips/differential/differential.cmake")
     set_tests_properties(cross_mips_differential_private_r3000 PROPERTIES
         LABELS "check.runtime;arch.mips;backend.native;feature.optimization")
-    # Global addressing, immediate comparisons, and filled delay slots on
-    # each CPU class and byte order, with the enabling controls switched off
-    # for comparison. Each entry:
-    # name|endian|address model|QEMU CPU|optimization|flags.
+    # Global addressing, immediate comparisons, filled delay slots, loop
+    # constants, narrow values, and shared addresses on each CPU class and
+    # byte order, under the N64 console profile's trapping floating
+    # environment, and with the enabling controls switched off for
+    # comparison. Each entry:
+    # name|ISA|endian|address model|QEMU CPU|optimization|flags.
     foreach(quality_case
-            "vr4300|BE|32|R4000|-O2|-mprofile=vr4300-o32"
-            "vr4300_le|LE|32|R4000|-O2|-target mipsel-unknown-elf -mabi=o32 -march=vr4300"
-            "vr4300_o3|BE|32|R4000|-O3|-mprofile=vr4300-o32"
-            "vr4300_os|BE|32|R4000|-Os|-mprofile=vr4300-o32"
-            "vr4300_controls_off|BE|32|R4000|-O2|-mprofile=vr4300-o32 -fno-schedule-insns2 -fno-combine-addresses -fno-machine-combine"
-            "r3000|BE|32|R4000|-O2|-mprofile=r3000-o32"
-            "r3000_le|LE|32|R4000|-O2|-target mipsel-unknown-elf -mabi=o32 -march=r3000"
-            "mips32|BE|32|24Kf|-O2|-target mips-unknown-elf -mabi=o32 -march=mips32"
-            "mips32_le|LE|32|24Kf|-O2|-target mipsel-unknown-elf -mabi=o32 -march=mips32"
-            "n64|BE|64|MIPS64R2-generic|-O2|-mprofile=mips64-n64 -mabi=n64"
-            "n64_le|LE|64|MIPS64R2-generic|-O2|-mprofile=mips64el-n64 -mabi=n64")
+            "vr4300|vr4300|BE|32|R4000|-O2|-mprofile=vr4300-o32"
+            "vr4300_le|vr4300|LE|32|R4000|-O2|-target mipsel-unknown-elf -mabi=o32 -march=vr4300"
+            "vr4300_o3|vr4300|BE|32|R4000|-O3|-mprofile=vr4300-o32"
+            "vr4300_o3_le|vr4300|LE|32|R4000|-O3|-target mipsel-unknown-elf -mabi=o32 -march=vr4300"
+            "vr4300_os|vr4300|BE|32|R4000|-Os|-mprofile=vr4300-o32"
+            "vr4300_console|vr4300|BE|32|R4000|-O2|-mprofile=n64"
+            "vr4300_console_o3|vr4300|BE|32|R4000|-O3|-mprofile=n64"
+            "vr4300_controls_off|vr4300|BE|32|R4000|-O2|-mprofile=vr4300-o32 -fno-schedule-insns2 -fno-combine-addresses -fno-machine-combine -fno-move-loop-invariants -fno-tree-reassoc"
+            "r3000|r3000|BE|32|R4000|-O2|-mprofile=r3000-o32"
+            "r3000_le|r3000|LE|32|R4000|-O2|-target mipsel-unknown-elf -mabi=o32 -march=r3000"
+            "mips32|mips32|BE|32|24Kf|-O2|-target mips-unknown-elf -mabi=o32 -march=mips32"
+            "mips32_le|mips32|LE|32|24Kf|-O2|-target mipsel-unknown-elf -mabi=o32 -march=mips32"
+            "n64|mips64|BE|64|MIPS64R2-generic|-O2|-mprofile=mips64-n64 -mabi=n64"
+            "n64_le|mips64|LE|64|MIPS64R2-generic|-O2|-mprofile=mips64el-n64 -mabi=n64")
         string(REPLACE "|" ";" quality_fields "${quality_case}")
         list(GET quality_fields 0 quality_name)
-        list(GET quality_fields 1 quality_endian)
-        list(GET quality_fields 2 quality_address)
-        list(GET quality_fields 3 quality_cpu)
-        list(GET quality_fields 4 quality_level)
-        list(GET quality_fields 5 quality_flags)
+        list(GET quality_fields 1 quality_isa)
+        list(GET quality_fields 2 quality_endian)
+        list(GET quality_fields 3 quality_address)
+        list(GET quality_fields 4 quality_cpu)
+        list(GET quality_fields 5 quality_level)
+        list(GET quality_fields 6 quality_flags)
         string(SUBSTRING "${quality_level}" 1 -1 quality_level_label)
         if(quality_address STREQUAL "64")
             set(quality_startup start_quality_n64.s)
@@ -2357,7 +2363,7 @@ if(BUILD_TESTING)
                     -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-differential-quality-${quality_name}
                     -P "${CMAKE_SOURCE_DIR}/test/target/mips/differential/differential.cmake")
         set_tests_properties(cross_mips_differential_quality_${quality_name} PROPERTIES
-            LABELS "check.runtime;arch.mips;backend.native;feature.optimization;endian.${quality_endian_label};opt.${quality_level_label}")
+            LABELS "check.runtime;arch.mips;backend.native;feature.optimization;isa.${quality_isa};endian.${quality_endian_label};opt.${quality_level_label}")
     endforeach()
     add_test(NAME cross_model_system
         COMMAND "${CMAKE_COMMAND}"

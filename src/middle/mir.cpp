@@ -12981,19 +12981,153 @@ bool if_convert_one_diamond(ManagedFunction& function,
     return true;
 }
 
+// The values of an integer for which its comparison with a constant holds,
+// as a closed interval whose bounds are biased by the signed minimum for a
+// signed comparison, so that unsigned order is the comparison's order.
+struct IntegerInterval {
+    ValueId value;
+    bool is_signed{};
+    unsigned bits{};
+    std::uint64_t low{};
+    std::uint64_t high{};
+};
+
+std::optional<IntegerInterval> comparison_interval(
+    const ManagedFunction& function, const hir::Module& hir_module,
+    ValueId id) {
+    const auto& compare = function.values[id.value];
+    if (compare.kind != ValueKind::Binary || compare.operands.size() != 2) {
+        return std::nullopt;
+    }
+    auto operation = compare.binary;
+    bool is_signed{};
+    switch (operation) {
+    case BinaryOperation::SignedLess:
+    case BinaryOperation::SignedLessEqual:
+    case BinaryOperation::SignedGreater:
+    case BinaryOperation::SignedGreaterEqual: is_signed = true; break;
+    case BinaryOperation::UnsignedLess:
+    case BinaryOperation::UnsignedLessEqual:
+    case BinaryOperation::UnsignedGreater:
+    case BinaryOperation::UnsignedGreaterEqual: break;
+    default: return std::nullopt;
+    }
+    auto value = compare.operands[0];
+    auto constant =
+        folded_integer_constant(function, hir_module, compare.operands[1]);
+    if (!constant) {
+        // `c < x` is `x > c`.
+        value = compare.operands[1];
+        constant =
+            folded_integer_constant(function, hir_module, compare.operands[0]);
+        switch (operation) {
+        case BinaryOperation::SignedLess: operation = BinaryOperation::SignedGreater; break;
+        case BinaryOperation::SignedLessEqual: operation = BinaryOperation::SignedGreaterEqual; break;
+        case BinaryOperation::SignedGreater: operation = BinaryOperation::SignedLess; break;
+        case BinaryOperation::SignedGreaterEqual: operation = BinaryOperation::SignedLessEqual; break;
+        case BinaryOperation::UnsignedLess: operation = BinaryOperation::UnsignedGreater; break;
+        case BinaryOperation::UnsignedLessEqual: operation = BinaryOperation::UnsignedGreaterEqual; break;
+        case BinaryOperation::UnsignedGreater: operation = BinaryOperation::UnsignedLess; break;
+        case BinaryOperation::UnsignedGreaterEqual: operation = BinaryOperation::UnsignedLessEqual; break;
+        default: break;
+        }
+    }
+    const auto bits = type_bits(hir_module, function.values[value.value].type);
+    if (!constant || bits == 0 || bits > 64 ||
+        !integer_type(hir_module, function.values[value.value].type) ||
+        folded_integer_constant(function, hir_module, value)) {
+        return std::nullopt;
+    }
+    const auto mask = bits == 64 ? ~std::uint64_t{0}
+                                 : (std::uint64_t{1} << bits) - 1U;
+    const auto bias = is_signed ? std::uint64_t{1} << (bits - 1U) : 0U;
+    const auto biased = (constant->low + bias) & mask;
+    IntegerInterval interval{value, is_signed, bits, 0, mask};
+    switch (operation) {
+    case BinaryOperation::SignedLess:
+    case BinaryOperation::UnsignedLess:
+        if (biased == 0) return std::nullopt;
+        interval.high = biased - 1U;
+        break;
+    case BinaryOperation::SignedLessEqual:
+    case BinaryOperation::UnsignedLessEqual:
+        interval.high = biased;
+        break;
+    case BinaryOperation::SignedGreater:
+    case BinaryOperation::UnsignedGreater:
+        if (biased == mask) return std::nullopt;
+        interval.low = biased + 1U;
+        break;
+    default:
+        interval.low = biased;
+        break;
+    }
+    if (interval.low == 0 && interval.high == mask) return std::nullopt;
+    return interval;
+}
+
+// `a && b` or `a || b` of comparisons of one integer with constants is a
+// test of the integer's offset from one range start: `x - lo <= hi - lo` or
+// `x - lo > hi - lo` in the unsigned type of its width.
+struct RangeTest {
+    ValueId value;
+    std::uint64_t start{};
+    std::uint64_t span{};
+    bool inside{};
+};
+
+std::optional<RangeTest> combined_range_test(const ManagedFunction& function,
+                                             const hir::Module& hir_module,
+                                             ValueId first_id,
+                                             ValueId second_id,
+                                             bool conjunction) {
+    const auto first = comparison_interval(function, hir_module, first_id);
+    const auto second = comparison_interval(function, hir_module, second_id);
+    if (!first || !second || first->value != second->value ||
+        first->is_signed != second->is_signed || first->bits != second->bits ||
+        (first->low == 0) == (second->low == 0)) {
+        return std::nullopt;
+    }
+    const auto& below = first->low == 0 ? *first : *second;
+    const auto& above = first->low == 0 ? *second : *first;
+    const auto mask = first->bits == 64 ? ~std::uint64_t{0}
+                                        : (std::uint64_t{1} << first->bits) - 1U;
+    if (above.high != mask) return std::nullopt;
+    std::uint64_t low{};
+    std::uint64_t high{};
+    if (conjunction) {
+        if (above.low > below.high) return std::nullopt;
+        low = above.low;
+        high = below.high;
+    } else {
+        if (below.high + 1U >= above.low) return std::nullopt;
+        low = below.high + 1U;
+        high = above.low - 1U;
+    }
+    const auto bias = first->is_signed ? std::uint64_t{1} << (first->bits - 1U)
+                                       : 0U;
+    return RangeTest{first->value, (low - bias) & mask, high - low,
+                     conjunction};
+}
+
 // Combines the branches of `if (a && b)` and `if (a || b)`: OWNER branches
 // to a block whose only predecessor it is and which computes a second
 // condition and branches to OWNER's other successor or to a block of its
 // own. That work then runs in OWNER under the if-conversion budget, loads
 // only where dereferenceable_load allows them, and one branch tests both
 // conditions; the common successor's phis must take one value from both
-// paths into it. Lineage: GCC tree-ssa-ifcombine.cc, LLVM SimplifyCFG
-// FoldBranchToCommonDest.
+// paths into it. Under -ftree-reassoc, two comparisons of one integer with
+// constants become one range test whatever their budget, as long as the
+// second block does no other work than the budget allows; with
+// `conditions` false, only range tests combine. Lineage: GCC
+// tree-ssa-ifcombine.cc and tree-ssa-reassoc.cc optimize_range_tests, LLVM
+// SimplifyCFG FoldBranchToCommonDest.
 bool combine_branch_conditions(
     ManagedFunction& function, const hir::Module& hir_module,
     const Subtarget& subtarget, std::size_t owner_index,
     const CompilerOptions& options,
-    std::unordered_map<std::uint32_t, EffectId>& forwarded) {
+    std::unordered_map<std::uint32_t, EffectId>& forwarded,
+    bool conditions) {
     const auto& owner = function.blocks[owner_index];
     const auto boolean = hir_module.builtin(BuiltinType::Bool);
     if (owner.terminator.kind != TerminatorKind::ConditionalBranch ||
@@ -13053,7 +13187,20 @@ bool combine_branch_conditions(
                 return from(owner_id) != from(inner_id);
             });
         if (distinguishes) continue;
+        const auto range = options.tree_reassoc
+            ? combined_range_test(
+                  function, hir_module,
+                  *function.blocks[owner_index].terminator.value,
+                  *inner.terminator.value, side == 0)
+            : std::nullopt;
+        const auto domain = range
+            ? modular_multiply_type(hir_module,
+                                    function.values[range->value.value].type)
+            : std::nullopt;
+        if (!conditions && !domain) continue;
         unsigned cost = cost_scale;
+        // The second block's work besides its comparison and constants.
+        unsigned other_cost = 0;
         bool speculatable = true;
         for (const auto id : inner.values) {
             const auto& value = function.values[id.value];
@@ -13073,7 +13220,13 @@ bool combine_branch_conditions(
                                    options.floating_environment);
             }
             if (!speculatable) break;
-            cost += if_conversion_cost(value, hir_module, options);
+            const auto value_cost =
+                if_conversion_cost(value, hir_module, options);
+            cost += value_cost;
+            if (id != *inner.terminator.value &&
+                value.kind != ValueKind::ConstantInteger) {
+                other_cost += value_cost;
+            }
         }
         if (!speculatable) continue;
         // Without a branchless select, the combined condition rarely becomes
@@ -13087,26 +13240,65 @@ bool combine_branch_conditions(
             limit = std::max(limit,
                              options.if_conversion_memory_limit * cost_scale);
         }
-        if (cost > limit) continue;
+        // A range test is cheaper than either branch it replaces.
+        if (domain ? other_cost > (conditions ? limit : 0U) : cost > limit) {
+            continue;
+        }
 
+        std::vector<ValueId> emitted;
+        const auto emit = [&](ManagedValue value) {
+            value.id = {static_cast<std::uint32_t>(function.values.size())};
+            value.location = inner.terminator.location;
+            value.inline_site = inner.terminator.inline_site;
+            emitted.push_back(value.id);
+            function.values.push_back(std::move(value));
+            return emitted.back();
+        };
+        const auto constant = [&](hir::TypeId type, std::uint64_t bits) {
+            ManagedValue value;
+            value.kind = ValueKind::ConstantInteger;
+            value.type = type;
+            value.integer = bits;
+            return emit(std::move(value));
+        };
         ManagedValue combined;
-        combined.id = {static_cast<std::uint32_t>(function.values.size())};
-        combined.location = inner.terminator.location;
         combined.type = *boolean;
         combined.kind = ValueKind::Binary;
-        combined.binary = side == 0 ? BinaryOperation::BitAnd
-                                    : BinaryOperation::BitOr;
-        combined.operands = {*function.blocks[owner_index].terminator.value,
-                             *inner.terminator.value};
-        const auto combined_id = combined.id;
-        function.values.push_back(std::move(combined));
+        if (domain) {
+            auto offset_value = range->value;
+            if (function.values[offset_value.value].type != *domain) {
+                ManagedValue view;
+                view.kind = ValueKind::Cast;
+                view.cast = CastOperation::Reinterpret;
+                view.type = *domain;
+                view.operands = {offset_value};
+                offset_value = emit(std::move(view));
+            }
+            ManagedValue offset;
+            offset.kind = ValueKind::Binary;
+            offset.binary = BinaryOperation::Subtract;
+            offset.type = *domain;
+            offset.operands = {offset_value, constant(*domain, range->start)};
+            const auto offset_id = emit(std::move(offset));
+            combined.binary = range->inside
+                ? BinaryOperation::UnsignedLessEqual
+                : BinaryOperation::UnsignedGreater;
+            combined.operands = {offset_id, constant(*domain, range->span)};
+        } else {
+            combined.binary = side == 0 ? BinaryOperation::BitAnd
+                                        : BinaryOperation::BitOr;
+            combined.operands = {*function.blocks[owner_index].terminator.value,
+                                 *inner.terminator.value};
+        }
+        const auto combined_id = emit(std::move(combined));
 
         auto& merged = function.blocks[owner_index];
         auto& dead = function.blocks[inner_id.value];
         const auto old_effect = merged.terminator.effect;
         merged.values.insert(merged.values.end(), dead.values.begin(),
                              dead.values.end());
-        merged.values.push_back(combined_id);
+        merged.values.insert(merged.values.end(), emitted.begin(),
+                             emitted.end());
         dead.values.clear();
         forwarded[dead.effect.value] = old_effect;
         merged.terminator.effect = dead.terminator.effect;
@@ -13164,8 +13356,28 @@ bool if_convert_diamonds(ManagedFunction& function,
             while (if_convert_one_diamond(function, hir_module, subtarget,
                                           index, options, forwarded) ||
                    combine_branch_conditions(function, hir_module, subtarget,
-                                             index, options, forwarded))
+                                             index, options, forwarded, true))
                 converted = changed = true;
+        }
+    }
+    if (changed) {
+        forward_effects(function, forwarded);
+        eliminate_unreachable_blocks(function);
+    }
+    return changed;
+}
+
+// Combines only range tests, for presets without if-conversion.
+bool combine_range_tests(ManagedFunction& function,
+                         const hir::Module& hir_module,
+                         const Subtarget& subtarget,
+                         const CompilerOptions& options) {
+    std::unordered_map<std::uint32_t, EffectId> forwarded;
+    bool changed = false;
+    for (std::size_t index = 0; index < function.blocks.size(); ++index) {
+        while (combine_branch_conditions(function, hir_module, subtarget,
+                                         index, options, forwarded, false)) {
+            changed = true;
         }
     }
     if (changed) {
@@ -14107,7 +14319,14 @@ bool reduce_affine_address_inductions(
         hir::TypeId pointer_type;
         hir::TypeId index_type;
         std::uint64_t element_size{};
+        // Elements per unit of the index.
+        std::uint64_t scale{};
         std::vector<Access> accesses;
+    };
+    // An index `phi * scale + offset`.
+    struct Affine {
+        std::uint64_t scale{};
+        std::uint64_t offset{};
     };
 
     bool changed = false;
@@ -14232,67 +14451,102 @@ bool reduce_affine_address_inductions(
             const auto update_location = update.location;
             const auto step_elements = step.integer;
 
+            // The index's affine form, through same-width views, its own
+            // conversion to an address index, sums, differences, and
+            // products and shifts by constants, each of which wraps like an
+            // address or, signed without -fwrapv, does not overflow.
             const auto affine_offset = [&](ValueId candidate) {
-                std::optional<std::uint64_t> result;
-                std::unordered_set<std::uint32_t> visited;
-                std::function<bool(ValueId, std::uint64_t&)> derive =
-                    [&](ValueId id, std::uint64_t& offset) {
-                        if (id == index_phi_id) {
-                            offset = 0;
-                            return true;
+                constexpr std::uint64_t limit = 1U << 15;
+                std::unordered_map<std::uint32_t, std::optional<Affine>> known;
+                std::function<std::optional<Affine>(ValueId)> derive =
+                    [&](ValueId id) -> std::optional<Affine> {
+                    if (id == index_phi_id) return Affine{1, 0};
+                    if (id.value >= function.values.size()) return std::nullopt;
+                    if (const auto found = known.find(id.value);
+                        found != known.end()) {
+                        return found->second;
+                    }
+                    known.emplace(id.value, std::nullopt);
+                    const auto& value = function.values[id.value];
+                    std::optional<Affine> result;
+                    if (value.kind == ValueKind::ConstantInteger) {
+                        if (value.integer_high == 0 && value.integer < limit) {
+                            result = Affine{0, value.integer};
                         }
-                        if (id.value >= function.values.size() ||
-                            !visited.insert(id.value).second) {
-                            return false;
+                    } else if (value.kind == ValueKind::Cast &&
+                               value.operands.size() == 1) {
+                        const auto from = type_bits(
+                            hir_module,
+                            function.values[value.operands.front().value].type);
+                        const auto to = type_bits(hir_module, value.type);
+                        if ((value.cast == CastOperation::Reinterpret &&
+                             to == index_bits) ||
+                            ((value.cast == CastOperation::SignExtend ||
+                              value.cast == CastOperation::Truncate) &&
+                             from == index_bits &&
+                             to == hir_module.address_bits)) {
+                            result = derive(value.operands.front());
                         }
-                        const auto& value = function.values[id.value];
-                        // A same-width view, or the index's own conversion
-                        // to an address index, which cannot wrap here.
-                        if (value.kind == ValueKind::Cast &&
-                            value.operands.size() == 1) {
-                            const auto from = type_bits(
-                                hir_module,
-                                function.values[value.operands.front().value].type);
-                            const auto to = type_bits(hir_module, value.type);
-                            if ((value.cast == CastOperation::Reinterpret &&
-                                 to == index_bits) ||
-                                ((value.cast == CastOperation::SignExtend ||
-                                  value.cast == CastOperation::Truncate) &&
-                                 from == index_bits &&
-                                 to == hir_module.address_bits)) {
-                                return derive(value.operands.front(), offset);
+                    } else if (value.kind == ValueKind::Binary &&
+                               value.operands.size() == 2 &&
+                               (type_bits(hir_module, value.type) ==
+                                    hir_module.address_bits ||
+                                (!options.wrapv &&
+                                 signed_type(hir_module, value.type)))) {
+                        const auto left = derive(value.operands[0]);
+                        const auto right =
+                            left ? derive(value.operands[1]) : std::nullopt;
+                        if (left && right) {
+                            switch (value.binary) {
+                            case BinaryOperation::Add:
+                                result = Affine{left->scale + right->scale,
+                                                left->offset + right->offset};
+                                break;
+                            case BinaryOperation::Subtract:
+                                if (left->scale >= right->scale &&
+                                    left->offset >= right->offset) {
+                                    result = Affine{left->scale - right->scale,
+                                                    left->offset - right->offset};
+                                }
+                                break;
+                            case BinaryOperation::Multiply:
+                                if (left->scale == 0 || right->scale == 0) {
+                                    const auto& term =
+                                        left->scale == 0 ? *right : *left;
+                                    const auto factor = left->scale == 0
+                                        ? left->offset : right->offset;
+                                    if (factor != 0 &&
+                                        term.scale < limit / factor &&
+                                        term.offset < limit / factor) {
+                                        result = Affine{term.scale * factor,
+                                                        term.offset * factor};
+                                    }
+                                }
+                                break;
+                            case BinaryOperation::ShiftLeft:
+                                if (right->scale == 0 && right->offset < 15U) {
+                                    const auto factor = std::uint64_t{1}
+                                                        << right->offset;
+                                    if (left->scale < limit / factor &&
+                                        left->offset < limit / factor) {
+                                        result = Affine{left->scale * factor,
+                                                        left->offset * factor};
+                                    }
+                                }
+                                break;
+                            default: break;
                             }
                         }
-                        if (value.kind != ValueKind::Binary ||
-                            value.binary != BinaryOperation::Add ||
-                            value.operands.size() != 2) {
-                            return false;
-                        }
-                        for (unsigned side = 0; side < 2; ++side) {
-                            const auto constant_id = value.operands[1U - side];
-                            if (constant_id.value >= function.values.size()) {
-                                continue;
-                            }
-                            const auto& constant =
-                                function.values[constant_id.value];
-                            if (constant.kind != ValueKind::ConstantInteger ||
-                                constant.integer_high != 0) {
-                                continue;
-                            }
-                            std::uint64_t base_offset{};
-                            if (!derive(value.operands[side], base_offset) ||
-                                constant.integer >
-                                    std::numeric_limits<std::uint64_t>::max() -
-                                        base_offset) {
-                                continue;
-                            }
-                            offset = base_offset + constant.integer;
-                            return true;
-                        }
-                        return false;
-                    };
-                std::uint64_t offset{};
-                if (derive(candidate, offset)) result = offset;
+                    }
+                    if (result &&
+                        (result->scale >= limit || result->offset >= limit)) {
+                        result.reset();
+                    }
+                    known[id.value] = result;
+                    return result;
+                };
+                auto result = derive(candidate);
+                if (result && result->scale == 0) result.reset();
                 return result;
             };
 
@@ -14330,8 +14584,9 @@ bool reduce_affine_address_inductions(
                         }
                     }
                     if (!base || !index) continue;
-                    const auto offset = affine_offset(*index);
-                    if (!offset) continue;
+                    const auto affine = affine_offset(*index);
+                    if (!affine) continue;
+                    const auto* offset = &affine->offset;
                     if (base->value >= definition_blocks.size() ||
                         !definition_blocks[base->value] ||
                         loop.blocks.contains(
@@ -14351,25 +14606,25 @@ bool reduce_affine_address_inductions(
                         target);
                     const auto pointee_size =
                         storage_size(hir_module, *pointer.pointee, target);
+                    constexpr auto displacement_limit = static_cast<std::uint64_t>(
+                        std::numeric_limits<std::int16_t>::max());
                     if (element_size == 0 || element_size != pointee_size ||
-                        *offset > static_cast<std::uint64_t>(
-                                      std::numeric_limits<std::int16_t>::max()) /
-                                      element_size ||
-                        step_elements > static_cast<std::uint64_t>(
-                                           std::numeric_limits<std::int16_t>::max()) /
-                                           element_size) {
+                        *offset > displacement_limit / element_size ||
+                        step_elements > displacement_limit / element_size /
+                                            affine->scale) {
                         continue;
                     }
                     auto group = std::find_if(
                         groups.begin(), groups.end(),
                         [&](const Group& candidate) {
                             return candidate.base == *base &&
-                                   candidate.element_size == element_size;
+                                   candidate.element_size == element_size &&
+                                   candidate.scale == affine->scale;
                         });
                     if (group == groups.end()) {
                         groups.push_back({*base, base_value.type,
                                           address_index_type, element_size,
-                                          {}});
+                                          affine->scale, {}});
                         group = std::prev(groups.end());
                     }
                     group->accesses.push_back({id, block_id, *offset});
@@ -14399,12 +14654,12 @@ bool reduce_affine_address_inductions(
                 const auto pointer_phi_id = append(std::move(pointer_phi));
 
                 auto step_index = *step_id;
-                if (address_index_type != index_type) {
+                if (address_index_type != index_type || group.scale != 1) {
                     ManagedValue constant;
                     constant.location = update_location;
                     constant.type = address_index_type;
                     constant.kind = ValueKind::ConstantInteger;
-                    constant.integer = step_elements;
+                    constant.integer = step_elements * group.scale;
                     step_index = append(std::move(constant));
                     function.blocks[loop.preheader.value].values.push_back(
                         step_index);
@@ -14468,7 +14723,47 @@ bool reduce_affine_address_inductions(
                         load.operands = {address};
                     }
                 }
-                if (std::any_of(group.accesses.begin(), group.accesses.end(),
+                // Every other address of the group's elements in the loop is
+                // the recurrence plus its offset, wherever it is read, so an
+                // address computed in the loop for a later access, such as a
+                // store after a search, needs no index arithmetic.
+                for (const auto raw_block : loop.blocks) {
+                    if (raw_block >= function.blocks.size()) continue;
+                    for (const auto id : function.blocks[raw_block].values) {
+                        auto& address = function.values[id.value];
+                        if (address.kind != ValueKind::IndexedAddress ||
+                            address.operands.size() != 2 ||
+                            address.operands[0] != group.base ||
+                            address.type != group.pointer_type) {
+                            continue;
+                        }
+                        const auto affine = affine_offset(address.operands[1]);
+                        if (!affine || affine->scale != group.scale) continue;
+                        const auto* offset = &affine->offset;
+                        if (*offset == 0) {
+                            address.kind = ValueKind::Cast;
+                            address.cast = CastOperation::Reinterpret;
+                            address.operands = {pointer_phi_id};
+                            continue;
+                        }
+                        auto constant = offsets.find(*offset);
+                        if (constant == offsets.end()) {
+                            ManagedValue element;
+                            element.location = index_location;
+                            element.type = group.index_type;
+                            element.kind = ValueKind::ConstantInteger;
+                            element.integer = *offset;
+                            const auto element_id = append(std::move(element));
+                            function.blocks[loop.preheader.value].values.push_back(
+                                element_id);
+                            constant = offsets.emplace(*offset, element_id).first;
+                        }
+                        function.values[id.value].operands = {pointer_phi_id,
+                                                              constant->second};
+                    }
+                }
+                if (group.scale == 1 &&
+                    std::any_of(group.accesses.begin(), group.accesses.end(),
                                 [&](const Access& access) {
                                     return dominators.dominates(access.block,
                                                                 latch);
@@ -16156,6 +16451,182 @@ bool reassociate_unit_recurrence_adds_impl(
                 changed = true;
             }
         }
+    }
+    return changed;
+}
+
+// An address indexed by `i + c` or `i - c` at address width is the address
+// indexed by `i` and displaced by `c` elements: both wrap modulo the address
+// width. Indexing by `i` lets value numbering share one address between the
+// accesses to neighboring elements, and a load/store RISC folds the constant
+// element offset into the access. A CISC addressing mode already absorbs the
+// addition, so the RISC/CISC balance decides.
+bool split_constant_address_indices(ManagedFunction& function,
+                                    const hir::Module& hir_module,
+                                    const CompilerOptions& options) {
+    if (options.risc_cisc_balance > 50) return false;
+    bool changed = false;
+    for (auto& block : function.blocks) {
+        std::vector<ValueId> rewritten;
+        rewritten.reserve(block.values.size());
+        for (const auto id : block.values) {
+            const auto& value = function.values[id.value];
+            if ((value.kind != ValueKind::IndexedAddress &&
+                 value.kind != ValueKind::IndexedLoad) ||
+                value.operands.size() != 2) {
+                rewritten.push_back(id);
+                continue;
+            }
+            const auto base = value.operands[0];
+            const auto& index = function.values[value.operands[1].value];
+            const auto bits = type_bits(hir_module, index.type);
+            if (index.kind != ValueKind::Binary || index.operands.size() != 2 ||
+                (index.binary != BinaryOperation::Add &&
+                 index.binary != BinaryOperation::Subtract) ||
+                bits != hir_module.address_bits || bits == 0 || bits > 64) {
+                rewritten.push_back(id);
+                continue;
+            }
+            auto variable = index.operands[0];
+            auto constant =
+                folded_integer_constant(function, hir_module, index.operands[1]);
+            if (!constant && index.binary == BinaryOperation::Add) {
+                variable = index.operands[1];
+                constant = folded_integer_constant(function, hir_module,
+                                                   index.operands[0]);
+            }
+            if (!constant || constant->low == 0) {
+                rewritten.push_back(id);
+                continue;
+            }
+            const auto offset = mask_to(
+                index.binary == BinaryOperation::Subtract
+                    ? negate(*constant)
+                    : *constant,
+                bits);
+            const auto index_type = index.type;
+            ManagedValue inner;
+            inner.kind = ValueKind::IndexedAddress;
+            inner.type = function.values[base.value].type;
+            inner.location = value.location;
+            inner.inline_site = value.inline_site;
+            inner.operands = {base, variable};
+            ManagedValue displacement;
+            displacement.kind = ValueKind::ConstantInteger;
+            displacement.type = index_type;
+            displacement.location = value.location;
+            displacement.inline_site = value.inline_site;
+            displacement.integer = offset.low;
+            displacement.integer_high = offset.high;
+            const ValueId inner_id{
+                static_cast<std::uint32_t>(function.values.size())};
+            inner.id = inner_id;
+            function.values.push_back(std::move(inner));
+            const ValueId displacement_id{
+                static_cast<std::uint32_t>(function.values.size())};
+            displacement.id = displacement_id;
+            function.values.push_back(std::move(displacement));
+            function.values[id.value].operands = {inner_id, displacement_id};
+            rewritten.push_back(inner_id);
+            rewritten.push_back(displacement_id);
+            rewritten.push_back(id);
+            changed = true;
+        }
+        block.values = std::move(rewritten);
+    }
+    return changed;
+}
+
+// A test of `(x >> c) & m` against zero tests `x & (m << c)`. The shift
+// disappears when the shifted mask costs no more than the mask to
+// materialize, as an immediate or one instruction a loop can hoist.
+bool fold_shifted_mask_tests(ManagedFunction& function,
+                             const hir::Module& hir_module,
+                             const Subtarget& subtarget) {
+    const UseLists uses(function);
+    const auto zero_test = [&](const ValueUse& use) {
+        if (!use.user || use.kind != UseKind::Operand) return false;
+        const auto& test = function.values[use.user->value];
+        if (test.kind != ValueKind::Binary || test.operands.size() != 2 ||
+            (test.binary != BinaryOperation::Equal &&
+             test.binary != BinaryOperation::NotEqual)) {
+            return false;
+        }
+        const auto other = test.operands[0] == test.operands[1]
+            ? std::optional<ValueId>{}
+            : std::optional<ValueId>{use.index == 0 ? test.operands[1]
+                                                    : test.operands[0]};
+        if (!other) return false;
+        const auto constant =
+            folded_integer_constant(function, hir_module, *other);
+        return constant && constant->low == 0 && constant->high == 0;
+    };
+    bool changed = false;
+    for (auto& block : function.blocks) {
+        std::vector<ValueId> rewritten;
+        rewritten.reserve(block.values.size());
+        for (const auto id : block.values) {
+            const auto& mask = function.values[id.value];
+            const auto bits = type_bits(hir_module, mask.type);
+            if (mask.kind != ValueKind::Binary ||
+                mask.binary != BinaryOperation::BitAnd ||
+                mask.operands.size() != 2 || bits == 0 || bits > 64 ||
+                uses.uses(id).empty() ||
+                !std::all_of(uses.uses(id).begin(), uses.uses(id).end(),
+                             zero_test)) {
+                rewritten.push_back(id);
+                continue;
+            }
+            std::optional<UInt128> constant;
+            std::optional<ValueId> shift_id;
+            for (unsigned side = 0; side < 2 && !constant; ++side) {
+                constant = folded_integer_constant(function, hir_module,
+                                                   mask.operands[side]);
+                if (constant) shift_id = mask.operands[1U - side];
+            }
+            if (!constant || !shift_id || uses.uses(*shift_id).size() != 1) {
+                rewritten.push_back(id);
+                continue;
+            }
+            const auto& shift = function.values[shift_id->value];
+            const auto amount = shift.kind == ValueKind::Binary &&
+                    shift.binary == BinaryOperation::ShiftRightLogical &&
+                    shift.operands.size() == 2 && shift.type == mask.type
+                ? folded_integer_constant(function, hir_module,
+                                          shift.operands[1])
+                : std::nullopt;
+            if (!amount || amount->high != 0 || amount->low == 0 ||
+                amount->low >= bits) {
+                rewritten.push_back(id);
+                continue;
+            }
+            const auto count = static_cast<unsigned>(amount->low);
+            // Bits the shift moved out stay clear.
+            const auto kept = mask_to(*constant, bits - count);
+            const auto shifted = mask_to(shift_left(kept, count), bits);
+            if ((shifted.low == 0 && shifted.high == 0) ||
+                subtarget.integer_constant_materialization_cost(
+                    {bits, shifted.low, shifted.high, false}) > 1) {
+                rewritten.push_back(id);
+                continue;
+            }
+            ManagedValue wide;
+            wide.kind = ValueKind::ConstantInteger;
+            wide.type = mask.type;
+            wide.location = mask.location;
+            wide.inline_site = mask.inline_site;
+            wide.integer = shifted.low;
+            wide.integer_high = shifted.high;
+            wide.id = ValueId{static_cast<std::uint32_t>(function.values.size())};
+            const auto wide_id = wide.id;
+            const auto source = shift.operands[0];
+            function.values.push_back(std::move(wide));
+            function.values[id.value].operands = {source, wide_id};
+            rewritten.push_back(wide_id);
+            rewritten.push_back(id);
+            changed = true;
+        }
+        block.values = std::move(rewritten);
     }
     return changed;
 }
@@ -20145,6 +20616,15 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
                 factor_common_select_addends(function);
                 return PassResult::changed_values();
             });
+    } else if (options.tree_reassoc) {
+        pipeline.add(
+            PassId::RangeTestCombining,
+            [&](ManagedFunction& function, FunctionAnalysisManager&) {
+                return combine_range_tests(function, hir_module, subtarget,
+                                           options)
+                    ? PassResult::changed_cfg()
+                    : PassResult::unchanged();
+            });
     }
     // Preserve complete diamonds until if-conversion has had the opportunity
     // to form semantic selects. Forwarding one empty arm first would turn a
@@ -20420,6 +20900,14 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
                     ? PassResult::changed_values()
                     : PassResult::unchanged();
             });
+        pipeline.add(
+            PassId::BitwiseCanonicalization,
+            [&](ManagedFunction& function, FunctionAnalysisManager&) {
+                return fold_shifted_mask_tests(function, hir_module,
+                                               subtarget)
+                    ? PassResult::changed_values()
+                    : PassResult::unchanged();
+            });
         // Lowers the rotations that canonicalization formed on a target
         // without them.
         pipeline.add(
@@ -20465,6 +20953,24 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
                     analyses.loops().canonical_loops());
                 return changed ? PassResult::changed_values()
                                : PassResult::unchanged();
+            });
+    }
+    // After vectorization and the induction passes, which match neighboring
+    // elements by index; value numbering then shares their common address.
+    if (options.tree_reassoc) {
+        pipeline.add(
+            PassId::AddressIndexSplitting,
+            [&](ManagedFunction& function, FunctionAnalysisManager&) {
+                if (!split_constant_address_indices(function, hir_module,
+                                                    options)) {
+                    return PassResult::unchanged();
+                }
+                if (options.tree_fre) {
+                    eliminate_fully_redundant_expressions(
+                        function, hir_module, subtarget,
+                        options.floating_environment);
+                }
+                return PassResult::changed_values();
             });
     }
     // Keep canonical top-tested loops available to vectorization, unrolling,

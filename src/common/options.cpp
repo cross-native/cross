@@ -408,7 +408,8 @@ std::span<const OptionDefinition> common_option_definitions() {
          "their bodies"},
         {"f.tree-reassoc", {}, OptionValueKind::Boolean, false, {}, 0, 0,
          OptionCategory::Optimization, true, OptionImplementation::Partial,
-         "rebalance legal associative SSA expressions under target cost policy"},
+         "rebalance legal associative SSA expressions and combine range tests "
+         "under target cost policy"},
         {"f.tree-slsr", {}, OptionValueKind::Boolean, false, {}, 0, 0,
          OptionCategory::Optimization, true, OptionImplementation::Implemented,
          "replace profitable unsigned constant multiplies with shifts and adds"},

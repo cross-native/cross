@@ -92,6 +92,9 @@ compile_variant(r3000 -march=r3000 -mtune=r3000)
 compile_variant(no_cprop -fno-cprop-registers)
 compile_variant(no_bit_ccp -fno-tree-bit-ccp)
 compile_variant(no_if_conversion -fno-if-conversion)
+compile_variant(no_reassoc -fno-tree-reassoc)
+compile_variant(console -mprofile=n64)
+compile_variant(no_ivopts -fno-ivopts)
 compile_variant(no_memory_if_conversion -fif-conversion-memory-limit=0)
 compile_variant(force_ordinary_if_conversion -fif-conversion-limit=12)
 compile_size_variant(size)
@@ -890,4 +893,142 @@ if(NOT int_to_float MATCHES "[\t ]mtc1[\t ]+\\$a0,\\$f" OR
     message(FATAL_ERROR
         "MIPS integer-to-float conversion staged its source through t0\n"
         "${int_to_float}")
+endif()
+
+# A one-operation arm runs in a branch-likely delay slot on its taken edge
+# and the branch continues past it, and the loop's latch branches back to
+# its header, so the loop has no unconditional jump.
+function_body("${OUTPUT}.enabled.s" mips_ring_step ring_step)
+function_body("${OUTPUT}.no_delay.s" mips_ring_step ring_step_no_delay)
+if(NOT ring_step MATCHES "[\t ]bnel[\t ][^\n]*\n[\t ]+addiu[\t ]" OR
+   NOT ring_step MATCHES "[\t ]bltzl[\t ][^\n]*\n[\t ]+addu[\t ]" OR
+   ring_step MATCHES "[\t ]b[\t ]" OR
+   ring_step_no_delay MATCHES "[\t ](bnel|bltzl)[\t ]")
+    message(FATAL_ERROR
+        "MIPS branch-likely arms or loop layout regressed, or "
+        "-fno-schedule-insns2 was ignored\n"
+        "enabled:\n${ring_step}\nwithout delay slots:\n${ring_step_no_delay}")
+endif()
+# A loop's register constants, including floating zero, are materialized
+# before it under -fmove-loop-invariants.
+function_body("${OUTPUT}.enabled.s" mips_constant_loop constant_loop)
+function_body("${OUTPUT}.no_licm.s" mips_constant_loop constant_loop_inside)
+if(constant_loop MATCHES "[\t ]mtc1[^\n]*\n[\t ]+nop\n" OR
+   constant_loop MATCHES "[\t ]li[\t ][^\n]*,200\n[\t ]+beql" OR
+   NOT constant_loop_inside MATCHES "[\t ]mtc1[\t ]+\\$zero[^\n]*\n[\t ]+nop\n" OR
+   NOT constant_loop_inside MATCHES "[\t ]li[\t ][^\n]*,200\n[\t ]+beql")
+    message(FATAL_ERROR
+        "MIPS loop constants were not hoisted, or "
+        "-fno-move-loop-invariants was ignored\n"
+        "enabled:\n${constant_loop}\nwithout:\n${constant_loop_inside}")
+endif()
+# LHU and LB results need no extension and SLLV no amount mask.
+function_body("${OUTPUT}.enabled.s" mips_narrow_sum narrow_sum)
+function_body("${OUTPUT}.no_machine_combine.s" mips_narrow_sum
+              narrow_sum_extended)
+if(narrow_sum MATCHES ",65535\n" OR narrow_sum MATCHES "[\t ]sra[\t ]" OR
+   narrow_sum MATCHES ",31\n" OR
+   NOT narrow_sum MATCHES "[\t ]lhu[\t ]" OR
+   NOT narrow_sum_extended MATCHES "[\t ]lhu[^\n]*\n[\t ]+andi[^\n]*,65535\n" OR
+   NOT narrow_sum_extended MATCHES "[\t ]sra[\t ]")
+    message(FATAL_ERROR
+        "MIPS extended loads or masked shift amounts were normalized again, "
+        "or -fno-machine-combine was ignored\n"
+        "enabled:\n${narrow_sum}\nwithout:\n${narrow_sum_extended}")
+endif()
+# Neighboring elements are displacements from one address under
+# -ftree-reassoc.
+function_body("${OUTPUT}.enabled.s" mips_neighbors neighbors)
+function_body("${OUTPUT}.no_reassoc.s" mips_neighbors neighbors_split)
+if(NOT neighbors MATCHES "[\t ]lw[\t ][^\n]*,4\\(" OR
+   NOT neighbors MATCHES "[\t ]lw[\t ][^\n]*,8\\(" OR
+   neighbors_split MATCHES "[\t ]lw[\t ][^\n]*,4\\(")
+    message(FATAL_ERROR
+        "MIPS neighboring elements no longer share an address, or "
+        "-fno-tree-reassoc was ignored\n"
+        "enabled:\n${neighbors}\nwithout:\n${neighbors_split}")
+endif()
+# Under the N64 profile's trapping floating environment a comparison still
+# fuses with its branch, which runs it in its place.
+function_body("${OUTPUT}.console.s" mips_trapping_compare trapping_compare)
+if(NOT trapping_compare MATCHES
+       "[\t ]c\\.lt\\.s[^\n]*\n[\t ]+nop\n[\t ]+bc1[tf]l?[\t ]" OR
+   trapping_compare MATCHES "[\t ]li[\t ][^\n]*,1\n")
+    message(FATAL_ERROR
+        "a trapping MIPS floating comparison materialized a boolean\n"
+        "${trapping_compare}")
+endif()
+# Under the console profile a floating operation that may trap fills an
+# integer branch's delay slot but does not move past a comparison that may
+# trap.
+function_body("${OUTPUT}.console.s" mips_trap_order trap_order)
+if(NOT trap_order MATCHES "[\t ]beq[\t ][^\n]*\n[\t ]+add\\.s[\t ]" OR
+   NOT trap_order MATCHES "[\t ]add\\.s[^\n]*\n[\t ]+c\\.lt\\.s[\t ]" OR
+   trap_order MATCHES "[\t ]bc1[tf]l?[\t ][^\n]*\n[\t ]+add\\.s[\t ]")
+    message(FATAL_ERROR
+        "a MIPS floating operation that may trap left its delay slot or "
+        "passed a trapping comparison\n${trap_order}")
+endif()
+# A range test is one unsigned comparison under -ftree-reassoc, also
+# without -fif-conversion and at -Oz, and a subtraction from zero subtracts
+# from $zero.
+function_body("${OUTPUT}.enabled.s" mips_range_test range_test)
+function_body("${OUTPUT}.no_if_conversion.s" mips_range_test range_no_if)
+function_body("${OUTPUT}.size.s" mips_range_test range_size)
+function_body("${OUTPUT}.no_reassoc.s" mips_range_test range_branches)
+string(REGEX MATCHALL "[\t ]slti?[\t ]" range_compares "${range_branches}")
+list(LENGTH range_compares range_compare_count)
+foreach(range_body IN ITEMS "${range_test}" "${range_no_if}" "${range_size}")
+    if(NOT range_body MATCHES "[\t ]sltu[\t ]" OR
+       range_body MATCHES "[\t ]slti?[\t ]")
+        message(FATAL_ERROR
+            "a MIPS range test was not one unsigned comparison\n"
+            "${range_body}")
+    endif()
+endforeach()
+if(NOT range_test MATCHES "[\t ]subu[\t ][^\n]*,\\$zero," OR
+   range_compare_count LESS 2)
+    message(FATAL_ERROR
+        "a MIPS negation did not subtract from $zero, or -fno-tree-reassoc "
+        "was ignored\nenabled:\n${range_test}\nwithout:\n${range_branches}")
+endif()
+# When neither successor of a latch follows it, the branch-likely back edge
+# runs the body's first load in its slot, and the exit's jump, after any PHI
+# copies, follows that slot.
+function_body("${OUTPUT}.unroll_risc.s" mips_rounds_sum rounds_sum)
+function_body("${OUTPUT}.unroll_risc.s" mips_rounds_sum64 rounds_sum64)
+function_body("${OUTPUT}.unroll_risc_no_delay.s" mips_rounds_sum64
+              rounds_sum64_no_delay)
+if(NOT rounds_sum MATCHES
+       "[\t ]bnel[\t ][^\n]*\n[\t ]+lw[\t ][^\n]*\n[\t ]+b[\t ]" OR
+   NOT rounds_sum64 MATCHES
+       "[\t ]bnel[\t ][^\n]*\n[\t ]+ld[\t ][^\n]*\n[\t ]+b[\t ][^\n]*\n[\t ]+move[\t ]" OR
+   rounds_sum64_no_delay MATCHES "[\t ]bnel[\t ]")
+    message(FATAL_ERROR
+        "a MIPS latch with both successors out of line left its back "
+        "edge's delay slot empty, or -fno-schedule-insns2 was ignored\n"
+        "${rounds_sum}\n${rounds_sum64}\nwithout:\n${rounds_sum64_no_delay}")
+endif()
+# Elements at `row * 4 + k` share a pointer recurrence that steps by a row
+# under -fivopts.
+function_body("${OUTPUT}.enabled.s" mips_matrix_rows matrix_rows)
+function_body("${OUTPUT}.no_ivopts.s" mips_matrix_rows matrix_rows_indexed)
+if(NOT matrix_rows MATCHES "[\t ]lw[\t ][^\n]*,12\\(" OR
+   NOT matrix_rows MATCHES "[\t ]addiu[\t ][^\n]*,16\n" OR
+   matrix_rows_indexed MATCHES "[\t ]addiu[\t ][^\n]*,16\n")
+    message(FATAL_ERROR
+        "MIPS scaled row accesses did not share a pointer recurrence, or "
+        "-fno-ivopts was ignored\n"
+        "enabled:\n${matrix_rows}\nwithout:\n${matrix_rows_indexed}")
+endif()
+# Doubleword constants take GNU as's `dli` sequences, without a zero high
+# word.
+function_body("${OUTPUT}.enabled.s" mips_wide_masks wide_masks)
+if(NOT wide_masks MATCHES
+       "[\t ]addiu[\t ]+([$][a-z0-9]+),[$]zero,-1\n[\t ]+dsrl32[\t ]+[$][a-z0-9]+,[$][a-z0-9]+,0\n" OR
+   NOT wide_masks MATCHES
+       "[\t ]dsrl[\t ][^\n]*,28\n[\t ]+dsll[\t ][^\n]*,24\n" OR
+   wide_masks MATCHES "[\t ]li[\t ][^\n]*,0\n")
+    message(FATAL_ERROR
+        "MIPS doubleword constants took longer sequences\n${wide_masks}")
 endif()
