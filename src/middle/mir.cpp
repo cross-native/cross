@@ -807,8 +807,9 @@ bool supported_call_type(const hir::Module& module, hir::TypeId type,
     // A result is a transported value, not a callee parameter cell. Its
     // top-level cv qualifiers need neither mutable nor volatile storage.
     // Keep the original qualified type and all nested/pointee qualifiers.
+    // A volatile parameter is a volatile callee cell.
     const bool allow_const = use == CallTypeUse::Result || use == CallTypeUse::Input;
-    const bool allow_volatile = use == CallTypeUse::Result;
+    const bool allow_volatile = use != CallTypeUse::Variadic;
     const bool cv_supported = (!value.is_const || allow_const) &&
                               (!value.is_volatile || allow_volatile);
     if (value.kind == hir::Type::Kind::Pointer)
@@ -1124,16 +1125,18 @@ private:
                 parameter.location);
             current_.values[value.value].parameter_index = index;
             current_.parameters.push_back(value);
-            // An atomic-qualified parameter is still transported by value,
-            // but source semantics require a distinct atomic callee cell.
-            // An unmodified scalar `in` parameter may stay in SSA. Written
-            // parameters and record designators need a distinct callee cell.
+            // An atomic- or volatile-qualified parameter is still transported
+            // by value, but source semantics require a distinct callee cell
+            // of that qualification. An unmodified scalar `in` parameter may
+            // stay in SSA. Written parameters and record designators need a
+            // distinct callee cell.
             if (parameter.mode == ParameterMode::In &&
                 (!parameter.physical_location ||
                  *parameter.physical_location == "auto") &&
                 !address_taken_names_.contains(name_key(parameter)) &&
                 !modified_names_.contains(name_key(parameter)) &&
                 !hir_.type(parameter.type).is_atomic &&
+                !hir_.type(parameter.type).is_volatile &&
                 !record_value_type(hir_, parameter.type)) {
                 if (!parameter_values_.emplace(
                         name_key(parameter), value).second) {
@@ -1146,7 +1149,8 @@ private:
             const auto cell_type = parameter.type;
             current_.slots.push_back(
                 {slot, parameter.location, cell_type,
-                 "$param." + std::to_string(index), std::nullopt, false,
+                 "$param." + std::to_string(index), std::nullopt,
+                 hir_.type(cell_type).is_volatile,
                  address_taken_names_.contains(name_key(parameter)),
                  parameter.mode != ParameterMode::In && !transport, 1,
                  index});

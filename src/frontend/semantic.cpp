@@ -1753,8 +1753,12 @@ bool deduce_generic_arguments(const FunctionDecl& generic,
         actual = clone_type(actual);
         auto formal = clone_type(
             callable_parameter_type(parameter.type, parameter.mode));
-        if (parameter.mode == ParameterMode::In)
+        // An `in` actual is a value: like lvalue conversion, it drops its
+        // top-level qualifiers.
+        if (parameter.mode == ParameterMode::In) {
             actual = callable_parameter_type(actual, ParameterMode::In);
+            actual->is_volatile = actual->is_atomic = actual->is_restrict = false;
+        }
         if (!normalize_generic_callable_abis(formal, state, diagnostics,
                                              parameter.location) ||
             !normalize_generic_callable_abis(actual, state, diagnostics,

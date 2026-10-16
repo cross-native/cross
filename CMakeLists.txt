@@ -3040,6 +3040,30 @@ if(BUILD_TESTING)
                 SKIP_REGULAR_EXPRESSION "skipping MIPS")
         endforeach()
     endforeach()
+    # Volatile parameter cells, and deduction from volatile lvalues.
+    foreach(level O0 O2)
+        add_test(NAME cross_runtime_volatile_parameters_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/volatile_parameters.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-volatile-parameters-${level}
+                -DENTRY=test_entry -DEXPECTED=0 "-DCC_FLAGS=-${level};-fno-eval-calls"
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_volatile_parameters_${level} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;middle;feature.parameters;feature.generic;opt.${level}")
+        add_test(NAME cross_runtime_volatile_parameters_mips_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/volatile_parameters.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-volatile-parameters-mips-${level}
+                -DEXPECTED=P "-DCC_FLAGS=-${level};-fno-eval-calls"
+                -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(cross_runtime_volatile_parameters_mips_${level} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;middle;feature.parameters;feature.generic;isa.vr4300;isa.r3000;endian.big;endian.little;opt.${level}"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS")
+    endforeach()
     # Stores to fixed locations that leave loops for the loop exits.
     foreach(motion_mode O0 O1 O2 O3 Os O2-no-move-loop-invariants O2-no-tree-loop-rotate)
         string(REGEX MATCH "^O[0-9s]" motion_level "${motion_mode}")

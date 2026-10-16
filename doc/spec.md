@@ -1746,8 +1746,9 @@ when a discarded-output temporary is used, without reading an `out` value. The
 adjusted formal and actual types are then matched structurally: every
 occurrence of an unbound type parameter must yield the same canonical type,
 retaining nominal enumeration and label identity, address spaces, pointer
-qualifications, and complete stable callable interfaces; top-level `const` on
-an `in` cell is ignored. No conversion chooses a deduction. After all arguments
+qualifications, and complete stable callable interfaces; the actual of an `in`
+parameter is its argument's value, so its top-level qualifiers are ignored, as
+in lvalue conversion. No conversion chooses a deduction. After all arguments
 are fixed, ordinary call conversion and mode checks apply, and an explicitly
 bound parameter may accept such a conversion. Deduction uses neither an
 expected result type nor overload ranking, specialization ranking,
