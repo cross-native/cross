@@ -179,12 +179,52 @@ def test_mca_cost_parsing_and_hotness_weighting() -> None:
         (benchmark.HotBlock(0x2000, 1, 2), ("nop",)),
     )
     record = benchmark.aggregate_pipeline_record(
-        "cross", "O3", descriptor, blocks, costs, invocations=2
+        "cross", "O3", descriptor, blocks, costs, invocations=2,
+        model_costs=(3.0, 1.0),
     )
     assert record.dynamic_instructions == 5
     assert record.instructions_per_unit == pytest.approx(1.0)
     assert record.modeled_cycles == pytest.approx(7.03)
     assert record.throughput_cycles == pytest.approx(5.0)
+    assert record.cost_model_cycles == pytest.approx(7.0)
+    assert record.cost_model_cycles_per_unit == pytest.approx(1.4)
+
+
+def test_print_costs_model_prices_latency_and_loops() -> None:
+    """The in-order model charges issue costs, waits for sources, and prices
+    a self-looping block in steady state."""
+
+    costs = benchmark.parse_print_costs(
+        "cpu: vr4300  tune: vr4300  issue_width: 1\n"
+        "lw  latency: 3  issue: 1  available: yes\n"
+        "addu  latency: 1  issue: 1  available: yes\n"
+        "mult  latency: 5  issue: 5  available: yes\n"
+    )
+    assert costs["mult"] == benchmark.InstructionCost(5, 5)
+    assert benchmark.instruction_operands("sw\t$3, -0x4($2)") == (
+        "sw", ("$3", "$2"), ()
+    )
+    assert benchmark.instruction_operands("mult\t$14, $4") == (
+        "mult", ("$14", "$4"), ("hi", "lo")
+    )
+    assert benchmark.instruction_operands("mtc1\t$8, $f6") == (
+        "mtc1", ("$8",), ("$f6",)
+    )
+    straight = benchmark.HotBlock(0x80100000, 3, 1)
+    # lw issues at 0 and is ready at 3; addu waits for it, then jr follows.
+    assert benchmark.model_block_cycles(
+        straight, ("lw\t$2, 0x0($4)", "addu\t$3, $2, $2", "jr\t$ra"), costs
+    ) == pytest.approx(5.0)
+    loop = benchmark.HotBlock(0x80100020, 4, 1)
+    body = (
+        "mult\t$14, $4",
+        "mflo\t$14",
+        "bnel\t$2, $8, 0x80100020",
+        "addu\t$2, $2, $14",
+    )
+    assert benchmark.model_block_cycles(loop, body, costs) == pytest.approx(8.0)
+    with pytest.raises(benchmark.BenchmarkError):
+        benchmark.parse_print_costs("cpu: vr4300\n")
 
 
 def test_pipeline_timing_cli_is_explicit_and_bounded() -> None:

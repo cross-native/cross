@@ -99,8 +99,21 @@ python benchmark/mips32/run.py --levels O3 --samples 3 \
 ```
 
 Use `--qemu-hotblocks-plugin <path>` when the plugin is installed elsewhere.
+Distributions do not package QEMU's contributed plugins; build
+`contrib/plugins/hotblocks.c` from the source of the installed QEMU version
+against its `include/qemu/qemu-plugin.h` and GLib. The driver passes
+`limit=0` to report every block, an option the plugin has from QEMU 11.
 `--mca-iterations` controls the repeated-block simulation length and defaults
-to 100. Pipeline timing is deliberately opt-in because it links and executes a
+to 100.
+
+The same traced paths are also priced by the CPU entry that `--cost-cpu`
+names (default `vr4300`), with the latencies and issue costs of
+`cc --print-costs -mtune=CPU`: each block runs on a single-issue pipeline in
+which an instruction starts once the pipeline is free and its sources are
+ready, holds the pipeline for its issue cost, and makes its results ready
+after its latency. A block that branches to itself is priced in steady state.
+Cache misses and dependencies between blocks are not modeled. A CPU entry from
+a user model is selected with `--cross-flag=--model=FILE --cost-cpu=NAME`. Pipeline timing is deliberately opt-in because it links and executes a
 separate image for every kernel and compiler path.
 
 Results are grouped by source revision under:

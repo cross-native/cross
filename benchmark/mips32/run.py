@@ -80,6 +80,8 @@ class Configuration:
     pipeline_timing: bool
     qemu_hotblocks_plugin: Path | None
     mca_iterations: int
+    cost_cpu: str
+    instruction_costs: Mapping[str, InstructionCost]
 
 
 @dataclass(frozen=True)
@@ -156,6 +158,14 @@ class HotBlock:
 
 
 @dataclass(frozen=True)
+class InstructionCost:
+    """One instruction's latency and issue cost from `cc --print-costs`."""
+
+    latency: int
+    issue: int
+
+
+@dataclass(frozen=True)
 class McaBlockCost:
     """LLVM-MCA steady-state costs for one translated block."""
 
@@ -180,6 +190,8 @@ class PipelineRecord:
     cycles_per_unit: float
     throughput_cycles: float
     throughput_cycles_per_unit: float
+    cost_model_cycles: float
+    cost_model_cycles_per_unit: float
     executed_blocks: int
 
 
@@ -673,6 +685,142 @@ def parse_mca_costs(
     return costs
 
 
+def parse_print_costs(output: str) -> dict[str, InstructionCost]:
+    """Parse `cc --print-costs` rows into per-mnemonic costs."""
+
+    costs: dict[str, InstructionCost] = {}
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) < 5 or fields[1] != "latency:" or fields[3] != "issue:":
+            continue
+        try:
+            costs[fields[0]] = InstructionCost(int(fields[2]), int(fields[4]))
+        except ValueError as error:
+            raise BenchmarkError(f"invalid --print-costs row: {line}") from error
+    if not costs:
+        raise BenchmarkError("cc --print-costs printed no instruction costs")
+    return costs
+
+
+STORE_OPCODES = frozenset(
+    {
+        "sb", "sh", "sw", "sd", "swl", "swr", "sdl", "sdr", "swc1", "sdc1",
+        "swxc1", "sdxc1", "suxc1", "cache", "pref", "teq", "tne", "tge",
+        "tgeu", "tlt", "tltu",
+    }
+)
+HILO_WRITERS = frozenset(
+    {"mult", "multu", "dmult", "dmultu", "div", "divu", "ddiv", "ddivu",
+     "madd", "maddu", "msub", "msubu"}
+)
+LINKING_OPCODES = frozenset({"jal", "bal", "bgezal", "bltzal", "bgezall", "bltzall"})
+CONDITION_READERS = ("bc1t", "bc1f", "movt", "movf")
+CONDITIONAL_MOVES = frozenset({"movn", "movz", "movn.s", "movn.d", "movz.s", "movz.d"})
+
+
+def instruction_operands(
+    instruction: str,
+) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
+    """Return an instruction's mnemonic, source registers, and results.
+
+    The VR4300 cost model needs only which registers an instruction reads
+    and writes; HI/LO and the FPU condition code count as registers.
+    """
+
+    parts = instruction.split(None, 1)
+    opcode = parts[0].lower() if parts else ""
+    rest = parts[1] if len(parts) > 1 else ""
+    operands = [value.strip() for value in rest.split(",")] if rest.strip() else []
+    registers = [re.findall(r"\$[0-9a-z]+", value.lower()) for value in operands]
+    flat = [register for values in registers for register in values]
+    sources: list[str] = []
+    results: list[str] = []
+    if opcode in STORE_OPCODES or opcode in {"jr", "j", "b", "mtc0", "dmtc0"}:
+        sources = flat
+    elif opcode in HILO_WRITERS:
+        sources = [value for value in flat if value not in {"$zero", "$0"}]
+        if opcode in {"madd", "maddu", "msub", "msubu"}:
+            sources += ["hi", "lo"]
+        results = ["hi", "lo"]
+    elif opcode in {"mfhi", "mflo"}:
+        sources = [opcode[2:]]
+        results = flat[:1]
+    elif opcode in {"mthi", "mtlo"}:
+        sources = flat
+        results = [opcode[2:]]
+    elif opcode in {"mtc1", "dmtc1", "ctc1", "mthc1"}:
+        sources = flat[:1]
+        results = flat[1:2]
+    elif opcode.startswith("c."):
+        sources = flat
+        results = ["fcc"]
+    elif opcode.startswith(("b", "j")) and opcode not in {"jalr"}:
+        sources = flat
+        if opcode.startswith(CONDITION_READERS[:2]):
+            sources.append("fcc")
+        if opcode in LINKING_OPCODES:
+            results = ["$ra"]
+    elif opcode == "jalr":
+        sources = flat[-1:]
+        results = flat[:1] if len(flat) > 1 else ["$ra"]
+    elif flat:
+        results = flat[:1]
+        sources = flat[1:]
+        if opcode in CONDITIONAL_MOVES or opcode.startswith(CONDITION_READERS[2:]):
+            sources.append(flat[0])
+            if opcode.startswith(CONDITION_READERS[2:]):
+                sources.append("fcc")
+        if opcode in {"sc", "scd"}:
+            sources.append(flat[0])
+    results = [value for value in results if value not in {"$zero", "$0"}]
+    return opcode, tuple(sources), tuple(results)
+
+
+def branch_target(instruction: str) -> int | None:
+    """Return the absolute target of a direct branch or jump, if any."""
+
+    opcode = instruction.split(None, 1)[0].lower()
+    if not opcode.startswith(("b", "j")) or opcode in {"jr", "jalr"}:
+        return None
+    match = re.search(r"0x([0-9a-fA-F]+)\s*$", instruction)
+    return int(match.group(1), 16) & 0xFFFFFFFF if match else None
+
+
+def model_block_cycles(
+    block: HotBlock,
+    instructions: Sequence[str],
+    costs: Mapping[str, InstructionCost],
+) -> float:
+    """Model one execution of a translated block on a single-issue CPU.
+
+    Each instruction starts once the pipeline is free and its sources are
+    ready, occupies the pipeline for its issue cost, and makes its results
+    ready after its latency. A block that branches to its own start is a
+    loop body: it runs three times with registers carried over, and the
+    cost is the steady-state difference, so loop-carried latencies count.
+    """
+
+    self_loop = any(
+        branch_target(text) == block.pc for text in instructions[-2:]
+    )
+    passes = 3 if self_loop else 1
+    ready: dict[str, int] = {}
+    cycle = 0
+    ends: list[int] = []
+    for _ in range(passes):
+        for text in instructions:
+            opcode, sources, results = instruction_operands(text)
+            cost = costs.get(opcode, InstructionCost(1, 1))
+            start = max([cycle, *(ready.get(value, 0) for value in sources)])
+            cycle = start + max(1, cost.issue)
+            for value in results:
+                ready[value] = start + max(1, cost.latency)
+        ends.append(cycle)
+    if self_loop:
+        return (ends[-1] - ends[0]) / (passes - 1)
+    return float(ends[0])
+
+
 def aggregate_pipeline_record(
     compiler: str,
     level: str,
@@ -680,14 +828,18 @@ def aggregate_pipeline_record(
     blocks: Sequence[tuple[HotBlock, Sequence[str]]],
     costs: Mapping[str, McaBlockCost],
     invocations: int,
+    model_costs: Sequence[float],
 ) -> PipelineRecord:
     """Weight per-TB scheduling costs by one deterministic kernel trace."""
 
     if invocations <= 0 or not blocks:
         raise BenchmarkError("pipeline aggregation requires executed invocations")
+    if len(model_costs) != len(blocks):
+        raise BenchmarkError("cost-model block count disagrees with QEMU")
     dynamic_total = 0
     modeled_total = 0.0
     throughput_total = 0.0
+    model_total = 0.0
     for index, (block, _) in enumerate(blocks):
         cost = costs.get(f"tb_{index}")
         if cost is None or cost.instruction_count != block.instruction_count:
@@ -695,11 +847,13 @@ def aggregate_pipeline_record(
         dynamic_total += block.instruction_count * block.execution_count
         modeled_total += cost.modeled_cycles * block.execution_count
         throughput_total += cost.throughput_cycles * block.execution_count
+        model_total += model_costs[index] * block.execution_count
     if dynamic_total <= 0 or dynamic_total % invocations != 0:
         raise BenchmarkError("pipeline trace does not divide into equal invocations")
     dynamic = dynamic_total // invocations
     modeled = modeled_total / invocations
     throughput = throughput_total / invocations
+    model = model_total / invocations
     return PipelineRecord(
         compiler,
         level,
@@ -712,6 +866,8 @@ def aggregate_pipeline_record(
         modeled / kernel_value.work_units,
         throughput,
         throughput / kernel_value.work_units,
+        model,
+        model / kernel_value.work_units,
         len(blocks),
     )
 
@@ -1560,8 +1716,18 @@ async def measure_pipeline_kernel(
     # inside its single measured sample. Candidate and runtime blocks therefore
     # have exactly two deterministic invocations; runner/startup blocks were
     # excluded by their link-map origins.
+    model_costs = tuple(
+        model_block_cycles(block, instructions, config.instruction_costs)
+        for block, instructions in selected
+    )
     return aggregate_pipeline_record(
-        compiler, level, kernel_value, selected, costs, invocations=2
+        compiler,
+        level,
+        kernel_value,
+        selected,
+        costs,
+        invocations=2,
+        model_costs=model_costs,
     )
 
 
@@ -1845,7 +2011,9 @@ def generate_report(
                 (
                     "Pipeline metric: isolated QEMU hot-block paths weighted by "
                     f"LLVM-MCA generic `mips3` TotalCycles/{config.mca_iterations} "
-                    "iterations; lower is better."
+                    "iterations, and by an in-order model of the "
+                    f"`{config.cost_cpu}` cpu entry's `--print-costs`; lower is "
+                    "better."
                 ),
             )
         )
@@ -1956,6 +2124,32 @@ def generate_report(
                     "",
                     "Each cell is `Cross modeled cycles / pipeline modeled cycles`.",
                     "",
+                    f"### Path-weighted `{config.cost_cpu}` cost model",
+                    "",
+                    "| pipeline | modeled cycles/work | Cross / row |",
+                    "|---|---:|---:|",
+                )
+            )
+            cross_model = pipeline_field_score(
+                pipelines, "cross", level, "cost_model_cycles_per_unit"
+            )
+            for compiler in compilers:
+                score = pipeline_field_score(
+                    pipelines, compiler, level, "cost_model_cycles_per_unit"
+                )
+                lines.append(
+                    f"| {compiler} | {score:.4f} | {cross_model / score:.3f}x |"
+                )
+            lines.extend(
+                (
+                    "",
+                    "Each executed block runs on a single-issue pipeline: an "
+                    "instruction starts when the pipeline is free and its sources "
+                    "are ready, holds the pipeline for its issue cost, and makes "
+                    "its results ready after its latency. Blocks that branch to "
+                    "themselves are priced in steady state. Cache misses and "
+                    "cross-block dependencies are not modeled.",
+                    "",
                 )
             )
         if level == "O3":
@@ -1997,6 +2191,37 @@ def generate_report(
                     scores = {
                         compiler: next(
                             value.cycles_per_unit
+                            for value in pipelines
+                            if value.compiler == compiler
+                            and value.level == level
+                            and value.kernel == kernel_value.name
+                        )
+                        for compiler in compilers
+                    }
+                    best_peer = min(
+                        score
+                        for compiler, score in scores.items()
+                        if compiler != "cross"
+                    )
+                    lines.append(
+                        f"| {kernel_value.name} | "
+                        + " | ".join(f"{scores[name]:.4f}" for name in compilers)
+                        + f" | {scores['cross'] / best_peer:.3f}x |"
+                    )
+                lines.extend(
+                    ("", "Cells are modeled cycles per declared work unit.", "")
+                )
+                lines.extend(
+                    (f"### Kernel `{config.cost_cpu}` cost model", "")
+                )
+                lines.append(
+                    "| kernel | " + " | ".join(compilers) + " | Cross / fastest peer |"
+                )
+                lines.append("|---|" + "---:|" * (len(compilers) + 1))
+                for kernel_value in config.kernels:
+                    scores = {
+                        compiler: next(
+                            value.cost_model_cycles_per_unit
                             for value in pipelines
                             if value.compiler == compiler
                             and value.level == level
@@ -2172,6 +2397,11 @@ def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--pipeline-timing", action="store_true")
     parser.add_argument("--qemu-hotblocks-plugin", type=Path)
     parser.add_argument("--mca-iterations", type=int, default=100)
+    parser.add_argument(
+        "--cost-cpu",
+        default="vr4300",
+        help="cpu entry whose `cc --print-costs` latencies price the traced paths",
+    )
     parser.add_argument("--levels", default="O3,Oz")
     parser.add_argument(
         "--kernels",
@@ -2272,6 +2502,18 @@ async def configuration_from_arguments(
         llvm_mca=llvm_mca,
     )
     libgcc, libgcc_symbols = await discover_libgcc(tools.gcc, tools.llvm_nm)
+    instruction_costs: dict[str, InstructionCost] = {}
+    if arguments.pipeline_timing:
+        printed = await run_command(
+            (
+                tools.cross_cc,
+                *cross_flags("O3")[1:2],
+                *arguments.cross_flag,
+                f"-mtune={arguments.cost_cpu}",
+                "--print-costs",
+            )
+        )
+        instruction_costs = parse_print_costs(printed.stdout)
     return Configuration(
         source_dir=source_dir,
         kernel_dir=source_dir.parent / "x86_64" / "kernels",
@@ -2290,6 +2532,8 @@ async def configuration_from_arguments(
         pipeline_timing=arguments.pipeline_timing,
         qemu_hotblocks_plugin=hotblocks_plugin,
         mca_iterations=arguments.mca_iterations,
+        cost_cpu=arguments.cost_cpu,
+        instruction_costs=instruction_costs,
     )
 
 
