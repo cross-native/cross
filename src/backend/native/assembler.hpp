@@ -16,15 +16,12 @@ class Diagnostics;
 namespace native {
 
 // Deliberately small boundary between Cross's native code generator and an
-// external object writer.  The assembly is already target assembly; the
-// invoked program only parses it and writes the requested object format.
+// external object writer for targets without an integrated assembler. The
+// assembly is already target assembly; the invoked program only parses it
+// and writes the requested object format.
 struct AssemblyRequest {
     std::string_view assembly;
     std::string_view target;
-    std::string_view cpu;
-    // Exact object-writer spellings supplied by the active target backend;
-    // never the user/model-facing Cross feature names.
-    const std::vector<std::string>* target_features{};
     ObjectFormat object_format{ObjectFormat::Unsupported};
     std::filesystem::path output;
     bool verbose{};

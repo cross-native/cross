@@ -13,9 +13,7 @@
 #include "target/subtarget.hpp"
 
 #include <algorithm>
-#include <array>
 #include <cstdint>
-#include <fstream>
 #include <limits>
 #include <string>
 #include <unordered_set>
@@ -153,184 +151,6 @@ class Backend final : public TargetBackend {
 public:
     std::string_view architecture() const override { return "mips"; }
 
-    std::string object_writer_cpu(
-        const Subtarget& subtarget) const override {
-        if (subtarget.has_feature(Feature::Mips64)) return "mips64";
-        if (subtarget.has_feature(Feature::Mips32r2)) return "mips32r2";
-        if (subtarget.has_feature(Feature::Mips32)) return "mips32";
-        if (subtarget.has_feature(Feature::Mips5)) return "mips5";
-        if (subtarget.has_feature(Feature::Mips4)) return "mips4";
-        if (subtarget.has_feature(Feature::Mips3)) return "mips3";
-        if (subtarget.has_feature(Feature::Mips2)) return "mips2";
-        return "mips1";
-    }
-
-    // A 64-bit address model produces ELF64 objects of the n64 class, which
-    // is defined on a 64-bit FPU: the 32 floating registers are independently
-    // addressable doublewords, so neither the FPXX transport rules nor the
-    // even-register restriction applies.
-    static bool wide_register_abi(const Subtarget& subtarget) {
-        return subtarget.abi_info().address_bits > 32;
-    }
-
-    std::vector<std::string> object_writer_features(
-        const Subtarget& subtarget) const override {
-        std::vector<std::string> result;
-        if (!subtarget.has_feature(Feature::AbiCalls)) {
-            result.emplace_back("+noabicalls");
-        }
-        if (subtarget.has_feature(Feature::SoftFloat)) {
-            result.emplace_back("+soft-float");
-        } else if (wide_register_abi(subtarget)) {
-            result.emplace_back("+fp64");
-        } else if (subtarget.has_feature(Feature::SingleFloat)) {
-            result.emplace_back("+single-float");
-        } else if (!subtarget.has_feature(Feature::Mips2)) {
-            // MIPS I has no doubleword coprocessor memory access, so its
-            // f64 halves travel through odd single-precision registers.
-            // That is plain FP32 code; FPXX cannot describe it and the
-            // assembler's FP32 default with odd registers is the truthful
-            // tag.
-        } else if (subtarget.has_feature(Feature::Fpxx) ||
-                   subtarget.has_feature(Feature::Fp32)) {
-            // The managed slice uses only the FPXX-compatible subset of the
-            // paired-register o32 convention. Conservative metadata keeps
-            // these objects link-compatible with either 32- or 64-bit FPU
-            // hardware while retaining the model's fp32 transport policy.
-            result.emplace_back("+fpxx");
-            result.emplace_back("+nooddspreg");
-        } else if (subtarget.has_feature(Feature::Fp64)) {
-            result.emplace_back("+fp64");
-        }
-        return result;
-    }
-
-    bool finalize_object(const std::filesystem::path& path,
-                         const Subtarget& subtarget,
-                         Diagnostics& diagnostics) const override {
-        const bool needs_eabi32 =
-            elf_abi_tag(subtarget.abi_info()) == ElfAbiTag::Eabi32;
-        const bool needs_single_float =
-            subtarget.has_feature(Feature::SingleFloat);
-        if (!needs_eabi32 && !needs_single_float) return true;
-
-        // LLVM MC knows Allegrex encodings but currently writes the o32 ABI
-        // tag for the PSP triple.  Its `.set mips2` parser path also loses the
-        // command-line single-float ABI tag. Rewrite only those standardized
-        // metadata fields; architecture, PIC, ASE, and register masks remain
-        // assembler-owned.
-        std::fstream object(path, std::ios::in | std::ios::out |
-                                      std::ios::binary);
-        if (!object) {
-            diagnostics.command_error(
-                "cannot reopen MIPS object for target finalization: '" +
-                path.string() + "'");
-            return false;
-        }
-        std::array<unsigned char, 52> header{};
-        object.read(reinterpret_cast<char*>(header.data()),
-                    static_cast<std::streamsize>(header.size()));
-        if (object.gcount() != static_cast<std::streamsize>(header.size()) ||
-            header[0] != 0x7f || header[1] != 'E' || header[2] != 'L' ||
-            header[3] != 'F' || header[4] != 1 ||
-            (header[5] != 1 && header[5] != 2)) {
-            diagnostics.command_error(
-                "assembler produced an invalid ELF32 MIPS object");
-            return false;
-        }
-        const bool little = header[5] == 1;
-        const auto decode16 = [&](const unsigned char* bytes) -> std::uint16_t {
-            if (little) {
-                return static_cast<std::uint16_t>(
-                    static_cast<std::uint16_t>(bytes[0]) |
-                    (static_cast<std::uint16_t>(bytes[1]) << 8U));
-            }
-            return static_cast<std::uint16_t>(
-                (static_cast<std::uint16_t>(bytes[0]) << 8U) |
-                static_cast<std::uint16_t>(bytes[1]));
-        };
-        if (decode16(header.data() + 18) != 8) {
-            diagnostics.command_error(
-                "assembler produced a non-MIPS object for a MIPS target");
-            return false;
-        }
-        const auto decode32 = [&](const unsigned char* bytes) -> std::uint32_t {
-            std::uint32_t value{};
-            for (unsigned index = 0; index < 4; ++index) {
-                const auto source = little ? index : 3U - index;
-                value |= static_cast<std::uint32_t>(bytes[source])
-                         << (index * 8U);
-            }
-            return value;
-        };
-        const auto write32 = [&](std::size_t offset, std::uint32_t value) {
-            for (unsigned index = 0; index < 4; ++index) {
-                const auto destination = little ? index : 3U - index;
-                header[offset + destination] = static_cast<unsigned char>(
-                    (value >> (index * 8U)) & 0xffU);
-            }
-        };
-        if (needs_eabi32) {
-            constexpr std::uint32_t abi_mask = 0x0000f000U;
-            constexpr std::uint32_t eabi32 = 0x00003000U;
-            write32(36, (decode32(header.data() + 36) & ~abi_mask) | eabi32);
-            object.clear();
-            object.seekp(36, std::ios::beg);
-            object.write(reinterpret_cast<const char*>(header.data() + 36), 4);
-            if (!object) {
-                diagnostics.command_error(
-                    "cannot finalize MIPS EABI32 flags in object '" +
-                    path.string() + "'");
-                return false;
-            }
-        }
-
-        if (needs_single_float) {
-            constexpr std::uint32_t sht_mips_abiflags = 0x7000002aU;
-            const auto section_table = decode32(header.data() + 32);
-            const auto section_size = decode16(header.data() + 46);
-            const auto section_count = decode16(header.data() + 48);
-            bool found = false;
-            if (section_size < 40 || section_count == 0) {
-                diagnostics.command_error(
-                    "MIPS object lacks a usable section table for single-float metadata");
-                return false;
-            }
-            for (std::uint16_t index = 0; index < section_count; ++index) {
-                std::array<unsigned char, 40> section{};
-                object.clear();
-                object.seekg(static_cast<std::streamoff>(section_table) +
-                                 static_cast<std::streamoff>(index) *
-                                     section_size,
-                             std::ios::beg);
-                object.read(reinterpret_cast<char*>(section.data()),
-                            static_cast<std::streamsize>(section.size()));
-                if (!object || decode32(section.data() + 4) !=
-                                   sht_mips_abiflags) {
-                    continue;
-                }
-                const auto offset = decode32(section.data() + 16);
-                const auto size = decode32(section.data() + 20);
-                if (size < 8) break;
-                object.clear();
-                object.seekp(static_cast<std::streamoff>(offset) + 7,
-                             std::ios::beg);
-                // Val_GNU_MIPS_ABI_FP_SINGLE from the standardized MIPS
-                // ABI flags enumeration.
-                object.put(static_cast<char>(2));
-                found = static_cast<bool>(object);
-                break;
-            }
-            if (!found) {
-                diagnostics.command_error(
-                    "cannot finalize single-float ABI metadata in MIPS object '" +
-                    path.string() + "'");
-                return false;
-            }
-        }
-        return true;
-    }
-
     bool validate_hir(const hir::Module& hir_module,
                       const Subtarget& subtarget,
                       const CompilerOptions& options,
@@ -340,8 +160,8 @@ public:
                 "the first MIPS backend slice supports ELF object targets only");
         }
         // The ABI's address model and the triple's ELF class must agree: the
-        // assembler derives the object class from the triple, so a mismatch
-        // would silently truncate every relocation or every pointer.
+        // object class follows the address width, which a mips64 triple
+        // names, so a mismatch would mislabel every object.
         const bool wide_triple = options.target.starts_with("mips64");
         const bool wide_abi = subtarget.abi_info().address_bits > 32;
         if (wide_abi && !wide_triple) {

@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
 # GNU as accepts the assembly of every shipped MIPS profile without warnings
-# and encodes each instruction as llvm-mc does when `cc -c` assembles the same
-# file. The instruction words of the code sections and their $gp-relative
+# and encodes each instruction as `cc -c` does when it assembles the same file.
+# The instruction words of the code sections and their $gp-relative
 # relocations are compared; labels, symbol tables, and metadata may differ.
 # VARIANTS replaces the default "name|flags" compilation variants.
 
@@ -131,10 +131,10 @@ foreach(profile IN LISTS profiles)
                         -o "${base}.s")
             run_checked("${profile} ${stem} ${level} object"
                         "${CC}" -c -mprofile=${profile} ${flags} "${source}"
-                        -o "${base}.llvm.o")
-            # The object writer's ABI class selects the GNU ABI option.
+                        -o "${base}.cross.o")
+            # The object's ABI class selects the GNU ABI option.
             execute_process(
-                COMMAND "${LLVM_READOBJ}" --file-headers "${base}.llvm.o"
+                COMMAND "${LLVM_READOBJ}" --file-headers "${base}.cross.o"
                 RESULT_VARIABLE status OUTPUT_VARIABLE header)
             if(header MATCHES "Class: 64-bit")
                 set(abi -mabi=64)
@@ -155,21 +155,21 @@ foreach(profile IN LISTS profiles)
                     "(${endian} -march=${arch_${profile}} ${abi})\n${stdout}\n${stderr}")
             endif()
             code_words("${base}.gnu.o" gnu_words)
-            code_words("${base}.llvm.o" llvm_words)
-            if(NOT gnu_words STREQUAL llvm_words)
+            code_words("${base}.cross.o" cross_words)
+            if(NOT gnu_words STREQUAL cross_words)
                 message(FATAL_ERROR
-                    "GNU as and llvm-mc encode ${profile} ${stem} ${level} "
-                    "differently\nGNU as:${gnu_words}\nllvm-mc:${llvm_words}")
+                    "GNU as and cc -c encode ${profile} ${stem} ${level} "
+                    "differently\nGNU as:${gnu_words}\ncc -c:${cross_words}")
             endif()
             gp_relocations("${base}.gnu.o" gnu_relocations)
-            gp_relocations("${base}.llvm.o" llvm_relocations)
-            if(NOT gnu_relocations STREQUAL llvm_relocations)
+            gp_relocations("${base}.cross.o" cross_relocations)
+            if(NOT gnu_relocations STREQUAL cross_relocations)
                 message(FATAL_ERROR
-                    "GNU as and llvm-mc relocate ${profile} ${stem} ${level} "
-                    "differently\nGNU as:${gnu_relocations}\nllvm-mc:${llvm_relocations}")
+                    "GNU as and cc -c relocate ${profile} ${stem} ${level} "
+                    "differently\nGNU as:${gnu_relocations}\ncc -c:${cross_relocations}")
             endif()
             math(EXPR compared "${compared} + 1")
         endforeach()
     endforeach()
 endforeach()
-message(STATUS "GNU as matched llvm-mc on ${compared} assemblies")
+message(STATUS "GNU as matched cc -c on ${compared} assemblies")

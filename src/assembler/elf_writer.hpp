@@ -1,0 +1,72 @@
+// Copyright (C) 2026 Cross contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+#pragma once
+
+#include "assembler/assembler.hpp"
+
+#include <cstdint>
+#include <span>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
+
+namespace cross::assembler {
+
+// Appends integers in a chosen byte order.
+class ByteWriter {
+public:
+    explicit ByteWriter(bool big_endian) : big_endian_(big_endian) {}
+    void u8(std::uint64_t value) {
+        data_.push_back(static_cast<std::uint8_t>(value));
+    }
+    void u16(std::uint64_t value) { integer(value, 2); }
+    void u32(std::uint64_t value) { integer(value, 4); }
+    void u64(std::uint64_t value) { integer(value, 8); }
+    void integer(std::uint64_t value, unsigned size);
+    void bytes(std::span<const std::uint8_t> bytes) {
+        data_.insert(data_.end(), bytes.begin(), bytes.end());
+    }
+    void align(std::uint64_t alignment);
+    [[nodiscard]] std::size_t size() const { return data_.size(); }
+    [[nodiscard]] std::vector<std::uint8_t>& data() { return data_; }
+
+private:
+    bool big_endian_;
+    std::vector<std::uint8_t> data_;
+};
+
+// A string table that shares the bytes of repeated strings.
+class StringTable {
+public:
+    StringTable() { data_.push_back(0); }
+    std::uint32_t add(std::string_view text);
+    [[nodiscard]] const std::vector<std::uint8_t>& data() const {
+        return data_;
+    }
+
+private:
+    std::vector<std::uint8_t> data_;
+    std::unordered_map<std::string, std::uint32_t> offsets_;
+};
+
+struct ElfSection {
+    std::uint32_t name{};
+    std::uint32_t type{};
+    std::uint64_t flags{};
+    std::uint64_t alignment{1};
+    std::uint64_t entry_size{};
+    std::uint32_t link{};
+    std::uint32_t info{};
+    std::vector<std::uint8_t> data;
+    // The size of a NOBITS section, which has no data.
+    std::uint64_t size{};
+};
+
+// Writes an ELF relocatable file. `sections` excludes the null section at
+// index 0; `names` is the index of the section-name string table.
+[[nodiscard]] std::vector<std::uint8_t> write_elf(
+    const ObjectInfo& object, std::uint32_t flags,
+    std::span<const ElfSection> sections, std::uint32_t names);
+
+} // namespace cross::assembler

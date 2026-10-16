@@ -94,6 +94,13 @@ cross_component(cross_common)
 target_compile_definitions(cross_common PRIVATE
     CROSS_DEFAULT_TARGET="${cross_default_target}")
 
+add_library(cross_assembler
+    src/assembler/assembler.cpp
+    src/assembler/elf_writer.cpp
+)
+target_link_libraries(cross_assembler PUBLIC cross_common)
+cross_component(cross_assembler)
+
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
              "${CMAKE_CURRENT_SOURCE_DIR}/model/common.xm"
              "${CMAKE_CURRENT_SOURCE_DIR}/model/x86_64.xm"
@@ -118,11 +125,12 @@ add_library(cross_targets
     src/target/assembly_format.cpp
     src/target/registry.cpp
     src/target/subtarget.cpp
+    src/target/mips/assembler.cpp
     src/target/mips/target.cpp
     src/target/x86_64/manual_endpoint.cpp
     src/target/x86_64/target.cpp
 )
-target_link_libraries(cross_targets PUBLIC cross_common)
+target_link_libraries(cross_targets PUBLIC cross_common cross_assembler)
 cross_component(cross_targets)
 
 add_library(cross_frontend
@@ -251,6 +259,11 @@ add_executable(cross_cpp src/driver/cpp_main.cpp)
 target_link_libraries(cross_cpp PRIVATE cross_driver)
 set_target_properties(cross_cpp PROPERTIES OUTPUT_NAME cpp)
 cross_tool(cross_cpp)
+
+add_executable(cross_as src/driver/as_main.cpp)
+target_link_libraries(cross_as PRIVATE cross_targets)
+set_target_properties(cross_as PROPERTIES OUTPUT_NAME as)
+cross_tool(cross_as)
 
 include(CTest)
 if(BUILD_TESTING)
@@ -1652,7 +1665,7 @@ if(BUILD_TESTING)
     set_tests_properties(cross_mips_optimization_codegen PROPERTIES
         LABELS "check.compile;arch.mips;backend.native;feature.optimization")
     # GNU as accepts the assembly of every MIPS profile and encodes it as
-    # llvm-mc does.
+    # cc -c does.
     add_test(NAME cross_mips_gnu_as
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
@@ -1670,6 +1683,47 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/target/mips/gnu_as.cmake")
     set_tests_properties(cross_mips_gnu_as_small_data PROPERTIES
         LABELS "check.compile;arch.mips;backend.native;endian.big;endian.little;feature.small_data;opt.O0;opt.O2")
+    # The Cross assembler: encodings, relocations, DWARF tables, diagnostics,
+    # the as tool, and linker acceptance of cc -c objects.
+    foreach(name encodings relocations directives dwarf)
+        add_test(NAME cross_mips_assembler_${name}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DAS=$<TARGET_FILE:cross_as>
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/assembler/${name}.s
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-assembler/${name}
+                    -P "${CMAKE_SOURCE_DIR}/test/target/mips/assembler/${name}.cmake")
+        set_tests_properties(cross_mips_assembler_${name} PROPERTIES
+            LABELS "feature.assembler;arch.mips;check.compile;endian.big;endian.little")
+    endforeach()
+    add_test(NAME cross_mips_assembler_isa
+        COMMAND "${CMAKE_COMMAND}"
+                -DAS=$<TARGET_FILE:cross_as>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-assembler-isa/case
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/assembler/isa.cmake")
+    set_tests_properties(cross_mips_assembler_isa PROPERTIES
+        LABELS "feature.assembler;arch.mips;check.compile;diagnostics")
+    add_test(NAME cross_mips_assembler_diagnostics
+        COMMAND "${CMAKE_COMMAND}"
+                -DAS=$<TARGET_FILE:cross_as>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-assembler-diagnostics/case
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/assembler/diagnostics.cmake")
+    set_tests_properties(cross_mips_assembler_diagnostics PROPERTIES
+        LABELS "feature.assembler;arch.mips;diagnostics")
+    add_test(NAME cross_mips_assembler_tool
+        COMMAND "${CMAKE_COMMAND}"
+                -DAS=$<TARGET_FILE:cross_as>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-assembler-tool
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/assembler/tool.cmake")
+    set_tests_properties(cross_mips_assembler_tool PROPERTIES
+        LABELS "feature.assembler;arch.mips;check.compile;endian.big;endian.little")
+    add_test(NAME cross_mips_assembler_linkers
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                "-DSOURCES=${CMAKE_SOURCE_DIR}/test/target/mips/gnu_as.x;${CMAKE_SOURCE_DIR}/test/target/mips/i64_pair.x;${CMAKE_SOURCE_DIR}/test/target/mips/vla.x"
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-assembler-linkers/output
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/assembler/linkers.cmake")
+    set_tests_properties(cross_mips_assembler_linkers PROPERTIES
+        LABELS "feature.assembler;arch.mips;backend.native;check.compile;endian.big;endian.little")
     add_test(NAME cross_mips_allegrex
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
@@ -1709,6 +1763,23 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/target/mips/runtime.cmake")
     set_tests_properties(cross_mips_vr4300_runtime PROPERTIES
         LABELS "check.runtime;arch.mips;backend.native;feature.codegen")
+    # The same image with its startup and wrapper assembled by Cross as.
+    add_test(NAME cross_mips_vr4300_runtime_as
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DAS=$<TARGET_FILE:cross_as>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/vr4300_o32.x
+                -DMEMORY_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/memory_atomic.x
+                -DPAIR_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/i64_pair.x
+                -DMIPS1_FLOAT_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/mips1_float.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/runtime.s
+                -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare.ld
+                -DWRAPPER_TEMPLATE=${CMAKE_SOURCE_DIR}/test/target/mips/runtime64.s.in
+                -DWRAPPER_LINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare64.ld
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-vr4300-runtime-as
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/runtime.cmake")
+    set_tests_properties(cross_mips_vr4300_runtime_as PROPERTIES
+        LABELS "check.runtime;arch.mips;backend.native;feature.codegen;feature.assembler")
     # Machine-instruction built-ins, coprocessor 0 hazards, and naked
     # functions on the VR4300.
     add_test(NAME cross_mips_machine_instructions COMMAND "${CMAKE_COMMAND}"

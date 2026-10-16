@@ -1,15 +1,15 @@
 # Building Cross
 
-Building produces two executables: `cc`, the compiler, and `cpp`, the
-standalone preprocessor. Both are self-contained; the shipped compiler models
-are built into them.
+Building produces three executables: `cc`, the compiler, `cpp`, the
+standalone preprocessor, and `as`, the MIPS assembler. All are self-contained;
+the shipped compiler models are built into them.
 
 ## Requirements
 
 - CMake 3.20 or later and a build tool it supports, such as Ninja or Make.
 - A C++20 compiler: GCC or Clang.
-- `llvm-mc` on `PATH` to produce object files with `cc -c`. Assembly output
-  (`cc -S`) needs no other tool.
+- `llvm-mc` on `PATH` to produce x86-64 object files with `cc -c`. MIPS
+  objects and assembly output (`cc -S`) need no other tool.
 
 The tested hosts are x86-64 Windows with the MSYS2 MINGW64 environment and
 x86-64 Ubuntu Linux. On Windows:
@@ -31,7 +31,7 @@ sudo apt install cmake ninja-build g++ clang llvm lld qemu-system-mips \
 
 Some distributions install the LLVM tools only under a versioned directory
 such as `/usr/lib/llvm-21/bin`; add it to `PATH`. The default static link of
-`cc` and `cpp` needs the static C and C++ runtime libraries, which the GCC
+the tools needs the static C and C++ runtime libraries, which the GCC
 development packages provide.
 
 ## Configure and build
@@ -43,8 +43,8 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
-The executables are written to `build/bin/` (`cc.exe` and `cpp.exe` on
-Windows). Add `-G Ninja` to choose a generator, or
+The executables are written to `build/bin/` (`cc.exe`, `cpp.exe`, and
+`as.exe` on Windows). Add `-G Ninja` to choose a generator, or
 `-DCMAKE_CXX_COMPILER=clang++` to choose a compiler. GCC needs several
 gigabytes of memory per job on the largest sources, so on a machine with many
 cores limit the parallelism, for example `cmake --build build -j 6`.
@@ -52,7 +52,7 @@ cores limit the parallelism, for example `cmake --build build -j 6`.
 | Option | Default | Effect |
 | --- | --- | --- |
 | `CROSS_DEFAULT_TARGET` | host | Target triple used when neither `-target` nor `-mprofile` is given. |
-| `CROSS_STATIC_TOOLS` | `ON` | Link `cc` and `cpp` without shared compiler runtime libraries. |
+| `CROSS_STATIC_TOOLS` | `ON` | Link `cc`, `cpp`, and `as` without shared compiler runtime libraries. |
 | `CROSS_ENABLE_LLVM_TEXT` | `ON` | Include the `-emit-llvm` output mode. |
 | `CROSS_ENABLE_GCC_GIMPLE_TEXT` | `ON` | Include the `-emit-gimple` output modes. |
 | `CROSS_PPSSPP_HEADLESS` | unset | PPSSPPHeadless executable for Allegrex runtime tests. |
@@ -66,9 +66,9 @@ host architecture has no Cross backend, compiling without `-target` or
 `CROSS_DEFAULT_TARGET` or pass a target. `cc --version` prints the configured
 default and `cc --print-targets` lists the compiled-in architectures.
 
-There is no install step. Copy `cc` and `cpp` to any directory. They do not
-depend on their file names, so they can be renamed to avoid clashing with the
-host's C compiler and preprocessor.
+There is no install step. Copy `cc`, `cpp`, and `as` to any directory. They
+do not depend on their file names, so they can be renamed to avoid clashing
+with the host's C compiler, preprocessor, and assembler.
 
 ## Testing
 
@@ -85,6 +85,7 @@ run the output natively or under emulation. They use these external tools:
 | The host C++ compiler and `gcc` | Linking generated x86-64 code into host test programs. |
 | `qemu-system-mips64`, `qemu-system-mips64el` | MIPS runtime tests; skipped when missing. |
 | `clang` with the MIPS targets | The C side of the MIPS o32 interoperation tests; skipped when missing. |
+| `mips64-elf-as`, `mips64-elf-ld`, `mips64-elf-objdump`, `mips64-elf-gcc` | Cross-checking MIPS encodings and objects with GNU binutils and GCC; skipped when missing. |
 | Python 3.11 or later with pytest | Benchmark-driver tests; omitted when Python is missing. |
 | PPSSPPHeadless | Allegrex runtime tests, with `CROSS_PPSSPP_HEADLESS`. |
 

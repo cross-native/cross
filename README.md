@@ -21,18 +21,19 @@ global void divide(u32 a, u32 b, out u32 quotient, out u32 remainder) {
 }
 ```
 
-This repository contains the compiler `cc`, the preprocessor `cpp`, the
-compiler models, tests, and benchmarks. One `cc` build targets x86-64 (ELF,
-COFF, and Mach-O) and MIPS (MIPS I to MIPS64, including the VR4300 and
-Allegrex). Cross is a pre-1.0 draft: the compiler implements part of the
-current specification draft ([doc/spec.md](doc/spec.md), 0.9), `cc --version`
-reports the draft it conforms to, and drafts do not promise source or binary
-compatibility with one another.
+This repository contains the compiler `cc`, the preprocessor `cpp`, the MIPS
+assembler `as`, the compiler models, tests, and benchmarks. One `cc` build
+targets x86-64 (ELF, COFF, and Mach-O) and MIPS (MIPS I to MIPS64, including
+the VR4300 and Allegrex). Cross is a pre-1.0 draft: the compiler implements
+part of the current specification draft ([doc/spec.md](doc/spec.md), 0.9),
+`cc --version` reports the draft it conforms to, and drafts do not promise
+source or binary compatibility with one another.
 
 ## Quick start
 
-You need CMake 3.20 or later and a C++20 compiler. `cc -c` also needs
-`llvm-mc` on `PATH`. With the example above saved as `example.x`:
+You need CMake 3.20 or later and a C++20 compiler. `cc -c` for x86-64 also
+needs `llvm-mc` on `PATH`; MIPS objects need no other tool. With the example
+above saved as `example.x`:
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -47,7 +48,7 @@ it compiles for the host it was built on.
 ## Documentation
 
 - [doc/install.md](doc/install.md): building, configuration, and tests.
-- [doc/invoke.md](doc/invoke.md): `cc` and `cpp` options.
+- [doc/invoke.md](doc/invoke.md): `cc`, `cpp`, and `as` options.
 - [doc/language.md](doc/language.md): the language, for C programmers.
 - [doc/spec.md](doc/spec.md): the language specification.
 - [doc/metaprogramming.md](doc/metaprogramming.md): macros, syntax

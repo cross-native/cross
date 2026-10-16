@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "driver/driver.hpp"
 
+#include "assembler/assembler.hpp"
+
 #if CROSS_ENABLE_LLVM_TEXT
 #include "backend/llvm/llvm_ir.hpp"
 #endif
@@ -1344,21 +1346,38 @@ int cc_main(int argc, char** argv) {
             if (!write_output(output, assembly, error)) {
                 diagnostics.command_error(error);
             }
-        } else {
-            const auto object_writer_cpu =
-                backend->object_writer_cpu(*subtarget);
-            const auto object_writer_features =
-                backend->object_writer_features(*subtarget);
-            native::AssemblyRequest request{
-                assembly, options.target,
-                object_writer_cpu,
-                &object_writer_features, subtarget->object_format(), output,
-                options.verbose,
-                options.save_temps};
-            if (native::assemble_object(request, diagnostics)) {
-                (void)backend->finalize_object(output, *subtarget,
-                                               diagnostics);
+        } else if (target->integrated_assembler) {
+            // The target's own assembler reads the assembly in process;
+            // -save-temps keeps it beside the object.
+            auto listing = output;
+            listing.replace_extension(".s");
+            if (options.save_temps && listing != output) {
+                std::string error;
+                if (!write_file(listing, assembly, error)) diagnostics.command_error(error);
             }
+            if (options.verbose) {
+                std::cerr << "cc: assembling " << backend->architecture()
+                          << " assembly in process\n";
+            }
+            const auto* source = sources.add(listing, std::move(assembly));
+            assembler::Options assembler_options;
+            assembler_options.compiler_output = true;
+            const auto object = target->integrated_assembler(
+                {source}, *subtarget, assembler_options, sources, diagnostics);
+            if (object) {
+                std::string error;
+                if (!write_file(output,
+                                std::string_view(reinterpret_cast<const char*>(object->data()),
+                                                 object->size()),
+                                error)) {
+                    diagnostics.command_error(error);
+                }
+            }
+        } else {
+            native::AssemblyRequest request{
+                assembly, options.target, subtarget->object_format(), output,
+                options.verbose, options.save_temps};
+            (void)native::assemble_object(request, diagnostics);
         }
     }
     return diagnostics.errors() == 0 ? 0 : 1;

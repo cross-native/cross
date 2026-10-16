@@ -163,7 +163,7 @@ else()
     # See test/target/mips/runtime.cmake for why the wrapper exists: Malta's
     # 64-bit firmware wants a sign-extended 64-bit kernel entry, so the
     # already relocated o32 image is transported into KSEG0 unmodified --
-    # every instruction under test remains the exact llvm-mc o32 output.
+    # every instruction under test remains the exact cc -c o32 output.
     file(TO_CMAKE_PATH "${image}" IMAGE)
     configure_file("${WRAPPER_TEMPLATE}" "${wrapper_source}" @ONLY)
     run_checked(wrapper "${LLVM_MC}" --filetype=obj

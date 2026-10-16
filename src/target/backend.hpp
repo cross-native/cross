@@ -7,8 +7,6 @@
 #include "middle/mir.hpp"
 #include "middle/raw_mir.hpp"
 
-#include <filesystem>
-#include <string>
 #include <string_view>
 #include <vector>
 
@@ -32,29 +30,6 @@ public:
     virtual ~TargetBackend() = default;
 
     [[nodiscard]] virtual std::string_view architecture() const = 0;
-
-    // Exact CPU spelling for the selected external object writer. This is
-    // target-owned because Cross CPU/model names need not match LLVM or
-    // binutils vocabulary. An empty value asks the writer to use its triple
-    // default; instruction selection has already happened before this hook.
-    [[nodiscard]] virtual std::string object_writer_cpu(
-        const Subtarget&) const {
-        return {};
-    }
-    [[nodiscard]] virtual std::vector<std::string> object_writer_features(
-        const Subtarget&) const {
-        return {};
-    }
-
-    // Some object metadata expresses target-owned ABI facts that a generic
-    // external assembler cannot infer from the triple or instruction stream.
-    // The default is deliberately a no-op; architecture backends may perform
-    // a checked, format-specific finalization after assembly.
-    [[nodiscard]] virtual bool finalize_object(
-        const std::filesystem::path&, const Subtarget&,
-        Diagnostics&) const {
-        return true;
-    }
 
     // Validate architecture-specific HIR contracts early enough that later
     // source/body diagnostics can still be accumulated in the same run.

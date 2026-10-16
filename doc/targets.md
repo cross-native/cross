@@ -281,6 +281,13 @@ options adjust them:
 
 `cross-n64` and `n64` code uses 64-bit addresses and produces ELF64 objects
 that assume a 64-bit FPU; the other ABIs produce ELF32, even on a 64-bit CPU.
+The objects record the CPU's ISA level, the ABI (`o32` or `eabi32` in ELF32),
+`32bitmode` for 64-bit registers in ELF32, `noreorder`, and `nan2008` in the
+header flags, and the floating-point ABI in `.MIPS.abiflags`: soft float,
+single precision, 64-bit FPRs, FP32 on CPUs without `ldc1` and `sdc1` (such
+as MIPS I), and otherwise FPXX with no odd single-precision registers,
+because the code uses only the part of the paired-register convention that
+runs on 32- and 64-bit FPUs alike.
 With 64-bit addresses, symbol addresses use two instructions by default, so
 symbols must lie in the low 2 GB or in the sign-extended KSEG0/KSEG1 range
 unless `-mcmodel=large` is given. Assembly output names general registers by
@@ -290,7 +297,8 @@ read `$t0`–`$t3` there as registers 12–15.
 
 Allegrex has a single-precision FPU: `f64` arithmetic is an error. Because
 its code uses odd single-precision registers, which MIPS II lacks, Allegrex
-assembly declares no ISA level; assemble it with GNU as `-march=allegrex`.
+assembly declares no ISA level; assemble it with `as -mprofile=psp-allegrex`
+or GNU as `-march=allegrex`.
 With `-mno-odd-spreg` it uses even registers only and declares MIPS II. Code that
 needs floating point under `-msoft-float` is an error, because Cross does not
 call a software floating-point library.

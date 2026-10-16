@@ -6,10 +6,10 @@
 
 namespace cross::mips {
 
-// The instructions the MIPS backend emits and costs, in the order of
-// `TargetInfo::instruction_costs`.
+// The instructions the MIPS backend emits and costs and the assembler
+// encodes, in the order of `TargetInfo::instruction_costs`.
 enum class Instruction : std::uint16_t {
-#define X(name, spelling, latency) name,
+#define X(name, spelling, latency, ...) name,
 #include "target/mips/instructions.def"
 #undef X
 };

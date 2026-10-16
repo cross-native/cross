@@ -271,6 +271,17 @@ bool parse_cc_options(int argc, char** argv, CompilerOptions& options,
 bool parse_cpp_options(int argc, char** argv, CompilerOptions& options,
                        Diagnostics& diagnostics);
 
+// The `as` options beyond target selection, output, and include paths.
+struct AssemblerCommand {
+    // GNU as -EB/-EL and -32/-64, applied to the selected triple.
+    std::optional<bool> big_endian;
+    std::optional<unsigned> address_bits;
+    bool fatal_warnings{};
+    bool no_warnings{};
+};
+bool parse_as_options(int argc, char** argv, CompilerOptions& options,
+                      AssemblerCommand& command, Diagnostics& diagnostics);
+
 std::span<const OptionDefinition> common_option_definitions();
 // The typed value of `value` for `definition`, or nothing with `reason` set.
 std::optional<OptionValue> checked_option_value(
@@ -307,6 +318,7 @@ std::string option_type_text(const OptionDefinition& definition);
 
 void print_cc_help();
 void print_cpp_help();
+void print_as_help();
 void print_version();
 
 } // namespace cross

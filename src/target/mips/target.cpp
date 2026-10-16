@@ -3,6 +3,7 @@
 #include "target/mips/target.hpp"
 
 #include "common/options.hpp"
+#include "target/mips/assembler.hpp"
 #include "target/mips/bit_operations.hpp"
 #include "target/mips/features.hpp"
 #include "target/mips/instructions.hpp"
@@ -546,7 +547,7 @@ std::vector<OptionDefinition> target_options() {
 
 std::vector<InstructionCostEntry> declared_instructions() {
     return {
-#define X(name, spelling, latency) {spelling, latency},
+#define X(name, spelling, latency, ...) {spelling, latency},
 #include "target/mips/instructions.def"
 #undef X
     };
@@ -614,6 +615,7 @@ TargetInfo make_target(ByteOrder order,
     set_instruction_costs(result, declared_instructions());
     // %gp_rel offsets are relative to _gp, which $gp holds.
     result.data_base_registers = {"gp"};
+    result.integrated_assembler = &mips::assemble;
     return result;
 }
 

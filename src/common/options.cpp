@@ -1200,6 +1200,66 @@ bool parse_cpp_options(int argc, char** argv, CompilerOptions& options,
     return diagnostics.errors() == 0;
 }
 
+bool parse_as_options(int argc, char** argv, CompilerOptions& options,
+                      AssemblerCommand& command, Diagnostics& diagnostics) {
+    options.emit = EmitKind::Object;
+    for (int index = 1; index < argc; ++index) {
+        const std::string_view argument = argv[index];
+        if (argument == "-EB" || argument == "-EL") {
+            command.big_endian = argument == "-EB";
+            continue;
+        }
+        if (argument == "-32" || argument == "-64") {
+            command.address_bits = argument == "-32" ? 32U : 64U;
+            continue;
+        }
+        if (argument == "-n32") {
+            diagnostics.command_error("the n32 ABI is not supported");
+            continue;
+        }
+        if (argument == "--fatal-warnings") {
+            command.fatal_warnings = true;
+            continue;
+        }
+        if (argument == "-W" || argument == "--no-warn") {
+            command.no_warnings = true;
+            continue;
+        }
+        // GNU as spells ISA levels -mips1 ... -mips64r2.
+        if (argument.starts_with("-mips") && argument.size() > 5 &&
+            argument[5] >= '0' && argument[5] <= '9') {
+            add_command_option(options, "m.arch", std::string(argument.substr(1)),
+                               std::string(argument));
+            continue;
+        }
+        if (argument == "-mnan=2008" || argument == "-mnan=legacy") {
+            add_command_option(options, "m.nan2008", argument == "-mnan=2008",
+                               std::string(argument));
+            continue;
+        }
+        if (argument == "-" ) {
+            options.inputs.emplace_back(argument);
+            continue;
+        }
+        const bool shared =
+            argument == "--help" || argument == "--version" || argument == "-v" ||
+            argument.starts_with("-o") || argument.starts_with("-I") ||
+            argument.starts_with("-target") || argument.starts_with("-march") ||
+            argument.starts_with("-mtune") || argument.starts_with("-mabi") ||
+            argument.starts_with("-mprofile") || argument.starts_with("--model") ||
+            (argument.starts_with("-m") && !argument.starts_with("-mmangling"));
+        if (shared && common_option(argc, argv, index, options, diagnostics)) {
+            continue;
+        }
+        if (!argument.empty() && argument.front() == '-') {
+            diagnostics.command_error("unknown argument '" + std::string(argument) + "'");
+            continue;
+        }
+        options.inputs.emplace_back(argument);
+    }
+    return diagnostics.errors() == 0;
+}
+
 std::string_view default_target() { return CROSS_DEFAULT_TARGET; }
 
 std::string_view toolchain_version() {
@@ -1268,6 +1328,26 @@ void print_cc_help() {
   --print-builtins      list implemented $:: names and categories
   --print-instructions  list instruction built-ins
   --print-features      list feature queries
+)";
+}
+
+void print_as_help() {
+    std::cout << R"(Usage: as [options] input.s ...
+  -o FILE               write the object to FILE (default a.out)
+  -I DIR                search DIR for .include and .incbin files
+  -target TRIPLE        select a compiled-in target
+  -mprofile=NAME        select a model profile
+  -march=CPU, -mipsN    select the CPU or ISA level
+  -mabi=NAME            select a registered target ABI (32, 64, eabi, ...)
+  -32, -64              select the o32 or n64 ABI and its ELF class
+  -EB, -EL              select big- or little-endian output
+  -mFEATURE/-mno-FEATURE
+                        enable or disable a registered target feature
+  -mnan=2008|legacy     select the NaN encoding
+  --model=FILE          load a named compiler-definition file
+  --model-path=DIR      add a compiler-definition search directory
+  --fatal-warnings      treat warnings as errors
+  -W, --no-warn         suppress warnings
 )";
 }
 

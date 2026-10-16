@@ -17,8 +17,21 @@
 
 namespace cross {
 
+class Diagnostics;
+class SourceManager;
 class Subtarget;
+struct SourceFile;
 struct SubtargetTable;
+
+namespace assembler {
+struct Options;
+}
+
+// Assembles GNU-syntax target assembly into a relocatable object.
+using IntegratedAssembler = std::optional<std::vector<std::uint8_t>> (*)(
+    const std::vector<const SourceFile*>& sources, const Subtarget& subtarget,
+    const assembler::Options& options, SourceManager& manager,
+    Diagnostics& diagnostics);
 
 struct AbiId {
     static constexpr std::uint32_t invalid_value =
@@ -710,6 +723,9 @@ struct TargetInfo {
     // The registers that can hold the base of `data_base` model entries;
     // none when the target has no base-relative data addressing.
     std::vector<std::string_view> data_base_registers{};
+    // Cross's own assembler; none while objects of the target still go
+    // through llvm-mc.
+    IntegratedAssembler integrated_assembler{};
 
     [[nodiscard]] bool matches(std::string_view triple) const;
     [[nodiscard]] std::string_view default_abi(std::string_view triple) const;

@@ -1,14 +1,17 @@
-# Using cc and cpp
+# Using cc, cpp, and as
 
 ```text
 cc [options] input.x ...
 cpp [options] input.x ...
+as [options] input.s ...
 ```
 
 `cc` preprocesses and compiles Cross source (`.x`) to assembly or object
 files. `cpp` only preprocesses, writing Cross to standard output or to `-o`.
-`cc --help` and `cpp --help` list every option. Options taking a value accept
-it joined or separate (`-oout.s`, `-o out.s`).
+`as` assembles hand-written GNU-syntax MIPS assembly into an object file
+([Assembling](#assembling)). `cc --help`, `cpp --help`, and `as --help` list
+every option. Options taking a value accept it joined or separate
+(`-oout.s`, `-o out.s`).
 
 ## Output
 
@@ -24,7 +27,9 @@ it joined or separate (`-oout.s`, `-o out.s`).
 `-o FILE` names the output, and `-o -` writes it to standard output, which an
 object file (`-c`) cannot use; files written beside the output, such as those
 of `-fstack-usage` and `-MD`, then take the names they have without `-o`.
-`-c` runs `llvm-mc` from `PATH` as the assembler; `cc` never calls a C
+For MIPS targets `-c` assembles the output in process with the assembler of
+`as`; for other targets it runs `llvm-mc` from `PATH`. `-save-temps` keeps the
+assembly beside the object, named like it with `.s`. `cc` never calls a C
 compiler, LLVM's code generator, or a linker.
 
 `-fstack-usage` writes one line per emitted function, in output order:
@@ -165,6 +170,58 @@ output, whose prerequisites are the files of every input. `-MP` adds an
 empty rule for each prerequisite other than an input, so that Make does not
 fail when a header is deleted.
 
+## Assembling
+
+`as` reads GNU-syntax assembly, the language of `cc -S` output, and writes one
+ELF relocatable object from all its inputs (`-` reads standard input). It
+assembles MIPS code; other targets are rejected.
+
+| Option | Selects |
+| --- | --- |
+| `-o FILE` | The object file (default `a.out`). |
+| `-target TRIPLE`, `-mprofile=NAME` | The target and its defaults, as for `cc`. |
+| `-march=CPU`, `-mips1` ... `-mips64r2` | The CPU or ISA level whose instructions are accepted, until a `.set` directive changes it. |
+| `-mabi=NAME`, `-32`, `-64` | The ABI, which fixes the ELF class and ABI flags: `-mabi=32` and `-32` select o32, `-mabi=64` and `-64` n64 (also switching the triple to `mips64`), `-mabi=eabi` EABI32. |
+| `-EB`, `-EL` | Big- or little-endian output. |
+| `-mFEATURE`, `-mno-FEATURE`, `-mnan=2008\|legacy` | Target features, such as `-msoft-float`, `-msingle-float`, `-mfp32`, `-mfpxx`, and `-mfp64`, which set the floating-point ABI that `.MIPS.abiflags` records. |
+| `-I DIR` | A further directory to search for `.include` and `.incbin` files. |
+| `--fatal-warnings`, `-W` | Treat warnings as errors, or suppress them. |
+
+Without `-target` or `-mprofile`, `as` uses the default target of `cc`. Accepted
+directives include sections and their flags and COMDAT groups (`.section`,
+`.text`, `.data`, `.bss`, `.rdata`, `.sdata`, `.sbss`, `.pushsection`,
+`.popsection`, `.previous`), symbols (`.globl`, `.local`, `.weak`, `.hidden`,
+`.internal`, `.protected`, `.type`, `.size`, `.set` and `=`, `.equ`,
+`.equiv`, `.comm`, `.lcomm`), data (`.byte`, `.2byte`, `.half`, `.short`,
+`.4byte`, `.word`, `.long`, `.8byte`, `.dword`, `.quad`, `.uleb128`,
+`.sleb128`, `.ascii`, `.asciz`, `.string`, `.float`, `.double`, `.zero`,
+`.space`, `.fill`, `.incbin`), layout (`.p2align`, `.balign`, `.align`,
+`.org`), source structure (`.include`, `.macro`, `.rept`, `.if` and its
+variants, `.error`), DWARF (`.file`, `.loc`, and the `.cfi_*` directives,
+which produce `.debug_line`, `.debug_frame`, and `.eh_frame`), and the MIPS
+`.set` options (`push`, `pop`, `reorder`, `noreorder`, `at`, `noat`, `macro`,
+`nomacro`, `mips0` ... `mips64r2`), `.option pic0`, `.ent`, `.end`, `.frame`,
+`.mask`, `.fmask`, and `.nan`. The instructions are the integer, multiply
+and divide, load and store, branch, jump, FPU, FPU control, CP0, TLB, cache,
+and `sync` instructions of MIPS I-V, MIPS32, and MIPS64 Release 1 and 2,
+each accepted where the current ISA level has it; `madd`, `msub`,
+`mul`, `ext`, `ins`, `seb`, `seh`, traps, `pref`, `round`, `ceil`, `floor`,
+coprocessor 2, MIPS16, microMIPS, and Allegrex instructions other than `wsbw`
+are not. The relocation operators are `%hi`, `%lo`, `%gp_rel`, `%higher`, and
+`%highest`; the macros are `li`, `dli`, `move`, `b`, `bal`, `beqz`, `bnez`,
+`beqzl`, `bnezl`, `negu`, `neg`, and `not`, expanded as LLVM MC expands them.
+Objects carry the MIPS ELF header flags, `.MIPS.abiflags`, `.reginfo` (ELF32)
+or `.MIPS.options` (ELF64), and `.pdr` for each `.end`. Unlike GNU as:
+
+- `.word`, `.half`, `.dword`, `.float`, and `.double` do not align their data;
+- in `.set reorder` mode a branch's delay slot gets a `nop`, but instructions
+  are not reordered and no MIPS I hazard `nop`s are inserted;
+- `.L` local labels stay out of the symbol table unless a relocation must
+  name one;
+- the `div` and `divu` macros, address macros such as `la` and `lw REG,
+  symbol`, and PIC code (`-mabicalls`, `.cpload`) are not available: write
+  `div $zero, rs, rt` and `%hi`/`%lo` pairs.
+
 ## Inspecting the compiler
 
 These options print what the selected target and models provide. Combine them
@@ -185,8 +242,9 @@ with `-target`, `-march`, or `-mprofile` to inspect another configuration.
 
 Diagnostics have the form `file:line:column: error: message`, followed by the
 source line and a caret. Errors in generated code also show the macro or
-syntax expansion chain. Errors in a model file have the form
-`file:line: error: message`, the same under `cc` and `cpp`, and errors that
-belong to no file, such as an unknown option, have the form
-`cc: error: message` or `cpp: error: message`. `cc` and `cpp` exit with
-status 1 after an error and 0 otherwise.
+syntax expansion chain; `as` reports an error inside a macro at the line that
+invokes it. Errors in a model file have the form
+`file:line: error: message`, the same under `cc`, `cpp`, and `as`, and errors
+that belong to no file, such as an unknown option, have the form
+`cc: error: message`, `cpp: error: message`, or `as: error: message`. The
+tools exit with status 1 after an error and 0 otherwise.

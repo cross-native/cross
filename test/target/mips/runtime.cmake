@@ -8,7 +8,13 @@ foreach(required CC SOURCE MEMORY_SOURCE PAIR_SOURCE MIPS1_FLOAT_SOURCE STARTUP
     endif()
 endforeach()
 
-find_program(LLVM_MC NAMES llvm-mc)
+# AS names the Cross assembler for the startup and wrapper assembly;
+# otherwise llvm-mc assembles them.
+if(DEFINED AS AND NOT "${AS}" STREQUAL "")
+    set(LLVM_MC "${AS}")
+else()
+    find_program(LLVM_MC NAMES llvm-mc)
+endif()
 find_program(LLVM_OBJCOPY NAMES llvm-objcopy)
 find_program(LLD NAMES ld.lld)
 find_program(QEMU NAMES qemu-system-mips64)
@@ -16,6 +22,14 @@ if(NOT LLVM_MC OR NOT LLVM_OBJCOPY OR NOT LLD OR NOT QEMU)
     message(STATUS
         "skipping MIPS runtime test: llvm-mc, llvm-objcopy, ld.lld, and qemu-system-mips64 are required")
     return()
+endif()
+if(DEFINED AS AND NOT "${AS}" STREQUAL "")
+    set(startup_assembler "${AS}" -target mips-unknown-elf -march=mips3 -mfp32)
+    set(wrapper_assembler "${AS}" -target mips64-unknown-elf -march=mips3)
+else()
+    set(startup_assembler "${LLVM_MC}" --filetype=obj --triple=mips-unknown-elf --mcpu=mips3
+        --mattr=+noabicalls,-fp64)
+    set(wrapper_assembler "${LLVM_MC}" --filetype=obj --triple=mips64-unknown-elf --mcpu=mips3)
 endif()
 
 function(run_checked label)
@@ -51,9 +65,7 @@ run_checked(cross-mips1-float "${CC}" -c -O2 -mprofile=r3000-o32
 # MIPS I objects are FP32 with odd single-precision registers; the MIPS III
 # startup must carry a 32-bit FPU tag to link with them and with the FPXX
 # VR4300 objects alike.
-run_checked(startup "${LLVM_MC}" --filetype=obj
-            --triple=mips-unknown-elf --mcpu=mips3
-            --mattr=+noabicalls,-fp64 "${STARTUP}" -o "${start}")
+run_checked(startup ${startup_assembler} "${STARTUP}" -o "${start}")
 run_checked(link-elf32 "${LLD}" -m elf32btsmip -T "${LINKER}"
             "${start}" "${functions}" "${memory}" "${pairs}"
             "${mips1_float}" -o "${elf32}")
@@ -61,12 +73,10 @@ run_checked(flatten-image "${LLVM_OBJCOPY}" -O binary "${elf32}" "${image}")
 
 # Malta's 64-bit firmware preserves a 64-bit ELF entry address. The wrapper
 # only transports the already-relocated ELF32 image into sign-extended KSEG0;
-# every instruction under test remains the exact Cross/llvm-mc o32 output.
+# every instruction under test remains the exact Cross o32 output.
 file(TO_CMAKE_PATH "${image}" IMAGE)
 configure_file("${WRAPPER_TEMPLATE}" "${wrapper_source}" @ONLY)
-run_checked(wrapper "${LLVM_MC}" --filetype=obj
-            --triple=mips64-unknown-elf --mcpu=mips3
-            "${wrapper_source}" -o "${wrapper_object}")
+run_checked(wrapper ${wrapper_assembler} "${wrapper_source}" -o "${wrapper_object}")
 run_checked(link-wrapper "${LLD}" -m elf64btsmip -T "${WRAPPER_LINKER}"
             "${wrapper_object}" -o "${elf64}")
 

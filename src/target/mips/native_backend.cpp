@@ -6330,8 +6330,7 @@ public:
         if (subtarget_.has_feature(Feature::Nan2008)) result.header = ".nan 2008\n";
         if (elf_abi_tag(subtarget_.abi_info()) == ElfAbiTag::Eabi32) {
             // GNU MIPS linkers use this conventional empty marker in addition
-            // to EF_MIPS_ABI_EABI32.  LLVM MC accepts the section even though
-            // it cannot infer EABI32 from the PSP triple by itself.
+            // to EF_MIPS_ABI_EABI32.
             result.header += ".section .mdebug.eabi32\n.previous\n"
                              ".section .gcc_compiled_long32\n.previous\n";
         }
@@ -14843,8 +14842,8 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
         return;
     }
     output_ << *directive << '\n';
-    // ISA directives are scoped so llvm-mc's command-line ABI features (for
-    // example +single-float) are restored before it finalizes .MIPS.abiflags.
+    // ISA directives are scoped to the function, so an assembler's own ISA
+    // and floating-point options apply again after it.
     output_ << ".set push\n.set noreorder\n.set noat\n.option pic0\n";
     if (subtarget_.has_feature(Feature::Mips64)) output_ << ".set mips64\n";
     else if (subtarget_.has_feature(Feature::Mips5)) output_ << ".set mips5\n";
