@@ -1656,7 +1656,7 @@ if(BUILD_TESTING)
     add_test(NAME cross_mips_gnu_as
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
-                "-DSOURCES=${CMAKE_SOURCE_DIR}/test/target/mips/gnu_as.x;${CMAKE_SOURCE_DIR}/test/language/semantics/mips.x;${CMAKE_SOURCE_DIR}/test/language/semantics/subscripts.x;${CMAKE_SOURCE_DIR}/test/target/mips/i64_pair.x;${CMAKE_SOURCE_DIR}/test/target/mips/vla.x;${CMAKE_SOURCE_DIR}/test/target/mips/preserved_width.x;${CMAKE_SOURCE_DIR}/test/language/semantics/bit_intrinsics.x"
+                "-DSOURCES=${CMAKE_SOURCE_DIR}/test/target/mips/gnu_as.x;${CMAKE_SOURCE_DIR}/test/language/semantics/mips.x;${CMAKE_SOURCE_DIR}/test/language/semantics/subscripts.x;${CMAKE_SOURCE_DIR}/test/target/mips/i64_pair.x;${CMAKE_SOURCE_DIR}/test/target/mips/vla.x;${CMAKE_SOURCE_DIR}/test/target/mips/preserved_width.x;${CMAKE_SOURCE_DIR}/test/language/semantics/bit_intrinsics.x;${CMAKE_SOURCE_DIR}/test/target/mips/fpr_allocation_single.x"
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-gnu-as/output
                 -P "${CMAKE_SOURCE_DIR}/test/target/mips/gnu_as.cmake")
     set_tests_properties(cross_mips_gnu_as PROPERTIES
@@ -2028,6 +2028,100 @@ if(BUILD_TESTING)
             set_tests_properties(cross_mips_n64_vla_${vla_mode}_${vla_endian} PROPERTIES
                 LABELS "check.runtime;arch.mips;backend.native;feature.array;endian.${vla_endian}")
         endforeach()
+    endforeach()
+    # Floating values in FPRs on every hard-float CPU, and floating
+    # comparisons that branch into phis.
+    add_test(NAME cross_mips_fpr_allocation
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/fpr_allocation.x
+                -DSINGLE_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/fpr_allocation_single.x
+                -DBRANCH_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/fp_branch.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-fpr-allocation
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/fpr_allocation.cmake")
+    set_tests_properties(cross_mips_fpr_allocation PROPERTIES
+        LABELS "check.compile;arch.mips;backend.native;feature.register_allocation;feature.floating;isa.r3000;isa.mips2;isa.mips32;isa.mips32r2;isa.vr4300;isa.allegrex;endian.big;endian.little;opt.O2")
+    # Each entry: name|-march CPUs, comma-separated|QEMU CPU|level. The
+    # harness runs both byte orders.
+    foreach(fpr_case
+            "r3000_O2|r3000|R4000|O2"
+            "r3000_O3|r3000|R4000|O3"
+            "mips2_O2|mips2|R4000|O2"
+            "vr4300_O2|vr4300|R4000|O2"
+            "mips32_O2|mips32,mips32r2|MIPS64R2-generic|O2")
+        string(REPLACE "|" ";" fpr_fields "${fpr_case}")
+        list(GET fpr_fields 0 fpr_name)
+        list(GET fpr_fields 1 fpr_cpus)
+        list(GET fpr_fields 2 fpr_qemu)
+        list(GET fpr_fields 3 fpr_level)
+        string(REPLACE "," ";" fpr_cpus "${fpr_cpus}")
+        set(fpr_labels "check.runtime;arch.mips;backend.native;feature.floating;endian.big;endian.little;opt.${fpr_level}")
+        foreach(fpr_cpu IN LISTS fpr_cpus)
+            list(APPEND fpr_labels "isa.${fpr_cpu}")
+        endforeach()
+        foreach(fpr_test fpr_allocation fp_branch)
+            add_test(NAME cross_mips_${fpr_test}_runtime_${fpr_name}
+                COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/${fpr_test}.x
+                    -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-${fpr_test}-runtime-${fpr_name}
+                    -DEXPECTED=P "-DCC_FLAGS=-${fpr_level};-fno-eval-calls"
+                    "-DMIPS_CPUS=${fpr_cpus}" -DQEMU_CPU=${fpr_qemu}
+                    -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+            set_tests_properties(cross_mips_${fpr_test}_runtime_${fpr_name} PROPERTIES
+                LABELS "${fpr_labels};feature.register_allocation"
+                SKIP_REGULAR_EXPRESSION "skipping MIPS")
+        endforeach()
+    endforeach()
+    add_test(NAME cross_mips_fp_branch_runtime_unfused
+        COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/fp_branch.x
+            -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-fp_branch-runtime-unfused
+            -DEXPECTED=P "-DCC_FLAGS=-O2;-fno-eval-calls;-fno-compare-branch-fusion"
+            "-DMIPS_CPUS=vr4300;r3000"
+            -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+    set_tests_properties(cross_mips_fp_branch_runtime_unfused PROPERTIES
+        LABELS "check.runtime;arch.mips;backend.native;feature.floating;isa.vr4300;isa.r3000;endian.big;endian.little;opt.O2"
+        SKIP_REGULAR_EXPRESSION "skipping MIPS")
+    # The floating kernels with FPR allocation before MIPS III, against the
+    # x86-64 reference. MIPS I lacks the float-to-integer conversion they use.
+    # Each entry: name|endian|QEMU CPU|flags.
+    foreach(float_case
+            "mips2|BE|R4000|-target mips-unknown-elf -mabi=o32 -march=mips2"
+            "mips2_le|LE|R4000|-target mipsel-unknown-elf -mabi=o32 -march=mips2"
+            "mips32|BE|24Kf|-target mips-unknown-elf -mabi=o32 -march=mips32"
+            "mips32_le|LE|24Kf|-target mipsel-unknown-elf -mabi=o32 -march=mips32")
+        string(REPLACE "|" ";" float_fields "${float_case}")
+        list(GET float_fields 0 float_name)
+        list(GET float_fields 1 float_endian)
+        list(GET float_fields 2 float_cpu)
+        list(GET float_fields 3 float_flags)
+        string(REGEX REPLACE "_le$" "" float_isa "${float_name}")
+        if(float_endian STREQUAL "LE")
+            set(float_endian_label little)
+        else()
+            set(float_endian_label big)
+        endif()
+        add_test(NAME cross_mips_differential_float_${float_name}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DTEMPLATE=${CMAKE_SOURCE_DIR}/test/target/mips/differential/float_kernels.x.in
+                    -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/differential/start_float.s
+                    -DHOST_MAIN=${CMAKE_SOURCE_DIR}/test/target/mips/differential/main_float.cpp
+                    -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare.ld
+                    -DWRAPPER_TEMPLATE=${CMAKE_SOURCE_DIR}/test/target/mips/runtime64.s.in
+                    -DWRAPPER_LINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare64.ld
+                    "-DTARGET_FLAGS=${float_flags}"
+                    -DENDIAN=${float_endian}
+                    -DQEMU_CPU=${float_cpu}
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-differential-float-${float_name}
+                    -P "${CMAKE_SOURCE_DIR}/test/target/mips/differential/differential.cmake")
+        set_tests_properties(cross_mips_differential_float_${float_name} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;feature.floating;feature.register_allocation;isa.${float_isa};endian.${float_endian_label};opt.O2")
     endforeach()
     add_test(NAME cross_mips_differential_int_vr4300
         COMMAND "${CMAKE_COMMAND}"

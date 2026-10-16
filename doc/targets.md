@@ -237,7 +237,7 @@ ABIs:
 | `cross64` | `cross-64` | Cross ABI with 64-bit registers and 32-bit addresses; needs MIPS III or later. |
 | `cross-n64` | `cross`, `cross_abi` | Cross ABI with 64-bit addresses; needs a `mips64` triple. |
 | `o32` | `32`, `abi32` | The standard 32-bit C ABI. |
-| `eabi32` | `eabi`, `eabi-32` | The embedded ABI used by the PSP toolchain. |
+| `eabi32` | `eabi`, `eabi-32` | The embedded ABI used by the PSP toolchain. A single-precision FPU with odd single-precision registers, such as Allegrex, passes `f32` arguments in consecutive registers from `f12`; other FPUs pass each in an even register, as GCC does. |
 | `n64` | `64`, `abi64` | The standard 64-bit C ABI; needs a `mips64` triple. |
 
 `cross` and `cross_abi` name `cross-n64` on `mips64` and `mips64el` triples
@@ -265,7 +265,8 @@ options adjust them:
 | Option | Effect |
 | --- | --- |
 | `-mhard-float`, `-msoft-float`, `-msingle-float` | FPU availability. |
-| `-mfp32`, `-mfpxx`, `-mfp64`, `-modd-spreg` | FPU register model. |
+| `-mfp32`, `-mfpxx`, `-mfp64` | FPU register model. |
+| `-modd-spreg` | The FPU has odd-numbered single-precision registers; the `mips32`, `mips32r2`, `mips64`, and `allegrex` entries enable it. A single-precision FPU then keeps `f32` values in all 32 registers; other FPUs keep them in even registers, which also hold `f64` values as even/odd pairs under `-mfp32`. |
 | `-mllsc` | 32-bit LL/SC atomics. |
 | `-mfix4300` | Separate consecutive floating-point multiplies affected by the VR4300 erratum. |
 | `-mnan2008` | Use the IEEE 754-2008 NaN encoding of MIPS32 Release 2 FPUs; the output declares it with `.nan 2008`. |
@@ -282,7 +283,10 @@ number (`$8`) under these ABIs and under ABIs whose `elf_abi_tag` is
 `"eabi32"` ([models.md](models.md)), such as `eabi32`, because assemblers
 read `$t0`–`$t3` there as registers 12–15.
 
-Allegrex has a single-precision FPU: `f64` arithmetic is an error. Code that
+Allegrex has a single-precision FPU: `f64` arithmetic is an error. Because
+its code uses odd single-precision registers, which MIPS II lacks, Allegrex
+assembly declares no ISA level; assemble it with GNU as `-march=allegrex`.
+With `-mno-odd-spreg` it uses even registers only and declares MIPS II. Code that
 needs floating point under `-msoft-float` is an error, because Cross does not
 call a software floating-point library.
 

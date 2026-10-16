@@ -152,6 +152,58 @@ std::optional<machine::PhysicalRegisterId> physical_register_id(
     return fpr_id(name);
 }
 
+// The odd register of the FR=0 pair whose even register is `even`.
+std::string_view pair_partner(std::string_view even) {
+    const auto id = fpr_id(even);
+    return id ? fpr_name({id->value + 1U}) : std::string_view{};
+}
+
+// Floating values take FPR colors on every hard-float CPU; a
+// single-precision FPU holds no f64.
+bool colorable_floating(const Subtarget& subtarget, unsigned bits) {
+    return subtarget.has_feature(Feature::HardFloat) &&
+           (bits <= 32 ||
+            (bits <= 64 && !subtarget.has_feature(Feature::SingleFloat)));
+}
+
+// A single-precision FPU has 32 independent registers. An FR=0 FPU with
+// doubles uses only even ones: MIPS I-IV have no odd single-precision
+// arithmetic, and the FPXX objects of MIPS32 do not name odd registers.
+bool odd_fpr_colors(const Subtarget& subtarget) {
+    return subtarget.has_feature(Feature::SingleFloat) &&
+           subtarget.has_feature(Feature::OddSpreg);
+}
+
+// Whether an FPR value of `bits` holds an even register and the odd one
+// above it, as an f64 does in FR=0 mode.
+bool occupies_fpr_pair(const Subtarget& subtarget, unsigned bits) {
+    return bits > 32 && !subtarget.has_feature(Feature::Fp64);
+}
+
+// Without 64-bit GPRs, an f64's words reach its FR=0 register pair directly
+// on MIPS I, which names the odd register, and on MIPS32 Release 2, which
+// has MTHC1/MFHC1. FPXX code for MIPS II and MIPS32R1 can do neither, so the
+// words pass through memory there.
+bool fpr_words_through_memory(const Subtarget& subtarget) {
+    return subtarget.has_feature(Feature::Mips2) &&
+           !subtarget.has_feature(Feature::Mips3) &&
+           !subtarget.has_feature(Feature::Mips32r2);
+}
+
+// Whether every piece moves a floating value whole: in an FPR or as one
+// stack copy of its memory image.
+bool whole_floating_pieces(const std::vector<ValuePiece>& pieces,
+                           unsigned bits) {
+    return std::all_of(pieces.begin(), pieces.end(),
+                       [&](const ValuePiece& piece) {
+                           return piece.location.kind ==
+                                      LocationKind::Register
+                               ? fpr_id(piece.location.reg).has_value()
+                               : piece.value_bit_offset == 0 &&
+                                     piece.value_bits == bits;
+                       });
+}
+
 bool is_void(const hir::Module& module, hir::TypeId id) {
     const auto& type = module.type(id);
     return type.kind == hir::Type::Kind::Builtin &&
@@ -554,7 +606,7 @@ bool single_register_argument(const ArgumentAssignment& assignment,
     }
     return !subtarget.has_feature(Feature::Mips3) ||
         piece.extension == AbiExtensionKind::None ||
-        (value_bits == 32 && piece.carrier_bits == 32 &&
+        (value_bits <= 32 && piece.carrier_bits == 32 &&
          piece.extension == AbiExtensionKind::Sign);
 }
 
@@ -722,6 +774,21 @@ Opcode swapped_comparison(Opcode predicate) {
     case Opcode::CmpUgt: return Opcode::CmpUlt;
     case Opcode::CmpUge: return Opcode::CmpUle;
     default: return predicate;
+    }
+}
+
+// The branches that test a comparison with zero, as the mnemonics that
+// branch when it holds and when it fails.
+std::optional<std::pair<std::string_view, std::string_view>>
+zero_branches(Opcode predicate) {
+    switch (predicate) {
+    case Opcode::CmpSlt: return std::pair{"bltz", "bgez"};
+    case Opcode::CmpSge: return std::pair{"bgez", "bltz"};
+    case Opcode::CmpSle: return std::pair{"blez", "bgtz"};
+    case Opcode::CmpSgt: return std::pair{"bgtz", "blez"};
+    case Opcode::CmpUgt: return std::pair{"bnez", "beqz"};
+    case Opcode::CmpUle: return std::pair{"beqz", "bnez"};
+    default: return std::nullopt;
     }
 }
 
@@ -2340,9 +2407,8 @@ private:
                  subtarget_.has_feature(Feature::Mips3));
             const bool floating =
                 register_class == machine::VirtualRegisterClass::Floating &&
-                function.virtual_registers[id].bits <= 64 &&
-                subtarget_.has_feature(Feature::Mips3) &&
-                subtarget_.has_feature(Feature::HardFloat);
+                colorable_floating(subtarget_,
+                                   function.virtual_registers[id].bits);
             eligible[id] = integer || floating;
         }
         const auto virtual_id = [&](const machine::Register& value)
@@ -2805,6 +2871,25 @@ private:
                 }
             }
         }
+        // An FR=0 double in an even color also occupies the odd register
+        // above it.
+        for (std::uint32_t id = 0; id < count; ++id) {
+            if (function.virtual_register_classes[id] !=
+                    machine::VirtualRegisterClass::Floating ||
+                !occupies_fpr_pair(subtarget_,
+                                   function.virtual_registers[id].bits)) {
+                continue;
+            }
+            for (auto* constraints :
+                 {&forbidden_colors[id], &hard_forbidden_colors[id]}) {
+                for (const auto color : LiveSet(*constraints)) {
+                    if (color > fpr_physical_base &&
+                        (color - fpr_physical_base) % 2U != 0) {
+                        constraints->insert(color - 1U);
+                    }
+                }
+            }
+        }
 
         std::vector<LiveSet> interference(count);
         std::vector<LiveSet> affinity(count);
@@ -2953,13 +3038,22 @@ private:
             integer_colors.push_back({id});
         }
         // F0/F2/F4 remain reserved for conversion, comparison, and ABI
-        // staging. Even registers avoid an FR=0 odd-double restriction while
-        // still covering the volatile o32/VR4300 bank without prologue saves.
+        // staging. Even registers hold FR=0 doubles and the singles of FPUs
+        // without odd single-precision registers; a single-precision FPU
+        // also colors the odd ones. Volatile registers come first.
         std::vector<machine::PhysicalRegisterId> floating_colors;
-        for (const auto number : {6U, 8U, 10U, 12U, 14U, 16U, 18U,
-                                  20U, 22U, 24U, 26U, 28U, 30U}) {
-            floating_colors.push_back({fpr_physical_base + number});
-        }
+        const bool odd_colors = odd_fpr_colors(subtarget_);
+        const auto add_colors = [&](unsigned first, unsigned last,
+                                    unsigned step) {
+            for (unsigned number = first; number <= last; number += step) {
+                if (number % 2U == 0 || odd_colors) {
+                    floating_colors.push_back({fpr_physical_base + number});
+                }
+            }
+        };
+        add_colors(6, 19, 1);
+        add_colors(1, 5, 2);
+        add_colors(20, 31, 1);
         if (naked_) {
             coalesce_hard_registers(function, live_in, live_out, interference,
                                     eligible);
@@ -2979,7 +3073,8 @@ private:
                 }
                 if (physical->value < fpr_physical_base) {
                     integer_colors.push_back(*physical);
-                } else if ((physical->value - fpr_physical_base) % 2U == 0) {
+                } else if ((physical->value - fpr_physical_base) % 2U == 0 ||
+                           odd_colors) {
                     floating_colors.push_back(*physical);
                 }
             }
@@ -3116,8 +3211,8 @@ private:
         // the ABI result endpoint. Values already sharing one color are
         // pairwise noninterfering, so this preserves PHI coalescing while
         // removing the final MOV.D/MOV.S.
-        const auto uses_fixed_f0 = [](Opcode opcode) {
-            switch (opcode) {
+        const auto uses_fixed_f0 = [](const machine::Instruction& value) {
+            switch (decode_opcode(value.opcode)) {
             case Opcode::Fiszero:
             case Opcode::FcmpEq:
             case Opcode::FcmpNe:
@@ -3125,10 +3220,12 @@ private:
             case Opcode::FcmpLe:
             case Opcode::FcmpGt:
             case Opcode::FcmpGe:
-            case Opcode::Uitofp:
             case Opcode::Select:
             case Opcode::Fselect:
                 return true;
+            case Opcode::Uitofp:
+                // Only a u32 source takes the fix-up through F0.
+                return value.uses.empty() || value.uses.front().mode.bits == 32;
             default:
                 return false;
             }
@@ -3141,8 +3238,7 @@ private:
                     [&](const machine::Instruction& instruction) {
                         return instruction.kind ==
                                    machine::InstructionKind::Call ||
-                               uses_fixed_f0(decode_opcode(
-                                   instruction.opcode));
+                               uses_fixed_f0(instruction);
                     });
             });
         if (can_rename_floating_result) {
@@ -3220,13 +3316,20 @@ private:
                         }
                         const auto color =
                             *function.virtual_register_assignments[id];
+                        const bool pair =
+                            color.value >= fpr_physical_base &&
+                            occupies_fpr_pair(
+                                subtarget_,
+                                function.virtual_registers[id].bits);
                         const bool clobbered =
                             std::any_of(
                                 item->clobbers.begin(), item->clobbers.end(),
                                 [&](const machine::Register& clobber) {
                                     return clobber.kind ==
                                                machine::RegisterKind::Physical &&
-                                           clobber.id == color.value;
+                                           (clobber.id == color.value ||
+                                            (pair &&
+                                             clobber.id == color.value + 1U));
                                 }) ||
                             (color.value < fpr_physical_base &&
                              function.virtual_registers[id].bits > preserved_bits);
@@ -3303,6 +3406,67 @@ private:
                                                : integer_name);
             function.stack_slots.push_back(std::move(save));
         };
+        // An f64 whose words pass between its FPR pair and GPRs through
+        // memory keeps its home as the transfer cell.
+        std::unordered_set<std::uint32_t> word_homes;
+        if (fpr_words_through_memory(subtarget_)) {
+            const auto note = [&](const machine::Register& value,
+                                  const ArgumentAssignment& assignment) {
+                const auto id = virtual_id(value);
+                if (id && function.virtual_register_classes[*id] ==
+                              machine::VirtualRegisterClass::Floating &&
+                    value.mode.bits == 64 &&
+                    (!whole_floating_pieces(assignment.pieces, 64) ||
+                     !whole_floating_pieces(assignment.shadows, 64))) {
+                    word_homes.insert(*id);
+                }
+            };
+            for (const auto& block : function.blocks) {
+                for (const auto& instruction : block.instructions) {
+                    if ((instruction.opcode == Opcode::Parameter ||
+                         instruction.opcode == Opcode::Fparameter) &&
+                        function_layout && !instruction.defs.empty() &&
+                        !instruction.operands.empty()) {
+                        const auto index = std::get<machine::ImmediateOperand>(
+                            instruction.operands.front()).value;
+                        if (index < function_layout->call.arguments.size()) {
+                            note(instruction.defs.front(),
+                                 function_layout->call.arguments[index]);
+                        }
+                    } else if (instruction.kind ==
+                                   machine::InstructionKind::Return &&
+                               function_layout &&
+                               function_layout->results.size() == 1 &&
+                               !instruction.uses.empty()) {
+                        ArgumentAssignment result;
+                        result.pieces = function_layout->results.front().pieces;
+                        note(instruction.uses.front(), result);
+                    } else if (instruction.kind ==
+                               machine::InstructionKind::Call) {
+                        const auto site = classify_call_site(
+                            hir_, subtarget_, options_, instruction);
+                        if (!site) continue;
+                        const auto& arguments = site->second.call.arguments;
+                        for (std::size_t index = 0;
+                             index < arguments.size() &&
+                             index + 1 < instruction.operands.size();
+                             ++index) {
+                            if (const auto* operand =
+                                    std::get_if<machine::RegisterOperand>(
+                                        &instruction.operands[index + 1])) {
+                                note(operand->value, arguments[index]);
+                            }
+                        }
+                        if (!instruction.defs.empty() &&
+                            site->second.results.size() == 1) {
+                            ArgumentAssignment result;
+                            result.pieces = site->second.results.front().pieces;
+                            note(instruction.defs.front(), result);
+                        }
+                    }
+                }
+            }
+        }
         for (std::size_t id = 0; id < count; ++id) {
             const auto assignment =
                 function.virtual_register_assignments[id];
@@ -3310,6 +3474,8 @@ private:
             for (auto& slot : function.stack_slots) {
                 if (slot.spill_for && slot.spill_for->value == id) {
                     if (!call_live_homes.contains(
+                            static_cast<std::uint32_t>(id)) &&
+                        !word_homes.contains(
                             static_cast<std::uint32_t>(id))) {
                         slot.elided = true;
                         slot.frame_offset.reset();
@@ -3318,6 +3484,14 @@ private:
                 }
             }
             preserve_storage(*assignment);
+            // MIPS I saves FPRs by words, so a double's odd register needs
+            // its own save.
+            if (assignment->value >= fpr_physical_base &&
+                occupies_fpr_pair(subtarget_,
+                                  function.virtual_registers[id].bits) &&
+                !subtarget_.has_feature(Feature::Mips2)) {
+                preserve_storage({assignment->value + 1U});
+            }
         }
         // A registered entry may call a private dynamic interface that uses
         // registers its own ABI promises to preserve as argument or scratch
@@ -3541,6 +3715,16 @@ private:
         spill.spill_for = id;
         function.stack_slots.push_back(std::move(spill));
         return machine::Register::virtual_register(id, mode);
+    }
+
+    machine::Register create_floating_temporary(
+        machine::Function& function, SourceLocation location,
+        std::string_view purpose) {
+        const auto value = create_integer_temporary(function, machine::i32,
+                                                    location, purpose);
+        function.virtual_register_classes[value.id] =
+            machine::VirtualRegisterClass::Floating;
+        return value;
     }
 
     bool share_index_scales(machine::Function& function) {
@@ -4568,6 +4752,12 @@ private:
         case Opcode::Sitofp:
         case Opcode::Uitofp:
             return sum({single ? I::CvtSW : I::CvtDW});
+        // MIPS I-III use a transferred register one instruction late.
+        case Opcode::Freinterpret:
+        case Opcode::Fconstant:
+            return sum({I::Mtc1}) +
+                   (subtarget_.has_feature(Feature::FpuTransferInterlocks)
+                        ? 0U : 1U);
         case Opcode::Fptosi:
         case Opcode::Fptoui:
             return sum({instruction.uses.empty() ||
@@ -4993,9 +5183,32 @@ private:
             return opcode != Opcode::MulStart &&
                 atomic_hilo_operation(instructions[begin + index]);
         };
+        // Without FPU transfer interlocks, the register a transfer writes is
+        // usable one instruction late: prefer ready work that does not read
+        // it, so the emitter need not separate the two with a NOP.
+        std::optional<std::uint32_t> delayed_result;
+        const auto reads_delayed_result = [&](std::size_t index) {
+            const auto& uses = instructions[begin + index].uses;
+            return delayed_result &&
+                std::any_of(uses.begin(), uses.end(),
+                            [&](machine::Register use) {
+                                return use.kind ==
+                                           machine::RegisterKind::Virtual &&
+                                       use.id == *delayed_result;
+                            });
+        };
         while (order.size() != count) {
             std::optional<std::size_t> best;
             int best_score = std::numeric_limits<int>::min();
+            const bool ready_independent_of_transfer = [&] {
+                for (std::size_t index = 0; index < count; ++index) {
+                    if (!emitted[index] && indegree[index] == 0 &&
+                        !reads_delayed_result(index)) {
+                        return true;
+                    }
+                }
+                return false;
+            }();
             const bool ready_non_hilo_writer = [&] {
                 for (std::size_t index = 0; index < count; ++index) {
                     if (!emitted[index] && indegree[index] == 0 &&
@@ -5082,6 +5295,10 @@ private:
                     reads_split_hilo(index)) {
                     score -= 10000;
                 }
+                if (ready_independent_of_transfer &&
+                    reads_delayed_result(index)) {
+                    score -= 10000;
+                }
                 const auto projected = projected_pressure(index);
                 if (ready_within_pressure_budget &&
                     (projected[integer_bank] > integer_limit ||
@@ -5108,6 +5325,15 @@ private:
             if (!best) return false;
             emitted[*best] = true;
             order.push_back(*best);
+            delayed_result.reset();
+            if (!subtarget_.has_feature(Feature::FpuTransferInterlocks) &&
+                (opcode_at(*best) == Opcode::Freinterpret ||
+                 opcode_at(*best) == Opcode::Fconstant) &&
+                instructions[begin + *best].defs.size() == 1 &&
+                instructions[begin + *best].defs.front().kind ==
+                    machine::RegisterKind::Virtual) {
+                delayed_result = instructions[begin + *best].defs.front().id;
+            }
             if (opcode_at(*best) == Opcode::MulStart) {
                 // A remaining post-MFLO exclusion is paid as hardware/emitter
                 // stalls when no independent node can fill it.  It no longer
@@ -5337,9 +5563,72 @@ private:
         return true;
     }
 
+    // Without FPU transfer interlocks, a word moved into an FPR is usable one
+    // instruction late. A conversion from a GPR therefore transfers its word
+    // as an operation of its own, which scheduling can separate from the
+    // conversion; a narrow source is first extended by its signedness, so
+    // that the word converts as a signed one.
+    bool split_fpu_transfers(machine::Function& function) {
+        if (subtarget_.has_feature(Feature::FpuTransferInterlocks)) {
+            return false;
+        }
+        bool changed = false;
+        for (auto& block : function.blocks) {
+            std::vector<machine::Instruction> expanded;
+            expanded.reserve(block.instructions.size());
+            for (auto& instruction : block.instructions) {
+                const auto opcode = decode_opcode(instruction.opcode);
+                auto source = instruction.uses.empty()
+                    ? machine::Register{} : instruction.uses.front();
+                const bool convert =
+                    instruction.kind == machine::InstructionKind::Target &&
+                    (opcode == Opcode::Sitofp ||
+                     (opcode == Opcode::Uitofp && source.mode.bits < 32)) &&
+                    instruction.uses.size() == 1 &&
+                    instruction.defs.size() == 1 &&
+                    source.kind == machine::RegisterKind::Virtual &&
+                    source.id < function.virtual_register_classes.size() &&
+                    function.virtual_register_classes[source.id] ==
+                        machine::VirtualRegisterClass::Integer &&
+                    source.mode.bits <= 32;
+                if (!convert) {
+                    expanded.push_back(std::move(instruction));
+                    continue;
+                }
+                const auto location = instruction.location;
+                if (source.mode.bits < 32) {
+                    auto extend = target_instruction(
+                        opcode == Opcode::Sitofp ? Opcode::Sext : Opcode::Zext,
+                        location);
+                    extend.inline_site = instruction.inline_site;
+                    extend.uses = {source};
+                    source = create_integer_temporary(function, machine::i32,
+                                                      location, "convert");
+                    extend.defs = {source};
+                    expanded.push_back(std::move(extend));
+                }
+                auto transfer = target_instruction(Opcode::Freinterpret,
+                                                   location);
+                transfer.inline_site = instruction.inline_site;
+                transfer.uses = {source};
+                const auto word =
+                    create_floating_temporary(function, location, "convert");
+                transfer.defs = {word};
+                expanded.push_back(std::move(transfer));
+                instruction.opcode = Opcode::Sitofp;
+                instruction.uses = {word};
+                expanded.push_back(std::move(instruction));
+                changed = true;
+            }
+            block.instructions = std::move(expanded);
+        }
+        return changed;
+    }
+
     bool schedule_instructions(machine::Function& function) {
         if (!options_.schedule_insns) return false;
         bool changed = split_hilo_operations(function);
+        changed = split_fpu_transfers(function) || changed;
         for (auto& block : function.blocks) {
             std::size_t begin{};
             while (begin < block.instructions.size()) {
@@ -5457,24 +5746,6 @@ private:
                 terminator.operands.size() < 3) {
                 continue;
             }
-            const auto edge_has_phi = [&](const machine::Operand& operand) {
-                const auto* edge = std::get_if<machine::BlockOperand>(&operand);
-                if (!edge) return true;
-                const auto successor = std::find_if(
-                    function.blocks.begin(), function.blocks.end(),
-                    [&](const machine::Block& candidate) {
-                        return candidate.id == edge->target;
-                    });
-                return successor != function.blocks.end() &&
-                    std::any_of(
-                        successor->instructions.begin(),
-                        successor->instructions.end(),
-                        [](const machine::Instruction& instruction) {
-                            return instruction.opcode == Opcode::Phi;
-                        });
-            };
-            const bool yes_has_phi = edge_has_phi(terminator.operands[1]);
-            const bool no_has_phi = edge_has_phi(terminator.operands[2]);
             const auto condition = terminator.uses.front();
             if (condition.kind != machine::RegisterKind::Virtual ||
                 condition.id >= uses.size() || uses[condition.id] != 1) {
@@ -5500,9 +5771,15 @@ private:
                 (opcode >= Opcode::CmpEq && opcode <= Opcode::CmpUge);
             const bool floating = opcode == Opcode::Fiszero ||
                 (opcode >= Opcode::FcmpEq && opcode <= Opcode::FcmpGe);
-            if ((!integer && !floating) ||
-                ((yes_has_phi || no_has_phi) &&
-                 opcode != Opcode::CmpEq && opcode != Opcode::CmpNe) ||
+            // Other ordered comparisons branch on $at, which a naked body
+            // may not write.
+            const auto* immediate = found->operands.size() == 2
+                ? std::get_if<machine::ImmediateOperand>(&found->operands[1])
+                : nullptr;
+            const bool needs_at = opcode >= Opcode::CmpSlt &&
+                opcode <= Opcode::CmpUge &&
+                !(immediate && immediate->value == 0 && zero_branches(opcode));
+            if ((!integer && !floating) || (naked_ && needs_at) ||
                 (!subtarget_.has_feature(Feature::Mips3) &&
                  found->uses.front().mode.bits > 32) ||
                 (floating && std::next(found) !=
@@ -5811,9 +6088,7 @@ private:
                          subtarget_.has_feature(Feature::Mips3))) ||
                        (floating_preserved &&
                         kind == machine::VirtualRegisterClass::Floating &&
-                        value.mode.bits <= 64 &&
-                        subtarget_.has_feature(Feature::Mips3) &&
-                        subtarget_.has_feature(Feature::HardFloat));
+                        colorable_floating(subtarget_, value.mode.bits));
             },
             phi_instruction);
     }
@@ -6104,28 +6379,52 @@ private:
         std::vector<IntegerLiteral> integers;
     };
 
-    bool prefer_float_literal(
-        const machine::ImmediateOperand& immediate) const {
-        if (!options_.machine_combine || immediate.mode.bits != 64 ||
+    // The instructions load_immediate emits: LI is one instruction for a
+    // 16-bit word or one whose low half is zero, else two.
+    static unsigned word_instructions(std::uint32_t word) {
+        const auto value = static_cast<std::int32_t>(word);
+        return (value >= -32768 && value <= 32767) || word <= 0xffffU ||
+                       (word & 0xffffU) == 0
+                   ? 1U : 2U;
+    }
+
+    static unsigned immediate_instructions(std::uint64_t value) {
+        const auto low = static_cast<std::uint32_t>(value);
+        if (static_cast<std::int64_t>(value) == static_cast<std::int32_t>(low)) {
+            return word_instructions(low);
+        }
+        return word_instructions(static_cast<std::uint32_t>(value >> 32U)) +
+               ((low >> 16U) != 0 ? 3U : 1U) + ((low & 0xffffU) != 0 ? 1U : 0U);
+    }
+
+    // Under a size goal, whether a pool entry, its load and eight data
+    // bytes, is smaller than `instructions` that materialize the constant.
+    // A `literal` data base reaches the entry in one load, and MIPS I loads
+    // a double as two words, the second with a delay slot.
+    bool pool_smaller(unsigned instructions, bool floating) const {
+        if (!options_.machine_combine ||
             (options_.optimize_for != OptimizationGoal::Size &&
              options_.optimize_for != OptimizationGoal::MinimumSize)) {
             return false;
         }
-        const auto signed_low = static_cast<std::int64_t>(immediate.value);
-        if (signed_low >= std::numeric_limits<std::int16_t>::min() &&
-            signed_low <= std::numeric_limits<std::int16_t>::max()) {
-            return false;
-        }
-        unsigned nonzero_halfwords = 0;
-        for (unsigned shift = 0; shift < 64; shift += 16) {
-            if (((immediate.value >> shift) & 0xffffU) != 0) {
-                ++nonzero_halfwords;
-            }
-        }
-        // Two relocation-bearing instructions plus eight pool bytes cost 16
-        // bytes. Three or more populated chunks require strictly more space
-        // for DLI followed by a GPR-to-FPR transfer.
-        return nonzero_halfwords >= 3;
+        unsigned load = literal_data_base() ? 1U
+                        : large_code_model() ? 7U : 2U;
+        if (floating && !subtarget_.has_feature(Feature::Mips2)) load += 2U;
+        return load + 2U < instructions;
+    }
+
+    // A double materializes through a 64-bit GPR and DMTC1, or before MIPS
+    // III as two words and two transfers.
+    bool prefer_float_literal(
+        const machine::ImmediateOperand& immediate) const {
+        if (immediate.mode.bits != 64) return false;
+        return pool_smaller(
+            subtarget_.has_feature(Feature::Mips3)
+                ? immediate_instructions(immediate.value) + 1U
+                : word_instructions(static_cast<std::uint32_t>(immediate.value)) +
+                      word_instructions(static_cast<std::uint32_t>(
+                          immediate.value >> 32U)) + 2U,
+            true);
     }
 
     const FloatLiteral& float_literal(
@@ -6151,21 +6450,8 @@ private:
 
     bool prefer_integer_literal(
         const machine::ImmediateOperand& immediate) const {
-        if (!options_.machine_combine || immediate.mode.bits != 64 ||
-            large_code_model() ||
-            (options_.optimize_for != OptimizationGoal::Size &&
-             options_.optimize_for != OptimizationGoal::MinimumSize)) {
-            return false;
-        }
-        // A pool reference costs two instructions and eight data bytes. Keep
-        // the transformation strictly profitable even after charging the
-        // data by accepting only constants whose four populated chunks need
-        // a full DLI construction. Leading 0xffff is excluded because GNU
-        // as can sometimes exploit sign extension for that shape.
-        for (unsigned shift = 0; shift < 64; shift += 16) {
-            if (((immediate.value >> shift) & 0xffffU) == 0) return false;
-        }
-        return (immediate.value >> 48U) != 0xffffU;
+        return immediate.mode.bits == 64 &&
+               pool_smaller(immediate_instructions(immediate.value), false);
     }
 
     const IntegerLiteral& integer_literal(
@@ -6859,6 +7145,24 @@ private:
         }
     }
 
+    // Whether an instruction may read the register of the pending transfer.
+    // An FR=0 double names only the even register of its pair, so a write
+    // to either half is pending for both, except for an instruction that
+    // only writes its FPR operand.
+    bool reads_transferred_register(std::string_view opcode,
+                                    std::string_view operands) const {
+        const auto& pending = *fpu_transfer_delay_register_;
+        if (mentions_register(operands, pending)) return true;
+        const auto id = fpr_id(pending);
+        if (!id || subtarget_.has_feature(Feature::Fp64) ||
+            subtarget_.has_feature(Feature::SingleFloat) ||
+            opcode == "mtc1" || opcode == "mthc1" || opcode == "lwc1" ||
+            opcode == "ldc1") {
+            return false;
+        }
+        return mentions_register(operands, fpr_name({id->value ^ 1U}));
+    }
+
     void instruction(std::string_view opcode,
                      std::string_view operands = {},
                      bool defer_load_delay = false) {
@@ -6874,7 +7178,7 @@ private:
         // address, or other-register work fills the slot instead of forcing a
         // NOP after every MTC1/MFC1.
         if (fpu_transfer_delay_register_) {
-            if (mentions_register(operands, *fpu_transfer_delay_register_)) {
+            if (reads_transferred_register(opcode, operands)) {
                 raw_instruction("nop");
                 if (hilo_write_barrier_ != 0) --hilo_write_barrier_;
             }
@@ -8122,6 +8426,81 @@ private:
                     reg_name(destination) + "," + reg_name(source));
     }
 
+    // Without 64-bit GPRs, an f64 in the FR=0 pair of `fpr` holds its low
+    // word in the even register and its high word in the odd one. Where
+    // those words pass through memory, `value`'s home carries them.
+    void move_words_to_fpr(const machine::Function& function,
+                           machine::Register value, std::string_view low,
+                           std::string_view high, std::string_view fpr,
+                           SourceLocation location) {
+        if (fpr_words_through_memory(subtarget_)) {
+            store_vreg_pair(function, value, low, high, location);
+            instruction("ldc1", reg_name(fpr) + "," +
+                                    memory(vreg_offset(function, value,
+                                                       location)));
+            return;
+        }
+        instruction("mtc1", reg_name(low) + "," + reg_name(fpr));
+        if (subtarget_.has_feature(Feature::Mips32r2)) {
+            instruction("mthc1", reg_name(high) + "," + reg_name(fpr));
+        } else {
+            instruction("mtc1",
+                        reg_name(high) + "," + reg_name(pair_partner(fpr)));
+        }
+    }
+
+    void move_fpr_word(const machine::Function& function,
+                       machine::Register value, std::string_view fpr,
+                       bool high, std::string_view gpr,
+                       SourceLocation location) {
+        if (fpr_words_through_memory(subtarget_)) {
+            const auto offset = vreg_offset(function, value, location);
+            instruction("sdc1", reg_name(fpr) + "," + memory(offset));
+            instruction("lw", reg_name(gpr) + "," +
+                                  memory(word_offset(offset, high)));
+        } else if (!high) {
+            instruction("mfc1", reg_name(gpr) + "," + reg_name(fpr));
+        } else if (subtarget_.has_feature(Feature::Mips32r2)) {
+            instruction("mfhc1", reg_name(gpr) + "," + reg_name(fpr));
+        } else {
+            instruction("mfc1",
+                        reg_name(gpr) + "," + reg_name(pair_partner(fpr)));
+        }
+    }
+
+    // The 0 or 1 of the floating condition in `gpr`: MOVT/MOVF where the
+    // FPU selects on its condition, a branch elsewhere.
+    void condition_value(const machine::Function& function,
+                         std::string_view gpr, bool true_on_condition) {
+        if (!select_instructions(subtarget_, {32, true, true}).empty()) {
+            instruction("li", reg_name(gpr) + ",1");
+            instruction(true_on_condition ? "movf" : "movt",
+                        reg_name(gpr) + ",$zero,$fcc0");
+            return;
+        }
+        const auto yes = local_label(function);
+        const auto done = local_label(function);
+        instruction(true_on_condition ? "bc1t" : "bc1f", yes);
+        instruction("move", reg_name(gpr) + ",$zero");
+        instruction("b", done);
+        instruction("nop");
+        output_ << yes << ":\n";
+        instruction("li", reg_name(gpr) + ",1");
+        output_ << done << ":\n";
+    }
+
+    // +0.0 in the f64 register pair of `fpr`, without 64-bit GPRs.
+    void zero_fpr_pair(std::string_view fpr) {
+        instruction("mtc1", "$zero," + reg_name(fpr));
+        if (fpr_words_through_memory(subtarget_)) {
+            instruction("cvt.d.w", reg_name(fpr) + "," + reg_name(fpr));
+        } else if (subtarget_.has_feature(Feature::Mips32r2)) {
+            instruction("mthc1", "$zero," + reg_name(fpr));
+        } else {
+            instruction("mtc1", "$zero," + reg_name(pair_partner(fpr)));
+        }
+    }
+
     // Loads a `bits`-wide constant as a 64-bit register holds it: a word
     // sign-extended. LI takes only a signed word, the one form whose
     // expansion every assembler shares; a wider doubleword continues with
@@ -8182,13 +8561,15 @@ private:
             subtarget_.has_feature(Feature::Mips3);
     }
 
+    // A value of at most 32 bits is sign-canonical above bit 31: word
+    // operations, narrow loads, and ANDI masks all produce that form.
     bool internal_value_matches_extension(const ValuePiece& piece,
                                           unsigned bits) const {
         if (!subtarget_.has_feature(Feature::Mips3) ||
             piece.extension == AbiExtensionKind::None) {
             return true;
         }
-        return bits == 32 && piece.carrier_bits == 32 &&
+        return bits <= 32 && piece.carrier_bits == 32 &&
             piece.extension == AbiExtensionKind::Sign;
     }
 
@@ -9111,7 +9492,13 @@ private:
         if (bits > 32 && !subtarget_.has_feature(Feature::Mips3)) {
             assemble_incoming_pair(function, assignment.pieces,
                                    *active_signature_->abi, bits, true);
-            store_vreg_pair(function, target, "t0", "t1", value.location);
+            if (const auto destination = assigned_fpr(function, target)) {
+                move_words_to_fpr(function, target, "t0", "t1", *destination,
+                                  value.location);
+            } else {
+                store_vreg_pair(function, target, "t0", "t1",
+                                value.location);
+            }
         } else {
             assemble_incoming_integer(
                 function, assignment.pieces, *active_signature_->abi, bits,
@@ -9258,13 +9645,19 @@ private:
         const auto shift = effective_piece_offset(
             piece, source.mode.bits,
             subtarget_.target().data_layout.byte_order);
-        if (const auto assigned = assigned_fpr(function, source)) {
+        const auto assigned = assigned_fpr(function, source);
+        if (assigned && !legalizes_to_pair(source)) {
             move_fpr_to_gpr(*assigned, "at", source.mode.bits);
         } else if (legalizes_to_pair(source)) {
-            const auto offset = vreg_offset(function, source, location);
             const bool high = shift >= 32;
-            instruction("lw", "$at," +
-                                  memory(word_offset(offset, high)));
+            if (assigned) {
+                move_fpr_word(function, source, *assigned, high, "at",
+                              location);
+            } else {
+                const auto offset = vreg_offset(function, source, location);
+                instruction("lw", "$at," +
+                                      memory(word_offset(offset, high)));
+            }
             const auto word_shift = shift - (high ? 32U : 0U);
             if (word_shift != 0) {
                 instruction("srl", "$at,$at," +
@@ -9413,7 +9806,12 @@ private:
         if (bits > 32 && !subtarget_.has_feature(Feature::Mips3)) {
             assemble_incoming_pair(function, assignment.pieces,
                                    *signature.abi, bits, false);
-            store_vreg_pair(function, target, "t0", "t1", call.location);
+            if (const auto destination = assigned_fpr(function, target)) {
+                move_words_to_fpr(function, target, "t0", "t1", *destination,
+                                  call.location);
+            } else {
+                store_vreg_pair(function, target, "t0", "t1", call.location);
+            }
         } else {
             assemble_incoming_integer(
                 function, assignment.pieces, *signature.abi, bits,
@@ -10700,15 +11098,7 @@ private:
         if (!immediate || immediate->value != 0 || branch.uses.size() != 1) {
             return std::nullopt;
         }
-        switch (decode_opcode(branch.condition_predicate)) {
-        case Opcode::CmpSlt: return std::pair{"bltz", "bgez"};
-        case Opcode::CmpSge: return std::pair{"bgez", "bltz"};
-        case Opcode::CmpSle: return std::pair{"blez", "bgtz"};
-        case Opcode::CmpSgt: return std::pair{"bgtz", "blez"};
-        case Opcode::CmpUgt: return std::pair{"bnez", "beqz"};
-        case Opcode::CmpUle: return std::pair{"beqz", "bnez"};
-        default: return std::nullopt;
-        }
+        return zero_branches(decode_opcode(branch.condition_predicate));
     }
 
     bool single_fused_compare_instruction(
@@ -12131,16 +12521,8 @@ void AssemblyEmitter::emit_floating_binary(
                            "unknown MIPS floating Machine IR operation");
         return;
     }
-    const auto yes = local_label(function);
-    const auto done = local_label(function);
     const auto result_gpr = output_gpr(function, target, "t0");
-    instruction(true_on_condition ? "bc1t" : "bc1f", yes);
-    instruction("move", reg_name(result_gpr) + ",$zero");
-    instruction("b", done);
-    instruction("nop");
-    output_ << yes << ":\n";
-    instruction("li", reg_name(result_gpr) + ",1");
-    output_ << done << ":\n";
+    condition_value(function, result_gpr, true_on_condition);
     commit_gpr(function, target, result_gpr, value.location);
 }
 
@@ -12242,10 +12624,27 @@ void AssemblyEmitter::emit_cast(const machine::Function& function,
     if (opcode == Opcode::Freinterpret) {
         if (source.mode.bits > 32 && target.mode.bits > 32 &&
             !subtarget_.has_feature(Feature::Mips3)) {
-            load_pair_memory(
-                "t0", "t1", vreg_offset(function, source, value.location));
-            store_pair_memory(
-                "t0", "t1", vreg_offset(function, target, value.location));
+            // The word pair's home is the doubleword's memory image.
+            const auto source_fpr = assigned_fpr(function, source);
+            const auto target_fpr = assigned_fpr(function, target);
+            if (source_fpr && !target_float) {
+                instruction("sdc1", reg_name(*source_fpr) + "," +
+                                        memory(vreg_offset(function, target,
+                                                           value.location)));
+            } else if (target_fpr && !source_float) {
+                instruction("ldc1", reg_name(*target_fpr) + "," +
+                                        memory(vreg_offset(function, source,
+                                                           value.location)));
+            } else if (source_float && target_float) {
+                copy_vreg(function, target, source, value.location);
+            } else {
+                load_pair_memory(
+                    "t0", "t1",
+                    vreg_offset(function, source, value.location));
+                store_pair_memory(
+                    "t0", "t1",
+                    vreg_offset(function, target, value.location));
+            }
         } else if (source_float && target_float) {
             copy_vreg(function, target, source, value.location);
         } else if (source_float) {
@@ -12274,7 +12673,17 @@ void AssemblyEmitter::emit_cast(const machine::Function& function,
     if (opcode == Opcode::Sitofp || opcode == Opcode::Uitofp) {
         const auto destination = target.mode.bits == 32
             ? std::string{"cvt.s."} : std::string{"cvt.d."};
-        if (opcode == Opcode::Uitofp && source.mode.bits <= 32) {
+        if (source_float) {
+            // A signed word that an earlier transfer put in an FPR.
+            const auto input = input_fpr(function, source, "f0",
+                                         value.location);
+            const auto output = output_fpr(function, target, "f2");
+            instruction(destination + "w",
+                        reg_name(output) + "," + reg_name(input));
+            commit_fpr(function, target, output, value.location);
+            return;
+        }
+        if (opcode == Opcode::Uitofp && source.mode.bits == 32) {
             load_vreg(function, source, "t0", value.location);
             // MIPS has signed-word conversion only. For a high-bit u32, an
             // f32 uses the standard sticky-low-bit halving expansion so its
@@ -12325,7 +12734,15 @@ void AssemblyEmitter::emit_cast(const machine::Function& function,
             return;
         }
         // The integer travels into the result register and converts there.
-        const auto input = input_gpr(function, source, "t0", value.location);
+        // A narrow source's register bits above its width are unspecified;
+        // extended by its signedness it is an exact word, never negative
+        // when unsigned.
+        auto input = input_gpr(function, source, "t0", value.location);
+        if (source.mode.bits < 32) {
+            normalize_integer("t0", input, source.mode.bits,
+                              opcode == Opcode::Sitofp);
+            input = "t0";
+        }
         const auto output = output_fpr(function, target, "f2");
         move_gpr_to_fpr(input, output, use_long ? 64U : 32U);
         instruction(destination + std::string(use_long ? "l" : "w"),
@@ -12942,13 +13359,28 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
             }
             return;
         }
-        if (legalizes_to_pair(target)) {
+        const auto pair_fpr = opcode == Opcode::Fconstant &&
+                legalizes_to_pair(target)
+            ? assigned_fpr(function, target) : std::nullopt;
+        if (pair_fpr && immediate.value == 0) {
+            zero_fpr_pair(*pair_fpr);
+            return;
+        }
+        if (legalizes_to_pair(target) &&
+            !(pair_fpr && (prefer_float_literal(immediate) ||
+                           fpr_words_through_memory(subtarget_)))) {
             const auto low = static_cast<std::uint32_t>(immediate.value);
             const auto high = static_cast<std::uint32_t>(
                 immediate.value >> 32U);
             load_immediate("t0", low, 32);
             load_immediate("t1", high, 32);
-            store_vreg_pair(function, target, "t0", "t1", value.location);
+            if (pair_fpr) {
+                move_words_to_fpr(function, target, "t0", "t1", *pair_fpr,
+                                  value.location);
+            } else {
+                store_vreg_pair(function, target, "t0", "t1",
+                                value.location);
+            }
             return;
         }
         if (opcode == Opcode::Fconstant) {
@@ -12957,7 +13389,8 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
                 move_gpr_to_fpr("zero", *destination, target.mode.bits);
                 return;
             }
-            if (destination && prefer_float_literal(immediate)) {
+            if (destination && (prefer_float_literal(immediate) ||
+                                pair_fpr)) {
                 const auto& literal = float_literal(function, immediate);
                 if (const auto* base = literal_data_base()) {
                     instruction(target.mode.bits == 32 ? "lwc1" : "ldc1",
@@ -13488,22 +13921,13 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
                 subtarget_.has_feature(Feature::Mips3)) {
                 move_gpr_to_fpr("zero", "f2", source.mode.bits);
             } else {
-                instruction("mtc1", "$zero,$f2");
-                instruction("mtc1", "$zero,$f3");
+                zero_fpr_pair("f2");
             }
             instruction("c.eq" + suffix,
                         reg_name(source_fpr) + ",$f2");
-            const auto yes = local_label(function);
-            const auto done = local_label(function);
             const auto target = value.defs.front();
             const auto destination = output_gpr(function, target, "t0");
-            instruction("bc1t", yes);
-            instruction("move", reg_name(destination) + ",$zero");
-            instruction("b", done);
-            instruction("nop");
-            output_ << yes << ":\n";
-            instruction("li", reg_name(destination) + ",1");
-            output_ << done << ":\n";
+            condition_value(function, destination, true);
             commit_gpr(function, target, destination, value.location);
         }
         return;
@@ -13557,13 +13981,48 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
         if (value.uses.size() < 3 || value.defs.empty()) return;
         if (value.defs.front().mode.bits <= 32 &&
             selects_cond_move()) {
-            load_vreg(function, value.uses[0], "t0", value.location);
-            load_vreg(function, value.uses[1], "t1", value.location);
-            load_vreg(function, value.uses[2], "t2", value.location);
-            // Allegrex uses the MIPS conditional-move operand layout even
-            // though generic MIPS-II assemblers do not recognize its mnemonic.
-            encoded(0x0128500bU, "movn $t2,$t1,$t0");
-            store_vreg(function, value.defs.front(), "t2", value.location);
+            const auto condition =
+                input_gpr(function, value.uses[0], "t0", value.location);
+            const auto yes =
+                input_gpr(function, value.uses[1], "t1", value.location);
+            const auto no =
+                input_gpr(function, value.uses[2], "t2", value.location);
+            const auto target = value.defs.front();
+            const auto result = output_gpr(function, target, "t2");
+            // MOVN and MOVZ keep the destination when they do not move, so
+            // it starts as the other value. Allegrex uses the MIPS
+            // conditional-move layout, which generic MIPS-II assemblers do
+            // not know, so the instruction is a word.
+            const auto move_if = [&](bool nonzero, std::string_view to,
+                                     std::string_view from) {
+                encoded(register_word(nonzero ? 0x0000000bU : 0x0000000aU,
+                                      from, condition, to),
+                        std::string(nonzero ? "movn " : "movz ") +
+                            reg_name(to) + "," + reg_name(from) + "," +
+                            reg_name(condition));
+            };
+            if (result == no) {
+                move_if(true, result, yes);
+            } else if (result == yes) {
+                move_if(false, result, no);
+            } else {
+                std::string_view work = result;
+                if (result == condition) {
+                    for (const std::string_view scratch : {"t2", "t1", "t0"}) {
+                        if (scratch != yes && scratch != no) {
+                            work = scratch;
+                            break;
+                        }
+                    }
+                }
+                instruction("move", reg_name(work) + "," + reg_name(no));
+                move_if(true, work, yes);
+                if (work != result) {
+                    instruction("move",
+                                reg_name(result) + "," + reg_name(work));
+                }
+            }
+            commit_gpr(function, target, result, value.location);
             return;
         }
         const auto otherwise = local_label(function);
@@ -13996,8 +14455,7 @@ void AssemblyEmitter::emit_terminator(
                             move_gpr_to_fpr(
                                 "zero", "f2", value.uses[0].mode.bits);
                         } else {
-                            instruction("mtc1", "$zero,$f2");
-                            instruction("mtc1", "$zero,$f3");
+                            zero_fpr_pair("f2");
                         }
                         comparison = "c.eq" + suffix;
                     } else {
@@ -14023,8 +14481,9 @@ void AssemblyEmitter::emit_terminator(
                             std::swap(left, right);
                             break;
                         case Opcode::FcmpGe:
-                            comparison = "c.lt" + suffix;
-                            truth_on_condition = false;
+                            // Not !(a < b), which a NaN satisfies.
+                            comparison = "c.le" + suffix;
+                            std::swap(left, right);
                             break;
                         default: return false;
                         }
@@ -14393,8 +14852,11 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
     else if (subtarget_.has_feature(Feature::Mips3)) output_ << ".set mips3\n";
     else if (subtarget_.has_feature(Feature::Mips32r2)) output_ << ".set mips32r2\n";
     else if (subtarget_.has_feature(Feature::Mips32)) output_ << ".set mips32\n";
-    else if (subtarget_.has_feature(Feature::Mips2)) output_ << ".set mips2\n";
-    else output_ << ".set mips1\n";
+    // MIPS II has no odd single-precision arithmetic registers; code that
+    // uses them leaves the ISA to the assembler's CPU.
+    else if (subtarget_.has_feature(Feature::Mips2)) {
+        if (!odd_fpr_colors(subtarget_)) output_ << ".set mips2\n";
+    } else output_ << ".set mips1\n";
     unsigned alignment_power = 2;
     if (options_.function_alignment != 0) {
         alignment_power = static_cast<unsigned>(

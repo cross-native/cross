@@ -58,8 +58,8 @@ expect(allegrex-features "${stdout}"
 
 run(print-cpus -target mips-unknown-elf --print-cpus)
 expect(print-cpus "${stdout}"
-    "(^|\n)mips1  features: mips1,hard-float,fp32,odd-spreg  issue_width: 1  source: shipped:mips[.]xm:[0-9]+\n"
-    "\nvr4300  inherits: mips3  features: mips3,hard-float,fp32,odd-spreg,llsc,branch-likely,load-interlocks  issue_width: 1  source: shipped:mips[.]xm:[0-9]+\n")
+    "(^|\n)mips1  features: mips1,hard-float,fp32  issue_width: 1  source: shipped:mips[.]xm:[0-9]+\n"
+    "\nvr4300  inherits: mips3  features: mips3,hard-float,fp32,llsc,branch-likely,load-interlocks  issue_width: 1  source: shipped:mips[.]xm:[0-9]+\n")
 reject(print-cpus "${stdout}" "haswell")
 
 # Costs: the -mtune entry's latency and issue, the -march entry's
@@ -238,12 +238,12 @@ function(compile_assembly label)
     set(assembly "${assembly}" PARENT_SCOPE)
 endfunction()
 compile_assembly(allegrex -mprofile=psp-allegrex "${ROTATE_SOURCE}")
-expect(allegrex "${assembly}" "[.]word[\t ]+0x0128500b" "[.]word[^\n]*# rotrv")
+expect(allegrex "${assembly}" "[.]word[^\n]*# movn" "[.]word[^\n]*# rotrv")
 compile_assembly(nomovn -mprofile=psp-allegrex -march=nomovn "${ROTATE_SOURCE}")
-expect(nomovn "${assembly}" "[.]word[^\n]*# rotrv" "[\t ]beq[\t ]")
-reject(nomovn "${assembly}" "0x0128500b")
+expect(nomovn "${assembly}" "[.]word[^\n]*# rotrv" "[\t ](beq|bne)l?[\t ]")
+reject(nomovn "${assembly}" "# movn")
 compile_assembly(norotate -mprofile=psp-allegrex -march=norotate "${ROTATE_SOURCE}")
-expect(norotate "${assembly}" "[.]word[\t ]+0x0128500b" "[\t ]srlv[\t ]")
+expect(norotate "${assembly}" "[.]word[^\n]*# movn" "[\t ]srlv[\t ]")
 reject(norotate "${assembly}" "# rotrv")
 
 set(branches "${OUTPUT}/branches.x")

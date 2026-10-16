@@ -81,11 +81,11 @@ file(READ "${eabi_assembly}" assembly)
 foreach(pattern
         "\\.section \\.mdebug\\.eabi32"
         "\\.section \\.gcc_compiled_long32"
-        "\\.set mips2"
         "\\.word[^\n]*# rotrv"
-        "\\.word[	 ]+0x0128500b"
-        "swc1[	 ]+[$]f12"
-        "swc1[	 ]+[$]f13")
+        "\\.word[^\n]*# movn"
+        # The EABI32 cursors place the floats in f12 and f13, and the
+        # single-precision FPU compares them where they arrive.
+        "c[.]eq[.]s[	 ]+[$]f12,[$]f13")
     if(NOT assembly MATCHES "${pattern}")
         message(FATAL_ERROR
             "Allegrex/EABI32 assembly is missing '${pattern}'\n${assembly}")
@@ -131,9 +131,9 @@ if(pair MATCHES "addiu[\t ]+[$]10,[$]10,-1" OR
 endif()
 
 file(READ "${baseline_assembly}" baseline)
-if(baseline MATCHES "# rotrv|\\.word[	 ]+0x0128500b" OR
+if(baseline MATCHES "# rotrv|# movn" OR
    NOT baseline MATCHES "[	 ]srlv[	 ]" OR
-   NOT baseline MATCHES "[	 ]beq[	 ]")
+   NOT baseline MATCHES "[	 ](beq|bne)l?[	 ]")
     message(FATAL_ERROR
         "Allegrex extension disable switches did not affect selection\n${baseline}")
 endif()

@@ -50,3 +50,9 @@ global u8 letter(u32 i) {
 global f64 third(f64 x) {
     return x * 0.3333333333333333;
 }
+
+// Two populated halfwords: one %gp_rel load and the pool entry are smaller
+// than materializing it, LUI with a load and the entry are not.
+global f64 near_pi(f64 x) {
+    return x * 3.1415901184082031;
+}

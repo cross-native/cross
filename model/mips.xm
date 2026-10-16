@@ -994,12 +994,26 @@ abi "eabi32" {
         applies_to = ["results"];
     }
 
+    # A single-precision FPU with odd single-precision registers passes
+    # singles in consecutive registers. Other FPUs pass each in the even
+    # register of a pair, as GCC does for an FPU with doubles.
     rule "floating32" {
         match = ["floating"];
         action = "direct";
         bank = "floating32";
         min_bits = 32;
         max_bits = 32;
+        requires_features = ["hard-float", "single-float", "odd-spreg"];
+    }
+
+    rule "floating32-pair" {
+        match = ["floating"];
+        action = "direct";
+        bank = "floating32";
+        min_bits = 32;
+        max_bits = 32;
+        cursor_alignment = 2;
+        cursor_advance = 2;
         requires_features = ["hard-float"];
     }
 
@@ -1096,7 +1110,7 @@ abi "eabi32" {
 # operations.
 cpu "mips1" {
     architecture = "mips";
-    features = ["mips1", "hard-float", "fp32", "odd-spreg"];
+    features = ["mips1", "hard-float", "fp32"];
     instruction "lb" { latency = 4; }
     instruction "lbu" { latency = 4; }
     instruction "lh" { latency = 4; }
@@ -1158,8 +1172,8 @@ cpu "r2000" {
 cpu "mips2" {
     architecture = "mips";
     inherits = "mips1";
-    features = ["mips2", "hard-float", "fp32", "odd-spreg", "llsc",
-                "branch-likely", "load-interlocks"];
+    features = ["mips2", "hard-float", "fp32", "llsc", "branch-likely",
+                "load-interlocks"];
 }
 
 cpu "r6000" {
@@ -1220,8 +1234,8 @@ cpu "mips32r2" {
 
 cpu "mips3" {
     architecture = "mips";
-    features = ["mips3", "hard-float", "fp32", "odd-spreg", "llsc",
-                "branch-likely", "load-interlocks"];
+    features = ["mips3", "hard-float", "fp32", "llsc", "branch-likely",
+                "load-interlocks"];
 }
 
 cpu "r4000" {
@@ -1304,17 +1318,17 @@ cpu "vr4300" {
 cpu "mips4" {
     architecture = "mips";
     inherits = "mips3";
-    features = ["mips4", "hard-float", "fp64", "odd-spreg", "llsc",
-                "branch-likely", "cond-move", "load-interlocks",
-                "fpu-transfer-interlocks", "fpu-compare-interlocks"];
+    features = ["mips4", "hard-float", "fp64", "llsc", "branch-likely",
+                "cond-move", "load-interlocks", "fpu-transfer-interlocks",
+                "fpu-compare-interlocks"];
 }
 
 cpu "mips5" {
     architecture = "mips";
     inherits = "mips4";
-    features = ["mips5", "hard-float", "fp64", "odd-spreg", "llsc",
-                "branch-likely", "cond-move", "load-interlocks",
-                "fpu-transfer-interlocks", "fpu-compare-interlocks"];
+    features = ["mips5", "hard-float", "fp64", "llsc", "branch-likely",
+                "cond-move", "load-interlocks", "fpu-transfer-interlocks",
+                "fpu-compare-interlocks"];
 }
 
 cpu "mips64" {
@@ -1335,10 +1349,9 @@ data_base "mips-gp" {
     kinds = ["writable"];
 }
 
-# MIPS profiles without a native conditional move preserve ordinary control
-# diamonds by default.  They retain the larger budget for recognized
-# high-entropy memory predicates, where speculation can still beat a branch.
-# Allegrex profiles keep the common policy because that ISA has MOVN/MOVZ.
+# MIPS profiles keep the larger budget for recognized high-entropy memory
+# predicates, where speculation can beat a branch even on a CPU without
+# conditional moves, whose diamonds otherwise stay branches.
 profile "mips-elf" {
     default_for = ["mips", "mips-*"];
     target = "mips-unknown-elf";
@@ -1346,7 +1359,6 @@ profile "mips-elf" {
     mangling = "cross";
     m.arch = "generic";
     m.risc-cisc-balance = 0;
-    f.if-conversion-limit = 0;
     f.if-conversion-memory-limit = 12;
 }
 
@@ -1357,7 +1369,6 @@ profile "mipsel-elf" {
     mangling = "cross";
     m.arch = "generic";
     m.risc-cisc-balance = 0;
-    f.if-conversion-limit = 0;
     f.if-conversion-memory-limit = 12;
 }
 
@@ -1373,7 +1384,6 @@ profile "mips64-n64" {
     mangling = "cross";
     m.arch = "mips64";
     m.risc-cisc-balance = 0;
-    f.if-conversion-limit = 0;
     f.if-conversion-memory-limit = 12;
 }
 
@@ -1384,7 +1394,6 @@ profile "mips64el-n64" {
     mangling = "cross";
     m.arch = "mips64";
     m.risc-cisc-balance = 0;
-    f.if-conversion-limit = 0;
     f.if-conversion-memory-limit = 12;
 }
 
@@ -1395,7 +1404,6 @@ profile "vr4300-cross64" {
     m.arch = "vr4300";
     m.tune = "vr4300";
     m.risc-cisc-balance = 0;
-    f.if-conversion-limit = 0;
     f.if-conversion-memory-limit = 12;
 }
 
@@ -1405,7 +1413,6 @@ profile "vr4300-o32" {
     mangling = "cross";
     m.arch = "vr4300";
     m.risc-cisc-balance = 0;
-    f.if-conversion-limit = 0;
     f.if-conversion-memory-limit = 12;
 }
 
@@ -1419,7 +1426,6 @@ profile "n64" {
     m.tune = "vr4300";
     m.fix4300 = true;
     m.risc-cisc-balance = 0;
-    f.if-conversion-limit = 0;
     f.if-conversion-memory-limit = 12;
     fp_traps = ["invalid"];
     fp_denormal_operand = "trap";
@@ -1452,7 +1458,6 @@ profile "r3000-o32" {
     m.arch = "r3000";
     m.tune = "r3000";
     m.risc-cisc-balance = 0;
-    f.if-conversion-limit = 0;
     f.if-conversion-memory-limit = 12;
 }
 
@@ -1463,6 +1468,5 @@ profile "r6000-eabi" {
     m.arch = "r6000";
     m.tune = "r6000";
     m.risc-cisc-balance = 0;
-    f.if-conversion-limit = 0;
     f.if-conversion-memory-limit = 12;
 }

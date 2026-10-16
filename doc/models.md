@@ -478,7 +478,8 @@ the next position and uses one position per register. The shipped `o32`
 entry aligns its arguments to the value, so 64-bit scalars and records with
 8-byte alignment start at an even slot and an `f64` in floating-point
 registers takes two positions; `eabi32` aligns its 64-bit values to two
-positions.
+positions, and so its `f32` values on an FPU without odd single-precision
+registers.
 
 `stack_alignment`, a power of two, and `stack_size`, both in bytes,
 override the alignment and the minimum size of a value that the rule places
@@ -1017,8 +1018,8 @@ what they cost. This entry describes part of the VR4300:
 ```text
 cpu "vr4300" {
     architecture = "mips";
-    features = ["mips3", "hard-float", "fp32", "odd-spreg", "llsc",
-                "branch-likely", "load-interlocks"];
+    features = ["mips3", "hard-float", "fp32", "llsc", "branch-likely",
+                "load-interlocks"];
     instruction "div.s" { latency = 29; issue = 29; }
     instruction "mul.s" { latency = 5; }
     instruction "div" { latency = 37; issue = 37; }

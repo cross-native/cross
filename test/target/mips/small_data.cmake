@@ -165,6 +165,10 @@ if(NOT text MATCHES
 endif()
 expect(literal "${text}" "${sdata}\n[.]p2align 3\n${CMAKE_MATCH_1}:\n")
 reject(literal "${text}" "[.]sbss" "[.]bss\n")
+expect(literal "${text}"
+    "near_pi:\n[^\n]*\n[^\n]*\n\tldc1\t[$]f[0-9]+,%gp_rel[(][.]L[^)]+[.]float[.][0-9]+[)][(][$]gp[)]\n")
+compile(no_literal -Oz -mprofile=vr4300-o32 -mdata-bases=mips-gp)
+expect(no_literal "${text}" "near_pi:\n[^\n]*\n[^\n]*\n(\t[^\n]*\n)*\tdmtc1\t")
 
 # An o32 function that calls a Cross function no longer saves the $gp that
 # the Cross ABI may clobber: the base register is reserved.

@@ -822,6 +822,12 @@ bool resolve_registered_options(
         resolved_unsigned(options, "f.ccp-rounds", 1));
     options.if_conversion_limit = static_cast<unsigned>(
         resolved_unsigned(options, "f.if-conversion-limit", 6));
+    if (const auto* limit =
+            find_resolved_option(options, "f.if-conversion-limit")) {
+        options.if_conversion_limit_explicit =
+            limit->origin == OptionOrigin::Profile ||
+            limit->origin == OptionOrigin::CommandLine;
+    }
     options.if_conversion_memory_limit = static_cast<unsigned>(
         resolved_unsigned(options, "f.if-conversion-memory-limit", 12));
     options.unroll_factor = static_cast<unsigned>(

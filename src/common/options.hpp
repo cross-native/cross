@@ -136,6 +136,10 @@ struct CompilerOptions {
     OptimizationGoal optimize_for{OptimizationGoal::Debug};
     unsigned ccp_rounds{1};
     unsigned if_conversion_limit{6};
+    // A budget a profile or the command line sets also covers selects that
+    // the target performs with a branch; a preset's budget covers only
+    // branchless ones.
+    bool if_conversion_limit_explicit{};
     unsigned if_conversion_memory_limit{12};
     unsigned unroll_factor{2};
     unsigned peel_limit{};

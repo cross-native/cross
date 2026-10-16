@@ -12742,8 +12742,10 @@ bool if_convert_one_diamond(ManagedFunction& function,
     // A select of TYPE costs the instructions the target adds for it. A
     // floating select needs a target that selects without a branch; an
     // integer one is lowered everywhere and costs one operation where the
-    // target branches. A comparison in OWNER of floating values as wide as
-    // the selected ones may become the select's mask.
+    // target branches, but then removes no branch, so a preset's ordinary
+    // budget does not pay for its arms. A comparison in OWNER of floating
+    // values as wide as the selected ones may become the select's mask.
+    bool selects_branch = false;
     const auto select_cost =
         [&](hir::TypeId type) -> std::optional<unsigned> {
         const bool floating = floating_type(hir_module, type);
@@ -12766,10 +12768,13 @@ bool if_convert_one_diamond(ManagedFunction& function,
         const auto cost =
             subtarget.select_cost({bits, floating, floating_comparison});
         if (!cost && floating) return std::nullopt;
+        if (!cost) selects_branch = true;
         return cost.value_or(1U) * cost_scale;
     };
     const auto profitable = [&](unsigned cost) {
-        unsigned limit = options.if_conversion_limit * cost_scale;
+        unsigned limit =
+            selects_branch && !options.if_conversion_limit_explicit
+            ? 0U : options.if_conversion_limit * cost_scale;
         // A low-bit test of loaded data commonly has little branch
         // predictability. Once allocation and if-conversion are enabled,
         // tolerate a few more cheap, nontrapping integer operations to replace
@@ -13071,7 +13076,12 @@ bool combine_branch_conditions(
             cost += if_conversion_cost(value, hir_module, options);
         }
         if (!speculatable) continue;
-        unsigned limit = options.if_conversion_limit * cost_scale;
+        // Without a branchless select, the combined condition rarely becomes
+        // one, so a preset's ordinary budget does not pay for the work.
+        unsigned limit =
+            subtarget.select_cost({32, false, false}) ||
+                    options.if_conversion_limit_explicit
+            ? options.if_conversion_limit * cost_scale : 0U;
         if (unpredictable_memory_condition(function, hir_module,
                                            *inner.terminator.value)) {
             limit = std::max(limit,

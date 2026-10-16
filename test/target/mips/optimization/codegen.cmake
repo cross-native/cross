@@ -869,6 +869,21 @@ if(NOT store_loop MATCHES "[\t ]beq[^\n]*\n[\t ]+li[\t ]" OR
         "loop:\n${store_loop}\nloop without delay slots:\n${store_loop_empty}\n"
         "call:\n${swap_call}\ncall without delay slots:\n${swap_call_empty}")
 endif()
+function_body("${OUTPUT}.enabled.s" mips_scaled_word scaled_word)
+function_body("${OUTPUT}.no_schedule.s" mips_scaled_word scaled_word_fixed)
+if(scaled_word MATCHES "[\t ]mtc1[^\n]*\n[\t ]+nop\n" OR
+   NOT scaled_word_fixed MATCHES "[\t ]mtc1[^\n]*\n[\t ]+nop\n")
+    message(FATAL_ERROR
+        "MIPS scheduling did not fill an FPU transfer delay, or "
+        "-fno-schedule-insns did\nscheduled:\n${scaled_word}\n"
+        "unscheduled:\n${scaled_word_fixed}")
+endif()
+function_body("${OUTPUT}.enabled.s" mips_byte_result byte_result)
+if(NOT byte_result MATCHES "[\t ]lbu[\t ]+\\$v0," OR
+   byte_result MATCHES "[$]at")
+    message(FATAL_ERROR
+        "a loaded MIPS byte result was copied through $at\n${byte_result}")
+endif()
 function_body("${OUTPUT}.enabled.s" mips_int_to_float int_to_float)
 if(NOT int_to_float MATCHES "[\t ]mtc1[\t ]+\\$a0,\\$f" OR
    int_to_float MATCHES "[\t ]move[\t ]+\\$t0")

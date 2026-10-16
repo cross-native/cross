@@ -454,6 +454,19 @@ global f32 mips_int_to_float(in i32 value, in f32 scale) {
     return (f32)value * scale;
 }
 
+// The converted word's transfer delay holds the constant's materialization.
+[[abi("o32"), noinline]]
+global f32 mips_scaled_word(in i32 value) {
+    return (f32)value * 0.5f32;
+}
+
+// A loaded byte is already a sign-canonical word for the o32 result.
+[[abi("o32"), noinline]]
+global u8 mips_byte_result(in u32 index) {
+    const u8* text = "hi";
+    return text[index & 1u32];
+}
+
 [[abi("o32"), noinline]]
 global u32 mips_swap_call(in u32 left, in u32 right) {
     return mips_quality_counter + mips_global_index(right) * left;
