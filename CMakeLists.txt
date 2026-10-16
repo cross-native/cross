@@ -1747,6 +1747,20 @@ if(BUILD_TESTING)
         set_tests_properties(${name} PROPERTIES
             LABELS "check.runtime;arch.mips;backend.native;feature.abi;feature.records;profile.o32;isa.vr4300;isa.r3000;endian.big;endian.little;opt.${level}"
             SKIP_REGULAR_EXPRESSION "skipping MIPS")
+        # Instances of generic records are classified like the equivalent
+        # written C structures.
+        set(name cross_mips_o32_generic_records_${level})
+        add_test(NAME ${name} COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/o32_generic_records.x
+            -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/o32_generic_records_start.s
+            -DREFERENCE_C=${CMAKE_SOURCE_DIR}/test/target/mips/o32_generic_records.c
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-o32-generic-records-${level}
+            -DEXPECTED=1 "-DCC_FLAGS=-${level}"
+            -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(${name} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;feature.abi;feature.records;feature.generic;profile.o32;isa.vr4300;isa.r3000;endian.big;endian.little;opt.${level}"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS")
     endforeach()
     add_test(NAME cross_mips_long_calls COMMAND "${CMAKE_COMMAND}"
         -DCC=$<TARGET_FILE:cross_cc>
@@ -2238,6 +2252,14 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/model/mangling_dsl.cmake")
     set_tests_properties(cross_mangling_dsl PROPERTIES
         LABELS "check.compile;arch.x86_64;feature.names;feature.model;feature.generic")
+    add_test(NAME cross_generic_record_mangling
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DMODEL=${CMAKE_SOURCE_DIR}/test/model/mangling_dsl.y
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/generic-record-mangling
+                -P "${CMAKE_SOURCE_DIR}/test/model/generic_record_mangling.cmake")
+    set_tests_properties(cross_generic_record_mangling PROPERTIES
+        LABELS "check.compile;arch.x86_64;feature.names;feature.model;feature.generic;feature.records")
     add_test(NAME cross_operator_binding
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
@@ -5589,6 +5611,66 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/frontend/type_reflection_errors.cmake")
     set_tests_properties(cross_type_reflection_errors PROPERTIES
         LABELS "check.compile;diagnostics;frontend;arch.x86_64;feature.meta")
+    # Generic records and unions: instances, layout, deduction, local generic
+    # records, embedding, and reflection, at translation time and at run time.
+    foreach(level O0 O2)
+        add_test(NAME cross_runtime_generic_records_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/generic_records.x
+                    -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/generic-records-${level}
+                    -DENTRY=generic_records_entry
+                    -DEXPECTED=1
+                    -DCC_FLAGS=-${level}
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_generic_records_${level} PROPERTIES
+            LABELS "check.runtime;frontend;arch.x86_64;backend.native;feature.generic;feature.records;opt.${level}")
+        # Pointer width and bit-field order differ from x86-64.
+        add_test(NAME cross_mips_generic_records_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/generic_records.x
+                    -DSTARTUP=${CMAKE_SOURCE_DIR}/test/language/generic_records_start.s
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/generic-records-mips-${level}
+                    -DEXPECTED=P -DMIPS_CPUS=vr4300 "-DMIPS_ENDIANS=b;l" "-DCC_FLAGS=-${level}"
+                    -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(cross_mips_generic_records_${level} PROPERTIES
+            LABELS "check.runtime;frontend;arch.mips;backend.native;feature.generic;feature.records;profile.o32;isa.vr4300;endian.big;endian.little;opt.${level}"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS")
+        add_test(NAME cross_runtime_generic_record_reflection_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/generic_record_reflection.x
+                    -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/generic-record-reflection-${level}
+                    -DENTRY=generic_record_reflection_entry
+                    -DEXPECTED=1
+                    -DCC_FLAGS=-${level}
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_generic_record_reflection_${level} PROPERTIES
+            LABELS "check.runtime;frontend;arch.x86_64;backend.native;feature.meta;feature.generic;feature.records;opt.${level}")
+        add_test(NAME cross_mips_generic_record_reflection_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/generic_record_reflection.x
+                    -DSTARTUP=${CMAKE_SOURCE_DIR}/test/frontend/generic_record_reflection_start.s
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/generic-record-reflection-mips-${level}
+                    -DEXPECTED=P -DMIPS_CPUS=vr4300 -DMIPS_ENDIANS=b "-DCC_FLAGS=-${level}"
+                    -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(cross_mips_generic_record_reflection_${level} PROPERTIES
+            LABELS "check.runtime;frontend;arch.mips;backend.native;feature.meta;feature.generic;feature.records;profile.o32;isa.vr4300;endian.big;opt.${level}"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS")
+    endforeach()
+    add_test(NAME cross_generic_records_errors
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/generic-records-errors
+                -P "${CMAKE_SOURCE_DIR}/test/language/generic_records_errors.cmake")
+    set_tests_properties(cross_generic_records_errors PROPERTIES
+        LABELS "check.compile;diagnostics;frontend;arch.x86_64;feature.generic;feature.records")
     add_test(NAME cross_expression_core_llvm
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

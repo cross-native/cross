@@ -677,6 +677,7 @@ std::unique_ptr<Parser> Parser::replacement_parser(SyntaxExecution::Output outpu
     child->record_types_ = record_types_;
     child->type_aliases_ = type_aliases_;
     child->active_function_ = active_function_;
+    child->active_record_parameters_ = active_record_parameters_;
     // Caller angle-token fences cannot constrain an independently bounded
     // replacement expression. Its own generic parses install their fences.
     child->parsing_generic_argument_ = false;
@@ -2949,7 +2950,8 @@ TypePtr Parser::rebind_tag_types(TypePtr type) const {
         if ((next->kind == Type::Kind::Record || is_integer(next)) &&
             !next->nominal_key().empty()) {
             for (std::size_t remaining = tag_rebindings_.size(); remaining; --remaining) {
-                const auto replacement = tag_rebindings_.find(next->nominal_key());
+                // A generic record use keeps its arguments.
+                const auto replacement = tag_rebindings_.find(next->nominal_key().generic());
                 if (replacement == tag_rebindings_.end()) break;
                 const auto& binding = *replacement->second;
                 next->kind = binding.kind == TagBinding::Kind::Enumeration
@@ -3209,6 +3211,66 @@ TypePtr Parser::resolve_tag_type(std::string_view name, const Token& token) cons
     return {};
 }
 
+const Parser::GenericSignature* Parser::tag_generic_signature(const TypePtr& type) const {
+    if (!type || type->kind != Type::Kind::Record) return nullptr;
+    if (!type->nominal_identity) {
+        const auto found = record_types_.find(type->nominal_name);
+        return found == record_types_.end() ? nullptr : &found->second.generic;
+    }
+    for (auto scope = local_tag_scopes_.rbegin(); scope != local_tag_scopes_.rend(); ++scope)
+        for (const auto& [key, tag] : *scope)
+            if (tag.type && tag.type->nominal_identity == type->nominal_identity) return &tag.generic;
+    return nullptr;
+}
+
+bool Parser::generic_tag_declaration_ahead(bool forward_declaration) {
+    auto at = generic_parameter_group_end(index_);
+    while (at && *at < tokens_.size() && tokens_[*at].is("[[")) at = bounded_group_end(*at);
+    return at && *at < tokens_.size() &&
+        (tokens_[*at].is("{") || (forward_declaration && tokens_[*at].is(";")));
+}
+
+EvaluationTask<std::shared_ptr<const NominalArguments>> Parser::parse_nominal_arguments_async(
+    SourceLocation location) {
+    ProductionScope list(*this, SyntaxProduction::GenericArguments);
+    auto result = std::make_shared<NominalArguments>();
+    result->location = location;
+    (co_await consume_async("<"));
+    if ((co_await consume_async(">"))) {
+        (co_await error_here_async("a generic argument list cannot be empty"));
+        co_return result;
+    }
+    for (;;) {
+        {
+            ProductionScope argument_scope(*this, SyntaxProduction::GenericArgument);
+            NominalArguments::Argument argument;
+            (void)(co_await current_async());
+            if (parsing_public_fragment_ && macro_start()) throw DeferredNameRecognition{};
+            if ((co_await type_start_async(TypeProbe::GenericArgumentAlternative))) {
+                ProductionScope type_name(*this, SyntaxProduction::TypeName);
+                argument.type = co_await parse_type_async();
+                std::optional<std::string> declared;
+                if (argument.type)
+                    argument.type = co_await parse_declarator_async(std::move(argument.type), declared,
+                                                                    DeclaratorContext::TypeName);
+                if (declared) (co_await error_here_async("a generic type argument cannot declare an object"));
+            } else {
+                const bool previous = parsing_generic_argument_;
+                parsing_generic_argument_ = true;
+                argument.value = co_await parse_constant_expression_async();
+                parsing_generic_argument_ = previous;
+                // A function header binds its value parameters afterwards.
+                header_type_bounds_.insert(argument.value.get());
+            }
+            result->items.push_back(std::move(argument));
+        }
+        if (!(co_await consume_async(","))) break;
+    }
+    if (!(co_await consume_generic_close_async()))
+        (co_await error_here_async("expected '>' to close generic argument list"));
+    co_return result;
+}
+
 std::shared_ptr<const NominalTypeIdentity> Parser::new_nominal_identity(SourceLocation location) {
     const auto origin = token_origin(location);
     return std::make_shared<const NominalTypeIdentity>(NominalTypeIdentity{
@@ -3217,7 +3279,8 @@ std::shared_ptr<const NominalTypeIdentity> Parser::new_nominal_identity(SourceLo
         function_scope_});
 }
 
-TypePtr Parser::declare_local_tag(TypePtr type, SourceLocation location, bool complete) {
+TypePtr Parser::declare_local_tag(TypePtr type, SourceLocation location, bool complete,
+                                  const GenericSignature& generic) {
     const NameKey key(type->nominal_name, location);
     auto& scope = local_tag_scopes_.back();
     if (tag_destination_ && tag_destination_depth_ == local_tag_scopes_.size()) {
@@ -3238,6 +3301,10 @@ TypePtr Parser::declare_local_tag(TypePtr type, SourceLocation location, bool co
             diagnostics_.error(location, "record tag '" + key.spelling + "' was previously declared with the other record kind");
         else if (prior->kind != Type::Kind::Record && prior->builtin != type->builtin)
             diagnostics_.error(location, "enumeration '" + key.spelling + "' redeclared with a different underlying type");
+        else if (found->second.generic != generic)
+            diagnostics_.error(location, "record tag '" + key.spelling + "' was previously declared " +
+                (found->second.generic.empty() ? "without generic parameters"
+                 : generic.empty() ? "with generic parameters" : "with a different generic parameter list"));
         else if (complete && found->second.complete)
             diagnostics_.error(location, "duplicate definition of " +
                 std::string(prior->kind == Type::Kind::Record ? "record '" : "enumeration '") + key.spelling + "'");
@@ -3262,7 +3329,7 @@ TypePtr Parser::declare_local_tag(TypePtr type, SourceLocation location, bool co
         }
     }
     if (!type->nominal_identity) type->nominal_identity = new_nominal_identity(location);
-    scope.emplace(key, LocalTag{copy_type(type), complete});
+    scope.emplace(key, LocalTag{copy_type(type), complete, generic});
     return type;
 }
 
@@ -3572,6 +3639,26 @@ EvaluationTask<TypePtr> Parser::parse_type_async(bool record_specifiers,
             const auto name_location = (co_await current_async()).location;
             const auto name = (co_await parse_qualified_name_async());
             if (name) for (auto at = name_index; at < index_; ++at) reject_keyword_name(tokens_[at]);
+            // After a tag, `<` starts the parameter list of a generic
+            // definition or block-scope forward declaration, or arguments.
+            struct GenericTypesFrame {
+                std::vector<std::string>& active;
+                std::size_t size;
+                ~GenericTypesFrame() { active.resize(std::min(size, active.size())); }
+            } generic_types{active_generic_types_, active_generic_types_.size()};
+            std::vector<GenericParameter> generic_parameters;
+            std::shared_ptr<const NominalArguments> generic_arguments;
+            if (!name && (co_await current_async()).is("<")) {
+                (co_await error_here_async("an anonymous record cannot be generic"));
+                (void)(co_await parse_angle_generic_parameters_async());
+            } else if (name && (co_await current_async()).is("<")) {
+                if (generic_tag_declaration_ahead(tag_declaration))
+                    generic_parameters = co_await parse_angle_generic_parameters_async();
+                else generic_arguments = co_await parse_nominal_arguments_async(name_location);
+            }
+            GenericSignature signature;
+            for (const auto& parameter : generic_parameters)
+                signature.push_back(parameter.value_type ? GenericParameterKind::Value : GenericParameterKind::Type);
             auto record_attributes = co_await parse_attributes_async();
             if (!name && !(co_await current_async()).is("{")) {
                 (co_await error_here_async("an anonymous record requires a definition"));
@@ -3579,8 +3666,15 @@ EvaluationTask<TypePtr> Parser::parse_type_async(bool record_specifiers,
             }
             const bool local_tag = name && !binds_at_file_scope() && name->find("::") == std::string::npos;
             if ((co_await current_async()).is("{")) {
+                if (generic_arguments)
+                    diagnostics_.error(name_location,
+                        "a generic record definition requires a parameter list, not arguments");
+                if (name && active_record_parameters_)
+                    diagnostics_.error(name_location,
+                        "a generic record cannot define a named record or union in its member list");
                 RecordDecl declaration;
                 declaration.location = location;
+                declaration.generic_parameters = std::move(generic_parameters);
                 declaration.name = !name ? std::string{} : local_tag ? *name : join_namespace(active_namespace_, *name);
                 declaration.is_union = is_union;
                 declaration.complete = true;
@@ -3611,14 +3705,18 @@ EvaluationTask<TypePtr> Parser::parse_type_async(bool record_specifiers,
                 if (!name) {
                     declaration.nominal_identity = new_nominal_identity(location);
                 } else if (local_tag) {
-                    type = declare_local_tag(record_type(*name, is_union), name_location, true);
+                    type = declare_local_tag(record_type(*name, is_union), name_location, true, signature);
                     declaration.nominal_identity = type->nominal_identity;
                 } else {
                     auto [tag, inserted] = record_types_.emplace(
-                        declaration.name, RecordTag{is_union, true});
+                        declaration.name, RecordTag{is_union, true, signature});
                     if (!inserted && tag->second.is_union != is_union) {
                         diagnostics_.error(location, "record tag '" + declaration.name +
                             "' was previously declared with the other record kind");
+                    } else if (!inserted && tag->second.generic != signature) {
+                        diagnostics_.error(location, "record tag '" + declaration.name + "' was previously declared " +
+                            (tag->second.generic.empty() ? "without generic parameters"
+                             : signature.empty() ? "with generic parameters" : "with a different generic parameter list"));
                     } else if (!inserted && tag->second.complete) {
                         diagnostics_.error(location,
                             "duplicate definition of record '" + declaration.name + "'");
@@ -3627,18 +3725,28 @@ EvaluationTask<TypePtr> Parser::parse_type_async(bool record_specifiers,
                 }
                 remember_tag_binding(name ? name_index : keyword_index,
                     name ? *name : is_union ? "union" : "struct", record_type(declaration), true);
+                GenericRecordFrame generic_record(*this, declaration);
                 if (co_await defer_public_header_group_async(allow_public_header_deferral_
                         ? bounded_group_end(index_) : std::nullopt, [&]() -> EvaluationTask<void> {
                         (co_await consume_async("{"));
                         co_await parse_record_members_async(declaration);
                     })) declaration.members.clear();
+                for (const auto& parameter : declaration.generic_parameters)
+                    if (parameter.value_type) bind_generic_type(*parameter.value_type, declaration.generic_parameters);
+                // A generic record is not a type: it cannot also declare an
+                // object, a function, or a member.
+                if (!declaration.generic_parameters.empty() && !(co_await current_async()).is(";"))
+                    diagnostics_.error(name_location, "a generic record definition must be a declaration of its own");
                 type = record_type(declaration);
                 if (attributes) attributes->inline_record = pending_records_.size();
                 pending_records_.push_back(std::move(declaration));
             } else {
                 bool declares_tag = local_tag && tag_declaration && (co_await current_async()).is(";");
+                if (!generic_parameters.empty() && !declares_tag)
+                    diagnostics_.error(name_location,
+                        "a generic parameter list requires a definition or a forward declaration");
                 type = declares_tag
-                    ? declare_local_tag(record_type(*name, is_union), name_location, false)
+                    ? declare_local_tag(record_type(*name, is_union), name_location, false, signature)
                     : resolve_tag_type(*name, tokens_[name_index]);
                 if (!type && !declares_tag && token_origin(name_location).value_context_captured) {
                     type = declare_retained_implicit_tag(*name, name_location, is_union);
@@ -3669,6 +3777,21 @@ EvaluationTask<TypePtr> Parser::parse_type_async(bool record_specifiers,
                 for (const auto& attribute : record_attributes)
                     type_error(type, attribute.location,
                         "record attributes on a type use are not yet supported");
+                // Every use of a generic tag names all of its arguments.
+                if (type && type->kind == Type::Kind::Record && generic_parameters.empty()) {
+                    const auto* generic = tag_generic_signature(type);
+                    if (generic_arguments && (declares_tag || (generic && generic->empty())))
+                        diagnostics_.error(name_location, declares_tag
+                            ? "generic record '" + *name + "' is not declared"
+                            : "record '" + *name + "' is not generic");
+                    else if (!generic_arguments && generic && !generic->empty())
+                        diagnostics_.error(name_location,
+                            "generic record '" + *name + "' requires an argument list");
+                    if (generic_arguments) {
+                        type = copy_type(type);
+                        type->nominal_arguments = generic_arguments;
+                    }
+                }
             }
         } else if ((co_await current_async()).is("enum")) {
             ProductionScope enumeration(*this, SyntaxProduction::EnumSpecifier);
@@ -3679,6 +3802,14 @@ EvaluationTask<TypePtr> Parser::parse_type_async(bool record_specifiers,
             const auto name_location = (co_await current_async()).location;
             const auto name = (co_await parse_qualified_name_async());
             if (name) for (auto at = name_index; at < index_; ++at) reject_keyword_name(tokens_[at]);
+            if ((co_await current_async()).is("<")) {
+                (co_await error_here_async("an enumeration cannot be generic"));
+                const auto generic_types = active_generic_types_.size();
+                if (generic_tag_declaration_ahead(tag_declaration))
+                    (void)(co_await parse_angle_generic_parameters_async());
+                else (void)(co_await parse_nominal_arguments_async(name_location));
+                active_generic_types_.resize(generic_types);
+            }
             auto enum_attributes = co_await parse_attributes_async();
             if (!name && !(co_await current_async()).is("{")) {
                 (co_await error_here_async("an anonymous enumeration requires a definition"));
@@ -3686,6 +3817,9 @@ EvaluationTask<TypePtr> Parser::parse_type_async(bool record_specifiers,
             }
             const bool local_tag = name && !binds_at_file_scope() && name->find("::") == std::string::npos;
             if ((co_await current_async()).is("{")) {
+                if (active_record_parameters_)
+                    diagnostics_.error(location,
+                        "a generic record cannot define an enumeration in its member list");
                 EnumDecl declaration;
                 declaration.location = location;
                 declaration.name = !name ? std::string{} : local_tag ? *name : join_namespace(active_namespace_, *name);
@@ -3804,7 +3938,14 @@ EvaluationTask<TypePtr> Parser::parse_type_async(bool record_specifiers,
                         (!origin.context || !origin.context->parse_environment ||
                          origin.context->parse_environment->header_bindings == header_bindings_ ||
                          origin.context->parse_environment->header_bindings == shared_specifier_header_);
-                    if (active_function_)
+                    // A generic record's own parameters shadow an enclosing function's.
+                    const NameKey use(spelling, generic_location);
+                    if (active_record_parameters_ && std::any_of(active_record_parameters_->begin(),
+                            active_record_parameters_->end(), [&](const GenericParameter& parameter) {
+                                return !parameter.value_type && NameKey(parameter.name, parameter.location) == use;
+                            }))
+                        bind_generic_type(*type, *active_record_parameters_);
+                    else if (active_function_)
                         bind_generic_type(*type, active_function_->generic_parameters);
                     else
                         bind_generic_type(*type, {});
@@ -3980,6 +4121,12 @@ EvaluationTask<std::vector<std::string>> Parser::preview_generic_types_async(boo
                 for (; at <= last_name; ++at)
                     if (!work(at)) co_return result;
                 if (const auto end = (co_await macro_end_async(last_name))) at = *end + 1;
+                // Generic record arguments or parameters bind nothing here.
+                if (at < tokens_.size() && tokens_[at].is("<")) {
+                    const auto end = generic_parameter_group_end(at);
+                    if (!end) co_return result;
+                    at = *end;
+                }
             }
             while (at < tokens_.size() && tokens_[at].is("[[")) {
                 const auto end = (co_await group_end_async(at));
@@ -5633,6 +5780,12 @@ EvaluationTask<void> Parser::parse_external_impl_async(Program& program, std::st
             if ((co_await current_async(at + 1)).kind != TokenKind::Identifier) break;
             at += 2;
         }
+        if ((co_await current_async(at)).is("<")) {
+            // The parameter list of a generic record or union.
+            const auto end = generic_parameter_group_end(index_ + at);
+            if (!end) co_return false;
+            at = *end - index_;
+        }
         while ((co_await current_async(at)).is("[[")) {
             unsigned depth = 1;
             ++at;
@@ -6097,6 +6250,12 @@ EvaluationTask<void> Parser::parse_enum_declaration_async(Program& program,
     if (record_types_.contains(*name))
         diagnostics_.error(location, "tag '" + *name +
             "' was previously declared as a record");
+    if ((co_await current_async()).is("<")) {
+        (co_await error_here_async("an enumeration cannot be generic"));
+        const auto generic_types = active_generic_types_.size();
+        (void)(co_await parse_angle_generic_parameters_async());
+        active_generic_types_.resize(generic_types);
+    }
     auto trailing = co_await parse_attributes_async();
     attributes.insert(attributes.end(),
                       std::make_move_iterator(trailing.begin()),
@@ -6263,6 +6422,10 @@ EvaluationTask<void> Parser::parse_record_declaration_async(
     for (auto at = name_index; at < index_; ++at) reject_keyword_name(tokens_[at]);
     const auto written_name = *name;
     *name = join_namespace(name_space, *name);
+    RecordDecl declaration;
+    const auto generic_types = active_generic_types_.size();
+    if ((co_await current_async()).is("<"))
+        declaration.generic_parameters = co_await parse_angle_generic_parameters_async();
     auto trailing = co_await parse_attributes_async();
     attributes.insert(attributes.end(),
                       std::make_move_iterator(trailing.begin()),
@@ -6270,8 +6433,11 @@ EvaluationTask<void> Parser::parse_record_declaration_async(
     apply_region_attributes(attributes, {RegionSubject::Record, (co_await current_async()).is("{"),
         false, Linkage::Group, nullptr, is_union});
 
+    GenericSignature signature;
+    for (const auto& parameter : declaration.generic_parameters)
+        signature.push_back(parameter.value_type ? GenericParameterKind::Value : GenericParameterKind::Type);
     auto [tag, inserted] = record_types_.emplace(
-        *name, RecordTag{is_union, false});
+        *name, RecordTag{is_union, false, signature});
     if (enum_types_.contains(*name))
         diagnostics_.error(location, "tag '" + *name +
             "' was previously declared as an enumeration");
@@ -6279,9 +6445,12 @@ EvaluationTask<void> Parser::parse_record_declaration_async(
         diagnostics_.error(
             location, "record tag '" + *name +
                           "' was previously declared with the other record kind");
+    } else if (!inserted && tag->second.generic != signature) {
+        diagnostics_.error(location, "record tag '" + *name + "' was previously declared " +
+            (tag->second.generic.empty() ? "without generic parameters"
+             : signature.empty() ? "with generic parameters" : "with a different generic parameter list"));
     }
 
-    RecordDecl declaration;
     declaration.location = location;
     declaration.name = *name;
     declaration.is_union = is_union;
@@ -6294,8 +6463,12 @@ EvaluationTask<void> Parser::parse_record_declaration_async(
                                "duplicate definition of record '" + *name + "'");
         }
         tag->second.complete = true;
+        GenericRecordFrame generic_record(*this, declaration);
         co_await parse_record_members_async(declaration);
     }
+    active_generic_types_.resize(generic_types);
+    for (const auto& parameter : declaration.generic_parameters)
+        if (parameter.value_type) bind_generic_type(*parameter.value_type, declaration.generic_parameters);
     record.finish();
     type_specifier.finish();
     specifier.finish();
@@ -6331,9 +6504,10 @@ EvaluationTask<void> Parser::parse_record_members_async(RecordDecl& declaration)
         if (base_type && base_type->kind == Type::Kind::Record && (co_await current_async()).is(";")) {
             // A record or union type without a declarator is embedded. Its
             // designator is the written tag or typedef name; an anonymous
-            // definition has only a private identity.
+            // definition has only a private identity, and a generic
+            // instance is designated by its tag.
             std::optional<std::size_t> name_index;
-            for (auto at = type_begin; at < index_ && !tokens_[at].is("{"); ++at) {
+            for (auto at = type_begin; at < index_ && !tokens_[at].is("{") && !tokens_[at].is("<"); ++at) {
                 if (tokens_[at].is("[[")) {
                     for (unsigned depth = 0; at < index_; ++at) {
                         if (tokens_[at].is("[[")) ++depth;
@@ -6760,6 +6934,18 @@ Parser::parse_function_async(std::size_t header_first, SourceLocation location, 
                 bind_type_bounds(parameter.declared_array_type);
             }
         }
+        if (type->nominal_arguments && !type->nominal_arguments->normalized) {
+            auto arguments = std::make_shared<NominalArguments>(*type->nominal_arguments);
+            for (auto& item : arguments->items) {
+                bind_type_bounds(item.type);
+                if (item.value && header_type_bounds_.contains(item.value.get())) {
+                    auto expression = copy_expression(*item.value);
+                    bind_attribute_name(bind_attribute_name, *expression);
+                    item.value = std::move(expression);
+                }
+            }
+            type->nominal_arguments = std::move(arguments);
+        }
     };
     for (auto& attribute : function->attributes) {
         if (attribute.expression_argument)
@@ -7150,7 +7336,7 @@ Parser::StatementTask Parser::parse_compound_async() {
                     const auto prior = prior_tags.find(key);
                     if (prior == prior_tags.end() || prior->second.complete != tag.complete ||
                         !same_type(prior->second.type, tag.type))
-                        event.tags.emplace(key, LocalTag{copy_type(tag.type), tag.complete});
+                        event.tags.emplace(key, LocalTag{copy_type(tag.type), tag.complete, tag.generic});
                 }
                 if (!event.values.empty() || !event.aliases.empty() || !event.tags.empty())
                     scope_events_->push_back(std::move(event));
@@ -8605,7 +8791,15 @@ Parser::ExpressionTask Parser::parse_primary_async() {
                     context->value_binding.kind = ValueBinding::Kind::Nonlocal;
                     if (result->text.find("::") == std::string::npos) {
                         const NameKey key(result->text, item.location);
-                        for (auto scope = prototype_scopes_.rbegin(); scope != prototype_scopes_.rend(); ++scope) {
+                        if (active_record_parameters_)
+                            for (const auto& parameter : *active_record_parameters_)
+                                if (parameter.value_type && NameKey(parameter.name, parameter.location) == key) {
+                                    context->value_binding = name_key(parameter).binding;
+                                    break;
+                                }
+                        for (auto scope = prototype_scopes_.rbegin();
+                             context->value_binding.kind == ValueBinding::Kind::Nonlocal &&
+                             scope != prototype_scopes_.rend(); ++scope) {
                             if (const auto found = scope->values.find(key); found != scope->values.end()) {
                                 context->value_binding = found->second.binding;
                                 break;

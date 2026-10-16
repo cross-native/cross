@@ -112,7 +112,7 @@ preset, profile, or command line), and whether it is `implemented` or only
 | `-fbounds-trap` | Check every subscript of an array whose bound is known, fixed or variable-length, and execute the inline `$::trap()` sequence when the index is outside the array; `&a[n]` may still form the address one past the end. No helper is called and no preset sets it. Functions with `[[naked]]` or `[[no_sanitize("bounds")]]` are not checked. |
 | `-feval-step-limit=N`, `-feval-depth-limit=N`, `-feval-memory-limit=N`, `-feval-byte-limit=N` | Limits for compile-time evaluation and macro expansion. |
 | `-feval-opportunistic-step-limit=N` | Evaluated instructions after which compile-time evaluation that nothing requires, such as of a call with constant arguments, gives up and leaves the code to run time (default 100000). |
-| `-fgeneric-instance-limit=N`, `-fgeneric-depth-limit=N` | Limits for generic instances per compilation (default 4096) and nested instantiation (default 128). |
+| `-fgeneric-instance-limit=N`, `-fgeneric-depth-limit=N` | Limits for the instances of generic functions, records, and unions per compilation (default 4096) and for nested instantiation (default 128). |
 | `-fzero-init-in-data` | Put zero-valued static objects with the initialized data instead of zero-filled storage such as `.bss`, so that an image patcher can change them; reads of such an object keep reading memory even when it is `const`. |
 | `-ffile-prefix-map=OLD=NEW` | Spell source paths that start with `OLD` as `NEW` in `$::source::file`, internal symbol names, and debugging information; line markers, dependency files, and diagnostics keep the real paths. Repeatable; the last matching mapping applies. |
 

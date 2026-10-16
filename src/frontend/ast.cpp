@@ -203,6 +203,12 @@ bool has_pending_type_bound(const TypePtr& type) {
              next->array_extent_dependency == Type::ArrayExtentDependency::ExpansionContext) ||
             deferred_vector_extent(next) || !next->alignment_requests.empty() ||
             next->kind == Type::Kind::Generic) return true;
+        // Written values of a generic record use compare only once evaluated.
+        if (next->nominal_arguments && !next->nominal_arguments->normalized)
+            for (const auto& item : next->nominal_arguments->items) {
+                if (item.value) return true;
+                pending.push_back(item.type);
+            }
         pending.push_back(next->element);
         pending.push_back(next->pointee);
         if (next->function) {
@@ -362,7 +368,104 @@ TypePtr enum_type(std::string name, BuiltinType underlying, bool is_const,
 TypePtr record_type(const RecordDecl& declaration) {
     auto type = record_type(declaration.name, declaration.is_union);
     type->nominal_identity = declaration.nominal_identity;
+    type->nominal_arguments = declaration.nominal_arguments;
     return type;
+}
+
+namespace {
+
+TypePtr generic_value_type(const Expr& value) {
+    if (value.type) return value.type;
+    if (value.evaluated_integer) return builtin_type(value.evaluated_integer->type);
+    return {};
+}
+
+// Normalized generic values compare by their typed value, address, or label.
+// Written ones, as in the generic declarations that a redeclaration compares,
+// compare by their written form.
+bool same_generic_value(const Expr* left, const Expr* right) {
+    if (left == right) return true;
+    if (!left || !right) return false;
+    const auto label = [](const Expr& value) {
+        return value.name_context ? value.name_context->label_address.get() : nullptr;
+    };
+    if (left->evaluated_address || right->evaluated_address)
+        return left->evaluated_address && right->evaluated_address &&
+            *left->evaluated_address == *right->evaluated_address &&
+            same_type(generic_value_type(*left), generic_value_type(*right));
+    if (left->evaluated_integer || right->evaluated_integer)
+        return left->evaluated_integer && right->evaluated_integer &&
+            left->evaluated_integer->value == right->evaluated_integer->value &&
+            same_type(generic_value_type(*left), generic_value_type(*right));
+    if (label(*left) || label(*right)) return label(*left) && label(*right) && *label(*left) == *label(*right);
+    if (left->kind != right->kind || left->text != right->text || left->string_value != right->string_value ||
+        static_cast<bool>(left->type) != static_cast<bool>(right->type) ||
+        (left->type && !same_type(left->type, right->type)) ||
+        left->arguments.size() != right->arguments.size() ||
+        !same_generic_value(left->left.get(), right->left.get()) ||
+        !same_generic_value(left->right.get(), right->right.get()) ||
+        !same_generic_value(left->third.get(), right->third.get())) return false;
+    for (std::size_t index = 0; index < left->arguments.size(); ++index)
+        if (!same_generic_value(left->arguments[index].get(), right->arguments[index].get())) return false;
+    return true;
+}
+
+// Consistent with same_type: equal types hash equally.
+std::size_t type_identity_hash(const TypePtr& type, unsigned depth) {
+    if (!type || depth > 16) return 0;
+    std::size_t result = static_cast<std::size_t>(type->kind) * 131 + static_cast<std::size_t>(type->builtin);
+    const auto mix = [&](std::size_t value) { result ^= value + 0x9e3779b9U + (result << 6) + (result >> 2); };
+    mix((type->is_const ? 1U : 0U) | (type->is_volatile ? 2U : 0U) | (type->is_restrict ? 4U : 0U) |
+        (type->is_atomic ? 8U : 0U));
+    if (type->kind == Type::Kind::Array || type->kind == Type::Kind::Vector) mix(type->lanes);
+    if (type->kind == Type::Kind::Record || type->kind == Type::Kind::Builtin) {
+        mix(type->nominal_identity ? std::hash<const NominalTypeIdentity*>{}(type->nominal_identity.get())
+                                   : std::hash<std::string>{}(type->nominal_name));
+        if (type->nominal_arguments)
+            for (const auto& item : type->nominal_arguments->items)
+                mix(item.type ? type_identity_hash(item.type, depth + 1)
+                    : item.value && item.value->evaluated_integer ? item.value->evaluated_integer->value.low : 0);
+    }
+    mix(type_identity_hash(type->pointee, depth + 1));
+    mix(type_identity_hash(type->element, depth + 1));
+    if (type->function) mix(type->function->parameters.size());
+    return result;
+}
+
+} // namespace
+
+bool same_nominal_arguments(const NominalArguments& left, const NominalArguments& right) {
+    if (&left == &right) return true;
+    if (left.items.size() != right.items.size()) return false;
+    for (std::size_t index = 0; index < left.items.size(); ++index) {
+        const auto& a = left.items[index];
+        const auto& b = right.items[index];
+        if (static_cast<bool>(a.type) != static_cast<bool>(b.type) ||
+            static_cast<bool>(a.value) != static_cast<bool>(b.value) ||
+            (a.type && !same_type(a.type, b.type)) ||
+            (a.value && !same_generic_value(a.value.get(), b.value.get()))) return false;
+    }
+    return true;
+}
+
+std::size_t nominal_arguments_hash(const NominalArguments& arguments) {
+    std::size_t result = arguments.items.size();
+    for (const auto& item : arguments.items)
+        result ^= (item.type ? type_identity_hash(item.type, 0)
+                   : item.value && item.value->evaluated_integer ? item.value->evaluated_integer->value.low : 0) +
+            0x9e3779b9U + (result << 6) + (result >> 2);
+    return result;
+}
+
+std::string canonical_nominal_arguments(const NominalArguments& arguments) {
+    std::string result = "<";
+    for (std::size_t index = 0; index < arguments.items.size(); ++index) {
+        const auto& item = arguments.items[index];
+        if (index != 0) result += ',';
+        result += item.type ? canonical_type_name(item.type)
+            : !item.spelling.empty() ? item.spelling : item.value ? item.value->text : std::string("<invalid>");
+    }
+    return result + '>';
 }
 
 TypePtr enum_type(const EnumDecl& declaration) {
@@ -435,8 +538,19 @@ std::string type_name(const TypePtr& type) {
                "]";
     }
     if (type->kind == Type::Kind::Record) {
-        return prefix + (type->is_union ? "union " : "struct ") +
+        auto result = prefix + (type->is_union ? "union " : "struct ") +
                (type->nominal_name.empty() ? "<anonymous>" : type->nominal_name);
+        if (type->nominal_arguments) {
+            const auto& items = type->nominal_arguments->items;
+            for (std::size_t index = 0; index < items.size(); ++index) {
+                result += index == 0 ? "<" : ", ";
+                result += items[index].type ? type_name(items[index].type)
+                    : !items[index].spelling.empty() ? items[index].spelling
+                    : items[index].value ? items[index].value->text : std::string("<invalid>");
+            }
+            result += '>';
+        }
+        return result;
     }
     static constexpr const char* names[] = {
         "void", "bool", "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64",
@@ -623,8 +737,24 @@ static bool same_type_impl(const TypePtr& left, const TypePtr& right,
                same(left->element, right->element);
     }
     if (left->kind == Type::Kind::Record) {
-        return left->is_union == right->is_union &&
-               left->nominal_key() == right->nominal_key();
+        if (left->is_union != right->is_union) return false;
+        const auto* a = left->nominal_arguments.get();
+        const auto* b = right->nominal_arguments.get();
+        if (mode != TypeComparisonMode::Generic || !a || !b || a->normalized || b->normalized)
+            return left->nominal_key() == right->nominal_key();
+        // Like an extent, a written value argument that depends on generic
+        // parameters is compared for each used instance.
+        if (!(left->nominal_key().generic() == right->nominal_key().generic()) ||
+            a->items.size() != b->items.size()) return false;
+        for (std::size_t index = 0; index < a->items.size(); ++index) {
+            const auto& x = a->items[index];
+            const auto& y = b->items[index];
+            if (static_cast<bool>(x.type) != static_cast<bool>(y.type) ||
+                static_cast<bool>(x.value) != static_cast<bool>(y.value) ||
+                (x.type && !same(x.type, y.type))) return false;
+            if (x.value && !same_generic_value(x.value.get(), y.value.get())) pending_extent = true;
+        }
+        return true;
     }
     if (left->kind == Type::Kind::Tokens || left->kind == Type::Kind::SyntaxMatch ||
         left->kind == Type::Kind::Syntax || left->kind == Type::Kind::Span ||

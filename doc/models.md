@@ -786,6 +786,16 @@ follows:
   record or enumeration, as in `struct net::packet`; an instance of a generic
   record or union appends `<`, its argument spellings separated by `,`, and
   `>`, as in `struct list<u32>`.
+- A type that an instance of a `global` generic function defines in its
+  header or body is qualified by the instance: the function's qualified
+  name, its argument spellings in `<` and `>`, `::`, and the tag, as in
+  `struct make_pair<u64>::Pair`. The anonymous records and unions that the
+  member list of a generic record or union defines are qualified the same
+  way by its instance, as in `union variant<u64>::{0}`. Within one instance,
+  in source order, the N-th anonymous type is `{N}` and the N-th repetition
+  of a tag appends `#N`, counting from zero. The spelling of another type
+  defined inside a function identifies its source unit and is otherwise
+  unspecified.
 - `P` followed by the pointee spells a pointer, as in `PKu8` for
   `const u8 *`. A pointer into address space `N` other than 0 is `PU`, `N`,
   `_`, and the pointee.

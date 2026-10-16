@@ -110,7 +110,10 @@ struct Type {
     // object layouts; values convert like the type without it.
     unsigned alignment{};
     std::shared_ptr<const NominalTypeIdentity> nominal_identity{};
-    [[nodiscard]] NominalTypeKey nominal_key() const { return {nominal_name, nominal_identity}; }
+    std::shared_ptr<const NominalArguments> nominal_arguments{};
+    [[nodiscard]] NominalTypeKey nominal_key() const {
+        return {nominal_name, nominal_identity, nominal_arguments};
+    }
 };
 
 struct RecordMember {

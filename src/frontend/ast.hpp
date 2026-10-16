@@ -104,7 +104,11 @@ struct Type {
     bool generic_header_view{};
     std::string nominal_name;
     std::shared_ptr<const NominalTypeIdentity> nominal_identity{};
-    [[nodiscard]] NominalTypeKey nominal_key() const { return {nominal_name, nominal_identity}; }
+    // The arguments of a generic record or union use.
+    std::shared_ptr<const NominalArguments> nominal_arguments{};
+    [[nodiscard]] NominalTypeKey nominal_key() const {
+        return {nominal_name, nominal_identity, nominal_arguments};
+    }
     bool is_union{};
     bool is_const{};
     bool is_volatile{};
@@ -609,10 +613,17 @@ struct RecordDecl {
     std::vector<Attribute> attributes;
     std::vector<RecordMemberDecl> members;
     std::shared_ptr<const NominalTypeIdentity> nominal_identity{};
+    // Nonempty for a generic record or union, which is not a type itself.
+    std::vector<GenericParameter> generic_parameters;
+    // Owns the anonymous records and unions its member list defines; each
+    // instance has its own copies.
+    std::shared_ptr<const GenericTagOwner> generic_tag_owner{};
+    // The normalized arguments of an instance of a generic record or union.
+    std::shared_ptr<const NominalArguments> nominal_arguments{};
     // A copy that generated code brought from the helper defining the record;
     // the program may also hold the original.
     bool carried{};
-    [[nodiscard]] NominalTypeKey nominal_key() const { return {name, nominal_identity}; }
+    [[nodiscard]] NominalTypeKey nominal_key() const { return {name, nominal_identity, nominal_arguments}; }
     [[nodiscard]] const Attribute* attribute(std::string_view name) const;
 };
 

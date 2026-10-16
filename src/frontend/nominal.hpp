@@ -24,21 +24,57 @@ struct NominalTypeIdentity {
     // Serialization-only identity of the enclosing concrete generic instance.
     std::string instance_key{};
     std::shared_ptr<const FunctionScopeIdentity> function_scope{};
+    // The mangling-input spelling of a type that an instance of a global
+    // generic function or of a generic record owns; empty otherwise.
+    std::string spelling{};
 };
+
+struct Type;
+struct Expr;
+
+// The arguments of a use of a generic record or union, in parameter order.
+// Semantic preparation replaces a written list by a normalized one (resolved
+// extents, canonical callable ABIs, evaluated values); equal normalized lists
+// select the same instance. A list is not mutated once a type refers to it.
+struct NominalArguments {
+    struct Argument {
+        std::shared_ptr<Type> type;
+        std::shared_ptr<const Expr> value;
+        // Descriptor spelling of a normalized value; serialization only.
+        std::string spelling;
+    };
+    std::vector<Argument> items;
+    // The written tag of the use, for diagnostics; not part of the identity.
+    SourceLocation location;
+    bool normalized{};
+};
+bool same_nominal_arguments(const NominalArguments& left, const NominalArguments& right);
+std::size_t nominal_arguments_hash(const NominalArguments& arguments);
+// `<`, the argument spellings separated by `,`, and `>` (models.md).
+std::string canonical_nominal_arguments(const NominalArguments& arguments);
 
 struct NominalTypeKey {
     std::string name;
     std::shared_ptr<const NominalTypeIdentity> identity{};
+    // Present for an instance of a generic record or union.
+    std::shared_ptr<const NominalArguments> arguments{};
 
     [[nodiscard]] bool empty() const { return !identity && name.empty(); }
+    // The generic record or union of an instance, or the key itself.
+    [[nodiscard]] NominalTypeKey generic() const { return {name, identity}; }
 
     bool operator==(const NominalTypeKey& other) const {
+        if (static_cast<bool>(arguments) != static_cast<bool>(other.arguments) ||
+            (arguments && arguments != other.arguments &&
+             !same_nominal_arguments(*arguments, *other.arguments))) return false;
         if (identity || other.identity) return identity == other.identity;
         return name == other.name;
     }
 
     [[nodiscard]] std::string canonical_name() const {
-        if (!identity) return name;
+        const auto suffix = arguments ? canonical_nominal_arguments(*arguments) : std::string{};
+        if (!identity) return name + suffix;
+        if (!identity->spelling.empty()) return identity->spelling + suffix;
         // Delimit/length-prefix fields: paths and source spellings are not
         // restricted to identifier characters. No pointer value is emitted.
         const auto& id = *identity;
@@ -48,14 +84,17 @@ struct NominalTypeKey {
             std::to_string(id.declaration.output_position) + ":" +
             std::to_string(id.ordinal) +
             (id.instance_key.empty() ? std::string{} :
-                ":instance:" + std::to_string(id.instance_key.size()) + ":" + id.instance_key) + ">";
+                ":instance:" + std::to_string(id.instance_key.size()) + ":" + id.instance_key) + ">" +
+            suffix;
     }
 };
 
 struct NominalTypeKeyHash {
     std::size_t operator()(const NominalTypeKey& key) const {
-        return key.identity ? std::hash<const NominalTypeIdentity*>{}(key.identity.get())
-                            : std::hash<std::string>{}(key.name);
+        const auto base = key.identity ? std::hash<const NominalTypeIdentity*>{}(key.identity.get())
+                                       : std::hash<std::string>{}(key.name);
+        return key.arguments ? base ^ (nominal_arguments_hash(*key.arguments) + (base << 6) + (base >> 2))
+                             : base;
     }
 };
 

@@ -256,7 +256,8 @@ private:
     TypePtr rebind_tag_types(TypePtr type) const;
     void remember_tag_binding(std::size_t token_index, std::string_view spelling,
                               const TypePtr& type, bool declaration);
-    TypePtr declare_local_tag(TypePtr type, SourceLocation location, bool complete);
+    TypePtr declare_local_tag(TypePtr type, SourceLocation location, bool complete,
+        const std::vector<ValuePlacementIdentity::GenericParameterKind>& generic = {});
     TypePtr declare_retained_implicit_tag(std::string_view name, SourceLocation location, bool is_union);
     std::shared_ptr<const NominalTypeIdentity> new_nominal_identity(SourceLocation location);
     void remember_label_binding(Statement& statement, std::size_t token_index);
@@ -518,6 +519,8 @@ private:
     struct LocalTag {
         TypePtr type;
         bool complete{};
+        // The parameter kinds of a generic record or union; empty otherwise.
+        GenericSignature generic{};
     };
     struct HeaderNominalScope {
         NameMap<ValueBinding> values;
@@ -731,7 +734,36 @@ private:
     struct RecordTag {
         bool is_union{};
         bool complete{};
+        GenericSignature generic{};
         bool operator==(const RecordTag&) const = default;
+    };
+    // The generic parameter kinds of the tag a type names, if it is known.
+    const GenericSignature* tag_generic_signature(const TypePtr& type) const;
+    // After a tag and `<`: whether a parameter list of a definition or of a
+    // standalone forward declaration follows, rather than arguments.
+    bool generic_tag_declaration_ahead(bool forward_declaration);
+    EvaluationTask<std::shared_ptr<const NominalArguments>> parse_nominal_arguments_async(
+        SourceLocation location);
+    // The parameters of the generic record or union whose members are parsed.
+    const std::vector<GenericParameter>* active_record_parameters_{};
+    // While a generic record's members are parsed, its parameters are in
+    // scope and it owns the anonymous records and unions they define.
+    struct GenericRecordFrame {
+        Parser& parser;
+        const std::vector<GenericParameter>* parameters;
+        std::shared_ptr<const GenericTagOwner> owner;
+        GenericRecordFrame(Parser& owner_parser, RecordDecl& record)
+            : parser(owner_parser), parameters(owner_parser.active_record_parameters_),
+              owner(owner_parser.generic_tag_owner_) {
+            if (record.generic_parameters.empty()) return;
+            record.generic_tag_owner = std::make_shared<const GenericTagOwner>();
+            parser.generic_tag_owner_ = record.generic_tag_owner;
+            parser.active_record_parameters_ = &record.generic_parameters;
+        }
+        ~GenericRecordFrame() {
+            parser.active_record_parameters_ = parameters;
+            parser.generic_tag_owner_ = std::move(owner);
+        }
     };
     std::unordered_map<std::string, RecordTag> record_types_;
     struct TagState {

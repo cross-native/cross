@@ -38,7 +38,7 @@ const std::vector<const TargetInfo*>& all_targets() {
 std::vector<std::string_view> language_features(const CompilerOptions& options) {
     std::vector<std::string_view> result{
         "runtime_free_intrinsics", "control_intrinsics", "evaluation",
-        "automatic_evaluation", "generics", "procedural_macros", "syntax_extensions",
+        "automatic_evaluation", "generics", "generic_types", "procedural_macros", "syntax_extensions",
         "embedded_assets",
         "patchable_values", "patchable_operands", "raw_inline",
         "contextual_attributes", "external_models", "operator_binding"};

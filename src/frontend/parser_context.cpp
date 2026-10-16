@@ -1627,7 +1627,7 @@ void Parser::restore_deferred_environment(const SyntaxParseEnvironment& environm
                     if (current == receiving_tags[receiving].end() || !current->second.type || !tag.type ||
                         current->second.type->nominal_key() != tag.type->nominal_key()) continue;
                 }
-                local_tag_scopes_[captured][key] = Parser::LocalTag{copy_type(tag.type), tag.complete};
+                local_tag_scopes_[captured][key] = Parser::LocalTag{copy_type(tag.type), tag.complete, tag.generic};
             }
         }
     }

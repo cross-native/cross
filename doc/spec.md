@@ -1813,10 +1813,13 @@ explicit `link_name` instead.
 A record or union definition may place a generic parameter list after its
 tag. The parameter forms and constraints are those of generic functions, and
 the parameters are in scope in the member list. A forward declaration of a
-generic tag repeats the same parameter list. An anonymous definition and an
-enumeration cannot be generic.
+generic tag repeats the same parameter list, and a generic tag is declared
+before its first use. An anonymous definition and an enumeration cannot be
+generic. The member list of a generic record or union may define anonymous
+records and unions, which each instance copies, but no named record, union,
+or enumeration.
 
-```text
+```x
 struct list<T> {
     T *items;
     uptr count;

@@ -505,6 +505,41 @@ struct Pair { U first; U second; } make_pair<U>(U a, U b) {
 }
 ```
 
+A record or union definition may also take a parameter list after its tag,
+and every use names all of its arguments. Each argument list is one distinct
+type, laid out and passed like a record written with those member types;
+`struct buf<u8, 2 + 2>` and `struct buf<u8, 4>` are the same type, and
+`struct list<u32>` and `struct list<i32>` are unrelated. A forward
+declaration repeats the parameter list. A generic function can take an
+instance, and deduction reads the arguments from it:
+
+```x
+struct list<T>;
+
+struct list<T> {
+    T *items;
+    uptr count;
+    struct list<T> *next;
+};
+
+struct buf<T, uptr N> { T data[N]; uptr used; };
+
+static T first<T>(in struct list<T> *values) {
+    return values->items[0];
+}
+
+global u32 head(in struct list<u32> *words, in struct buf<u8, 4> *bytes) {
+    return first(words) + bytes->data[bytes->used - 1];
+}
+```
+
+An instance is designated by its tag when embedded, and its descriptor in
+mangling input appends the argument spellings, as in `struct list<u32>`.
+Anonymous records and unions in a generic record's member list are copied for
+each instance; named records, unions, and enumerations cannot be defined
+there. Enumerations and anonymous definitions cannot be generic, and a generic
+tag is declared before its first use.
+
 ## Metaprogramming
 
 A procedural macro is a Cross function that runs during compilation and

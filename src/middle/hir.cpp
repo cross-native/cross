@@ -844,7 +844,8 @@ private:
 
     void collect_record_shells() {
         for (const auto& declaration : program_.records) {
-            if (declaration.nominal_identity && declaration.nominal_identity->generic_owner) continue;
+            if ((declaration.nominal_identity && declaration.nominal_identity->generic_owner) ||
+                !declaration.generic_parameters.empty()) continue;
             auto found = module_.record_ids.find(declaration.nominal_key());
             RecordId id;
             if (found == module_.record_ids.end()) {
@@ -1136,6 +1137,7 @@ private:
         const auto key = module_.record(id).source_key;
         auto type = record_type(key.name, module_.record(id).is_union);
         type->nominal_identity = key.identity;
+        type->nominal_arguments = key.arguments;
         const auto prepare_type = program_.evaluation_prepare_type;
         if (prepare_type &&
             !(co_await prepare_type.async(type, EvaluationLayoutKind::Complete))) co_return false;
@@ -2810,6 +2812,7 @@ TypeId Module::intern_type(const TypePtr& source) {
         candidate.builtin = source->builtin;
         candidate.nominal_name = source->nominal_name;
         candidate.nominal_identity = source->nominal_identity;
+        candidate.nominal_arguments = source->nominal_arguments;
         candidate.is_const = source->is_const;
         candidate.is_volatile = source->is_volatile;
         candidate.is_atomic = source->is_atomic;
@@ -3497,8 +3500,9 @@ std::string type_name(const Module& module, TypeId id) {
     }
     if (type.kind == Type::Kind::Record && type.record) {
         const auto& record = module.record(*type.record);
-        return prefix + (record.is_union ? "union " : "struct ") +
-               record.source_name;
+        auto source = cross::record_type(record.source_name, record.is_union);
+        source->nominal_arguments = record.source_key.arguments;
+        return prefix + cross::type_name(source);
     }
     if (!type.nominal_key().empty()) {
         return prefix + "enum " + type.nominal_name;

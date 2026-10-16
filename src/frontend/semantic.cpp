@@ -63,22 +63,67 @@ struct NominalInstantiation {
     std::shared_ptr<const FunctionScopeIdentity> function_scope{
         std::make_shared<const FunctionScopeIdentity>()};
     std::string serialization;
+    // Mangling-input spellings of the owned types, when the instance has one.
+    std::unordered_map<const NominalTypeIdentity*, std::string> spellings;
+    // The owners of the anonymous members of generic records that the
+    // instance owns. Their copies stay generic, under a fresh owner.
+    std::unordered_map<const GenericTagOwner*, std::shared_ptr<const GenericTagOwner>> nested_owners;
     mutable std::unordered_map<const NominalTypeIdentity*,
         std::shared_ptr<const NominalTypeIdentity>> identities;
 
+    std::shared_ptr<const GenericTagOwner> owner_of(const std::shared_ptr<const GenericTagOwner>& source) const {
+        const auto found = source ? nested_owners.find(source.get()) : nested_owners.end();
+        return found == nested_owners.end() ? source : found->second;
+    }
+
     std::shared_ptr<const NominalTypeIdentity> substitute(
         const std::shared_ptr<const NominalTypeIdentity>& source) const {
-        if (!source || !owner || source->generic_owner != owner) return source;
+        if (!source || !owner || !source->generic_owner) return source;
+        const auto nested = nested_owners.find(source->generic_owner.get());
+        if (source->generic_owner != owner && nested == nested_owners.end()) return source;
         if (const auto found = identities.find(source.get()); found != identities.end())
             return found->second;
         auto identity = std::make_shared<NominalTypeIdentity>(*source);
-        identity->generic_owner.reset();
+        identity->generic_owner = nested == nested_owners.end() ? nullptr : nested->second;
         identity->function_scope = function_scope;
         identity->instance_key = serialization;
+        if (const auto found = spellings.find(source.get()); found != spellings.end())
+            identity->spelling = found->second;
         identities.emplace(source.get(), identity);
         return identity;
     }
 };
+
+// The types that `owner` owns are spelled in mangling input as the owning
+// instance's spelling, `::`, and the tag, in source order: a repeated tag
+// adds `#N` for its N-th repetition, and the N-th anonymous type is `{N}`.
+std::unordered_map<const NominalTypeIdentity*, std::string> owned_type_spellings(
+    const std::vector<RecordDecl>& records, const std::vector<EnumDecl>& enumerations,
+    const std::shared_ptr<const GenericTagOwner>& owner, const std::string& instance) {
+    std::vector<std::pair<const NominalTypeIdentity*, const std::string*>> owned;
+    const auto add = [&](const auto& declaration) {
+        const auto* identity = declaration.nominal_identity.get();
+        if (identity && identity->generic_owner == owner &&
+            std::none_of(owned.begin(), owned.end(), [&](const auto& item) { return item.first == identity; }))
+            owned.emplace_back(identity, &declaration.name);
+    };
+    for (const auto& record : records) add(record);
+    for (const auto& enumeration : enumerations) add(enumeration);
+    std::stable_sort(owned.begin(), owned.end(),
+        [](const auto& left, const auto& right) { return left.first->ordinal < right.first->ordinal; });
+    std::unordered_map<const NominalTypeIdentity*, std::string> result;
+    std::unordered_map<std::string, unsigned> repeated;
+    unsigned anonymous = 0;
+    for (const auto& [identity, name] : owned) {
+        if (name->empty()) {
+            result.emplace(identity, instance + "::{" + std::to_string(anonymous++) + "}");
+            continue;
+        }
+        const auto ordinal = repeated[*name]++;
+        result.emplace(identity, instance + "::" + *name + (ordinal ? "#" + std::to_string(ordinal) : ""));
+    }
+    return result;
+}
 
 struct TypeSubstitutions : NameMap<TypePtr> {
     std::shared_ptr<NominalInstantiation> nominal;
@@ -315,6 +360,22 @@ ContinuationTask<TypePtr> clone_type_async(const TypePtr& source,
             result->array_bound = co_await clone_expr_async(*source->array_bound, substitutions, values);
     } else if (source->kind == Type::Kind::Record) {
         result = record_type(source->nominal_name, source->is_union);
+        // A normalized list is concrete and immutable; a written one may
+        // name generic parameters.
+        if (source->nominal_arguments && source->nominal_arguments->normalized) {
+            result->nominal_arguments = source->nominal_arguments;
+        } else if (source->nominal_arguments) {
+            auto arguments = std::make_shared<NominalArguments>();
+            arguments->location = source->nominal_arguments->location;
+            for (const auto& item : source->nominal_arguments->items) {
+                NominalArguments::Argument copy;
+                if (item.type) copy.type = co_await clone_type_async(item.type, substitutions, values);
+                if (item.value)
+                    copy.value = std::shared_ptr<const Expr>(co_await clone_expr_async(*item.value, substitutions, values));
+                arguments->items.push_back(std::move(copy));
+            }
+            result->nominal_arguments = std::move(arguments);
+        }
     } else if (source->kind == Type::Kind::Tokens) {
         result = tokens_type();
     } else if (source->kind == Type::Kind::SyntaxMatch) {
@@ -540,14 +601,35 @@ std::vector<Attribute> clone_attributes(
     return result;
 }
 
-RecordDecl instantiate_record(const RecordDecl& source, const TypeSubstitutions& types,
+// Copying a generic record keeps its own type parameters.
+void keep_type_parameters(TypeSubstitutions& types, const RecordDecl& record) {
+    for (const auto& parameter : record.generic_parameters) {
+        if (parameter.value_type) continue;
+        auto self = generic_type(parameter.name);
+        self->generic_location = parameter.location;
+        self->generic_binding = name_key(parameter).binding;
+        types.insert_or_assign(name_key(parameter), std::move(self));
+    }
+}
+
+RecordDecl instantiate_record(const RecordDecl& source, const TypeSubstitutions& outer_types,
                               const ValueSubstitutions& values) {
+    std::optional<TypeSubstitutions> own_types;
+    if (!source.generic_parameters.empty()) {
+        own_types = outer_types;
+        keep_type_parameters(*own_types, source);
+    }
+    const auto& types = own_types ? *own_types : outer_types;
     RecordDecl copy;
     copy.location = source.location;
     copy.name = source.name;
     copy.is_union = source.is_union;
     copy.complete = source.complete;
     copy.nominal_identity = types.nominal->substitute(source.nominal_identity);
+    copy.generic_parameters = source.generic_parameters;
+    for (auto& parameter : copy.generic_parameters)
+        parameter.value_type = clone_type(parameter.value_type, types, values);
+    copy.generic_tag_owner = types.nominal->owner_of(source.generic_tag_owner);
     copy.attributes = clone_attributes(source.attributes, types, values);
     for (const auto& member : source.members)
         copy.members.push_back({member.location, member.name, clone_type(member.type, types, values),
@@ -907,6 +989,10 @@ struct GenericExpansionState {
         std::string name;
     };
     std::vector<Instance> instances;
+    // Instances of generic records and unions, counted against the same budget.
+    std::size_t record_instances{};
+    // Records whose members' generic record uses have been instantiated.
+    std::unordered_set<NominalTypeKey, NominalTypeKeyHash> member_records;
     struct PendingInterface {
         const FunctionDecl* left{};
         const FunctionDecl* right{};
@@ -1291,6 +1377,44 @@ bool validate_generic_redeclarations(const Program& program,
     return diagnostics.errors() == errors;
 }
 
+// Each declaration of a generic record or union repeats the parameter list
+// of the first one: the same kinds and, for value parameters, the same types.
+bool validate_generic_record_redeclarations(const Program& program, Diagnostics& diagnostics) {
+    const auto errors = diagnostics.errors();
+    for (std::size_t left = 0; left < program.records.size(); ++left) {
+        const auto& first = program.records[left];
+        if (first.generic_parameters.empty()) continue;
+        for (std::size_t right = left + 1; right < program.records.size(); ++right) {
+            const auto& later = program.records[right];
+            if (later.generic_parameters.empty() || !(later.nominal_key() == first.nominal_key())) continue;
+            bool same = first.generic_parameters.size() == later.generic_parameters.size();
+            TypeSubstitutions first_names;
+            TypeSubstitutions later_names;
+            for (std::size_t index = 0; same && index < first.generic_parameters.size(); ++index) {
+                const auto& a = first.generic_parameters[index];
+                const auto& b = later.generic_parameters[index];
+                if (static_cast<bool>(a.value_type) != static_cast<bool>(b.value_type)) {
+                    same = false;
+                } else if (!a.value_type) {
+                    const auto placeholder = generic_type("__generic_parameter_" + std::to_string(index));
+                    first_names.emplace(name_key(a), placeholder);
+                    later_names.emplace(name_key(b), placeholder);
+                } else {
+                    same = compare_generic_types(clone_type(a.value_type, first_names),
+                        clone_type(b.value_type, later_names)) != TypeComparison::Different;
+                }
+            }
+            if (!same) {
+                diagnostics.error(later.location, "record tag '" + later.name +
+                    "' was previously declared with a different generic parameter list");
+                diagnostics.note(first.location, "earlier declaration is here");
+            }
+            break;
+        }
+    }
+    return diagnostics.errors() == errors;
+}
+
 // The result types of the type-reflection operations; null for other names.
 TypePtr reflection_result_type(std::string_view name) {
     if (name == "$::meta::type" || name == "$::meta::member_type" || name == "$::meta::element")
@@ -1475,6 +1599,9 @@ bool match_deduced_type(const TypePtr& formal, const TypePtr& actual,
         if (!type) return false;
         if (type->kind == Type::Kind::Generic)
             return type_parameters.contains(generic_type_key(*type));
+        if (type->kind == Type::Kind::Record && type->nominal_arguments)
+            return std::any_of(type->nominal_arguments->items.begin(), type->nominal_arguments->items.end(),
+                [&](const NominalArguments::Argument& item) { return self(self, item.type); });
         if (type->kind == Type::Kind::Pointer)
             return self(self, type->pointee);
         if (type->kind == Type::Kind::Array ||
@@ -1497,6 +1624,22 @@ bool match_deduced_type(const TypePtr& formal, const TypePtr& actual,
         return formal->address_space == actual->address_space &&
                match_deduced_type(formal->pointee, actual->pointee,
                                   bindings, type_parameters, conflict, allow_deferred);
+    if (formal->kind == Type::Kind::Record) {
+        // An instance of the same generic record binds the type arguments;
+        // value arguments are checked after substitution.
+        const auto& written = formal->nominal_arguments->items;
+        if (formal->is_union != actual->is_union || !actual->nominal_arguments ||
+            !(formal->nominal_key().generic() == actual->nominal_key().generic()) ||
+            written.size() != actual->nominal_arguments->items.size()) return false;
+        for (std::size_t index = 0; index < written.size(); ++index) {
+            const auto& item = actual->nominal_arguments->items[index];
+            if (static_cast<bool>(written[index].type) != static_cast<bool>(item.type) ||
+                (item.type && !match_deduced_type(written[index].type, item.type,
+                                                  bindings, type_parameters, conflict, allow_deferred)))
+                return false;
+        }
+        return true;
+    }
     if (formal->kind == Type::Kind::Array ||
         formal->kind == Type::Kind::Vector) {
         const auto pending_extent = [](const TypePtr& type) {
@@ -1659,7 +1802,8 @@ void lift_pointer_argument_strings(Program& program, std::unique_ptr<Expr>& expr
 EvaluationTask<void> prepare_generic_inferred_array_async(VariableDecl& declaration, const FunctionDecl& caller,
     Program& program, Diagnostics& diagnostics, const GenericExpansionState& state);
 
-EvaluationTask<bool> normalize_generic_arguments_async(const FunctionDecl& generic,
+EvaluationTask<bool> normalize_generic_arguments_async(std::span<const GenericParameter> parameters,
+                                 std::string_view name,
                                  std::vector<Expr::GenericArgument>& arguments,
                                  const FunctionDecl* caller, Program& program,
                                  Diagnostics& diagnostics, SourceLocation location,
@@ -1694,12 +1838,18 @@ const char* source_array_element_error(const TypePtr& type) {
     return nullptr;
 }
 
+EvaluationTask<bool> instantiate_record_use_async(TypePtr type, const FunctionDecl* caller, Program& program,
+    Diagnostics& diagnostics, GenericExpansionState& state, std::string_view mangling, SourceLocation location);
+
 EvaluationTask<void> rewrite_generic_type_bounds_async(TypePtr type, const FunctionDecl* caller, Program& program,
     Diagnostics& diagnostics, GenericExpansionState& state, std::string_view mangling,
     SourceLocation location = {}) {
     GenericResourceFrame resource_frame(state, program);
     if (!type || state.resource_failed(program)) co_return;
     if (!location.valid() && caller) location = caller->location;
+    if (type->kind == Type::Kind::Record && type->nominal_arguments &&
+        !(co_await instantiate_record_use_async(type, caller, program, diagnostics, state, mangling, location)))
+        co_return;
     if (const auto* reason = source_array_element_error(type)) {
         diagnostics.error(location, reason);
         co_return;
@@ -1942,6 +2092,9 @@ EvaluationTask<void> prepare_generic_local_types_async(FunctionDecl& function, P
     }
 }
 
+EvaluationTask<bool> instantiate_member_records_async(NominalTypeKey key, Program& program,
+    Diagnostics& diagnostics, GenericExpansionState& state, std::string_view mangling);
+
 EvaluationTask<bool> prepare_generic_record_async(NominalTypeKey key, Program& program,
     Diagnostics& diagnostics, GenericExpansionState& state, std::string_view mangling,
     EvaluationLayoutKind kind = EvaluationLayoutKind::Complete) {
@@ -1952,11 +2105,15 @@ EvaluationTask<bool> prepare_generic_record_async(NominalTypeKey key, Program& p
         ? state.required_record_alignments : state.required_records;
     if (const auto found = prepared_records.find(key); found != prepared_records.end())
         co_return found->second != GenericExpansionState::RecordPreparation::Failed;
+    if (!(co_await instantiate_member_records_async(key, program, diagnostics, state, mangling))) co_return false;
     const auto* definition = program.record_index.definition(program, key);
-    if (!definition) co_return true;
+    // A generic record or union is prepared through its instances.
+    if (!definition || !definition->generic_parameters.empty()) co_return true;
     const auto index = static_cast<std::size_t>(definition - program.records.data());
     if (const auto error = record_source_error(*definition, program, program.record_index, &state.record_proofs)) {
         diagnostics.error(error->location, error->message);
+        if (key.arguments)
+            diagnostics.note(key.arguments->location, "in instance '" + type_name(record_type(*definition)) + "'");
         prepared_records[key] = GenericExpansionState::RecordPreparation::Failed;
         co_return false;
     }
@@ -2030,6 +2187,197 @@ bool prepare_generic_record(const NominalTypeKey& key, Program& program,
     Diagnostics& diagnostics, GenericExpansionState& state, std::string_view mangling,
     EvaluationLayoutKind kind = EvaluationLayoutKind::Complete) {
     return prepare_generic_record_async(key, program, diagnostics, state, mangling, kind).run();
+}
+
+// The declaration of `key`, preferring a definition.
+std::optional<std::size_t> record_declaration(Program& program, const NominalTypeKey& key) {
+    if (const auto* definition = program.record_index.definition(program, key))
+        return static_cast<std::size_t>(definition - program.records.data());
+    for (std::size_t index = 0; index < program.records.size(); ++index)
+        if (program.records[index].nominal_key() == key) return index;
+    return std::nullopt;
+}
+
+// An instance has the generic record's members and attributes with the
+// arguments substituted for the parameters, followed by copies of the
+// anonymous records and unions those members define.
+std::vector<RecordDecl> make_record_instance(const Program& program, const RecordDecl& generic,
+    const std::shared_ptr<const NominalArguments>& arguments, Diagnostics& diagnostics) {
+    TypeSubstitutions types;
+    types.diagnostics = &diagnostics;
+    ValueSubstitutions values;
+    for (std::size_t index = 0; index < generic.generic_parameters.size(); ++index) {
+        const auto& parameter = generic.generic_parameters[index];
+        if (parameter.value_type) values.emplace(name_key(parameter), arguments->items[index].value.get());
+        else types.emplace(name_key(parameter), arguments->items[index].type);
+    }
+    if (generic.generic_tag_owner) {
+        types.nominal = std::make_shared<NominalInstantiation>();
+        types.nominal->owner = generic.generic_tag_owner;
+        types.nominal->function_scope = generic.nominal_identity ? generic.nominal_identity->function_scope : nullptr;
+        types.nominal->serialization = generic.name + canonical_nominal_arguments(*arguments);
+        if (!generic.nominal_identity)
+            types.nominal->spellings = owned_type_spellings(program.records, program.enumerations,
+                generic.generic_tag_owner, types.nominal->serialization);
+    }
+    std::vector<RecordDecl> result(1);
+    auto& instance = result.front();
+    instance.location = generic.location;
+    instance.name = generic.name;
+    instance.is_union = generic.is_union;
+    instance.complete = generic.complete;
+    instance.nominal_identity = generic.nominal_identity;
+    instance.nominal_arguments = arguments;
+    instance.attributes = clone_attributes(generic.attributes, types, values);
+    for (const auto& member : generic.members)
+        instance.members.push_back({member.location, member.name, clone_type(member.type, types, values),
+            member.bit_width ? clone_expr(*member.bit_width, types, values) : nullptr,
+            clone_attributes(member.attributes, types, values), member.fresh, member.embedded});
+    if (types.nominal)
+        for (const auto& record : program.records)
+            if (record.nominal_identity && record.nominal_identity->generic_owner == generic.generic_tag_owner)
+                result.push_back(instantiate_record(record, types, values));
+    return result;
+}
+
+// Normalizes the arguments of a generic record or union use and creates
+// the instance they select on first use, together with the instances its
+// members name. Equal normalized arguments select the same instance.
+EvaluationTask<bool> instantiate_record_use_async(TypePtr type, const FunctionDecl* caller, Program& program,
+    Diagnostics& diagnostics, GenericExpansionState& state, std::string_view mangling, SourceLocation location) {
+    GenericResourceFrame resource_frame(state, program);
+    if (state.resource_failed(program)) co_return false;
+    const auto written = type->nominal_arguments;
+    const NominalTypeKey generic_key{type->nominal_name, type->nominal_identity};
+    const auto display = type_name(record_type(type->nominal_name, type->is_union));
+    auto generic = record_declaration(program, generic_key);
+    if (!generic || program.records[*generic].generic_parameters.empty()) {
+        diagnostics.error(written->location, "record '" + type->nominal_name + "' is not generic");
+        co_return false;
+    }
+    if (!written->normalized) {
+        const auto parameters = program.records[*generic].generic_parameters;
+        if (written->items.size() != parameters.size()) {
+            diagnostics.error(written->location, "'" + display + "' takes " +
+                std::to_string(parameters.size()) + " generic argument" + (parameters.size() == 1 ? "" : "s") +
+                ", but " + std::to_string(written->items.size()) + (written->items.size() == 1 ? " was" : " were") +
+                " given");
+            co_return false;
+        }
+        const auto errors = diagnostics.errors();
+        std::vector<Expr::GenericArgument> arguments(parameters.size());
+        for (std::size_t index = 0; index < parameters.size(); ++index) {
+            const auto& item = written->items[index];
+            const bool value = parameters[index].value_type != nullptr;
+            if (value ? !item.value : !item.type) {
+                diagnostics.error(written->location, "generic " + std::string(value ? "value" : "type") +
+                    " parameter '" + parameters[index].name + "' of '" + display + "' requires a " +
+                    (value ? "value" : "type") + " argument");
+                co_return false;
+            }
+            if (value) {
+                arguments[index].value = clone_expr(*item.value);
+                continue;
+            }
+            arguments[index].type = clone_type(item.type);
+            co_await rewrite_generic_type_bounds_async(arguments[index].type, caller, program, diagnostics,
+                state, mangling, location);
+            if (diagnostics.errors() != errors || state.resource_failed(program) ||
+                !normalize_generic_callable_abis(arguments[index].type, state, diagnostics, written->location))
+                co_return false;
+        }
+        if (!(co_await normalize_generic_arguments_async(parameters, display, arguments, caller, program,
+                diagnostics, written->location, state, mangling))) co_return false;
+        auto normalized = std::make_shared<NominalArguments>();
+        normalized->location = written->location;
+        normalized->normalized = true;
+        const auto descriptors = generic_argument_descriptors(arguments);
+        for (std::size_t index = 0; index < arguments.size(); ++index)
+            normalized->items.push_back({arguments[index].type,
+                std::shared_ptr<const Expr>(std::move(arguments[index].value)),
+                arguments[index].type ? std::string{} : descriptors[index].spelling});
+        type->nominal_arguments = std::move(normalized);
+    }
+    const auto key = type->nominal_key();
+    generic = record_declaration(program, generic_key);
+    const auto existing = record_declaration(program, key);
+    if (existing && (program.records[*existing].complete || !program.records[*generic].complete)) co_return true;
+    const auto& limits = program.evaluation_limits;
+    if (state.depth >= limits.generic_depth ||
+        state.instances.size() + state.record_instances >= limits.generic_instances) {
+        ++program.evaluation_resource_errors;
+        diagnostics.error(written->location,
+            state.depth >= limits.generic_depth
+                ? "generic instantiation budget exceeded: nesting depth limit " +
+                      std::to_string(limits.generic_depth) + " (-fgeneric-depth-limit)"
+                : "generic instantiation budget exceeded: instance limit " +
+                      std::to_string(limits.generic_instances) + " (-fgeneric-instance-limit)");
+        co_return false;
+    }
+    const auto errors = diagnostics.errors();
+    auto records = make_record_instance(program, program.records[*generic], type->nominal_arguments, diagnostics);
+    if (diagnostics.errors() != errors) co_return false;
+    ++state.record_instances;
+    // A definition published after an incomplete instance completes it.
+    if (existing) program.records[*existing] = std::move(records.front());
+    else program.records.push_back(std::move(records.front()));
+    std::vector<NominalTypeKey> keys{key};
+    for (auto record = std::next(records.begin()); record != records.end(); ++record) {
+        keys.push_back(record->nominal_key());
+        program.records.push_back(std::move(*record));
+    }
+    ++state.depth;
+    struct RestoreDepth {
+        unsigned& depth;
+        ~RestoreDepth() { --depth; }
+    } restore_depth{state.depth};
+    for (const auto& record_key : keys)
+        if (!(co_await prepare_generic_record_async(record_key, program, diagnostics, state, mangling))) co_return false;
+    co_return true;
+}
+
+// The structural record checks compare normalized keys. First select the
+// instances that the record's members name, and those that the records it
+// contains by value name.
+EvaluationTask<bool> instantiate_member_records_async(NominalTypeKey key, Program& program,
+    Diagnostics& diagnostics, GenericExpansionState& state, std::string_view mangling) {
+    if ((key.identity && key.identity->generic_owner) || !state.member_records.insert(key).second) co_return true;
+    const auto index = record_declaration(program, key);
+    if (!index || !program.records[*index].generic_parameters.empty()) co_return true;
+    const auto& record = program.records[*index];
+    FunctionDecl context;
+    context.source_namespace = namespace_prefix(record.name);
+    if (record.location.file) context.source_unit = record.location.file->source_unit_at(record.location.line);
+    const auto* owner = record.nominal_identity ? lexical_function(program, record.nominal_identity->function_scope)
+                                                : nullptr;
+    std::vector<std::pair<TypePtr, SourceLocation>> roots;
+    for (const auto& member : record.members) roots.emplace_back(member.type, member.location);
+    std::vector<NominalTypeKey> contained;
+    for (const auto& [root, location] : roots) {
+        std::vector<TypePtr> pending{root};
+        std::unordered_set<const Type*> seen;
+        while (!pending.empty()) {
+            auto next = std::move(pending.back());
+            pending.pop_back();
+            if (!next || !seen.insert(next.get()).second) continue;
+            if (next->kind == Type::Kind::Record && next->nominal_arguments &&
+                !(co_await instantiate_record_use_async(next, owner ? owner : &context, program, diagnostics,
+                    state, mangling, location))) co_return false;
+            pending.push_back(next->pointee);
+            pending.push_back(next->element);
+            if (next->function) {
+                pending.push_back(next->function->result);
+                for (const auto& parameter : next->function->parameters) pending.push_back(parameter.type);
+            }
+        }
+        auto type = root;
+        while (type && (type->kind == Type::Kind::Array || type->kind == Type::Kind::Vector)) type = type->element;
+        if (type && type->kind == Type::Kind::Record && !type->nominal_arguments) contained.push_back(type->nominal_key());
+    }
+    for (const auto& member_key : contained)
+        if (!(co_await instantiate_member_records_async(member_key, program, diagnostics, state, mangling)))
+            co_return false;
+    co_return true;
 }
 
 EvaluationTask<bool> prepare_generic_layout_type_async(TypePtr type, EvaluationLayoutKind kind, Program& program,
@@ -2158,8 +2506,15 @@ EvaluationTask<void> rewrite_generic_function_async(FunctionDecl& function, Prog
     if (state.resource_failed(program)) co_return;
     if (!function.generic_parameters.empty() ||
         !state.rewritten_functions.insert(&function).second) co_return;
+    std::vector<NominalTypeKey> local_records;
+    for (const auto& record : program.records)
+        if (record.nominal_identity && record.nominal_identity->function_scope == function.function_scope &&
+            record.generic_parameters.empty()) local_records.push_back(record.nominal_key());
+    for (const auto& key : local_records)
+        if (!(co_await instantiate_member_records_async(key, program, diagnostics, state, mangling))) co_return;
     for (const auto& record : program.records) {
-        if (!record.nominal_identity || record.nominal_identity->function_scope != function.function_scope) continue;
+        if (!record.nominal_identity || record.nominal_identity->function_scope != function.function_scope ||
+            !record.generic_parameters.empty()) continue;
         if (const auto error = record_source_error(record, program, program.record_index, &state.record_proofs)) {
             diagnostics.error(error->location, error->message);
             co_return;
@@ -2258,6 +2613,23 @@ std::unique_ptr<FunctionDecl> instantiate(
         types.nominal = std::make_shared<NominalInstantiation>();
         types.nominal->owner = source.generic_tag_owner;
         types.nominal->serialization = std::move(instance_key);
+        // A global instance is one program-wide entity, so the types it owns
+        // need no source-unit identity in mangling input.
+        if (source.linkage == Linkage::Global) {
+            std::string spelling = source.name + '<';
+            const auto descriptors = generic_argument_descriptors(arguments);
+            for (std::size_t index = 0; index < descriptors.size(); ++index)
+                spelling += (index ? "," : "") + descriptors[index].spelling;
+            types.nominal->spellings = owned_type_spellings(program.records, program.enumerations,
+                source.generic_tag_owner, spelling + '>');
+        }
+        for (const auto& record : program.records)
+            if (record.generic_tag_owner && record.nominal_identity &&
+                record.nominal_identity->generic_owner == source.generic_tag_owner) {
+                types.nominal->nested_owners.emplace(record.generic_tag_owner.get(),
+                    std::make_shared<const GenericTagOwner>());
+                keep_type_parameters(types, record);
+            }
     }
     ValueSubstitutions values;
     for (std::size_t index = 0; index < arguments.size(); ++index) {
@@ -2404,8 +2776,9 @@ std::unique_ptr<FunctionDecl> instantiate(
         std::vector<RecordDecl> records;
         std::vector<EnumDecl> enumerations;
         for (const auto& record : program.records)
-            if (record.nominal_identity &&
-                record.nominal_identity->generic_owner == source.generic_tag_owner)
+            if (record.nominal_identity && record.nominal_identity->generic_owner &&
+                (record.nominal_identity->generic_owner == source.generic_tag_owner ||
+                 types.nominal->nested_owners.contains(record.nominal_identity->generic_owner.get())))
                 records.push_back(instantiate_record(record, types, values));
         for (const auto& enumeration : program.enumerations)
             if (enumeration.nominal_identity &&
@@ -2544,7 +2917,7 @@ EvaluationTask<void> rewrite_generic_expr_async(std::unique_ptr<Expr>& expressio
     } else if (!deduce_generic_arguments(*generic, *expression, caller, program,
                                   state, arguments,
                                   diagnostics, allow_deferred ? &context_dependent : nullptr)) co_return;
-    if (!(co_await normalize_generic_arguments_async(*generic, arguments,
+    if (!(co_await normalize_generic_arguments_async(generic->generic_parameters, generic->name, arguments,
                                      caller, program, diagnostics, expression->location,
                                      state, mangling, allow_deferred ? &context_dependent : nullptr))) co_return;
     if (context_dependent) {
@@ -2611,13 +2984,6 @@ EvaluationTask<void> rewrite_generic_expr_async(std::unique_ptr<Expr>& expressio
         if (!instance) co_return;
         instance->invocation_specialization = state.invocation_owner != nullptr ||
             (caller && evaluation_only(*caller));
-        if (instance->linkage == Linkage::Global && !instance->attribute("link_name")) {
-            const auto link_name = generic_link_name(generic->name, *instance,
-                expression->generic_arguments, state, diagnostics, mangling);
-            if (!link_name) co_return;
-            instance->attributes.push_back(
-                {"link_name", {'"' + *link_name + '"'}, instance->location});
-        }
         state.instances.push_back({generic, std::move(keys), internal_name});
         auto* concrete = instance.get();
         program.functions.push_back(std::move(instance));
@@ -2644,6 +3010,15 @@ EvaluationTask<void> rewrite_generic_expr_async(std::unique_ptr<Expr>& expressio
         // can then be evaluated through the same visible definition table.
         if (concrete->body) {
             co_await rewrite_generic_function_async(*concrete, program, diagnostics, state, mangling);
+        }
+        // The mangling input spells the prepared signature, whose generic
+        // record uses name their instances.
+        if (concrete->linkage == Linkage::Global && !concrete->attribute("link_name")) {
+            const auto link_name = generic_link_name(generic->name, *concrete,
+                expression->generic_arguments, state, diagnostics, mangling);
+            if (!link_name) co_return;
+            concrete->attributes.push_back(
+                {"link_name", {'"' + *link_name + '"'}, concrete->location});
         }
     }
     if (!designator->instance_label.empty()) {
@@ -2683,7 +3058,8 @@ bool expand_generics(Program& program, Diagnostics& diagnostics,
     GenericExpansionState state;
     state.pointer_resolver = pointer_resolver;
     state.canonical_abi = canonical_abi;
-    if (!validate_generic_redeclarations(program, state, diagnostics))
+    if (!validate_generic_redeclarations(program, state, diagnostics) ||
+        !validate_generic_record_redeclarations(program, diagnostics))
         return false;
     if (!install_operator_bindings(program, diagnostics, state)) return false;
     auto previous_prepare = std::move(program.evaluation_prepare_type);
@@ -2767,7 +3143,8 @@ bool expand_generics(Program& program, Diagnostics& diagnostics,
                        }),
         program.functions.end());
     std::erase_if(program.records, [](const auto& record) {
-        return record.nominal_identity && record.nominal_identity->generic_owner;
+        return (record.nominal_identity && record.nominal_identity->generic_owner) ||
+            !record.generic_parameters.empty();
     });
     program.record_index = {};
     std::erase_if(program.enumerations, [](const auto& enumeration) {
@@ -13937,12 +14314,21 @@ private:
     // Array extents that a type keeps as required expressions are fixed, so
     // that equal types compare the same.
     EvaluationTask<bool> resolve_reflected_bounds_async(const TypePtr& type, SourceLocation location) {
-        std::vector<Type*> pending{type.get()};
+        std::vector<TypePtr> pending{type};
         std::unordered_set<const Type*> seen;
         while (!pending.empty()) {
-            auto* node = pending.back();
+            auto node = std::move(pending.back());
             pending.pop_back();
-            if (!node || !seen.insert(node).second) continue;
+            if (!node || !seen.insert(node.get()).second) continue;
+            // A generic record use selects its instance in this declaration view.
+            if (node->kind == Type::Kind::Record && node->nominal_arguments) {
+                const auto prepare = program_.evaluation_prepare_type;
+                if (!prepare || !(co_await prepare.async(node, EvaluationLayoutKind::Complete)) ||
+                    !node->nominal_arguments->normalized) {
+                    fail(location, "generic record arguments could not be resolved");
+                    co_return false;
+                }
+            }
             if (node->kind == Type::Kind::Array && !node->lanes && node->array_bound) {
                 const auto bound = co_await required_integer_async(*node->array_bound);
                 const auto lanes = bound ? fixed_array_bound_value({bound->integer, bound->type->builtin},
@@ -13953,11 +14339,11 @@ private:
                 }
                 node->lanes = *lanes;
             }
-            pending.push_back(node->pointee.get());
-            pending.push_back(node->element.get());
+            pending.push_back(node->pointee);
+            pending.push_back(node->element);
             if (node->function) {
-                pending.push_back(node->function->result.get());
-                for (const auto& parameter : node->function->parameters) pending.push_back(parameter.type.get());
+                pending.push_back(node->function->result);
+                for (const auto& parameter : node->function->parameters) pending.push_back(parameter.type);
             }
         }
         co_return true;
@@ -15377,9 +15763,12 @@ public:
             if (record.nominal_identity && record.nominal_identity->generic_owner) continue;
             caller_ = nullptr;
             current_namespace_ = namespace_prefix(record.name);
+            scopes_.emplace_back();
+            for (const auto& parameter : record.generic_parameters) scopes_.back().insert(name_key(parameter));
             for (auto& member : record.members) {
                 rewrite(member.bit_width);
             }
+            scopes_.pop_back();
         }
         for (auto& assertion : program_.static_assertions) {
             caller_ = assertion_lexical_function(program_, assertion);
@@ -16049,20 +16438,21 @@ EvaluationTask<bool> normalize_generic_label_async(std::unique_ptr<Expr>& value,
     co_return true;
 }
 
-EvaluationTask<bool> normalize_generic_arguments_async(const FunctionDecl& generic,
+EvaluationTask<bool> normalize_generic_arguments_async(std::span<const GenericParameter> parameters,
+                                 std::string_view name,
                                  std::vector<Expr::GenericArgument>& arguments,
                                  const FunctionDecl* caller, Program& program,
                                  Diagnostics& diagnostics, SourceLocation location,
                                  GenericExpansionState& state, std::string_view mangling,
                                  bool* context_dependent) {
-    if (arguments.size() != generic.generic_parameters.size()) {
-        diagnostics.error(location, "generic argument count does not match '" + generic.name + "'");
+    if (arguments.size() != parameters.size()) {
+        diagnostics.error(location, "generic argument count does not match '" + std::string(name) + "'");
         co_return false;
     }
     TypeSubstitutions types;
     ValueSubstitutions values;
     for (std::size_t index = 0; index < arguments.size(); ++index) {
-        const auto& parameter = generic.generic_parameters[index];
+        const auto& parameter = parameters[index];
         auto& argument = arguments[index];
         if (!parameter.value_type) {
             if (argument.type) {
@@ -17448,6 +17838,10 @@ RecordDecl copy_evaluation_declaration(const RecordDecl& source) {
     result.is_union = source.is_union;
     result.complete = source.complete;
     result.nominal_identity = source.nominal_identity;
+    result.generic_parameters = source.generic_parameters;
+    for (auto& parameter : result.generic_parameters) parameter.value_type = clone_type(parameter.value_type);
+    result.generic_tag_owner = source.generic_tag_owner;
+    result.nominal_arguments = source.nominal_arguments;
     result.attributes = clone_attributes(source.attributes, {}, {});
     for (const auto& member : source.members)
         result.members.push_back({member.location, member.name, clone_type(member.type),

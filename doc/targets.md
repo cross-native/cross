@@ -491,8 +491,6 @@ and `clo` are SPECIAL functions 0x16 and 0x17, not the MIPS32 encodings.
   through which an `out` or `inout` parameter is copied back, typedef names,
   lexical scopes, thread-local objects, and big-endian bit-fields are not
   described, and naked functions have no call-frame information.
-- Generic records and unions (`struct list<T>`) are specified but not
-  implemented; `$::feature::generic_types` is absent.
 - A function is wrapped for another ABI or other register locations only
   when it is named directly; an explicit cast of a function-pointer value
   reinterprets it without a wrapper; see
