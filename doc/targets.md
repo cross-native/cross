@@ -360,13 +360,15 @@ global void timer_vector() {
 ```
 
 Any general or floating register can hold a bound object, including `k0`,
-`k1`, `sp`, and `ra`, and `gp` unless a `data_base` entry uses it. Temporaries use the registers of the `clobber` list,
+`k1`, `sp`, and `ra`, and `gp` unless a `data_base` entry uses it.
+Temporaries use the registers of the `clobber` list other than `zero` and `at`,
 and a bound register that the function writes anyway while its object's value
 is not needed. A naked function has
 no frame: a value that needs another register, stack storage, a call, a
 `return`, or an instruction that writes a register outside its clobbers,
-interface, and bound registers (such as `hi` and `lo` for a multiply) is an
-error. `[[raw_inline]]` functions are inlined into it. Other functions cannot
+interface, and bound registers (such as `hi` and `lo` for a multiply, which
+`clobber("hi", "lo")` permits) is an error. No `clobber` list can name `gp`,
+`sp`, or `fp`, which hold compiler state across calls. `[[raw_inline]]` functions are inlined into it. Other functions cannot
 call a naked function that has parameters or a result.
 
 A variadic definition reads its unnamed arguments through the states of its

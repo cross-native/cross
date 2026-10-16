@@ -26,7 +26,8 @@ std::vector<RegisterEntry> target_registers() {
     std::vector<RegisterEntry> result;
     // Instruction operands and naked hard bindings carry sign-canonical
     // words and, from MIPS III, doublewords in any GPR. Managed code binds
-    // only allocatable registers; k0/k1 belong to exception handlers.
+    // only allocatable registers; k0/k1 belong to exception handlers. gp,
+    // sp, and fp hold compiler state across calls, so no clobber names them.
     const auto gpr = [&](std::string_view name, std::string_view storage,
                          bool compiler_owned = false, bool managed = true) {
         result.push_back({
@@ -38,8 +39,8 @@ std::vector<RegisterEntry> target_registers() {
             compiler_owned, {{32, false}, {64, false}}, false,
             storage != "r0"});
     };
-    gpr("zero", "r0", true);
-    gpr("at", "r1", true);
+    gpr("zero", "r0", false, false);
+    gpr("at", "r1", false, false);
     gpr("v0", "r2"); gpr("v1", "r3");
     gpr("a0", "r4"); gpr("a1", "r5");
     gpr("a2", "r6"); gpr("a3", "r7");
@@ -54,7 +55,7 @@ std::vector<RegisterEntry> target_registers() {
     gpr("t8", "r24"); gpr("t9", "r25");
     gpr("k0", "r26", false, false); gpr("k1", "r27", false, false);
     gpr("gp", "r28", true); gpr("sp", "r29", true);
-    gpr("fp", "r30", true); gpr("ra", "r31", true);
+    gpr("fp", "r30", true); gpr("ra", "r31", false, false);
 
     for (unsigned index = 0; index < 32; ++index) {
         static constexpr std::array<std::string_view, 32> names{
@@ -76,10 +77,8 @@ std::vector<RegisterEntry> target_registers() {
                           "hard-float", false, std::move(modes), false,
                           std::move(instruction_modes)});
     }
-    result.push_back({"hi", "hi", 64, "special", "mips1", false,
-                      {}, true});
-    result.push_back({"lo", "lo", 64, "special", "mips1", false,
-                      {}, true});
+    result.push_back({"hi", "hi", 64, "special", "mips1", false, {}});
+    result.push_back({"lo", "lo", 64, "special", "mips1", false, {}});
     return result;
 }
 

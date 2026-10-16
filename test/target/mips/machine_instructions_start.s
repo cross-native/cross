@@ -61,6 +61,12 @@ _start:
         nop
         jal print_digit
         addiu $a0,$v0,-8
+        # 6 * 7 through MULT and MFLO.
+        addiu $a0,$zero,6
+        jal naked_product
+        addiu $a1,$zero,7
+        jal print_digit
+        addiu $a0,$v0,-41
         # min(9, 5) and min(3, 5) through a branching raw_inline callee.
         addiu $a0,$zero,9
         jal naked_clamp

@@ -65,6 +65,14 @@ global u32 naked_leaf(in u32 base "a0") -> "v0" {
     $::_jr(link);
 }
 
+// Clobbers of registers that calls never preserve add nothing to a caller.
+global void reset_unit() [[clobber("at", "ra", "hi", "lo", "zero")]];
+
+global u32 after_reset(in u32 value) {
+    reset_unit();
+    return value * 3u32;
+}
+
 // Only k0/k1 are free in an exception vector.
 global void exception_handler();
 

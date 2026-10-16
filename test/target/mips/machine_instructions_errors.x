@@ -57,4 +57,6 @@ global f64 double_root(in f64 value) {
     $::_sqrt(result, value);
     return result;
 }
+#elif MACHINE_ERROR == 11
+global void reset_base() [[clobber("gp")]];
 #endif

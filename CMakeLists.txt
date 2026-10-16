@@ -1726,7 +1726,7 @@ if(BUILD_TESTING)
             -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/machine_instructions.x
             -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/machine_instructions_start.s
             -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-machine-instructions-${level}
-            -DMIPS_CPUS=vr4300 -DEXPECTED=1111111111111 "-DCC_FLAGS=-${level}"
+            -DMIPS_CPUS=vr4300 -DEXPECTED=11111111111111 "-DCC_FLAGS=-${level}"
             -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
         set_tests_properties(${name} PROPERTIES
             LABELS "check.runtime;arch.mips;backend.native;feature.raw;isa.vr4300;endian.big;endian.little;opt.${level}"

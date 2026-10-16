@@ -93,6 +93,10 @@ endif()
 # A naked leaf computes into v0 and returns through ra.
 body("${text}" naked_leaf code)
 expect(naked_leaf "${code}" "\taddiu\t[$]v0,[$]a0,42\n\tjr\t[$]ra\n\tnop$")
+body("${text}" after_reset code)
+if(code MATCHES "[$]zero,[0-9]+[(][$]sp[)]|[$]at,[0-9]+[(][$]sp[)]")
+    message(FATAL_ERROR "after_reset preserves a register calls never preserve\n${code}")
+endif()
 
 # Release 2 clears the Status hazard with one EHB.
 compile("${OUTPUT}-mips32r2.s" -march=mips32r2 -O2)
@@ -145,7 +149,8 @@ set(error_cases
     "vr4300|ordinary automatic and stack objects are not permitted in a naked function"
     "vr4300|a naked function value needs a register. declare more registers in its clobber contract"
     "vr4300|naked function writes '[$]hi' in 'mult [$]a0,[$]a1', outside its clobber contract"
-    "allegrex|target instruction '[$]::_sqrt' is unavailable with feature 'single-float'")
+    "allegrex|target instruction '[$]::_sqrt' is unavailable with feature 'single-float'"
+    "vr4300|clobber cannot name compiler-owned register 'gp'")
 set(index 0)
 foreach(case IN LISTS error_cases)
     string(FIND "${case}" "|" split)

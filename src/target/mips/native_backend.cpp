@@ -1574,12 +1574,14 @@ private:
                 }
             }
             if (has_result(value)) result.defs.push_back(reg(value.id));
-            // A data base's register holds its base across every call.
+            // A data base's register holds its base across every call, and
+            // writes to $zero are discarded.
             const auto append_clobbers =
                 [&](const std::vector<std::string>& names) {
                     for (const auto& name : names) {
                         const auto physical = physical_register_id(name);
-                        if (!physical || data_base_register(*physical) ||
+                        if (!physical || physical->value == 0 ||
+                            data_base_register(*physical) ||
                             std::any_of(
                                 result.clobbers.begin(),
                                 result.clobbers.end(),
@@ -2957,12 +2959,13 @@ private:
             coalesce_hard_registers(function, live_in, live_out, interference,
                                     eligible);
             // A naked body colors temporaries only with the registers its
-            // clobber contract declares and no hard-bound object owns.
+            // clobber contract declares and no hard-bound object owns;
+            // expansions keep $at.
             integer_colors.clear();
             floating_colors.clear();
             for (const auto& name : entity.clobbers) {
                 const auto physical = physical_register_id(name);
-                if (!physical || physical->value == 0 ||
+                if (!physical || physical->value <= 1 ||
                     std::any_of(hard_slots_.begin(), hard_slots_.end(),
                                 [&](const auto& hard) {
                                     return hard.second == *physical;

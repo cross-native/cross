@@ -126,6 +126,15 @@ static u32 smaller(in u32 value, in u32 limit) {
     return value;
 }
 
+// A multiply writes hi and lo, which the clobber contract declares.
+[[naked, clobber("hi", "lo")]]
+global u32 naked_product(in u32 left "a0", in u32 right "a1") -> "v0" {
+    register u32 result "v0";
+    register void *link "ra";
+    result = left * right;
+    $::_jr(link);
+}
+
 // An inlined body with a branch and two returns.
 [[naked, clobber("t0", "t1", "t2")]]
 global u32 naked_clamp(in u32 value "a0", in u32 limit "a1") -> "v0" {

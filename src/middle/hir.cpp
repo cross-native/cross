@@ -2081,8 +2081,8 @@ private:
                             } else if (entry && entry->compiler_owned) {
                                 diagnostics_.error(
                                     attribute.location,
-                                    "stack/frame pointer cannot be a raw-inline "
-                                    "scratch clobber");
+                                    "clobber cannot name compiler-owned "
+                                    "register '" + *value + "'");
                             }
                         }
                     }
