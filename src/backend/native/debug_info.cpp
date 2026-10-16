@@ -996,6 +996,11 @@ std::string DebugInfo::finish(std::string assembly) {
             add_type(die, object.type);
             if (object.linkage == Linkage::Global)
                 die.attributes.push_back({dw::at_external, dw::form_flag_present, {}});
+            // A discarded object has no storage: its value is optimized out.
+            if (object.discarded) {
+                scopes.add(path, std::move(die));
+                continue;
+            }
             const auto address = object.fixed_address
                 ? std::to_string(*object.fixed_address)
                 : assembly_symbol(format_, object.link_symbol);

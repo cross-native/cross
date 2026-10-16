@@ -219,6 +219,7 @@ struct CompilerOptions {
     bool inline_functions{};
     bool ipa_ra{};
     bool ipa_pure_const{};
+    bool ipa_reference_addressable{};
     bool private_abi{};
     bool ipa_cp_clone{};
     unsigned inline_unit_limit{96};

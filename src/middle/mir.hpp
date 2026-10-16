@@ -390,6 +390,21 @@ void discard_unreferenced_functions(ManagedModule& module,
                                     hir::Module& hir_module,
                                     const data::Module& data_module);
 
+struct RawModule;
+
+// Once no later pass adds a reference, removes the internal objects that no
+// emitted code reads, with their stores, from Data IR, and marks them
+// discarded in HIR. An object stays when it is `global`, weak, `used`,
+// `retain`, volatile, `noinit`, in a section, an alias, a weak reference, or
+// the target of one, a patch sink, named by a patch or by the initializer of
+// an object that stays, or when code uses its address other than as the
+// address of its own stores. Returns whether it removed any.
+bool discard_write_only_objects(ManagedModule& module,
+                                hir::Module& hir_module,
+                                data::Module& data_module,
+                                const RawModule& raw_module,
+                                const CompilerOptions& options);
+
 // Diagnoses a patch identity that more than one function of the final module
 // contains. Required inlining copies the sinkless patch of an always_inline
 // or raw_inline callee, which must leave exactly one emitted identity.

@@ -67,6 +67,7 @@ int main() {
                     !o0->tree_tail_merge &&
                     !o0->inline_functions && !o0->ipa_ra &&
                     !o0->ipa_pure_const &&
+                    !o0->ipa_reference_addressable &&
                     !o0->private_abi && !o0->ipa_cp_clone &&
                     !o0->omit_frame_pointer &&
                     !o0->fast_math && !o0->finite_math_only &&
@@ -97,6 +98,7 @@ int main() {
                     o2->div_by_constant &&
                     o2->tree_loop_rotate && o2->ipa_ra &&
                     o2->ipa_pure_const &&
+                    o2->ipa_reference_addressable &&
                     o2->private_abi && !o2->ipa_cp_clone &&
                     o2->inline_unit_limit == 96 &&
                     o2->ccp_rounds == 2 &&
@@ -111,9 +113,9 @@ int main() {
     const auto o3_override = parse(
         {"cc", "-fno-inline", "-fno-tree-dce", "-O3",
          "-fno-tree-dse", "-fno-tree-tail-merge", "-fno-ipa-ra",
-         "-fno-ipa-pure-const", "-fno-tree-reassoc",
-         "-fno-tree-slsr", "-fno-tree-loop-rotate", "-fno-div-by-constant",
-         "-fno-expensive-optimizations"});
+         "-fno-ipa-pure-const", "-fno-ipa-reference-addressable",
+         "-fno-tree-reassoc", "-fno-tree-slsr", "-fno-tree-loop-rotate",
+         "-fno-div-by-constant", "-fno-expensive-optimizations"});
     ok = expect(o3_override && o3_override->tree_ccp &&
                     o3_override->tree_bit_ccp &&
                     !o3_override->tree_dce &&
@@ -122,6 +124,7 @@ int main() {
                     !o3_override->inline_functions &&
                     !o3_override->ipa_ra &&
                     !o3_override->ipa_pure_const &&
+                    !o3_override->ipa_reference_addressable &&
                     !o3_override->tree_reassoc &&
                     !o3_override->tree_slsr &&
                     !o3_override->div_by_constant &&

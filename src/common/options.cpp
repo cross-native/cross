@@ -397,7 +397,8 @@ std::span<const OptionDefinition> common_option_definitions() {
         {"f.move-loop-invariants", {}, OptionValueKind::Boolean, false, {},
          0, 0, OptionCategory::Optimization, true,
          OptionImplementation::Implemented,
-         "hoist proven nontrapping loop-invariant values"},
+         "hoist proven nontrapping loop-invariant values and sink stores to "
+         "fixed locations to loop exits"},
         {"f.unroll-loops", {}, OptionValueKind::Boolean, false, {}, 0, 0,
          OptionCategory::Optimization, true, OptionImplementation::Partial,
          "unroll target-independent loops when legality and profitability are proven"},
@@ -521,6 +522,11 @@ std::span<const OptionDefinition> common_option_definitions() {
         {"f.ipa-pure-const", {}, OptionValueKind::Boolean, false, {}, 0, 0,
          OptionCategory::Optimization, true, OptionImplementation::Partial,
          "managed-function purity and removability inference"},
+        {"f.ipa-reference-addressable", {}, OptionValueKind::Boolean, false,
+         {}, 0, 0, OptionCategory::Optimization, true,
+         OptionImplementation::Implemented,
+         "remove internal objects that no emitted code reads, with their "
+         "stores"},
         {"f.private-abi", {}, OptionValueKind::Boolean, false, {}, 0, 0,
          OptionCategory::Optimization, true, OptionImplementation::Implemented,
          "private parameter and result placement"},
@@ -896,6 +902,8 @@ bool resolve_registered_options(
     options.ipa_ra = resolved_bool(options, "f.ipa-ra");
     options.ipa_pure_const =
         resolved_bool(options, "f.ipa-pure-const");
+    options.ipa_reference_addressable =
+        resolved_bool(options, "f.ipa-reference-addressable");
     options.private_abi = resolved_bool(options, "f.private-abi");
     options.ipa_cp_clone = resolved_bool(options, "f.ipa-cp-clone");
     options.evaluate_calls = resolved_bool(options, "f.eval-calls", true);

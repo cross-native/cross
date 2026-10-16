@@ -17,7 +17,7 @@ set(api "i32 bee_helper(in i32 x);\n#define TWICE(x) ((x) + (x))\n")
 string(CONCAT macro_definition
     "[[macro]] static $::meta::tokens hidden_cell(in $::meta::tokens input) {\n"
     "    $::meta::tokens name = $::meta::gensym(\"cell\");\n"
-    "    return $::quote { static u32 $::unquote(name) = 5u32; };\n"
+    "    return $::quote { [[used]] static u32 $::unquote(name) = 5u32; };\n"
     "}\n")
 string(CONCAT unit_a
     "#include \"api.h\"\n"

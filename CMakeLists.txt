@@ -2737,6 +2737,15 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/middle/unreferenced_functions.cmake")
     set_tests_properties(cross_unreferenced_functions PROPERTIES
         LABELS "check.compile;arch.x86_64;arch.mips;middle;backend.native;backend.llvm;feature.optimization;opt.O0;opt.O2")
+    add_test(NAME cross_write_only_objects
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/write_only_objects.x
+                -DLLVM_TEXT=${CROSS_ENABLE_LLVM_TEXT}
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/write-only-objects
+                -P "${CMAKE_SOURCE_DIR}/test/middle/write_only_objects.cmake")
+    set_tests_properties(cross_write_only_objects PROPERTIES
+        LABELS "check.compile;arch.x86_64;arch.mips;middle;backend.native;backend.llvm;feature.optimization;feature.object;feature.debug;isa.vr4300;opt.O0;opt.O2;opt.O3;opt.Os")
     if(CROSS_ENABLE_GCC_GIMPLE_TEXT AND CROSS_TEST_GCC)
         add_test(NAME cross_gcc_gimple_unreferenced_functions
             COMMAND "${CMAKE_COMMAND}"
@@ -3009,6 +3018,53 @@ if(BUILD_TESTING)
                 SKIP_REGULAR_EXPRESSION "skipping MIPS")
         endforeach()
     endforeach()
+    # Stores to fixed locations that leave loops for the loop exits.
+    foreach(motion_mode O0 O1 O2 O3 Os O2-no-move-loop-invariants O2-no-tree-loop-rotate)
+        string(REGEX MATCH "^O[0-9s]" motion_level "${motion_mode}")
+        if(motion_mode MATCHES "^O[0-9s]-no-(.*)$")
+            set(motion_flags "-${motion_level};-fno-${CMAKE_MATCH_1}")
+        else()
+            set(motion_flags "-${motion_mode}")
+        endif()
+        add_test(NAME cross_runtime_store_motion_${motion_mode}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/store_motion.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-store-motion-${motion_mode}
+                -DENTRY=test_entry -DEXPECTED=0 "-DCC_FLAGS=${motion_flags};-fno-eval-calls"
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_store_motion_${motion_mode} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;middle;feature.optimization;feature.object;opt.${motion_level}")
+    endforeach()
+    foreach(motion_mode O2 O3 Os O2-no-move-loop-invariants)
+        string(REGEX MATCH "^O[0-9s]" motion_level "${motion_mode}")
+        if(motion_mode MATCHES "^O[0-9s]-no-(.*)$")
+            set(motion_flags "-${motion_level};-fno-${CMAKE_MATCH_1}")
+        else()
+            set(motion_flags "-${motion_mode}")
+        endif()
+        add_test(NAME cross_runtime_store_motion_mips_${motion_mode}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/store_motion.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-store-motion-mips-${motion_mode}
+                -DEXPECTED=P "-DCC_FLAGS=${motion_flags};-fno-eval-calls"
+                -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(cross_runtime_store_motion_mips_${motion_mode} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;middle;feature.optimization;feature.object;isa.vr4300;isa.r3000;endian.big;endian.little;opt.${motion_level}"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS")
+    endforeach()
+    add_test(NAME cross_store_motion_codegen
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/store_motion_codegen.x
+                -DMODEL=${CMAKE_SOURCE_DIR}/test/middle/floating_environment/environments.xm
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/store-motion-codegen
+                -P "${CMAKE_SOURCE_DIR}/test/middle/store_motion_codegen.cmake")
+    set_tests_properties(cross_store_motion_codegen PROPERTIES
+        LABELS "check.compile;arch.x86_64;arch.mips;middle;backend.native;feature.optimization;feature.object;feature.floating;feature.model;isa.vr4300;opt.O2;opt.O3;opt.Os")
     # Loop bounds computed inside a vectorized reduction loop.
     foreach(level O0 O1 O2 O3 Os Oz)
         add_test(NAME cross_runtime_loop_invariant_bounds_${level}

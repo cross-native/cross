@@ -18922,6 +18922,12 @@ void prune_unreachable_blocks(ManagedFunction& function) {
     eliminate_unreachable_blocks(function);
 }
 
+void remove_dead_values(ManagedFunction& function,
+                        const hir::Module& hir_module,
+                        const floating::Environment& environment) {
+    eliminate_dead_values(function, hir_module, environment);
+}
+
 bool promote_native_induction_views(ManagedModule& module,
                                     hir::Module& hir_module,
                                     unsigned native_integer_bits) {
@@ -19447,6 +19453,19 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
                 }
                 return changed ? PassResult::changed_cfg()
                                : PassResult::unchanged();
+            });
+    }
+    // Rotation places the exits of guarded loops after their bodies, where
+    // stores to fixed locations can leave for the exit edges.
+    if (options.move_loop_invariants) {
+        pipeline.add(
+            PassId::LoopInvariantMotion,
+            [&](ManagedFunction& function, FunctionAnalysisManager&) {
+                return sink_loop_stores(function, hir_module,
+                                        subtarget.target(),
+                                        options.floating_environment)
+                    ? PassResult::changed_cfg()
+                    : PassResult::unchanged();
             });
     }
     if (options.fast_math || options.finite_math_only ||

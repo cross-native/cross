@@ -45,8 +45,8 @@ All inputs of one command form a single compilation group with one output, named
 after the first input when `-o` is absent. Definitions without `static` or
 `global` are shared within the group but not exported to the linker. Compile
 separately and link only `global` entities to combine objects. A function that
-is not `global` is emitted only when an emitted function or static data refers
-to it, when it has `[[used]]` or `[[retain]]`, or when an alias names it, so a
+is not `global` is emitted only when an emitted function or object refers to
+it, when it has `[[used]]` or `[[retain]]`, or when an alias names it, so a
 function inlined into every caller leaves no copy.
 
 The output depends only on the inputs, options, and models, not on the working
@@ -102,6 +102,7 @@ preset, profile, or command line), and whether it is `implemented` or only
 | `-funwind-tables` | Emit unwind tables (CFI or SEH). No unwinder is linked. |
 | `-fno-inline-functions` | Disable discretionary inlining; `[[always_inline]]` still applies. |
 | `-finline-limit=N` | Inline a call that `[[always_inline]]` does not require only when the callee has at most N operations, counting conditional branches (2N for an `inline` function), until the calls inlined into one function add up to 8N operations from `-O1` to `-O3`, 4N at `-Os`, and 2N otherwise, but at least 32. The presets set 32 at `-O1`, 96 at `-O2`, 256 at `-O3`, 24 at `-Os`, and 8 at `-Oz`. A function that allocates a variable-length array is inlined only when required, and a `[[naked]]` function inlines only `[[raw_inline]]` and `[[always_inline]]` functions. |
+| `-fno-ipa-reference-addressable` | Keep objects that no emitted code reads. From `-O1`, an object that is not `global`, `weak`, `used`, `retain`, `noinit`, volatile, in a section, an alias, a weak reference, or the target of one, and that no `$::patch` and no initializer of an emitted object names, is not emitted when code uses its address only to store to it, and those stores are removed. Debugging information still describes the object, without a location. |
 | `-fno-ipa-cp-clone` | Do not specialize functions for constant arguments. From `-O3` on x86-64, calls with constant arguments to a function that is not `global` may use a copy of it specialized for those constants: at most four copies per function, each named `NAME.const.I_V` after the function's link name `NAME`, with the index `I` and hexadecimal value `V` of each constant argument, and placed right after the function. |
 | `-fpeel-loops`, `-fpeel-limit=N` | Replace a loop whose trip count is known at compile time with one copy of its body per iteration when the copies have at most N operations, so that each copy computes with constant induction values; like GCC's `-fpeel-loops` with `--param max-completely-peeled-insns=N`. A loop qualifies when it has one exit, tested on every iteration, and integer arithmetic on its induction variables decides the trip count. The presets enable it at `-O2` with N = 96 and at `-O3` with N = 192. |
 | `-fno-shrink-wrap` | Set up the stack frame and save preserved registers at function entry, not only on the paths that need them (the default from `-O1`). |

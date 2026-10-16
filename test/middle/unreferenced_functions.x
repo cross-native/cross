@@ -31,10 +31,10 @@ static u32 called_only_by_unused(in u32 value) { return value ^ 0x55u32; }
 
 #if !defined(GIMPLE)
 [[noinline]] static u32 kept_in_table(in u32 value) { return value + 11u32; }
-static const unreferenced_step unreferenced_table[1] = { kept_in_table };
+global const unreferenced_step unreferenced_table[1] = { kept_in_table };
 
 static void kept_label_owner() { mark: ; }
-label unreferenced_label = kept_label_owner::mark;
+global label unreferenced_label = kept_label_owner::mark;
 #endif
 
 global unreferenced_step unreferenced_pointer;

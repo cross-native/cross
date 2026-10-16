@@ -1249,6 +1249,14 @@ int cc_main(int argc, char** argv) {
         return 1;
     }
     mir::discard_unreferenced_functions(managed_mir, hir_module, data_module);
+    // A discarded initializer may have named the only references to
+    // functions, and a discarded function to objects.
+    while (options.ipa_reference_addressable &&
+           mir::discard_write_only_objects(managed_mir, hir_module,
+                                           data_module, raw_mir, options)) {
+        mir::discard_unreferenced_functions(managed_mir, hir_module,
+                                            data_module);
+    }
     if (!mir::check_patch_owners(managed_mir, hir_module, diagnostics)) return 1;
     if (options.verbose) std::cerr << "cc: emitting raw machine assembly\n";
     native::DebugInfo debug(options, hir_module, managed_mir,

@@ -261,6 +261,9 @@ struct Object {
     // The selected data_base entry (an index in CompilerOptions::data_bases)
     // through whose base register code reaches the object.
     std::optional<std::uint32_t> data_base;
+    // Removed after optimization: no emitted code reads it and nothing
+    // else names it, so it has no storage.
+    bool discarded{};
     std::vector<const ObjectDecl*> declarations;
     const ObjectDecl* definition{};
 };

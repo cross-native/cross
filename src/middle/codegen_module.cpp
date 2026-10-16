@@ -192,8 +192,11 @@ bool verify(const ModuleView& module, Diagnostics& diagnostics) {
         }
     }
     for (const auto& entity : module.hir().objects) {
-        if (!data_ids.contains(entity.id.value)) {
-            diagnostics.error(entity.location, "HIR object has no data IR entry");
+        if (data_ids.contains(entity.id.value) == entity.discarded) {
+            diagnostics.error(entity.location,
+                              entity.discarded
+                                  ? "discarded HIR object has a data IR entry"
+                                  : "HIR object has no data IR entry");
             valid = false;
         }
     }

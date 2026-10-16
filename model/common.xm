@@ -58,6 +58,7 @@ optimization "O0" {
     f.align-loops = false;
     f.ipa-ra = false;
     f.ipa-pure-const = false;
+    f.ipa-reference-addressable = false;
     f.private-abi = false;
     f.ipa-cp-clone = false;
 }
@@ -89,6 +90,7 @@ optimization "O1" {
     f.shrink-wrap = true;
     f.align-loops = true;
     f.move-loop-invariants = true;
+    f.ipa-reference-addressable = true;
     f.tree-cfg-cleanup = true;
     f.machine-combine = true;
     f.machine-dce = true;

@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "middle/mir_transform.hpp"
+#include "middle/raw_mir.hpp"
 
 #include <algorithm>
 #include <limits>
 #include <optional>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -290,6 +292,164 @@ struct View {
     SourceLocation location;
 };
 
+// A memory operation of a loop and the bytes it accesses.
+struct LoopAccess {
+    ValueId value;
+    BlockId block;
+    std::size_t position{};
+    Access access;
+};
+
+// Moves out of `loop` each ordinary store to a slot or object at a constant
+// offset that runs before every exit of the loop and whose bytes no other
+// memory operation of the loop may access. Copies of those stores run on each
+// exit edge instead, in a block of their own: every path that leaves the loop
+// stored before, and the value of the last store remains.
+bool sink_stores(ManagedFunction& function, const hir::Module& hir_module,
+                 const floating::Environment& environment,
+                 const NaturalLoop& loop, const DominatorTree& dominators,
+                 const AccessAnalysis& analysis,
+                 const std::vector<bool>& labeled) {
+    std::vector<std::uint32_t> members(loop.blocks.begin(), loop.blocks.end());
+    std::sort(members.begin(), members.end());
+    std::vector<std::pair<BlockId, BlockId>> exits;
+    for (const auto member : members) {
+        // A labeled block may be entered other than through the header.
+        if (labeled[member] ||
+            !dominators.dominates(loop.header, BlockId{member})) {
+            return false;
+        }
+        const auto& terminator = function.blocks[member].terminator;
+        for (const auto successor : terminator.successors) {
+            if (loop.blocks.contains(successor.value)) continue;
+            if (terminator.kind == TerminatorKind::IndirectBranch) return false;
+            exits.push_back({BlockId{member}, successor});
+        }
+    }
+    if (exits.empty()) return false;
+
+    std::vector<LoopAccess> accesses;
+    std::vector<std::uint32_t> lifetimes;
+    for (const auto member : members) {
+        const auto& block = function.blocks[member];
+        for (std::size_t position = 0; position < block.values.size();
+             ++position) {
+            const auto id = block.values[position];
+            const auto& value = function.values[id.value];
+            // A trap must observe the stores of earlier passes.
+            if (value.kind == ValueKind::PatchValue ||
+                may_trap_floating(value, function, hir_module, environment)) {
+                return false;
+            }
+            if (!value.effect_input && !value.effect_output) continue;
+            if ((value.kind == ValueKind::LifetimeStart ||
+                 value.kind == ValueKind::LifetimeEnd) && value.slot) {
+                lifetimes.push_back(value.slot->value);
+                continue;
+            }
+            // Calls, atomics, volatile accesses, machine instructions, traps,
+            // and dynamic-stack operations may access any memory or end the
+            // program inside the loop.
+            const auto access = load_kind(value.kind) || store_kind(value.kind)
+                                    ? analysis.access(value)
+                                    : std::nullopt;
+            if (!access) return false;
+            accesses.push_back({id, block.id, position, *access});
+        }
+    }
+
+    std::vector<LoopAccess> sunk;
+    for (const auto& store : accesses) {
+        const auto& address = store.access.address;
+        if (!store_kind(function.values[store.value.value].kind) ||
+            address.base == Address::Base::Value || address.index ||
+            (address.base == Address::Base::Slot &&
+             std::find(lifetimes.begin(), lifetimes.end(), address.id) !=
+                 lifetimes.end()) ||
+            std::any_of(accesses.begin(), accesses.end(),
+                        [&](const LoopAccess& other) {
+                            return other.value != store.value &&
+                                   analysis.may_alias(other.access,
+                                                      store.access);
+                        }) ||
+            !std::all_of(exits.begin(), exits.end(), [&](const auto& exit) {
+                return dominators.dominates(store.block, exit.first);
+            })) {
+            continue;
+        }
+        sunk.push_back(store);
+    }
+    if (sunk.empty()) return false;
+    // Each sunk store dominates the exits, so they lie on one dominator chain
+    // and the copies keep their order.
+    std::sort(sunk.begin(), sunk.end(),
+              [&](const LoopAccess& left, const LoopAccess& right) {
+                  return left.block == right.block
+                             ? left.position < right.position
+                             : dominators.dominates(left.block, right.block);
+              });
+
+    std::unordered_set<std::uint32_t> removed;
+    for (const auto& store : sunk) removed.insert(store.value.value);
+    for (const auto& [from, to] : exits) {
+        ManagedBlock block;
+        block.id = BlockId{static_cast<std::uint32_t>(function.blocks.size())};
+        block.location = function.blocks[to.value].location;
+        block.predecessors = {from};
+        ManagedEffect entry;
+        entry.id =
+            EffectId{static_cast<std::uint32_t>(function.effects.size())};
+        entry.location = block.location;
+        entry.kind = EffectKind::Phi;
+        entry.incoming = {
+            {from, function.blocks[from.value].terminator.effect}};
+        block.effect = entry.id;
+        function.effects.push_back(std::move(entry));
+        auto effect = block.effect;
+        for (const auto& store : sunk) {
+            auto copy = function.values[store.value.value];
+            copy.id =
+                ValueId{static_cast<std::uint32_t>(function.values.size())};
+            ManagedEffect output;
+            output.id =
+                EffectId{static_cast<std::uint32_t>(function.effects.size())};
+            output.location = copy.location;
+            output.kind = EffectKind::Operation;
+            output.input = effect;
+            output.operation = copy.id;
+            copy.effect_input = effect;
+            copy.effect_output = output.id;
+            effect = output.id;
+            block.values.push_back(copy.id);
+            function.values.push_back(std::move(copy));
+            function.effects.push_back(std::move(output));
+        }
+        block.terminator.kind = TerminatorKind::Branch;
+        block.terminator.location = block.location;
+        block.terminator.successors = {to};
+        block.terminator.effect = effect;
+
+        auto& successors = function.blocks[from.value].terminator.successors;
+        std::replace(successors.begin(), successors.end(), to, block.id);
+        auto& target = function.blocks[to.value];
+        std::replace(target.predecessors.begin(), target.predecessors.end(),
+                     from, block.id);
+        for (const auto id : target.values) {
+            for (auto& incoming : function.values[id.value].incoming) {
+                if (incoming.predecessor == from) {
+                    incoming.predecessor = block.id;
+                }
+            }
+        }
+        for (auto& incoming : function.effects[target.effect.value].incoming) {
+            if (incoming.predecessor == from) incoming = {block.id, effect};
+        }
+        function.blocks.push_back(std::move(block));
+    }
+    remove_effectful_values(function, removed);
+    return true;
+}
+
 } // namespace
 
 bool forward_memory_values(ManagedFunction& function,
@@ -507,6 +667,35 @@ bool forward_memory_values(ManagedFunction& function,
     return true;
 }
 
+bool sink_loop_stores(ManagedFunction& function, const hir::Module& hir_module,
+                      const TargetInfo& target,
+                      const floating::Environment& environment) {
+    std::vector<bool> labeled(function.blocks.size());
+    for (const auto& label : function.labels) labeled[label.block.value] = true;
+    // Each sinking adds blocks, so the analyses are rebuilt before the next
+    // loop, innermost first. A store only ever moves outward; the bound is a
+    // safeguard.
+    bool changed = false;
+    for (std::size_t round = 0, rounds = function.blocks.size(); round < rounds;
+         ++round) {
+        const DominatorTree dominators(function);
+        const LoopForest forest(function, dominators);
+        const AccessAnalysis analysis(function, hir_module, target);
+        labeled.resize(function.blocks.size());
+        bool sunk = false;
+        for (const auto& loop : forest.loops()) {
+            if (sink_stores(function, hir_module, environment, loop,
+                            dominators, analysis, labeled)) {
+                sunk = true;
+                break;
+            }
+        }
+        if (!sunk) break;
+        changed = true;
+    }
+    return changed;
+}
+
 ConstantObjects::ConstantObjects(const hir::Module& hir_module,
                                  const data::Module& data_module,
                                  const CompilerOptions& options)
@@ -659,6 +848,177 @@ bool fold_constant_object_reads(ManagedFunction& function,
     if (removed.empty()) return false;
     replacements.apply(function);
     remove_effectful_values(function, removed);
+    return true;
+}
+
+namespace {
+
+// Whether some bytes of an object of this type are volatile.
+bool volatile_storage(const hir::Module& module, hir::TypeId id) {
+    const auto& type = module.type(id);
+    if (type.is_volatile) return true;
+    if (type.kind == hir::Type::Kind::Array && type.element) {
+        return volatile_storage(module, *type.element);
+    }
+    if (type.kind == hir::Type::Kind::Record && type.record) {
+        const auto& members = module.record(*type.record).members;
+        return std::any_of(members.begin(), members.end(),
+                           [&](const hir::RecordMember& member) {
+                               return volatile_storage(module, member.type);
+                           });
+    }
+    return false;
+}
+
+// Collects an object's `address`, the addresses derived from it, and the
+// stores through them, when every use is the address of such a store.
+bool only_stored_to(const ManagedFunction& function, const hir::Module& module,
+                    const UseLists& uses, ValueId address,
+                    std::vector<ValueId>& values) {
+    std::vector<ValueId> pending{address};
+    while (!pending.empty()) {
+        const auto id = pending.back();
+        pending.pop_back();
+        values.push_back(id);
+        for (const auto& use : uses.uses(id)) {
+            if (use.kind != UseKind::Operand || !use.user) return false;
+            const auto& user = function.values[use.user->value];
+            if (user.kind == ValueKind::PointerStore && use.index == 0 &&
+                !user.is_volatile_access) {
+                values.push_back(*use.user);
+            } else if ((user.kind == ValueKind::IndexedAddress &&
+                        use.index == 0) ||
+                       (user.kind == ValueKind::Cast &&
+                        user.cast == CastOperation::Reinterpret &&
+                        pointer_type(module, user.type))) {
+                pending.push_back(*use.user);
+            } else {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+bool discard_write_only_objects(ManagedModule& module,
+                                hir::Module& hir_module,
+                                data::Module& data_module,
+                                const RawModule& raw_module,
+                                const CompilerOptions& options) {
+    std::unordered_set<std::string_view> targets;
+    for (const auto& function : hir_module.functions) {
+        if (function.alias_target) targets.insert(*function.alias_target);
+        if (function.weakref_target) targets.insert(*function.weakref_target);
+    }
+    for (const auto& object : hir_module.objects) {
+        if (object.alias_target) targets.insert(*object.alias_target);
+        if (object.weakref_target) targets.insert(*object.weakref_target);
+    }
+    std::vector<bool> kept(hir_module.objects.size(), true);
+    for (const auto& object : data_module.objects) {
+        const auto& entity = hir_module.object(object.source);
+        kept[object.source.value] =
+            object.initializer == data::InitializerKind::Declaration ||
+            object.initializer == data::InitializerKind::Uninitialized ||
+            entity.linkage == Linkage::Global || entity.weak ||
+            entity.section || entity.alias_target || entity.weakref_target ||
+            entity.fixed_address || object.used || object.retain ||
+            targets.contains(entity.link_symbol) ||
+            module.object_definitions.contains(object.source.value) ||
+            raw_module.object_definitions.contains(object.source.value) ||
+            volatile_storage(hir_module, entity.type);
+    }
+    // Each function's values that only store to an object: its direct
+    // stores, and its addresses with the stores through them.
+    std::vector<std::vector<std::pair<std::uint32_t, ValueId>>> stores(
+        module.functions.size());
+    for (std::size_t index = 0; index < module.functions.size(); ++index) {
+        const auto& function = module.functions[index];
+        const UseLists uses(function);
+        for (const auto& block : function.blocks) {
+            for (const auto id : block.values) {
+                const auto& value = function.values[id.value];
+                if (value.patch_initial_address &&
+                    value.patch_initial_address->object) {
+                    kept[value.patch_initial_address->object->value] = true;
+                }
+                if (!value.object) continue;
+                const auto object = value.object->value;
+                std::vector<ValueId> values;
+                if (value.kind == ValueKind::GlobalStore &&
+                    !value.is_volatile_access) {
+                    values.push_back(id);
+                } else if (value.kind != ValueKind::GlobalAddress ||
+                           !only_stored_to(function, hir_module, uses, id,
+                                           values)) {
+                    kept[object] = true;
+                    continue;
+                }
+                for (const auto stored : values) {
+                    stores[index].push_back({object, stored});
+                }
+            }
+        }
+    }
+    // The initializer of an object that stays keeps the objects it names.
+    std::vector<hir::ObjectId> pending;
+    for (const auto& object : data_module.objects) {
+        if (kept[object.source.value]) pending.push_back(object.source);
+    }
+    const auto keep = [&](const data::AddressConstant& address) {
+        if (address.object && !kept[address.object->value]) {
+            kept[address.object->value] = true;
+            pending.push_back(*address.object);
+        }
+    };
+    while (!pending.empty()) {
+        const auto* object = data_module.find(pending.back());
+        pending.pop_back();
+        if (!object) continue;
+        if (object->address) keep(*object->address);
+        for (const auto& relocation : object->relocations) {
+            keep(relocation.address);
+        }
+    }
+    const auto discarded = [&](const data::Object& object) {
+        return !kept[object.source.value];
+    };
+    if (std::none_of(data_module.objects.begin(), data_module.objects.end(),
+                     discarded)) {
+        return false;
+    }
+
+    for (std::size_t index = 0; index < module.functions.size(); ++index) {
+        std::unordered_set<std::uint32_t> removed;
+        for (const auto& [object, value] : stores[index]) {
+            if (!kept[object]) removed.insert(value.value);
+        }
+        if (removed.empty()) continue;
+        auto& function = module.functions[index];
+        remove_effectful_values(function, removed);
+        // Nothing else may use the stored values, and blocks that held only
+        // stores now only branch.
+        if (options.tree_dce) {
+            remove_dead_values(function, hir_module,
+                               options.floating_environment);
+        }
+        if (options.tree_cfg_cleanup) {
+            (void)eliminate_forwarding_blocks(function);
+        }
+    }
+    for (const auto& object : data_module.objects) {
+        if (discarded(object)) {
+            hir_module.objects[object.source.value].discarded = true;
+        }
+    }
+    std::erase_if(data_module.objects, discarded);
+    data_module.object_indices.clear();
+    for (std::size_t index = 0; index < data_module.objects.size(); ++index) {
+        data_module.object_indices.emplace(
+            data_module.objects[index].source.value, index);
+    }
     return true;
 }
 

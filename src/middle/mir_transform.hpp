@@ -81,6 +81,17 @@ void remove_effectful_values(ManagedFunction& function,
                                          const hir::Module& hir_module,
                                          const TargetInfo& target);
 
+// Moves a non-volatile store to a slot or object at a constant offset out of
+// a natural loop when it runs before every exit and no other memory operation
+// of the loop may access its bytes; a copy runs on each exit edge instead.
+// Calls, atomics, volatile accesses, machine instructions, patch values, and
+// floating operations that may raise a trap `environment` enables keep the
+// stores of their loop.
+[[nodiscard]] bool sink_loop_stores(ManagedFunction& function,
+                                    const hir::Module& hir_module,
+                                    const TargetInfo& target,
+                                    const floating::Environment& environment);
+
 // The initial bytes of the const objects defined in the compilation group
 // whose contents no store, loader, or patcher may change.
 class ConstantObjects {
@@ -113,5 +124,11 @@ private:
 // Shared identity-preserving cleanup used by CFG transforms after they make
 // one or more non-addressable blocks unreachable.
 void prune_unreachable_blocks(ManagedFunction& function);
+
+// Removes the effect-free values that nothing uses, except floating
+// operations that may raise an exception `environment` traps.
+void remove_dead_values(ManagedFunction& function,
+                        const hir::Module& hir_module,
+                        const floating::Environment& environment);
 
 } // namespace cross::mir
