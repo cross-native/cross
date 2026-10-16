@@ -355,6 +355,10 @@ std::span<const OptionDefinition> common_option_definitions() {
          std::uint64_t{2}, {}, 1, 16, OptionCategory::Optimization, true,
          OptionImplementation::Implemented,
          "maximum target-independent loop unroll factor"},
+        {"f.peel-limit", {}, OptionValueKind::Unsigned,
+         std::uint64_t{0}, {}, 0, 4096, OptionCategory::Optimization, true,
+         OptionImplementation::Implemented,
+         "maximum MIR operations of a completely peeled loop"},
         {"f.vector-interleave", {}, OptionValueKind::Unsigned,
          std::uint64_t{2}, {}, 1, 16, OptionCategory::Optimization, true,
          OptionImplementation::Implemented,
@@ -397,6 +401,10 @@ std::span<const OptionDefinition> common_option_definitions() {
         {"f.unroll-loops", {}, OptionValueKind::Boolean, false, {}, 0, 0,
          OptionCategory::Optimization, true, OptionImplementation::Partial,
          "unroll target-independent loops when legality and profitability are proven"},
+        {"f.peel-loops", {}, OptionValueKind::Boolean, false, {}, 0, 0,
+         OptionCategory::Optimization, true, OptionImplementation::Partial,
+         "replace loops whose trip count is a known constant with copies of "
+         "their bodies"},
         {"f.tree-reassoc", {}, OptionValueKind::Boolean, false, {}, 0, 0,
          OptionCategory::Optimization, true, OptionImplementation::Partial,
          "rebalance legal associative SSA expressions under target cost policy"},
@@ -802,6 +810,8 @@ bool resolve_registered_options(
         resolved_unsigned(options, "f.if-conversion-memory-limit", 12));
     options.unroll_factor = static_cast<unsigned>(
         resolved_unsigned(options, "f.unroll-factor", 2));
+    options.peel_limit = static_cast<unsigned>(
+        resolved_unsigned(options, "f.peel-limit"));
     options.vector_interleave = static_cast<unsigned>(
         resolved_unsigned(options, "f.vector-interleave", 2));
     options.risc_cisc_balance = static_cast<unsigned>(
@@ -826,6 +836,7 @@ bool resolve_registered_options(
     options.move_loop_invariants =
         resolved_bool(options, "f.move-loop-invariants");
     options.unroll_loops = resolved_bool(options, "f.unroll-loops");
+    options.peel_loops = resolved_bool(options, "f.peel-loops");
     options.tree_reassoc = resolved_bool(options, "f.tree-reassoc");
     options.tree_slsr = resolved_bool(options, "f.tree-slsr");
     options.div_by_constant = resolved_bool(options, "f.div-by-constant");

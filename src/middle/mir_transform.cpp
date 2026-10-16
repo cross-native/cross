@@ -303,6 +303,114 @@ bool narrow_single_use_integer_loads(ManagedFunction& function,
     return changed;
 }
 
+unsigned leading_zeros(UInt128 value, unsigned bits) {
+    unsigned count = 0;
+    while (count < bits && !bit(value, bits - 1U - count)) ++count;
+    return count;
+}
+
+// How many high bits of a scalar integer value are known to be zero. A phi
+// that depends on itself counts as having none.
+unsigned known_leading_zeros(const ManagedFunction& function,
+                             const hir::Module& hir_module, ValueId id,
+                             std::unordered_set<std::uint32_t>& phis,
+                             unsigned depth = 0) {
+    const auto& value = function.values[id.value];
+    const auto bits = scalar_integer_bits(hir_module, value.type);
+    if (bits == 0 || depth > 12) return 0;
+    const auto zeros = [&](ValueId source) {
+        return known_leading_zeros(function, hir_module, source, phis,
+                                   depth + 1);
+    };
+    const auto operand = [&](std::size_t index) {
+        return zeros(value.operands[index]);
+    };
+    const auto constant = [&](std::size_t index) -> std::optional<UInt128> {
+        const auto& source = function.values[value.operands[index].value];
+        if (source.kind != ValueKind::ConstantInteger) return std::nullopt;
+        return mask_to(UInt128{source.integer, source.integer_high}, bits);
+    };
+    switch (value.kind) {
+    case ValueKind::ConstantInteger:
+        return leading_zeros(
+            mask_to(UInt128{value.integer, value.integer_high}, bits), bits);
+    case ValueKind::Cast: {
+        const auto source_bits = scalar_integer_bits(
+            hir_module, function.values[value.operands[0].value].type);
+        if (source_bits == 0) return 0;
+        if (value.cast == CastOperation::ZeroExtend && source_bits < bits) {
+            return bits - source_bits + operand(0);
+        }
+        if (value.cast == CastOperation::SignExtend && source_bits < bits) {
+            const auto known = operand(0);
+            return known == 0 ? 0 : bits - source_bits + known;
+        }
+        if (value.cast == CastOperation::Truncate ||
+            value.cast == CastOperation::Reinterpret ||
+            value.cast == CastOperation::ZeroExtend) {
+            const auto known = operand(0);
+            return known + bits > source_bits ? known + bits - source_bits : 0;
+        }
+        return 0;
+    }
+    case ValueKind::Select: return std::min(operand(1), operand(2));
+    case ValueKind::Phi: {
+        if (!phis.insert(id.value).second) return 0;
+        unsigned result = bits;
+        for (const auto& incoming : value.incoming) {
+            result = std::min(result, zeros(incoming.value));
+        }
+        phis.erase(id.value);
+        return result;
+    }
+    case ValueKind::Binary:
+        if (value.binary >= BinaryOperation::Equal) return bits - 1U;
+        switch (value.binary) {
+        case BinaryOperation::BitAnd: return std::max(operand(0), operand(1));
+        case BinaryOperation::BitOr:
+        case BinaryOperation::BitXor: return std::min(operand(0), operand(1));
+        case BinaryOperation::ShiftRightLogical: {
+            const auto amount = constant(1);
+            return amount && *amount < UInt128{bits}
+                       ? std::min(bits, operand(0) +
+                                            static_cast<unsigned>(amount->low))
+                       : operand(0);
+        }
+        case BinaryOperation::UnsignedDivide: {
+            const auto divisor = constant(1);
+            return divisor && !(*divisor == UInt128{})
+                       ? std::min(bits, operand(0) + bits - 1U -
+                                            leading_zeros(*divisor, bits))
+                       : operand(0);
+        }
+        case BinaryOperation::UnsignedRemainder:
+            return std::max(operand(0), operand(1));
+        default: return 0;
+        }
+    default: return 0;
+    }
+}
+
+// A value whose top bit is clear converts to floating the same as a signed
+// integer, which every target converts directly.
+bool convert_nonnegative_integers_signed(ManagedFunction& function,
+                                         const hir::Module& hir_module) {
+    bool changed = false;
+    for (auto& value : function.values) {
+        std::unordered_set<std::uint32_t> phis;
+        if (value.kind != ValueKind::Cast ||
+            value.cast != CastOperation::UnsignedIntegerToFloat ||
+            value.operands.size() != 1 ||
+            known_leading_zeros(function, hir_module, value.operands[0],
+                                phis) == 0) {
+            continue;
+        }
+        value.cast = CastOperation::SignedIntegerToFloat;
+        changed = true;
+    }
+    return changed;
+}
+
 bool factor_zero_extended_bitwise_chains_impl(
     ManagedFunction& function, const hir::Module& hir_module) {
     struct Plan {
@@ -1656,7 +1764,9 @@ bool narrow_bitwise_values(ManagedFunction& function,
         commute_masked_truncations(function, hir_module);
     const bool narrowed =
         narrow_single_use_integer_loads(function, hir_module, target);
-    return factored || commuted || narrowed;
+    const bool converted =
+        convert_nonnegative_integers_signed(function, hir_module);
+    return factored || commuted || narrowed || converted;
 }
 
 bool factor_zero_extended_bitwise_chains(
@@ -1793,6 +1903,78 @@ bool eliminate_forwarding_blocks(ManagedFunction& function) {
     prune_unreachable_blocks(function);
     if (ForwardingSweep(function).run(std::numeric_limits<std::size_t>::max()) != 0)
         prune_unreachable_blocks(function);
+    return true;
+}
+
+bool merge_block_chains(ManagedFunction& function) {
+    std::vector<bool> labeled(function.blocks.size());
+    for (const auto& label : function.labels) labeled[label.block.value] = true;
+    std::vector<bool> merged(function.blocks.size());
+    ValueReplacements replacements;
+    std::unordered_map<std::uint32_t, EffectId> forwarded;
+    for (auto& head : function.blocks) {
+        while (!merged[head.id.value] &&
+               head.terminator.kind == TerminatorKind::Branch &&
+               head.terminator.successors.size() == 1) {
+            const auto next_id = head.terminator.successors.front();
+            auto& next = function.blocks[next_id.value];
+            if (next_id == head.id || next_id == function.entry ||
+                labeled[next_id.value] || next.predecessors.size() != 1) {
+                break;
+            }
+            for (const auto id : next.values) {
+                const auto& value = function.values[id.value];
+                if (value.kind == ValueKind::Phi) {
+                    replacements.add(id, value.incoming.front().value);
+                } else {
+                    head.values.push_back(id);
+                }
+            }
+            forwarded.emplace(next.effect.value, head.terminator.effect);
+            head.terminator = next.terminator;
+            for (const auto successor : head.terminator.successors) {
+                auto& block = function.blocks[successor.value];
+                std::replace(block.predecessors.begin(), block.predecessors.end(),
+                             next_id, head.id);
+                for (auto& incoming : function.effects[block.effect.value].incoming) {
+                    if (incoming.predecessor == next_id) incoming.predecessor = head.id;
+                }
+                for (const auto id : block.values) {
+                    for (auto& incoming : function.values[id.value].incoming) {
+                        if (incoming.predecessor == next_id) {
+                            incoming.predecessor = head.id;
+                        }
+                    }
+                }
+            }
+            next.values.clear();
+            next.predecessors.clear();
+            next.terminator.kind = TerminatorKind::Unreachable;
+            next.terminator.value.reset();
+            next.terminator.successors.clear();
+            merged[next_id.value] = true;
+        }
+    }
+    if (forwarded.empty()) return false;
+    const auto resolve = [&](EffectId effect) {
+        for (auto found = forwarded.find(effect.value); found != forwarded.end();
+             found = forwarded.find(effect.value)) {
+            effect = found->second;
+        }
+        return effect;
+    };
+    for (auto& value : function.values) {
+        if (value.effect_input) value.effect_input = resolve(*value.effect_input);
+    }
+    for (auto& effect : function.effects) {
+        if (effect.input) effect.input = resolve(*effect.input);
+        for (auto& incoming : effect.incoming) incoming.effect = resolve(incoming.effect);
+    }
+    for (auto& block : function.blocks) {
+        block.terminator.effect = resolve(block.terminator.effect);
+    }
+    replacements.apply(function);
+    prune_unreachable_blocks(function);
     return true;
 }
 

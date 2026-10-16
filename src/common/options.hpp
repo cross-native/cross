@@ -126,6 +126,7 @@ struct CompilerOptions {
     unsigned if_conversion_limit{6};
     unsigned if_conversion_memory_limit{12};
     unsigned unroll_factor{2};
+    unsigned peel_limit{};
     unsigned vector_interleave{2};
     unsigned risc_cisc_balance{50};
     unsigned function_alignment{};
@@ -174,6 +175,7 @@ struct CompilerOptions {
     bool ivopts{};
     bool move_loop_invariants{};
     bool unroll_loops{};
+    bool peel_loops{};
     bool tree_reassoc{};
     bool tree_slsr{};
     bool div_by_constant{};

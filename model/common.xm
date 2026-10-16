@@ -8,6 +8,7 @@ optimization "O0" {
     f.if-conversion-limit = 6;
     f.if-conversion-memory-limit = 6;
     f.unroll-factor = 2;
+    f.peel-limit = 0;
     f.vector-interleave = 2;
     f.tree-ccp = false;
     f.tree-bit-ccp = false;
@@ -21,6 +22,7 @@ optimization "O0" {
     f.ivopts = false;
     f.move-loop-invariants = false;
     f.unroll-loops = false;
+    f.peel-loops = false;
     f.tree-reassoc = false;
     f.tree-slsr = false;
     f.div-by-constant = false;
@@ -102,6 +104,7 @@ optimization "O2" {
     f.ccp-rounds = 2;
     f.if-conversion-memory-limit = 12;
     f.unroll-factor = 2;
+    f.peel-limit = 96;
     f.vector-interleave = 2;
     f.inline-limit = 96;
     f.ipa-ra = true;
@@ -115,6 +118,7 @@ optimization "O2" {
     f.tree-loop-vectorize = true;
     f.tree-slp-vectorize = true;
     f.unroll-loops = true;
+    f.peel-loops = true;
     f.tree-reassoc = true;
     f.tree-slsr = true;
     f.tree-loop-rotate = true;
@@ -137,6 +141,7 @@ optimization "O3" {
     f.ccp-rounds = 3;
     f.if-conversion-limit = 12;
     f.unroll-factor = 4;
+    f.peel-limit = 192;
     f.vector-interleave = 4;
     f.inline-limit = 256;
     f.ipa-cp-clone = true;
@@ -151,6 +156,7 @@ optimization "Os" {
     f.if-conversion-limit = 5;
     f.inline-limit = 24;
     f.unroll-loops = false;
+    f.peel-loops = false;
     f.if-conversion = false;
     f.align-loops = false;
 }

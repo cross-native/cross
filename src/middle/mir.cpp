@@ -10524,6 +10524,23 @@ void simplify_integer_operations(ManagedFunction& function,
     remove_replaced_values(function, removed);
 }
 
+// An integer conversion of a `source_bits`-wide constant.
+std::optional<UInt128> fold_integer_cast(CastOperation cast, UInt128 value,
+                                         unsigned source_bits,
+                                         unsigned target_bits) {
+    if (source_bits == 0 || target_bits == 0) return std::nullopt;
+    value = mask_to(value, source_bits);
+    if (cast == CastOperation::SignExtend && bit(value, source_bits - 1U)) {
+        value = bit_or(value, bit_not(mask_to(bit_not(UInt128{}), source_bits)));
+    } else if (cast != CastOperation::ZeroExtend &&
+               cast != CastOperation::Truncate &&
+               cast != CastOperation::Reinterpret &&
+               cast != CastOperation::SignExtend) {
+        return std::nullopt;
+    }
+    return mask_to(value, target_bits);
+}
+
 std::optional<UInt128> folded_integer_constant(
     const ManagedFunction& function, const hir::Module& hir_module,
     ValueId id) {
@@ -10539,24 +10556,102 @@ std::optional<UInt128> folded_integer_constant(
     }
     const auto source_id = value.operands.front();
     if (source_id.value >= function.values.size()) return std::nullopt;
-    const auto source_bits = type_bits(
-        hir_module, function.values[source_id.value].type);
-    if (source_bits == 0) return std::nullopt;
-    auto folded = folded_integer_constant(function, hir_module, source_id);
+    const auto folded = folded_integer_constant(function, hir_module, source_id);
     if (!folded) return std::nullopt;
-    *folded = mask_to(*folded, source_bits);
-    if (value.cast == CastOperation::SignExtend &&
-        bit(*folded, source_bits - 1U)) {
-        *folded = bit_or(
-            *folded,
-            bit_not(mask_to(bit_not(UInt128{}), source_bits)));
-    } else if (value.cast != CastOperation::ZeroExtend &&
-               value.cast != CastOperation::Truncate &&
-               value.cast != CastOperation::Reinterpret &&
-               value.cast != CastOperation::SignExtend) {
-        return std::nullopt;
+    return fold_integer_cast(
+        value.cast, *folded,
+        type_bits(hir_module, function.values[source_id.value].type), bits);
+}
+
+// The exact result of an integer operation on `bits`-wide constants (the
+// operand width for a comparison), or nothing when the operation is
+// undefined for them or not folded. Shift counts are reduced modulo the
+// width.
+std::optional<UInt128> fold_integer_binary(BinaryOperation operation,
+                                           UInt128 left, UInt128 right,
+                                           unsigned bits) {
+    if (bits == 0) return std::nullopt;
+    left = mask_to(left, bits);
+    right = mask_to(right, bits);
+    const auto sign = shift_left(UInt128{1}, bits - 1U);
+    // Flipping the sign bit makes unsigned order signed order.
+    const auto ordered = [&](UInt128 value) { return bit_xor(value, sign); };
+    const auto magnitude = [&](UInt128 value) {
+        return bit(value, bits - 1U) ? mask_to(negate(value), bits) : value;
+    };
+    const auto amount = static_cast<unsigned>(right.low % bits);
+    switch (operation) {
+    case BinaryOperation::Add: return mask_to(add(left, right), bits);
+    case BinaryOperation::Subtract: return mask_to(subtract(left, right), bits);
+    case BinaryOperation::Multiply: return mask_to(multiply(left, right), bits);
+    case BinaryOperation::BitAnd: return bit_and(left, right);
+    case BinaryOperation::BitOr: return bit_or(left, right);
+    case BinaryOperation::BitXor: return bit_xor(left, right);
+    case BinaryOperation::ShiftLeft:
+        return mask_to(shift_left(left, amount), bits);
+    case BinaryOperation::ShiftRightLogical: return shift_right(left, amount);
+    case BinaryOperation::ShiftRightArithmetic: {
+        auto shifted = shift_right(left, amount);
+        if (bit(left, bits - 1U)) {
+            shifted = bit_or(shifted,
+                             bit_and(mask_to(bit_not(UInt128{}), bits),
+                                     bit_not(mask_to(bit_not(UInt128{}),
+                                                     bits - amount))));
+        }
+        return shifted;
     }
-    return mask_to(*folded, bits);
+    case BinaryOperation::RotateLeft:
+        return amount == 0 ? left
+                           : mask_to(bit_or(shift_left(left, amount),
+                                            shift_right(left, bits - amount)),
+                                     bits);
+    case BinaryOperation::RotateRight:
+        return amount == 0 ? left
+                           : mask_to(bit_or(shift_right(left, amount),
+                                            shift_left(left, bits - amount)),
+                                     bits);
+    case BinaryOperation::UnsignedDivide:
+    case BinaryOperation::UnsignedRemainder: {
+        if (right == UInt128{}) return std::nullopt;
+        const auto [quotient, remainder] = divide(left, right);
+        return operation == BinaryOperation::UnsignedDivide ? quotient
+                                                            : remainder;
+    }
+    case BinaryOperation::SignedDivide:
+    case BinaryOperation::SignedRemainder: {
+        // Division by zero and the overflowing minimum / -1 stay.
+        if (right == UInt128{} ||
+            (left == sign && right == mask_to(bit_not(UInt128{}), bits))) {
+            return std::nullopt;
+        }
+        auto [quotient, remainder] = divide(magnitude(left), magnitude(right));
+        if (bit(left, bits - 1U) != bit(right, bits - 1U)) {
+            quotient = negate(quotient);
+        }
+        if (bit(left, bits - 1U)) remainder = negate(remainder);
+        return mask_to(operation == BinaryOperation::SignedDivide ? quotient
+                                                                  : remainder,
+                       bits);
+    }
+    case BinaryOperation::Equal: return UInt128{left == right ? 1U : 0U};
+    case BinaryOperation::NotEqual: return UInt128{left == right ? 0U : 1U};
+    case BinaryOperation::UnsignedLess: return UInt128{left < right ? 1U : 0U};
+    case BinaryOperation::UnsignedLessEqual:
+        return UInt128{right < left ? 0U : 1U};
+    case BinaryOperation::UnsignedGreater:
+        return UInt128{right < left ? 1U : 0U};
+    case BinaryOperation::UnsignedGreaterEqual:
+        return UInt128{left < right ? 0U : 1U};
+    case BinaryOperation::SignedLess:
+        return UInt128{ordered(left) < ordered(right) ? 1U : 0U};
+    case BinaryOperation::SignedLessEqual:
+        return UInt128{ordered(right) < ordered(left) ? 0U : 1U};
+    case BinaryOperation::SignedGreater:
+        return UInt128{ordered(right) < ordered(left) ? 1U : 0U};
+    case BinaryOperation::SignedGreaterEqual:
+        return UInt128{ordered(left) < ordered(right) ? 0U : 1U};
+    default: return std::nullopt;
+    }
 }
 
 // The unsigned type of an integer type's width, in which the shifts and
@@ -12974,7 +13069,9 @@ bool select_unit_induction_exits(
             bound_id.value >= definition_blocks.size() ||
             (definition_blocks[bound_id.value] &&
              loop.blocks.contains(
-                 definition_blocks[bound_id.value]->value))) {
+                 definition_blocks[bound_id.value]->value) &&
+             function.values[bound_id.value].kind !=
+                 ValueKind::ConstantInteger)) {
             continue;
         }
         const auto& induction = function.values[induction_id.value];
@@ -13011,9 +13108,28 @@ bool select_unit_induction_exits(
         }
         if (!step_id || step_id->value >= function.values.size()) continue;
         const auto& step = function.values[step_id->value];
-        if (step.kind != ValueKind::ConstantInteger || step.integer != 1 ||
-            step.integer_high != 0) {
+        if (step.kind != ValueKind::ConstantInteger || step.integer == 0 ||
+            !std::has_single_bit(step.integer) || step.integer_high != 0) {
             continue;
+        }
+        // A wider power-of-two step reaches a bound that is a multiple of
+        // it exactly, such as an unrolled loop's masked bound.
+        if (step.integer != 1) {
+            const auto low = UInt128{step.integer - 1U};
+            const auto multiple = [&](ValueId id) {
+                const auto& value = function.values[id.value];
+                return value.kind == ValueKind::ConstantInteger &&
+                       bit_and(UInt128{value.integer, value.integer_high},
+                               low) == UInt128{};
+            };
+            const auto& bound = function.values[bound_id.value];
+            if (!multiple(bound_id) &&
+                !(bound.kind == ValueKind::Binary &&
+                  bound.binary == BinaryOperation::BitAnd &&
+                  (multiple(bound.operands[0]) ||
+                   multiple(bound.operands[1])))) {
+                continue;
+            }
         }
 
         ManagedValue selected = condition;
@@ -13254,10 +13370,21 @@ void coalesce_equivalent_inductions(ManagedFunction& function,
                     // from the loop's unit-step counter. One multiply per
                     // outer trip is normally smaller than another phi,
                     // update, edge copy, and long-lived register or spill.
-                    phi.kind = ValueKind::Binary;
-                    phi.binary = BinaryOperation::Multiply;
-                    phi.operands = {unit->phi, *step_id};
-                    phi.incoming.clear();
+                    // The step may be defined in the body, after the header,
+                    // so the header gets its own copy of the constant.
+                    auto factor = function.values[step_id->value];
+                    factor.id = ValueId{
+                        static_cast<std::uint32_t>(function.values.size())};
+                    const auto factor_id = factor.id;
+                    function.values.push_back(std::move(factor));
+                    header.values.insert(std::find(header.values.begin(),
+                                                   header.values.end(), id),
+                                         factor_id);
+                    auto& scaled = function.values[id.value];
+                    scaled.kind = ValueKind::Binary;
+                    scaled.binary = BinaryOperation::Multiply;
+                    scaled.operands = {unit->phi, factor_id};
+                    scaled.incoming.clear();
                     removed.insert(candidate.update.value);
                     converted = true;
                     continue;
@@ -13329,12 +13456,41 @@ bool reduce_affine_address_inductions(
                          return left.blocks.size() < right.blocks.size();
                      });
     const auto definition_blocks = value_definition_blocks(function);
+    const DominatorTree dominators(function);
     const auto append = [&](ManagedValue value) {
         value.id = ValueId{static_cast<std::uint32_t>(
             function.values.size())};
         const auto id = value.id;
         function.values.push_back(std::move(value));
         return id;
+    };
+    // Whether `id` is read by anything but `ignored`, or by a value that
+    // nothing reads.
+    const auto read_elsewhere = [&](ValueId id,
+                                    std::initializer_list<ValueId> ignored) {
+        const UseLists uses(function);
+        std::vector<ValueId> pending{id};
+        std::unordered_set<std::uint32_t> seen{id.value};
+        while (!pending.empty()) {
+            const auto current = pending.back();
+            pending.pop_back();
+            for (const auto& use : uses.uses(current)) {
+                if (!use.user) return true;
+                if (current == id &&
+                    std::find(ignored.begin(), ignored.end(), *use.user) !=
+                        ignored.end()) {
+                    continue;
+                }
+                const auto& user = function.values[use.user->value];
+                if (is_effectful_value(user) || user.kind == ValueKind::Phi) {
+                    return true;
+                }
+                if (seen.insert(use.user->value).second) {
+                    pending.push_back(*use.user);
+                }
+            }
+        }
+        return false;
     };
 
     for (const auto& loop : loops) {
@@ -13402,6 +13558,7 @@ bool reduce_affine_address_inductions(
                 continue;
             }
             const auto latch = carried->predecessor;
+            const auto update_id = carried->value;
             const auto index_type = index_phi.type;
             const auto index_bits = type_bits(hir_module, index_type);
             // New offsets are address indices.
@@ -13556,6 +13713,8 @@ bool reduce_affine_address_inductions(
                 }
             }
 
+            // Pointer recurrences with an access in every pass.
+            std::vector<std::pair<ValueId, const Group*>> every_pass;
             for (auto& group : groups) {
                 if ((options.optimize_for == OptimizationGoal::Size ||
                      options.optimize_for ==
@@ -13646,8 +13805,84 @@ bool reduce_affine_address_inductions(
                         load.operands = {address};
                     }
                 }
+                if (std::any_of(group.accesses.begin(), group.accesses.end(),
+                                [&](const Access& access) {
+                                    return dominators.dominates(access.block,
+                                                                latch);
+                                })) {
+                    every_pass.emplace_back(pointer_phi_id, &group);
+                }
                 changed = true;
             }
+
+            // When the index only counts passes, test the pointer instead:
+            // `index != bound` becomes `pointer != base + bound` and the
+            // index dies. Each pass that continues accesses the array
+            // through the pointer, so the array, and no wrapping offset,
+            // spans the `bound` elements; that needs a single exit.
+            auto& header = function.blocks[loop.header.value];
+            if (every_pass.empty() || !header.terminator.value) continue;
+            const auto condition_id = *header.terminator.value;
+            const auto& condition = function.values[condition_id.value];
+            if (condition.kind != ValueKind::Binary ||
+                (condition.binary != BinaryOperation::NotEqual &&
+                 condition.binary != BinaryOperation::Equal) ||
+                condition.operands.size() != 2 ||
+                (condition.operands[0] != index_phi_id &&
+                 condition.operands[1] != index_phi_id)) {
+                continue;
+            }
+            const auto bound = condition.operands[0] == index_phi_id
+                                   ? condition.operands[1]
+                                   : condition.operands[0];
+            const bool single_exit = std::all_of(
+                loop.blocks.begin(), loop.blocks.end(), [&](std::uint32_t id) {
+                    const auto& successors =
+                        function.blocks[id].terminator.successors;
+                    return id == loop.header.value ||
+                           std::all_of(successors.begin(), successors.end(),
+                                       [&](BlockId successor) {
+                                           return loop.blocks.contains(
+                                               successor.value);
+                                       });
+                });
+            const bool constant_bound =
+                function.values[bound.value].kind == ValueKind::ConstantInteger;
+            if (!single_exit || bound.value >= definition_blocks.size() ||
+                !definition_blocks[bound.value] ||
+                (!constant_bound &&
+                 loop.blocks.contains(definition_blocks[bound.value]->value)) ||
+                read_elsewhere(index_phi_id, {condition_id, update_id}) ||
+                read_elsewhere(update_id, {index_phi_id})) {
+                continue;
+            }
+            const auto [pointer_id, group] = every_pass.front();
+            auto& preheader = function.blocks[loop.preheader.value].values;
+            auto offset = bound;
+            if (constant_bound) {
+                offset = append(function.values[bound.value]);
+                preheader.push_back(offset);
+            }
+            if (address_index_type != index_type) {
+                ManagedValue widened;
+                widened.location = index_location;
+                widened.type = address_index_type;
+                widened.kind = ValueKind::Cast;
+                widened.cast = signed_type(hir_module, index_type)
+                                   ? CastOperation::SignExtend
+                                   : CastOperation::ZeroExtend;
+                widened.operands = {bound};
+                offset = append(std::move(widened));
+                preheader.push_back(offset);
+            }
+            ManagedValue end;
+            end.location = index_location;
+            end.type = group->pointer_type;
+            end.kind = ValueKind::IndexedAddress;
+            end.operands = {group->base, offset};
+            const auto end_id = append(std::move(end));
+            preheader.push_back(end_id);
+            function.values[condition_id.value].operands = {pointer_id, end_id};
         }
     }
     return changed;
@@ -14594,6 +14829,518 @@ void unroll_loops(ManagedFunction& function,
     }
 }
 
+// A loop whose exit test an exact evaluation of its header recurrences
+// decides, to be replaced by one copy of its body per iteration.
+struct CompletePeel {
+    BlockId header;
+    BlockId preheader;
+    BlockId latch;
+    BlockId exiting;
+    BlockId exit;
+    // The loop's blocks in function order.
+    std::vector<BlockId> blocks;
+    // How often the latch branches back to the header.
+    unsigned backedges{};
+};
+
+bool iteration_integer(const hir::Module& hir_module, hir::TypeId type) {
+    return integer_type(hir_module, type) && type_bits(hir_module, type) != 0;
+}
+
+// Evaluates pure integer computations in one pass through a loop, given
+// the values its header phis take in that pass. Phis elsewhere, memory, and
+// nonintegers have no value.
+class IterationEvaluator {
+public:
+    IterationEvaluator(const ManagedFunction& function,
+                       const hir::Module& hir_module,
+                       const std::unordered_map<std::uint32_t, UInt128>& phis)
+        : function_(function), hir_module_(hir_module), phis_(phis) {}
+
+    std::optional<UInt128> operator()(ValueId id, unsigned depth = 0) {
+        if (const auto found = memo_.find(id.value); found != memo_.end()) {
+            return found->second;
+        }
+        const auto result = depth > 64 ? std::nullopt : evaluate(id, depth);
+        memo_.emplace(id.value, result);
+        return result;
+    }
+
+private:
+    std::optional<UInt128> evaluate(ValueId id, unsigned depth) {
+        const auto& value = function_.values[id.value];
+        if (!iteration_integer(hir_module_, value.type)) return std::nullopt;
+        const auto bits = type_bits(hir_module_, value.type);
+        const auto operand_bits = [&](std::size_t index) {
+            return type_bits(hir_module_,
+                             function_.values[value.operands[index].value].type);
+        };
+        std::vector<std::optional<UInt128>> operands;
+        if (value.kind != ValueKind::Select) {
+            for (const auto operand : value.operands) {
+                operands.push_back((*this)(operand, depth + 1));
+                if (!operands.back()) return std::nullopt;
+            }
+        }
+        switch (value.kind) {
+        case ValueKind::ConstantInteger:
+            return mask_to(UInt128{value.integer, value.integer_high}, bits);
+        case ValueKind::Phi: {
+            const auto found = phis_.find(id.value);
+            if (found == phis_.end()) return std::nullopt;
+            return found->second;
+        }
+        case ValueKind::Cast:
+            if (!iteration_integer(hir_module_,
+                                   function_.values[value.operands[0].value].type)) {
+                return std::nullopt;
+            }
+            return fold_integer_cast(value.cast, *operands[0], operand_bits(0),
+                                     bits);
+        case ValueKind::Unary:
+            switch (value.unary) {
+            case UnaryOperation::Negate:
+                return mask_to(negate(*operands[0]), bits);
+            case UnaryOperation::BitNot:
+                return mask_to(bit_not(*operands[0]), bits);
+            case UnaryOperation::IsZero:
+                return UInt128{*operands[0] == UInt128{} ? 1U : 0U};
+            }
+            return std::nullopt;
+        case ValueKind::Binary:
+            return fold_integer_binary(
+                value.binary, *operands[0], *operands[1],
+                comparison(value.binary) ? operand_bits(0) : bits);
+        case ValueKind::Select: {
+            const auto condition = (*this)(value.operands[0], depth + 1);
+            if (!condition) return std::nullopt;
+            return (*this)(value.operands[*condition != UInt128{} ? 1 : 2],
+                           depth + 1);
+        }
+        default: return std::nullopt;
+        }
+    }
+
+    const ManagedFunction& function_;
+    const hir::Module& hir_module_;
+    const std::unordered_map<std::uint32_t, UInt128>& phis_;
+    std::unordered_map<std::uint32_t, std::optional<UInt128>> memo_;
+};
+
+// Adds the header phis that `id` reads through pure integer operations to
+// `phis`; false when `id` reads anything else that a pass may change.
+bool collect_iteration_phis(const ManagedFunction& function,
+                            const hir::Module& hir_module, BlockId header,
+                            const std::vector<std::optional<BlockId>>& definitions,
+                            ValueId id, std::vector<ValueId>& phis,
+                            std::unordered_set<std::uint32_t>& visited,
+                            unsigned depth = 0) {
+    if (!visited.insert(id.value).second) return true;
+    const auto& value = function.values[id.value];
+    if (depth > 64 || !iteration_integer(hir_module, value.type)) return false;
+    switch (value.kind) {
+    case ValueKind::ConstantInteger: return true;
+    case ValueKind::Phi:
+        if (definitions[id.value] != header) return false;
+        phis.push_back(id);
+        return true;
+    case ValueKind::Cast:
+    case ValueKind::Unary:
+    case ValueKind::Binary:
+    case ValueKind::Select: break;
+    default: return false;
+    }
+    return std::all_of(
+        value.operands.begin(), value.operands.end(), [&](ValueId operand) {
+            return collect_iteration_phis(function, hir_module, header,
+                                          definitions, operand, phis, visited,
+                                          depth + 1);
+        });
+}
+
+// Plans the complete peeling of a canonical loop with one latch and one
+// exit edge, from a block that runs in every iteration, whose test the
+// header recurrences decide, when its copies have at most `limit`
+// operations.
+std::optional<CompletePeel> plan_complete_peel(
+    const ManagedFunction& function, const hir::Module& hir_module,
+    const DominatorTree& dominators,
+    const std::vector<std::optional<BlockId>>& definitions,
+    const CanonicalLoop& loop, unsigned limit) {
+    if (std::any_of(function.labels.begin(), function.labels.end(),
+                    [&](const ManagedLabel& label) {
+                        return loop.blocks.contains(label.block.value);
+                    })) {
+        return std::nullopt;
+    }
+    const auto& header = function.blocks[loop.header.value];
+    if (header.predecessors.size() != 2) return std::nullopt;
+    const auto latch = header.predecessors[0] == loop.preheader
+                           ? header.predecessors[1]
+                           : header.predecessors[0];
+    std::optional<std::pair<BlockId, BlockId>> exit_edge;
+    std::size_t size = 0;
+    CompletePeel peel{loop.header, loop.preheader, latch, {}, {}, {}, 0};
+    for (const auto& block : function.blocks) {
+        if (!loop.blocks.contains(block.id.value)) continue;
+        peel.blocks.push_back(block.id);
+        if (block.terminator.kind != TerminatorKind::Branch &&
+            block.terminator.kind != TerminatorKind::ConditionalBranch) {
+            return std::nullopt;
+        }
+        for (const auto successor : block.terminator.successors) {
+            if (loop.blocks.contains(successor.value)) continue;
+            if (exit_edge) return std::nullopt;
+            exit_edge = {block.id, successor};
+        }
+        for (const auto id : block.values) {
+            switch (function.values[id.value].kind) {
+            case ValueKind::Parameter:
+            case ValueKind::VariadicState:
+            case ValueKind::PatchValue:
+            case ValueKind::DynamicStackSave:
+            case ValueKind::DynamicAlloca:
+            case ValueKind::DynamicStackRestore: return std::nullopt;
+            case ValueKind::Phi:
+            case ValueKind::ConstantInteger:
+            case ValueKind::ConstantFloating: break;
+            default: ++size;
+            }
+        }
+    }
+    if (!exit_edge) return std::nullopt;
+    peel.exiting = exit_edge->first;
+    peel.exit = exit_edge->second;
+    const auto& terminator = function.blocks[peel.exiting.value].terminator;
+    if (terminator.kind != TerminatorKind::ConditionalBranch ||
+        !terminator.value || !dominators.dominates(peel.exiting, latch)) {
+        return std::nullopt;
+    }
+    const bool exit_on_true = terminator.successors[0] == peel.exit;
+
+    std::vector<ValueId> phis;
+    std::unordered_set<std::uint32_t> visited;
+    if (!collect_iteration_phis(function, hir_module, loop.header, definitions,
+                                *terminator.value, phis, visited)) {
+        return std::nullopt;
+    }
+    for (std::size_t index = 0; index < phis.size(); ++index) {
+        const auto next = phi_value_from(function.values[phis[index].value], latch);
+        if (!next || !collect_iteration_phis(function, hir_module, loop.header,
+                                             definitions, *next, phis,
+                                             visited)) {
+            return std::nullopt;
+        }
+    }
+    std::unordered_map<std::uint32_t, UInt128> state;
+    {
+        const std::unordered_map<std::uint32_t, UInt128> outside;
+        IterationEvaluator evaluate(function, hir_module, outside);
+        for (const auto phi : phis) {
+            const auto value = evaluate(
+                *phi_value_from(function.values[phi.value], loop.preheader));
+            if (!value) return std::nullopt;
+            state.emplace(phi.value, *value);
+        }
+    }
+    // A loop tested at its header runs only that test in its last pass.
+    const std::size_t final_pass = peel.exiting == loop.header ? 0U : 1U;
+    for (unsigned backedges = 0;; ++backedges) {
+        IterationEvaluator evaluate(function, hir_module, state);
+        const auto condition = evaluate(*terminator.value);
+        if (!condition) return std::nullopt;
+        if ((*condition != UInt128{}) == exit_on_true) {
+            if ((backedges + final_pass) * size > limit) return std::nullopt;
+            peel.backedges = backedges;
+            return peel;
+        }
+        if ((backedges + 1U + final_pass) * size > limit) return std::nullopt;
+        std::unordered_map<std::uint32_t, UInt128> next;
+        for (const auto phi : phis) {
+            const auto value =
+                evaluate(*phi_value_from(function.values[phi.value], latch));
+            if (!value) return std::nullopt;
+            next.emplace(phi.value, *value);
+        }
+        state = std::move(next);
+    }
+}
+
+// Replaces the loop with one copy per pass through its header, in order.
+// Each copy starts with the values its header phis take in that pass; the
+// exit test leaves only in the last copy, whose values the code after the
+// loop reads.
+void peel_completely(ManagedFunction& function, const CompletePeel& peel) {
+    const unsigned copies = peel.backedges + 1U;
+    const unsigned last = peel.backedges;
+    const auto block_base = static_cast<std::uint32_t>(function.blocks.size());
+    const auto value_base = static_cast<std::uint32_t>(function.values.size());
+    const auto effect_base = static_cast<std::uint32_t>(function.effects.size());
+    constexpr std::uint32_t none = std::numeric_limits<std::uint32_t>::max();
+    std::vector<std::uint32_t> block_index(block_base, none);
+    std::vector<std::uint32_t> member_index(value_base, none);
+    std::vector<std::uint32_t> phi_index(value_base, none);
+    std::vector<std::uint32_t> effect_index(effect_base, none);
+    std::vector<ValueId> members;
+    std::vector<ValueId> header_phis;
+    std::vector<EffectId> effects;
+    for (std::uint32_t index = 0; index < peel.blocks.size(); ++index) {
+        const auto id = peel.blocks[index];
+        block_index[id.value] = index;
+        const auto& block = function.blocks[id.value];
+        effect_index[block.effect.value] =
+            static_cast<std::uint32_t>(effects.size());
+        effects.push_back(block.effect);
+        for (const auto value_id : block.values) {
+            const auto& value = function.values[value_id.value];
+            if (id == peel.header && value.kind == ValueKind::Phi) {
+                phi_index[value_id.value] =
+                    static_cast<std::uint32_t>(header_phis.size());
+                header_phis.push_back(value_id);
+                continue;
+            }
+            member_index[value_id.value] =
+                static_cast<std::uint32_t>(members.size());
+            members.push_back(value_id);
+            if (value.effect_output) {
+                effect_index[value.effect_output->value] =
+                    static_cast<std::uint32_t>(effects.size());
+                effects.push_back(*value.effect_output);
+            }
+        }
+    }
+    const auto block_count = static_cast<std::uint32_t>(peel.blocks.size());
+    const auto member_count = static_cast<std::uint32_t>(members.size());
+    const auto effect_count = static_cast<std::uint32_t>(effects.size());
+    std::vector<std::vector<ValueId>> starts(copies);
+    const auto map_value = [&](ValueId id, unsigned copy) {
+        if (id.value < value_base && phi_index[id.value] != none) {
+            return starts[copy][phi_index[id.value]];
+        }
+        if (id.value < value_base && member_index[id.value] != none) {
+            return ValueId{value_base + copy * member_count +
+                           member_index[id.value]};
+        }
+        return id;
+    };
+    const auto map_block = [&](BlockId id, unsigned copy) {
+        return BlockId{block_base + copy * block_count + block_index[id.value]};
+    };
+    const auto map_effect = [&](EffectId id, unsigned copy) {
+        if (id.value < effect_base && effect_index[id.value] != none) {
+            return EffectId{effect_base + copy * effect_count +
+                            effect_index[id.value]};
+        }
+        return id;
+    };
+    for (unsigned copy = 0; copy < copies; ++copy) {
+        for (const auto phi : header_phis) {
+            const auto& value = function.values[phi.value];
+            starts[copy].push_back(
+                copy == 0 ? *phi_value_from(value, peel.preheader)
+                          : map_value(*phi_value_from(value, peel.latch),
+                                      copy - 1U));
+        }
+    }
+
+    const auto preheader_effect =
+        function.blocks[peel.preheader.value].terminator.effect;
+    const auto latch_effect =
+        function.blocks[peel.latch.value].terminator.effect;
+    const auto header_effect = function.blocks[peel.header.value].effect;
+    const auto exiting_effect =
+        function.blocks[peel.exiting.value].terminator.effect;
+    function.values.reserve(value_base + copies * member_count);
+    function.effects.reserve(effect_base + copies * effect_count);
+    for (unsigned copy = 0; copy < copies; ++copy) {
+        for (const auto member : members) {
+            auto clone = function.values[member.value];
+            clone.id = map_value(member, copy);
+            for (auto& operand : clone.operands) {
+                operand = map_value(operand, copy);
+            }
+            for (auto& argument : clone.call_arguments) {
+                if (argument.value) {
+                    argument.value = map_value(*argument.value, copy);
+                }
+            }
+            for (auto& incoming : clone.incoming) {
+                incoming.predecessor = map_block(incoming.predecessor, copy);
+                incoming.value = map_value(incoming.value, copy);
+            }
+            if (clone.effect_input) {
+                clone.effect_input = map_effect(*clone.effect_input, copy);
+            }
+            if (clone.effect_output) {
+                clone.effect_output = map_effect(*clone.effect_output, copy);
+            }
+            function.values.push_back(std::move(clone));
+        }
+        for (const auto source : effects) {
+            auto effect = function.effects[source.value];
+            effect.id = map_effect(source, copy);
+            if (effect.input) effect.input = map_effect(*effect.input, copy);
+            if (effect.operation) {
+                effect.operation = map_value(*effect.operation, copy);
+            }
+            if (source == header_effect) {
+                effect.incoming = {
+                    copy == 0
+                        ? EffectIncoming{peel.preheader, preheader_effect}
+                        : EffectIncoming{map_block(peel.latch, copy - 1U),
+                                         map_effect(latch_effect, copy - 1U)}};
+            } else {
+                for (auto& incoming : effect.incoming) {
+                    incoming.predecessor = map_block(incoming.predecessor, copy);
+                    incoming.effect = map_effect(incoming.effect, copy);
+                }
+            }
+            function.effects.push_back(std::move(effect));
+        }
+    }
+
+    std::vector<ManagedBlock> blocks;
+    blocks.reserve(copies * block_count);
+    for (unsigned copy = 0; copy < copies; ++copy) {
+        for (const auto source_id : peel.blocks) {
+            const auto& source = function.blocks[source_id.value];
+            ManagedBlock block;
+            block.id = map_block(source_id, copy);
+            block.location = source.location;
+            for (const auto id : source.values) {
+                if (phi_index[id.value] == none) {
+                    block.values.push_back(map_value(id, copy));
+                }
+            }
+            if (source_id == peel.header) {
+                block.predecessors = {copy == 0
+                                          ? peel.preheader
+                                          : map_block(peel.latch, copy - 1U)};
+            } else {
+                for (const auto predecessor : source.predecessors) {
+                    block.predecessors.push_back(map_block(predecessor, copy));
+                }
+            }
+            block.effect = map_effect(source.effect, copy);
+            auto& terminator = block.terminator;
+            terminator = source.terminator;
+            terminator.effect = map_effect(source.terminator.effect, copy);
+            if (terminator.value) {
+                terminator.value = map_value(*terminator.value, copy);
+            }
+            // The successor of a pass is the next pass's header.
+            const auto successor = [&](BlockId id) {
+                return id == peel.header ? map_block(id, copy + 1U)
+                                         : map_block(id, copy);
+            };
+            if (source_id == peel.exiting) {
+                const auto inside = source.terminator.successors[0] == peel.exit
+                                        ? source.terminator.successors[1]
+                                        : source.terminator.successors[0];
+                terminator.kind = TerminatorKind::Branch;
+                terminator.value.reset();
+                terminator.successors = {copy == last ? peel.exit
+                                                      : successor(inside)};
+            } else if (source_id == peel.latch && copy == last) {
+                // The last pass leaves before its latch.
+                terminator.kind = TerminatorKind::Unreachable;
+                terminator.value.reset();
+                terminator.successors.clear();
+            } else {
+                for (auto& target : terminator.successors) {
+                    target = successor(target);
+                }
+            }
+            blocks.push_back(std::move(block));
+        }
+    }
+
+    // Enter the first pass and leave from the last one.
+    auto& preheader = function.blocks[peel.preheader.value];
+    std::replace(preheader.terminator.successors.begin(),
+                 preheader.terminator.successors.end(), peel.header,
+                 map_block(peel.header, 0));
+    auto& old_header = function.blocks[peel.header.value];
+    std::erase(old_header.predecessors, peel.preheader);
+    std::erase_if(function.effects[header_effect.value].incoming,
+                  [&](const EffectIncoming& incoming) {
+                      return incoming.predecessor == peel.preheader;
+                  });
+    for (const auto phi : header_phis) {
+        std::erase_if(function.values[phi.value].incoming,
+                      [&](const PhiIncoming& incoming) {
+                          return incoming.predecessor == peel.preheader;
+                      });
+    }
+    const auto last_exiting = map_block(peel.exiting, last);
+    auto& exit = function.blocks[peel.exit.value];
+    std::replace(exit.predecessors.begin(), exit.predecessors.end(),
+                 peel.exiting, last_exiting);
+    for (auto& incoming : function.effects[exit.effect.value].incoming) {
+        if (incoming.predecessor != peel.exiting) continue;
+        incoming.predecessor = last_exiting;
+        incoming.effect = map_effect(exiting_effect, last);
+    }
+    // Code after the loop reads the values of the last pass.
+    for (std::uint32_t index = 0; index < block_base; ++index) {
+        if (block_index[index] != none) continue;
+        auto& block = function.blocks[index];
+        for (const auto id : block.values) {
+            auto& value = function.values[id.value];
+            for (auto& operand : value.operands) operand = map_value(operand, last);
+            for (auto& argument : value.call_arguments) {
+                if (argument.value) {
+                    argument.value = map_value(*argument.value, last);
+                }
+            }
+            for (auto& incoming : value.incoming) {
+                if (incoming.predecessor == peel.exiting) {
+                    incoming.predecessor = last_exiting;
+                }
+                incoming.value = map_value(incoming.value, last);
+            }
+        }
+        if (block.terminator.value) {
+            block.terminator.value = map_value(*block.terminator.value, last);
+        }
+    }
+
+    // Lay the passes out where the loop was; the loop itself is unreachable.
+    std::vector<BlockId> order;
+    order.reserve(block_base + blocks.size());
+    for (std::uint32_t index = 0; index < block_base; ++index) {
+        if (BlockId{index} == peel.header) {
+            for (const auto& block : blocks) order.push_back(block.id);
+        }
+        if (block_index[index] == none) order.push_back(BlockId{index});
+    }
+    for (const auto id : peel.blocks) order.push_back(id);
+    for (auto& block : blocks) function.blocks.push_back(std::move(block));
+    reorder_blocks(function, order);
+    eliminate_unreachable_blocks(function);
+}
+
+// Completely peels loops, innermost first, while one qualifies. Peeling
+// replaces a loop's blocks, so every peel starts from a fresh loop forest.
+bool peel_loops_completely(ManagedFunction& function,
+                           const hir::Module& hir_module, unsigned limit) {
+    bool changed = false;
+    while (true) {
+        const DominatorTree dominators(function);
+        const LoopForest forest(function, dominators);
+        const auto definitions = value_definition_blocks(function);
+        std::optional<CompletePeel> peel;
+        for (const auto& loop : forest.canonical_loops()) {
+            peel = plan_complete_peel(function, hir_module, dominators,
+                                      definitions, loop, limit);
+            if (peel) break;
+        }
+        if (!peel) return changed;
+        peel_completely(function, *peel);
+        changed = true;
+    }
+}
+
 bool reassociate_unit_recurrence_adds_impl(
     ManagedFunction& function, const hir::Module& hir_module,
     std::span<const CanonicalLoop> loops, const UseLists& use_lists) {
@@ -15389,13 +16136,22 @@ bool vectorize_reduction_loop(
     const unsigned memory_interleave = expanded_avx2_qword_multiply
         ? std::min(options.vector_interleave, 2U)
         : options.vector_interleave;
-    const unsigned interleave = reassociate
+    unsigned interleave = reassociate
         ? (conditional_depth >= 2U
                ? 1U
                : conditional_depth != 0U
                    ? 2U
                    : !pattern.stores.empty() ? memory_interleave : 4U)
         : 1U;
+    // A zero-based loop to a constant bound runs no vector step wider than
+    // that bound.
+    if (const auto trip = folded_integer_constant(function, hir_module,
+                                                  pattern.bound)) {
+        if (*trip < UInt128{lanes}) return false;
+        while (interleave > 1U && *trip < UInt128{lanes * interleave}) {
+            interleave /= 2U;
+        }
+    }
     if (lanes > std::numeric_limits<unsigned>::max() / interleave) {
         return false;
     }
@@ -17775,25 +18531,13 @@ bool fold_constants(ManagedFunction& function,
                    value.operands.size() == 1) {
             const auto& operand = function.values[value.operands[0].value];
             if (operand.kind != ValueKind::ConstantInteger) continue;
-            const auto source_bits = type_bits(hir_module, operand.type);
-            const auto target_bits = type_bits(hir_module, value.type);
-            if (source_bits == 0 || target_bits == 0) continue;
-            auto folded = mask_to(
-                UInt128{operand.integer, operand.integer_high}, source_bits);
-            if (value.cast == CastOperation::SignExtend &&
-                bit(folded, source_bits - 1U)) {
-                folded = bit_or(
-                    folded,
-                    bit_not(mask_to(bit_not(UInt128{}), source_bits)));
-            } else if (value.cast != CastOperation::ZeroExtend &&
-                       value.cast != CastOperation::Truncate &&
-                       value.cast != CastOperation::Reinterpret &&
-                       value.cast != CastOperation::SignExtend) {
-                continue;
-            }
-            folded = mask_to(folded, target_bits);
-            value.integer = folded.low;
-            value.integer_high = folded.high;
+            const auto folded = fold_integer_cast(
+                value.cast, UInt128{operand.integer, operand.integer_high},
+                type_bits(hir_module, operand.type),
+                type_bits(hir_module, value.type));
+            if (!folded) continue;
+            value.integer = folded->low;
+            value.integer_high = folded->high;
             value.kind = ValueKind::ConstantInteger;
             value.operands.clear();
             changed = true;
@@ -17808,83 +18552,12 @@ bool fold_constants(ManagedFunction& function,
             const auto bits = comparison(value.binary)
                 ? type_bits(hir_module, left.type)
                 : type_bits(hir_module, value.type);
-            const UInt128 left_value{left.integer, left.integer_high};
-            const UInt128 right_value{right.integer, right.integer_high};
-            UInt128 folded;
-            switch (value.binary) {
-            case BinaryOperation::Add:
-                folded = mask_to(add(left_value, right_value), bits);
-                break;
-            case BinaryOperation::Subtract:
-                folded = mask_to(subtract(left_value, right_value), bits);
-                break;
-            case BinaryOperation::Multiply:
-                folded = mask_to(multiply(left_value, right_value), bits);
-                break;
-            case BinaryOperation::BitAnd:
-                folded = bit_and(left_value, right_value);
-                break;
-            case BinaryOperation::BitOr:
-                folded = bit_or(left_value, right_value);
-                break;
-            case BinaryOperation::BitXor:
-                folded = bit_xor(left_value, right_value);
-                break;
-            case BinaryOperation::ShiftLeft:
-                folded = mask_to(
-                    shift_left(left_value,
-                               static_cast<unsigned>(right_value.low % bits)),
-                    bits);
-                break;
-            case BinaryOperation::ShiftRightLogical:
-                folded = shift_right(
-                    left_value,
-                    static_cast<unsigned>(right_value.low % bits));
-                break;
-            case BinaryOperation::RotateLeft: {
-                const auto amount =
-                    static_cast<unsigned>(right_value.low % bits);
-                folded = amount == 0
-                    ? mask_to(left_value, bits)
-                    : mask_to(
-                          bit_or(shift_left(left_value, amount),
-                                 shift_right(left_value, bits - amount)),
-                          bits);
-                break;
-            }
-            case BinaryOperation::RotateRight: {
-                const auto amount =
-                    static_cast<unsigned>(right_value.low % bits);
-                folded = amount == 0
-                    ? mask_to(left_value, bits)
-                    : mask_to(
-                          bit_or(shift_right(left_value, amount),
-                                 shift_left(left_value, bits - amount)),
-                          bits);
-                break;
-            }
-            case BinaryOperation::Equal:
-                folded = left_value == right_value ? 1 : 0;
-                break;
-            case BinaryOperation::NotEqual:
-                folded = left_value == right_value ? 0 : 1;
-                break;
-            case BinaryOperation::UnsignedLess:
-                folded = left_value < right_value ? 1 : 0;
-                break;
-            case BinaryOperation::UnsignedLessEqual:
-                folded = right_value < left_value ? 0 : 1;
-                break;
-            case BinaryOperation::UnsignedGreater:
-                folded = right_value < left_value ? 1 : 0;
-                break;
-            case BinaryOperation::UnsignedGreaterEqual:
-                folded = left_value < right_value ? 0 : 1;
-                break;
-            default: continue;
-            }
-            value.integer = folded.low;
-            value.integer_high = folded.high;
+            const auto folded = fold_integer_binary(
+                value.binary, UInt128{left.integer, left.integer_high},
+                UInt128{right.integer, right.integer_high}, bits);
+            if (!folded) continue;
+            value.integer = folded->low;
+            value.integer_high = folded->high;
             value.kind = ValueKind::ConstantInteger;
             value.operands.clear();
             changed = true;
@@ -18386,6 +19059,19 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
                                : PassResult::unchanged();
             });
     }
+    // A diamond arm that reloads what its branch condition read is pure
+    // once the load is forwarded, so forward memory before conditional
+    // replacement and if-conversion as well.
+    if (options.tree_fre) {
+        pipeline.add(
+            PassId::MemoryValueForwarding,
+            [&](ManagedFunction& function, FunctionAnalysisManager&) {
+                return forward_memory_values(function, hir_module,
+                                             subtarget.target())
+                    ? PassResult::changed_values()
+                    : PassResult::unchanged();
+            });
+    }
     if (options.tree_ccp) {
         pipeline.add(
             PassId::ConditionalReplacement,
@@ -18493,6 +19179,43 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
                                : PassResult::unchanged();
             });
     }
+    // After vectorization, which keeps its loops, and before unrolling, which
+    // would hide a loop's trip count. Folding then makes each pass's
+    // induction values constant, and the later value numbering and memory
+    // forwarding see the accesses at constant offsets.
+    if (options.peel_loops) {
+        pipeline.add(
+            PassId::CompleteLoopPeeling,
+            [&](ManagedFunction& function, FunctionAnalysisManager&) {
+                if (!peel_loops_completely(function, hir_module,
+                                           options.peel_limit)) {
+                    return PassResult::unchanged();
+                }
+                if (options.tree_ccp) {
+                    // Code after the loop reads values of the last pass,
+                    // which folding visits later.
+                    for (unsigned round = 0;
+                         round < std::max(1U, options.ccp_rounds); ++round) {
+                        bool folded = fold_constants(
+                            function, hir_module, options.floating_environment,
+                            subtarget.nan_encoding());
+                        if (constant_objects &&
+                            fold_constant_object_reads(function, hir_module,
+                                                       *constant_objects,
+                                                       subtarget.target())) {
+                            folded = true;
+                        }
+                        if (!folded) break;
+                    }
+                    simplify_integer_operations(function, hir_module);
+                    (void)fold_constant_branches(function);
+                }
+                if (options.tree_copy_prop) propagate_trivial_copies(function);
+                // The passes form one straight-line chain of blocks.
+                (void)merge_block_chains(function);
+                return PassResult::changed_cfg();
+            });
+    }
     // Preserve vectorizable reductions before expanding scalar bodies. The
     // unroller then handles dependency-heavy scalar loops and vector cleanup
     // tails without hiding the canonical reduction shape from vectorization.
@@ -18588,6 +19311,15 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
                     function, hir_module, subtarget,
                     options.floating_environment);
                 return PassResult::changed_values();
+            });
+        // Peeled and unrolled copies access memory at constant offsets.
+        pipeline.add(
+            PassId::MemoryValueForwarding,
+            [&](ManagedFunction& function, FunctionAnalysisManager&) {
+                return forward_memory_values(function, hir_module,
+                                             subtarget.target())
+                    ? PassResult::changed_values()
+                    : PassResult::unchanged();
             });
     }
     if (options.tree_ccp) {
@@ -18693,12 +19425,21 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
                     // Rotation clones the continuation predicate after the
                     // ordinary scalar simplification rounds. Re-canonicalize
                     // boolean cast/compare chains so machine compare-branch
-                    // fusion sees the same direct predicate at both tests.
-                    if (options.tree_ccp) {
-                        simplify_integer_operations(function, hir_module);
-                    }
+                    // fusion sees the same direct predicate at both tests,
+                    // and fold a guard that tests constant initial values,
+                    // which reach it through single-input phis.
                     if (options.tree_copy_prop) {
                         propagate_trivial_copies(function);
+                    }
+                    if (options.tree_ccp) {
+                        (void)fold_constants(function, hir_module,
+                                             options.floating_environment,
+                                             subtarget.nan_encoding());
+                        simplify_integer_operations(function, hir_module);
+                        (void)fold_constant_branches(function);
+                        if (options.tree_copy_prop) {
+                            propagate_trivial_copies(function);
+                        }
                     }
                 }
                 return changed ? PassResult::changed_cfg()

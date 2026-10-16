@@ -415,7 +415,7 @@ global i32 mips_zero_branch(in i32 value, in i32 other) {
 [[abi("o32"), noinline]]
 global void mips_store_loop(in u32 *cells, in u32 count, in u32 value) {
     for (u32 index = 0u32; index < count; index = index + 1u32) {
-        cells[index] = value;
+        cells[index] = value ^ index;
         value = value * 3u32 + 1u32;
     }
 }

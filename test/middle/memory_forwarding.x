@@ -99,6 +99,71 @@ union view { f32 value; u32 bits; };
     return cell.bits;
 }
 
+// Each pass reads the value the previous pass stored; a pass that may skip
+// the store, a call, or a store through a pointer that may alias keeps the
+// read.
+[[noinline]] global u32 carried(in u32 n) {
+    counter = 3u32;
+    u32 total = 0u32;
+    for (u32 i = 0u32; i < n; ++i) {
+        const u32 at = counter == 0u32 ? 54u32 : counter - 1u32;
+        total = total * 7u32 + at;
+        counter = at;
+    }
+    return total + counter;
+}
+
+[[noinline]] global u32 sometimes(in u32 n) {
+    counter = 1u32;
+    u32 total = 0u32;
+    for (u32 i = 0u32; i < n; ++i) {
+        total = total + counter;
+        if ((i & 1u32) != 0u32) counter = counter * 3u32;
+    }
+    return total;
+}
+
+[[noinline]] global u32 calling(in u32 n) {
+    counter = 2u32;
+    u32 total = 0u32;
+    for (u32 i = 0u32; i < n; ++i) {
+        total = total + counter;
+        touch();
+    }
+    return total;
+}
+
+[[noinline]] global u32 through(in u32 n, in u32 *p) {
+    counter = 4u32;
+    u32 total = 0u32;
+    for (u32 i = 0u32; i < n; ++i) {
+        total = total + counter;
+        *p = total;
+    }
+    return total;
+}
+
+union wide_view { f64 value; u64 bits; };
+union half_view { u16 unsigned_half; i16 signed_half; };
+
+[[noinline]] global u64 wide_bits(in f64 x) {
+    union wide_view cell;
+    cell.value = x * 2.0f64;
+    return cell.bits;
+}
+
+[[noinline]] global f32 from_bits(in u32 bits) {
+    union view cell;
+    cell.bits = bits;
+    return cell.value + 1.0f32;
+}
+
+[[noinline]] global i32 signed_half(in u16 x) {
+    union half_view cell;
+    cell.unsigned_half = x;
+    return (i32)cell.signed_half;
+}
+
 [[noinline]] global u32 local_arrays(in u32 n) {
     u32 total = 0u32;
     for (u32 i = 0u32; i < n; ++i) {
@@ -149,6 +214,20 @@ global u32 test_entry() {
     if ($::runtime(looped(4u32)) != 11u32) return 13u32;
     if ($::runtime(reinterpreted(1.0f32)) != 0x3f800000u32) return 14u32;
     if ($::runtime(local_arrays(4u32)) != 10u32) return 15u32;
+    // counter: 3, 2, 1, 0, 54, 53.
+    if ($::runtime(carried(5u32)) != (((2u32 * 7u32 + 1u32) * 7u32) * 7u32 + 54u32) * 7u32 +
+                                     53u32 + 53u32) return 22u32;
+    // counter: 1, 1, 3, 3, 9.
+    if ($::runtime(sometimes(5u32)) != 1u32 + 1u32 + 3u32 + 3u32 + 9u32) return 23u32;
+    counter = 0u32;
+    // touch adds 100 after each pass.
+    if ($::runtime(calling(3u32)) != 2u32 + 102u32 + 202u32) return 24u32;
+    if ($::runtime(through(3u32, &other)) != 12u32 || other != 12u32) return 25u32;
+    // p is counter, which each pass doubles.
+    if ($::runtime(through(3u32, &counter)) != 16u32) return 26u32;
+    if ($::runtime(wide_bits(1.0f64)) != 0x4000000000000000u64) return 27u32;
+    if ($::runtime(from_bits(0x40000000u32)) != 3.0f32) return 28u32;
+    if ($::runtime(signed_half(65535u16)) != -1) return 29u32;
     for (u32 i = 0u32; i < 55u32; ++i) seeds[i] = i * i;
     $::runtime(refresh());
     for (u32 i = 0u32; i < 24u32; ++i) {

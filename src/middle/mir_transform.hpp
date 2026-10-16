@@ -23,6 +23,9 @@ canonicalize_bitwise_operations(ManagedFunction& function,
 [[nodiscard]] bool factor_zero_extended_bitwise_chains(
     ManagedFunction& function, const hir::Module& hir_module);
 [[nodiscard]] bool eliminate_forwarding_blocks(ManagedFunction& function);
+// Merges each block into its predecessor when that is the block's only
+// predecessor and the block its only successor.
+[[nodiscard]] bool merge_block_chains(ManagedFunction& function);
 [[nodiscard]] bool factor_common_phi_tails(
     ManagedFunction& function, const hir::Module& hir_module);
 // Reuse an existing unsigned `index + 1` latch value in expressions shaped

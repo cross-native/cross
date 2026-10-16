@@ -45,3 +45,27 @@ global u32 read_replaceable() { return replaceable; }
 global const u32 zero_word = 0u32;
 global u32 read_zero_word() { return zero_word; }
 global u32 constant_tag() { return constant_pair.second; }
+
+// The shifted seed has a clear top bit and converts as a signed word.
+global f32 scaled_seed(in u32 seed) { return (f32)(seed >> 20) * 0.00390625f32; }
+
+// Each pass reads the value the previous pass stored.
+global u32 cursor;
+global u32 carried_cursor(in u32 n) {
+    cursor = 3u32;
+    u32 total = 0u32;
+    for (u32 i = 0u32; i < n; ++i) {
+        const u32 at = cursor == 0u32 ? 54u32 : cursor - 1u32;
+        total = total * 7u32 + at;
+        cursor = at;
+    }
+    return total;
+}
+
+// The stored bits read back as another type of their width.
+union word_view { f32 value; u32 bits; };
+global u32 word_of(in f32 x) {
+    union word_view cell;
+    cell.value = x;
+    return cell.bits;
+}

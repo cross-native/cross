@@ -260,6 +260,36 @@ using MemoryState = std::vector<Available>;
 
 constexpr std::size_t maximum_available = 64;
 
+// The width of an integer or floating scalar whose bits a scalar of another
+// such type may reinterpret.
+std::optional<unsigned> reinterpretable_bits(const hir::Module& module,
+                                             hir::TypeId id) {
+    const auto& type = module.type(id);
+    if (type.kind != hir::Type::Kind::Builtin) return std::nullopt;
+    switch (type.builtin) {
+    case BuiltinType::I8:
+    case BuiltinType::U8: return 8U;
+    case BuiltinType::I16:
+    case BuiltinType::U16: return 16U;
+    case BuiltinType::I32:
+    case BuiltinType::U32:
+    case BuiltinType::F32: return 32U;
+    case BuiltinType::I64:
+    case BuiltinType::U64:
+    case BuiltinType::F64: return 64U;
+    default: return std::nullopt;
+    }
+}
+
+// A load whose location holds a value of another type of its width.
+struct View {
+    BlockId block;
+    ValueId load;
+    ValueId source;
+    hir::TypeId type;
+    SourceLocation location;
+};
+
 } // namespace
 
 bool forward_memory_values(ManagedFunction& function,
@@ -280,6 +310,7 @@ bool forward_memory_values(ManagedFunction& function,
     // A rewrite then replaces a load whose location is already available.
     ValueReplacements replacements;
     std::unordered_set<std::uint32_t> removed;
+    std::vector<View> views;
     const auto transfer = [&](const ManagedBlock& block, MemoryState& state,
                               bool rewrite) {
         for (const auto id : block.values) {
@@ -292,8 +323,24 @@ bool forward_memory_values(ManagedFunction& function,
                         return entry.access == *access &&
                                function.values[entry.value.value].type == value.type;
                     });
+                const auto bits = reinterpretable_bits(hir_module, value.type);
+                const auto view = !bits ? state.end() : std::find_if(
+                    state.begin(), state.end(), [&](const Available& entry) {
+                        return entry.access == *access &&
+                               reinterpretable_bits(
+                                   hir_module,
+                                   function.values[entry.value.value].type) == bits;
+                    });
                 if (rewrite && found != state.end()) {
                     replacements.add(id, replacements.resolve(found->value));
+                    removed.insert(id.value);
+                } else if (rewrite && view != state.end()) {
+                    const ValueId cast{static_cast<std::uint32_t>(
+                        function.values.size() + views.size())};
+                    views.push_back({block.id, id,
+                                     replacements.resolve(view->value),
+                                     value.type, value.location});
+                    replacements.add(id, cast);
                     removed.insert(id.value);
                 }
                 state.push_back({*access, id});
@@ -323,6 +370,9 @@ bool forward_memory_values(ManagedFunction& function,
     std::vector<bool> reachable(function.blocks.size());
     for (const auto block : order) reachable[block.value] = true;
     std::vector<std::optional<MemoryState>> exits(function.blocks.size());
+    // A location whose predecessors leave different known values in it holds
+    // a phi of those values at a join.
+    std::vector<MemoryState> joined(function.blocks.size());
     const auto entry_state = [&](BlockId id) {
         MemoryState state;
         const auto& block = function.blocks[id.value];
@@ -343,26 +393,115 @@ bool forward_memory_values(ManagedFunction& function,
                 });
             }
         }
+        for (const auto& phi : joined[id.value]) {
+            std::erase_if(state, [&](const Available& entry) {
+                return entry.access == phi.access;
+            });
+            state.push_back(phi);
+        }
         return state;
     };
-    bool converged = false;
-    for (unsigned sweep = 0; sweep < 16 && !converged; ++sweep) {
-        converged = true;
-        for (const auto id : order) {
-            auto state = entry_state(id);
-            transfer(function.blocks[id.value], state, false);
-            if (exits[id.value] != state) {
-                exits[id.value] = std::move(state);
-                converged = false;
+    const auto solve = [&] {
+        for (unsigned sweep = 0; sweep < 16; ++sweep) {
+            bool converged = true;
+            for (const auto id : order) {
+                auto state = entry_state(id);
+                transfer(function.blocks[id.value], state, false);
+                if (exits[id.value] != state) {
+                    exits[id.value] = std::move(state);
+                    converged = false;
+                }
             }
+            if (converged) return true;
+        }
+        return false;
+    };
+    if (!solve()) return false;
+    // Only locations that some load reads are worth a phi.
+    std::vector<Access> read;
+    for (const auto& value : function.values) {
+        const auto& access = accesses[value.id.value];
+        if (load_kind(value.kind) && access &&
+            std::find(read.begin(), read.end(), *access) == read.end()) {
+            read.push_back(*access);
         }
     }
-    if (!converged) return false;
+    bool inserted = false;
+    for (unsigned round = 0; round < 4; ++round) {
+        bool added = false;
+        for (const auto id : order) {
+            const auto& block = function.blocks[id.value];
+            if (block.predecessors.size() < 2 || labeled[id.value] ||
+                std::any_of(block.predecessors.begin(), block.predecessors.end(),
+                            [&](BlockId predecessor) {
+                                return !reachable[predecessor.value] ||
+                                       !exits[predecessor.value];
+                            })) {
+                continue;
+            }
+            const auto candidates = *exits[block.predecessors.front().value];
+            for (const auto& candidate : candidates) {
+                const auto type = function.values[candidate.value.value].type;
+                if (std::find(read.begin(), read.end(), candidate.access) ==
+                        read.end() ||
+                    std::any_of(joined[id.value].begin(), joined[id.value].end(),
+                                [&](const Available& phi) {
+                                    return phi.access == candidate.access;
+                                })) {
+                    continue;
+                }
+                ManagedValue phi;
+                phi.kind = ValueKind::Phi;
+                phi.type = type;
+                phi.location = block.location;
+                bool everywhere = true;
+                bool differs = false;
+                for (const auto predecessor : block.predecessors) {
+                    const auto& state = *exits[predecessor.value];
+                    const auto found = std::find_if(
+                        state.begin(), state.end(), [&](const Available& entry) {
+                            return entry.access == candidate.access &&
+                                   function.values[entry.value.value].type == type;
+                        });
+                    if (found == state.end()) {
+                        everywhere = false;
+                        break;
+                    }
+                    differs = differs || found->value != candidate.value;
+                    phi.incoming.push_back({predecessor, found->value});
+                }
+                if (!everywhere || !differs) continue;
+                phi.id = ValueId{static_cast<std::uint32_t>(function.values.size())};
+                const auto phi_id = phi.id;
+                function.values.push_back(std::move(phi));
+                auto& values = function.blocks[id.value].values;
+                values.insert(values.begin(), phi_id);
+                joined[id.value].push_back({candidate.access, phi_id});
+                added = true;
+            }
+        }
+        if (!added) break;
+        inserted = true;
+        accesses.resize(function.values.size());
+        if (!solve()) return true;
+    }
     for (const auto id : order) {
         auto state = entry_state(id);
         transfer(function.blocks[id.value], state, true);
     }
-    if (removed.empty()) return false;
+    if (removed.empty()) return inserted;
+    for (const auto& view : views) {
+        ManagedValue cast;
+        cast.id = ValueId{static_cast<std::uint32_t>(function.values.size())};
+        cast.location = view.location;
+        cast.type = view.type;
+        cast.kind = ValueKind::Cast;
+        cast.cast = CastOperation::Reinterpret;
+        cast.operands = {view.source};
+        auto& values = function.blocks[view.block.value].values;
+        values.insert(std::find(values.begin(), values.end(), view.load), cast.id);
+        function.values.push_back(std::move(cast));
+    }
     replacements.apply(function);
     remove_effectful_values(function, removed);
     return true;

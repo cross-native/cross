@@ -40,6 +40,7 @@ std::string_view pass_name(PassId pass) {
     case PassId::ReductionVectorization: return "reduction-vectorization";
     case PassId::EarlyExitVectorization:
         return "early-exit-vectorization";
+    case PassId::CompleteLoopPeeling: return "complete-loop-peeling";
     case PassId::LoopUnrolling: return "loop-unrolling";
     case PassId::UnitRecurrenceReassociation:
         return "unit-recurrence-reassociation";

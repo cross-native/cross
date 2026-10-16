@@ -3,8 +3,10 @@
 
 # Floating constant folding follows the profile environment, and constant
 # folding, constant-object reads, memory value forwarding, conditional
-# replacement, power-of-two division, and shared store addresses follow
-# their controls on x86-64 and MIPS.
+# replacement, power-of-two division, shared store addresses, values
+# carried in memory across loop passes and type views, and signed
+# conversion of nonnegative integers follow their controls on x86-64 and
+# MIPS.
 
 foreach(required CC SOURCE MODEL OUTPUT)
     if(NOT DEFINED ${required} OR "${${required}}" STREQUAL "")
@@ -79,8 +81,11 @@ expect(x86-no-ccp reciprocal "\tdivss\t" TRUE)
 expect(x86-no-ccp scaled "_scale[(]%rip[)]" TRUE)
 expect(x86-no-ccp below "\tcmov[a-z]*\t" TRUE)
 expect(x86-no-ccp constant_tag "constant_pair" TRUE)
+expect(x86-O2 carried_cursor "\tmovl\tcursor[(]%rip[)], " FALSE)
+expect(x86-O2 word_of "\tmovd\t" TRUE)
 compile(x86-no-fre -O2 -fno-tree-fre ${x86})
 expect_count(x86-no-fre bump "\tmovl\tcounter[(]%rip[)], " 2)
+expect(x86-no-fre carried_cursor "\tmovl\tcursor[(]%rip[)], " TRUE)
 compile(x86-no-div -O2 -fno-div-by-constant ${x86})
 expect(x86-no-div eighth "\tdivss\t" TRUE)
 
@@ -103,14 +108,24 @@ compile(mips-O2 -O2 ${mips})
 expect(mips-O2 reciprocal "\tdiv[.]s\t" FALSE)
 expect(mips-O2 below "\tb[a-z]*\t" FALSE)
 expect(mips-O2 refresh "\tsll\t" FALSE)
+# The pointer, not a separate index, counts the passes.
+expect(mips-O2 refresh "\tsltiu\t" FALSE)
 expect_count(mips-O2 bump "\tlw\t" 3)
 expect(mips-O2 eighth "\tmul[.]s\t" TRUE)
+expect(mips-O2 scaled_seed "\tbgez\t" FALSE)
 compile(mips-no-ccp -O2 -fno-tree-ccp ${mips})
 expect(mips-no-ccp below "\tb[a-z]*\t" TRUE)
+compile(mips-no-bit-ccp -O2 -fno-tree-bit-ccp ${mips})
+expect(mips-no-bit-ccp scaled_seed "\tbgez\t" TRUE)
+expect(mips-O2 carried_cursor "\tlw\t" FALSE)
+expect(mips-O2 word_of "\tmfc1\t" TRUE)
+expect(mips-O2 word_of "\tlw\t" FALSE)
 compile(mips-no-fre -O2 -fno-tree-fre ${mips})
 expect_count(mips-no-fre bump "\tlw\t" 5)
+expect(mips-no-fre carried_cursor "\tlw\t" TRUE)
 compile(mips-no-ivopts -O2 -fno-ivopts ${mips})
 expect(mips-no-ivopts refresh "\tsll\t" TRUE)
+expect(mips-no-ivopts refresh "\tsltiu\t" TRUE)
 compile(mips-no-div -O2 -fno-div-by-constant ${mips})
 expect(mips-no-div eighth "\tdiv[.]s\t" TRUE)
 compile(mips-trapping -O2 ${mips} ${model} -mprofile=trapping-fp)
