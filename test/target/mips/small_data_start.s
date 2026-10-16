@@ -1,0 +1,57 @@
+# Copyright (C) 2026 Cross contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# o32 startup for small data: $gp holds _gp before any code that reaches
+# small data runs. Prints one digit per round of small_data_check.
+
+        .set noreorder
+        .set noat
+        .set mips3
+        .section .text.boot,"ax",@progbits
+        .globl _start
+_start:
+        lui $sp,0x8080
+        addiu $sp,$sp,-64
+        mfc0 $t0,$12
+        lui $t1,0x2000
+        or $t0,$t0,$t1
+        mtc0 $t0,$12
+        nop
+        nop
+        lui $gp,%hi(_gp)
+        addiu $gp,$gp,%lo(_gp)
+        move $a0,$zero
+        jal small_data_check
+        nop
+        move $a0,$v0
+        jal print_digit
+        nop
+        addiu $a0,$zero,1
+        jal small_data_check
+        nop
+        move $a0,$v0
+        jal print_digit
+        nop
+        addiu $a0,$zero,2
+        jal small_data_check
+        nop
+        move $a0,$v0
+        jal print_digit
+        nop
+        lui $t0,0xbf00
+        ori $t0,$t0,0x0900
+        addiu $t1,$zero,10
+        sb $t1,0($t0)
+        move $a0,$zero
+        addiu $v0,$zero,1
+        addiu $t9,$zero,1
+        .word 0x7000007f
+halt:   b halt
+        nop
+print_digit:
+        lui $t0,0xbf00
+        ori $t0,$t0,0x0900
+        addiu $a0,$a0,48
+        sb $a0,0($t0)
+        jr $ra
+        nop

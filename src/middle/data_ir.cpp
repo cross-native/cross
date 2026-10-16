@@ -6,6 +6,7 @@
 #include "common/floating_bits.hpp"
 #include "common/floating_semantics.hpp"
 #include "common/integer_semantics.hpp"
+#include "common/options.hpp"
 #include "common/relocation_addend.hpp"
 #include "frontend/ast.hpp"
 #include "frontend/semantic.hpp"
@@ -1720,6 +1721,48 @@ std::optional<AddressConstant> relocatable_address(
 
 std::optional<UInt128> parse_binary128_literal(std::string text) {
     return parse_binary128(std::move(text));
+}
+
+void place_data_bases(hir::Module& hir_module, const Module& data_module,
+                      const CompilerOptions& options) {
+    const auto& bases = options.data_bases;
+    for (auto& entity : hir_module.objects) {
+        if (bases.empty() || entity.is_thread_local || entity.fixed_address) {
+            continue;
+        }
+        for (std::uint32_t index = 0; index < bases.size(); ++index) {
+            const auto& base = bases[index];
+            bool reached = false;
+            if (entity.section) {
+                reached = std::find(base.sections.begin(), base.sections.end(),
+                                    *entity.section) != base.sections.end();
+            } else if (const auto* object = data_module.find(entity.id)) {
+                // Weak symbols may resolve outside the base's reach.
+                const auto initializer = object->initializer;
+                reached = initializer != InitializerKind::Declaration &&
+                          initializer != InitializerKind::Uninitialized &&
+                          !entity.weak && !entity.alias_target &&
+                          !entity.weakref_target && object->size != 0 &&
+                          object->size <= base.max_size &&
+                          (entity.literal ? base.literal
+                           : object->read_only ? base.readonly
+                                               : base.writable);
+            }
+            if (reached) {
+                entity.data_base = index;
+                break;
+            }
+        }
+    }
+}
+
+std::optional<std::string> data_base_section(const hir::Object& entity,
+                                             bool zero, bool split,
+                                             const CompilerOptions& options) {
+    if (!entity.data_base || entity.section) return std::nullopt;
+    const auto& sections = options.data_bases[*entity.data_base].sections;
+    const auto& section = zero ? sections.back() : sections.front();
+    return split ? section + '.' + entity.link_symbol : section;
 }
 
 const Object* Module::find(hir::ObjectId id) const {

@@ -638,6 +638,12 @@ std::span<const OptionDefinition> common_option_definitions() {
          OptionCategory::CodeGeneration, false,
          OptionImplementation::Partial,
          "debug model entry whose information is emitted; empty for none"},
+        // Every target accepts it; a target without base-relative data
+        // rejects a selection.
+        {"m.data-bases", {}, OptionValueKind::Text, std::string("none"), {},
+         0, 0, OptionCategory::CodeGeneration, false,
+         OptionImplementation::Implemented,
+         "data_base model entries in use, comma-separated, or none"},
     };
     return definitions;
 }
@@ -1083,6 +1089,7 @@ bool parse_cc_options(int argc, char** argv, CompilerOptions& options,
         if (argument == "--print-optimizations") { options.print_optimizations = true; continue; }
         if (argument == "--print-cpus") { options.print_cpus = true; continue; }
         if (argument == "--print-costs") { options.print_costs = true; continue; }
+        if (argument == "--print-data-bases") { options.print_data_bases = true; continue; }
         if (argument == "--print-options" ||
             argument.starts_with("--print-options=")) {
             options.print_options = true;
@@ -1216,6 +1223,8 @@ void print_cc_help() {
   -mabi=NAME            select a registered target ABI
   -mmangling=NAME       select a registered name-mangling model
   -mprofile=NAME        select a model profile
+  -mdata-bases=NAME[,NAME...]
+                        select data_base model entries; none selects none
   --model=FILE          load a named compiler-definition file
   --model-path=DIR      add a compiler-definition search directory
   --print-targets       list compiled-in target architectures
@@ -1226,6 +1235,7 @@ void print_cc_help() {
   --print-optimizations list loaded optimization presets
   --print-cpus          list the target's CPU entries
   --print-costs         list instruction costs for -march and -mtune
+  --print-data-bases    list data_base model entries
   --print-options[=CATEGORY]
                         list typed effective options and origins
   --print-attributes    list contextual [[attribute]] names

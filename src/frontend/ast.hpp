@@ -558,6 +558,8 @@ struct ObjectDecl {
     std::vector<Attribute> attributes;
     std::unique_ptr<Expr> initializer;
     Linkage linkage{Linkage::Group};
+    // A constant the compiler created for a literal.
+    bool literal{};
 };
 
 struct EnumDecl {

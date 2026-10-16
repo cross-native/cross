@@ -2494,6 +2494,7 @@ private:
             }
             object.tls_model = decode_attribute_string(
                 object_attribute(*representative, "tls_model"));
+            object.literal = representative->literal;
         }
     }
 

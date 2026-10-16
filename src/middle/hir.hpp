@@ -256,6 +256,11 @@ struct Object {
     std::optional<std::uint64_t> fixed_address;
     bool is_thread_local{};
     std::string tls_model;
+    // A constant the compiler created for a literal.
+    bool literal{};
+    // The selected data_base entry (an index in CompilerOptions::data_bases)
+    // through whose base register code reaches the object.
+    std::optional<std::uint32_t> data_base;
     std::vector<const ObjectDecl*> declarations;
     const ObjectDecl* definition{};
 };

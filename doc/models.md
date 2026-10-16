@@ -1082,20 +1082,29 @@ data_base "mips-gp" {
 | Property | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `base` | text | none | Required: the register that holds the base address, by a name `cc --print-registers` lists. |
-| `sections` | list | none | Required: the sections the base reaches; the first holds objects with initial values, the second, if given, objects that start as zero. |
-| `max_size` | integer | `0` | Objects of at most this many bytes that have no `section` attribute are placed in those sections. |
-| `kinds` | list | `["writable"]` | Which objects `max_size` places: `writable` objects, `readonly` objects (defined `const`), and `literal` constants the compiler creates. |
+| `sections` | list | none | Required: one or two sections the base reaches; the first holds objects with initial values and, without a second section, also objects that start as zero. |
+| `max_size` | integer | `0` | Definitions of one to this many bytes that have no `section` attribute are placed in those sections; thread-local, weak, `noinit`, alias, and `weakref` objects are not. |
+| `kinds` | list | `["writable"]` | Which objects `max_size` places: `writable` objects, `readonly` objects (defined `const`), and `literal` constants that the compiler creates for string and byte-sequence literals and for constant pools. |
 
 A profile's `data_bases` property or `-mdata-bases=NAME[,NAME...]` selects
 entries; `-mdata-bases=none`, the default, selects none. While an entry is
 selected, the compiler does not allocate its base register, places the
 qualifying objects defined in the compilation group in its sections (in the
-first listed entry that admits them), and reaches every object defined or
-declared with a `section` attribute naming one of its sections through the
-base. An object defined in another group is reached by its full address
-unless its declaration names such a section, so `section` opts an object in
-or out. Thread-local objects are never placed by size. The base register
-must not carry arguments or results in the selected ABIs. The program sets
+first listed entry that admits them), and reaches those objects, and every
+object defined or declared with a `section` attribute naming one of its
+sections, through the base. An object defined in another group is reached by
+its full address unless its declaration names such a section, so `section`
+opts an object in or out. With `-fdata-sections` a placed object's section is
+the entry's section followed by `.` and its link name, such as
+`.sdata.counter`; the first section is writable unless the entry admits only
+`readonly` and `literal` objects. A target accepts as `base` only the
+registers it can address data from (on MIPS `gp`); a target without
+base-relative data addressing, such as x86-64, rejects every entry, and two
+selected entries cannot name the same section. No ABI that the compilation
+uses may carry arguments or results in the base register, and no manual
+location or register binding may name it. A profile's `data_bases` sets
+`-mdata-bases` (`[]` selects none); a profile cannot also set
+`m.data-bases`. The program sets
 the base register before such code runs, and the linker keeps the sections
 within the base's reach; on MIPS, `$gp` holds the address the linker gives
 `_gp` and reaches 32 KiB on either side of it.

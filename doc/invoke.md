@@ -66,6 +66,7 @@ give such files different spellings, for example with `-ffile-prefix-map`.
 | `-mabi=NAME` | ABI for global, unresolved, and indirect calls (normally the Cross ABI). |
 | `-mmangling=NAME` | Link-name encoding: `cross` (default), `simple`, `itanium`, or `msvc`. `itanium` and `msvc` match C++ names only for scalar and pointer-to-scalar types. |
 | `-mprofile=NAME` | A profile: target, ABI, mangling, optimization preset, and options together. |
+| `-mdata-bases=NAME[,NAME...]` | `data_base` model entries ([models.md](models.md#data-base-entries)): small objects placed where one register reaches them, such as MIPS small data through `$gp`; `-mdata-bases=none`, the default, selects none. Targets without base-relative data addressing, such as x86-64, reject an entry. |
 
 Without `-target` or `-mprofile`, `cc` uses the default target configured at
 build time; `cc --version` prints it. Explicit options override a profile's
@@ -168,6 +169,7 @@ with `-target`, `-march`, or `-mprofile` to inspect another configuration.
 | `--print-profiles`, `--print-abis` (`-mabi=help`), `--print-manglings`, `--print-optimizations`, `--print-models` | Model entries. |
 | `--print-cpus` | The target's CPU entries with their parents, features, and issue widths. |
 | `--print-costs` | The latency, issue cost, and availability of each of the target's instructions for `-march` and `-mtune`: a `cpu: NAME  tune: NAME  issue_width: N` line, then one `INSTRUCTION  latency: N  issue: N  available: yes` (or `no`) line per instruction. |
+| `--print-data-bases` | The `data_base` entries: one `NAME  base: REGISTER  sections: LIST  max_size: N  kinds: LIST  source: FILE:LINE` line each. |
 | `--print-options[=all\|optimization\|common\|target]` | Options, values, and origins. |
 | `--print-keywords`, `--print-builtins`, `--print-attributes` | The language surface. |
 | `--print-features`, `--print-instructions`, `--print-registers` | Target feature queries, machine instructions, and register names. |

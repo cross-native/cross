@@ -1661,6 +1661,15 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/target/mips/gnu_as.cmake")
     set_tests_properties(cross_mips_gnu_as PROPERTIES
         LABELS "check.compile;arch.mips;backend.native;endian.big;endian.little")
+    add_test(NAME cross_mips_gnu_as_small_data
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                "-DSOURCES=${CMAKE_SOURCE_DIR}/test/target/mips/gnu_as.x;${CMAKE_SOURCE_DIR}/test/target/mips/i64_pair.x;${CMAKE_SOURCE_DIR}/test/language/semantics/subscripts.x"
+                "-DVARIANTS=sdata-O0|-O0 -mdata-bases=mips-gp;sdata-O2|-O2 -g -fdata-sections -mdata-bases=mips-gp"
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-gnu-as-small-data/output
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/gnu_as.cmake")
+    set_tests_properties(cross_mips_gnu_as_small_data PROPERTIES
+        LABELS "check.compile;arch.mips;backend.native;endian.big;endian.little;feature.small_data;opt.O0;opt.O2")
     add_test(NAME cross_mips_allegrex
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
@@ -1746,6 +1755,72 @@ if(BUILD_TESTING)
         -P "${CMAKE_SOURCE_DIR}/test/target/mips/long_calls.cmake")
     set_tests_properties(cross_mips_long_calls PROPERTIES
         LABELS "check.compile;arch.mips;backend.native;feature.calls;opt.O2")
+    add_test(NAME cross_mips_small_data COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc>
+        -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/small_data.x
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-small-data
+        -DLLVM_TEXT=${CROSS_ENABLE_LLVM_TEXT}
+        -DGIMPLE_TEXT=${CROSS_ENABLE_GCC_GIMPLE_TEXT}
+        -P "${CMAKE_SOURCE_DIR}/test/target/mips/small_data.cmake")
+    set_tests_properties(cross_mips_small_data PROPERTIES
+        LABELS "check.compile;diagnostics;arch.mips;endian.big;backend.native;backend.llvm;backend.gcc;feature.small_data;feature.abi;opt.O0;opt.O2;opt.Oz;profile.custom")
+    # Small data through $gp at run time: VR4300 and R3000 o32 and n64 in
+    # both byte orders, with a Cross partner unit or a GCC -G8 one.
+    foreach(small_data_level O0 O2)
+        add_test(NAME cross_mips_small_data_runtime_${small_data_level} COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/small_data_runtime.x
+            -DCALLEE_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/small_data_partner.x
+            -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/small_data_start.s
+            -DMIPS_LINKER=${CMAKE_SOURCE_DIR}/test/target/mips/small-data.ld
+            "-DCC_FLAGS=-${small_data_level};-mdata-bases=mips-gp"
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-small-data-runtime-${small_data_level}
+            -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(cross_mips_small_data_runtime_${small_data_level} PROPERTIES
+            LABELS "check.runtime;arch.mips;endian.big;endian.little;backend.native;feature.small_data;opt.${small_data_level}")
+        foreach(small_data_endian big little)
+            set(small_data_test cross_mips_small_data_n64_${small_data_endian}_${small_data_level})
+            add_test(NAME ${small_data_test} COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/small_data_runtime.x
+                -DCALLEE_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/small_data_partner.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/small_data_n64_start.s
+                -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/small-data-n64.ld
+                -DN64_ENDIAN=${small_data_endian}
+                "-DEXTRA_FLAGS=-${small_data_level} -mdata-bases=mips-gp"
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-small-data-n64-${small_data_endian}-${small_data_level}
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.cmake")
+            set_tests_properties(${small_data_test} PROPERTIES
+                LABELS "check.runtime;arch.mips;endian.${small_data_endian};backend.native;feature.small_data;profile.n64;opt.${small_data_level}")
+        endforeach()
+    endforeach()
+    add_test(NAME cross_mips_small_data_gcc COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc>
+        -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/small_data_runtime.x
+        -DGCC_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/small_data_partner.c
+        -DGCC_FLAGS=-G8
+        -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/small_data_start.s
+        -DMIPS_LINKER=${CMAKE_SOURCE_DIR}/test/target/mips/small-data.ld
+        -DCC_FLAGS=-mdata-bases=mips-gp
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-small-data-gcc
+        -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+    set_tests_properties(cross_mips_small_data_gcc PROPERTIES
+        LABELS "check.runtime;arch.mips;endian.big;endian.little;backend.native;feature.small_data;feature.interop;opt.O2")
+    foreach(small_data_endian big little)
+        add_test(NAME cross_mips_small_data_n64_gcc_${small_data_endian} COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/small_data_runtime.x
+            -DGCC_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/small_data_partner.c
+            -DGCC_FLAGS=-G8
+            -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/small_data_n64_start.s
+            -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/small-data-n64.ld
+            -DN64_ENDIAN=${small_data_endian}
+            -DEXTRA_FLAGS=-mdata-bases=mips-gp
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-small-data-n64-gcc-${small_data_endian}
+            -P "${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.cmake")
+        set_tests_properties(cross_mips_small_data_n64_gcc_${small_data_endian} PROPERTIES
+            LABELS "check.runtime;arch.mips;endian.${small_data_endian};backend.native;feature.small_data;feature.interop;profile.n64;opt.O2")
+    endforeach()
     add_test(NAME cross_mips_n64
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
@@ -2146,6 +2221,14 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/model/cpu_entries.cmake")
     set_tests_properties(cross_model_cpu_entries PROPERTIES
         LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;feature.model;feature.driver;feature.optimization")
+    add_test(NAME cross_model_data_base_entries
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DCPP=$<TARGET_FILE:cross_cpp>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/model-data-base-entries
+                -P "${CMAKE_SOURCE_DIR}/test/model/data_base_entries.cmake")
+    set_tests_properties(cross_model_data_base_entries PROPERTIES
+        LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;feature.model;feature.driver;feature.small_data")
     add_test(NAME cross_mangling_dsl
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

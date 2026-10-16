@@ -108,5 +108,19 @@ struct Module {
 [[nodiscard]] Module lower(hir::Module& hir_module, const Subtarget& subtarget,
                            Diagnostics& diagnostics);
 
+// Sets hir::Object::data_base for every object a selected data_base entry
+// reaches: a definition without a section attribute that the first admitting
+// entry places by size and kind, or an object whose section attribute names
+// a section of an entry.
+void place_data_bases(hir::Module& hir_module, const Module& data_module,
+                      const CompilerOptions& options);
+
+// The section of a definition that a data_base entry places by size: the
+// entry's first section, or its second for an object that starts as zero;
+// `split` appends the link name, as -fdata-sections does.
+[[nodiscard]] std::optional<std::string> data_base_section(
+    const hir::Object& entity, bool zero, bool split,
+    const CompilerOptions& options);
+
 } // namespace data
 } // namespace cross

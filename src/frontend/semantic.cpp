@@ -17259,6 +17259,7 @@ private:
             object->type->is_const = true;
             object->initializer = std::move(expression);
             object->linkage = Linkage::Static;
+            object->literal = true;
             program_.objects.push_back(std::move(object));
             expression = std::make_unique<Expr>();
             expression->kind = Expr::Kind::Name;
@@ -17316,6 +17317,7 @@ private:
                 static_cast<std::uint32_t>(expression->string_value.size() + 1));
             object->initializer = std::move(expression);
             object->linkage = Linkage::Static;
+            object->literal = true;
             program_.objects.push_back(std::move(object));
 
             expression = std::make_unique<Expr>();

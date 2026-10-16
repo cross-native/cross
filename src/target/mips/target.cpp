@@ -599,6 +599,8 @@ TargetInfo make_target(ByteOrder order,
         {{"$::sqrt", "$::_sqrt"}},
     };
     set_instruction_costs(result, declared_instructions());
+    // %gp_rel offsets are relative to _gp, which $gp holds.
+    result.data_base_registers = {"gp"};
     return result;
 }
 

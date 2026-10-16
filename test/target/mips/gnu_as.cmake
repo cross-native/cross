@@ -3,8 +3,9 @@
 #
 # GNU as accepts the assembly of every shipped MIPS profile without warnings
 # and encodes each instruction as llvm-mc does when `cc -c` assembles the same
-# file. Only the instruction words of the code sections are compared; labels,
-# symbol tables, and metadata may differ.
+# file. The instruction words of the code sections and their $gp-relative
+# relocations are compared; labels, symbol tables, and metadata may differ.
+# VARIANTS replaces the default "name|flags" compilation variants.
 
 foreach(required CC SOURCES OUTPUT)
     if(NOT DEFINED ${required} OR "${${required}}" STREQUAL "")
@@ -84,7 +85,31 @@ function(code_words object result)
     set(${result} "${words}" PARENT_SCOPE)
 endfunction()
 
-set(variants "O0|-O0" "O2|-O2 -g -ffunction-sections -fdata-sections")
+# The $gp-relative relocations, as "section: offset type symbol" lines.
+function(gp_relocations object result)
+    execute_process(COMMAND "${GNU_OBJDUMP}" -r "${object}"
+        RESULT_VARIABLE status OUTPUT_VARIABLE text ERROR_VARIABLE error)
+    if(NOT status EQUAL 0)
+        message(FATAL_ERROR "cannot read the relocations of ${object}\n${error}")
+    endif()
+    string(REPLACE ";" "," text "${text}")
+    string(REPLACE "\n" ";" text_lines "${text}")
+    set(relocations "")
+    foreach(text_line IN LISTS text_lines)
+        if(text_line MATCHES "^RELOCATION RECORDS FOR [[]([^]]+)[]]:")
+            set(section "${CMAKE_MATCH_1}")
+        elseif(text_line MATCHES "^([0-9a-f]+) +(R_MIPS_GPREL[A-Z0-9_]*)[^ ]* +([^ ]+)")
+            string(APPEND relocations "\n${section}: ${CMAKE_MATCH_1} ${CMAKE_MATCH_2} ${CMAKE_MATCH_3}")
+        endif()
+    endforeach()
+    set(${result} "${relocations}" PARENT_SCOPE)
+endfunction()
+
+if(DEFINED VARIANTS)
+    set(variants "${VARIANTS}")
+else()
+    set(variants "O0|-O0" "O2|-O2 -g -ffunction-sections -fdata-sections")
+endif()
 set(compared 0)
 foreach(profile IN LISTS profiles)
     set(triple "${triple_${profile}}")
@@ -135,6 +160,13 @@ foreach(profile IN LISTS profiles)
                 message(FATAL_ERROR
                     "GNU as and llvm-mc encode ${profile} ${stem} ${level} "
                     "differently\nGNU as:${gnu_words}\nllvm-mc:${llvm_words}")
+            endif()
+            gp_relocations("${base}.gnu.o" gnu_relocations)
+            gp_relocations("${base}.llvm.o" llvm_relocations)
+            if(NOT gnu_relocations STREQUAL llvm_relocations)
+                message(FATAL_ERROR
+                    "GNU as and llvm-mc relocate ${profile} ${stem} ${level} "
+                    "differently\nGNU as:${gnu_relocations}\nllvm-mc:${llvm_relocations}")
             endif()
             math(EXPR compared "${compared} + 1")
         endforeach()

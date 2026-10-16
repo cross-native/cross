@@ -25,6 +25,15 @@ if(NOT LLVM_MC OR NOT LLD OR NOT QEMU)
         "skipping MIPS n64 runtime test: llvm-mc, ld.lld, and qemu-system-mips64 are required")
     return()
 endif()
+# An optional C unit, compiled by GNU GCC with GCC_FLAGS, checks that its
+# objects and Cross objects link and run together.
+if(DEFINED GCC_SOURCE AND NOT "${GCC_SOURCE}" STREQUAL "")
+    find_program(GNU_GCC NAMES mips64-elf-gcc)
+    if(NOT GNU_GCC)
+        message(STATUS "skipping MIPS n64 runtime test: mips64-elf-gcc is required")
+        return()
+    endif()
+endif()
 
 function(run_checked label)
     execute_process(
@@ -72,6 +81,21 @@ if(DEFINED CALLEE_SOURCE AND NOT "${CALLEE_SOURCE}" STREQUAL "")
     run_checked(cross-callee "${CC}" -c -O2 -mprofile=${n64_arch}-n64 ${abi_flags}
                 ${extra_flags} ${callee_flags} "${CALLEE_SOURCE}" -o "${callee}")
     list(APPEND objects "${callee}")
+endif()
+if(DEFINED GCC_SOURCE AND NOT "${GCC_SOURCE}" STREQUAL "")
+    set(gcc_flags "")
+    if(GCC_FLAGS)
+        separate_arguments(gcc_flags NATIVE_COMMAND "${GCC_FLAGS}")
+    endif()
+    if(N64_ENDIAN STREQUAL "little")
+        set(gcc_endian -EL)
+    else()
+        set(gcc_endian -EB)
+    endif()
+    run_checked(gcc "${GNU_GCC}" ${gcc_endian} -march=mips64 -mabi=64
+                -mno-abicalls -fno-pic -ffreestanding -O2 ${gcc_flags} -c
+                "${GCC_SOURCE}" -o "${OUTPUT}.gcc.o")
+    list(APPEND objects "${OUTPUT}.gcc.o")
 endif()
 run_checked(startup "${LLVM_MC}" --filetype=obj
             --triple=${n64_arch}-unknown-elf --mcpu=mips64

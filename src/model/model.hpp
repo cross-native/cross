@@ -164,6 +164,20 @@ struct CpuEntry {
     std::vector<CpuInstructionEntry> instructions;
 };
 
+// Data that code reaches through a register holding a fixed base address.
+struct DataBaseEntry {
+    std::string canonical_name;
+    std::string source;  // "file:line" of the declaration
+    std::string base;    // a register name
+    std::string base_source;  // "file:line" of the base property
+    std::vector<std::string> sections;
+    unsigned max_size{};
+    // The kinds of objects max_size places.
+    bool writable{true};
+    bool readonly{};
+    bool literal{};
+};
+
 // A cpu entry with its parents applied.
 struct ResolvedCpu {
     std::vector<std::string> features;
@@ -201,6 +215,8 @@ public:
     [[nodiscard]] const DebugEntry* find_debug(std::string_view name) const;
     [[nodiscard]] const CpuEntry* find_cpu(std::string_view architecture,
                                            std::string_view name) const;
+    [[nodiscard]] const DataBaseEntry* find_data_base(
+        std::string_view name) const;
     [[nodiscard]] ResolvedCpu resolve_cpu(const TargetInfo& target,
                                           const CpuEntry& entry) const;
     // The profiles whose default_for patterns match `triple` most
@@ -224,6 +240,9 @@ public:
         return debugs_;
     }
     [[nodiscard]] const std::vector<CpuEntry>& cpus() const { return cpus_; }
+    [[nodiscard]] const std::vector<DataBaseEntry>& data_bases() const {
+        return data_bases_;
+    }
     [[nodiscard]] const std::vector<std::string>& origins() const {
         return origins_;
     }
@@ -238,6 +257,7 @@ private:
     std::vector<OptimizationEntry> optimizations_;
     std::vector<DebugEntry> debugs_;
     std::vector<CpuEntry> cpus_;
+    std::vector<DataBaseEntry> data_bases_;
     std::vector<std::string> origins_;
     std::unordered_set<std::string> loaded_files_;
 };

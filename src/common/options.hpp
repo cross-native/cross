@@ -91,6 +91,18 @@ struct DebugInfoOptions {
     bool types{};
 };
 
+// The contents of a data_base model entry that -mdata-bases selected.
+struct DataBaseOptions {
+    std::string name;
+    // The base register, as the target's register registry names it.
+    std::string base;
+    std::vector<std::string> sections;
+    unsigned max_size{};
+    bool writable{};
+    bool readonly{};
+    bool literal{};
+};
+
 struct CompilerOptions {
     EmitKind emit{EmitKind::Link};
     std::string optimization{"O0"};
@@ -210,6 +222,8 @@ struct CompilerOptions {
     bool ipa_cp_clone{};
     unsigned inline_unit_limit{96};
     std::optional<DebugInfoOptions> debug_info;
+    // In -mdata-bases order.
+    std::vector<DataBaseOptions> data_bases;
 
     bool wrapv{};
     bool bounds_trap{};
@@ -226,6 +240,7 @@ struct CompilerOptions {
     bool print_optimizations{};
     bool print_cpus{};
     bool print_costs{};
+    bool print_data_bases{};
     bool print_options{};
     std::string print_options_category{"all"};
     bool print_attributes{};

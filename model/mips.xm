@@ -1326,6 +1326,15 @@ cpu "mips64" {
                 "hilo-interlocks"];
 }
 
+# Small data through $gp, like GCC's -G8 with constants kept out. No profile
+# selects it: the program must set $gp to _gp first.
+data_base "mips-gp" {
+    base = "gp";
+    sections = [".sdata", ".sbss"];
+    max_size = 8;
+    kinds = ["writable"];
+}
+
 # MIPS profiles without a native conditional move preserve ordinary control
 # diamonds by default.  They retain the larger budget for recognized
 # high-entropy memory predicates, where speculation can still beat a branch.

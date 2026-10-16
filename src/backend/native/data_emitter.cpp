@@ -274,8 +274,10 @@ private:
         const bool uninitialized =
             object.initializer == data::InitializerKind::Uninitialized;
         const bool split_section = options_.data_sections || object.retain;
-        const auto section = entity.section
-            ? *entity.section
+        const auto placed =
+            data::data_base_section(entity, zero, split_section, options_);
+        const auto section = entity.section ? *entity.section
+            : placed ? *placed
             : object.is_thread_local
                   ? format_ == ObjectFormat::Coff
                         ? std::string(".tls$") +
@@ -309,7 +311,7 @@ private:
                 "assembler");
             return false;
         }
-        const auto kind = object.is_thread_local
+        auto kind = object.is_thread_local
             ? (zero || uninitialized
                    ? AssemblySectionKind::ThreadZeroFill
                    : AssemblySectionKind::ThreadData)
@@ -318,6 +320,18 @@ private:
             : zero ? AssemblySectionKind::ZeroFill
             : object.read_only ? AssemblySectionKind::ReadOnlyData
                                : AssemblySectionKind::WritableData;
+        // A data base's sections take the kinds of what the entry admits,
+        // so its objects agree on each section's flags.
+        if (entity.data_base) {
+            const auto& base = options_.data_bases[*entity.data_base];
+            const bool second = base.sections.size() == 2 &&
+                (entity.section ? *entity.section == base.sections[1]
+                                : zero);
+            kind = second ? AssemblySectionKind::ZeroFill
+                : !base.writable && (base.readonly || base.literal)
+                    ? AssemblySectionKind::ReadOnlyData
+                    : AssemblySectionKind::WritableData;
+        }
         std::string error;
         const auto directive = assembly_section_directive(
             format_, {section, kind, entity.section.has_value(), object.retain},

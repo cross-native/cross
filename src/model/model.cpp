@@ -199,6 +199,7 @@ struct ModelDocument {
     std::vector<ProfileEntry> profiles;
     std::vector<DebugEntry> debugs;
     std::vector<CpuEntry> cpus;
+    std::vector<DataBaseEntry> data_bases;
 };
 
 // Instruction costs are cycle counts that cost sums must not overflow.
@@ -215,7 +216,7 @@ public:
             if (current_.kind != ModelTokenKind::Identifier) {
                 fail(current_.line,
                      "expected model domain: abi, mangling, optimization, "
-                     "profile, debug, or cpu");
+                     "profile, debug, cpu, or data_base");
                 break;
             }
             const auto domain = current_.text;
@@ -223,7 +224,8 @@ public:
             advance();
             if (domain != "abi" && domain != "mangling" &&
                 domain != "optimization" && domain != "profile" &&
-                domain != "debug" && domain != "cpu") {
+                domain != "debug" && domain != "cpu" &&
+                domain != "data_base") {
                 fail(line, "unknown model domain '" + domain + "'");
                 break;
             }
@@ -269,6 +271,11 @@ public:
                 if (auto entry = make_debug(name, *properties, line)) {
                     entry->source = position(line);
                     result.debugs.push_back(std::move(*entry));
+                }
+            } else if (domain == "data_base") {
+                if (auto entry = make_data_base(name, *properties, line)) {
+                    entry->source = position(line);
+                    result.data_bases.push_back(std::move(*entry));
                 }
             } else if (auto entry = make_profile(name, *properties, line)) {
                 entry->source = position(line);
@@ -2435,10 +2442,34 @@ private:
             !collect_option_properties(
                 properties,
                 {"default_for", "target", "abi", "mangling", "optimization",
-                 "debug", "fp_traps", "fp_denormal_operand",
+                 "debug", "data_bases", "fp_traps", "fp_denormal_operand",
                  "fp_denormal_result"},
                 result.options)) {
             return std::nullopt;
+        }
+        // data_bases is the profile spelling of -mdata-bases.
+        if (const auto names = list_property(properties, "data_bases")) {
+            const auto line = properties.at("data_bases").line;
+            if (properties.contains("m.data-bases")) {
+                fail(line, "profile sets both data_bases and m.data-bases");
+                return std::nullopt;
+            }
+            std::string value;
+            for (const auto& entry : *names) {
+                if (entry.empty() || entry.find(',') != std::string::npos) {
+                    fail(line, "profile data_bases must list entry names");
+                    return std::nullopt;
+                }
+                value += (value.empty() ? "" : ",") + entry;
+            }
+            result.options.push_back({"m.data-bases",
+                                      value.empty() ? "none" : value,
+                                      position(line)});
+            std::sort(result.options.begin(), result.options.end(),
+                      [](const OptionAssignment& left,
+                         const OptionAssignment& right) {
+                          return left.name < right.name;
+                      });
         }
         if (!error_.empty()) return std::nullopt;
         return result;
@@ -2488,6 +2519,81 @@ private:
         for (const auto& [property, flag] : contents) {
             if (const auto value = bool_property(properties, property)) {
                 *flag = *value;
+            }
+        }
+        if (!error_.empty()) return std::nullopt;
+        return result;
+    }
+
+    std::optional<DataBaseEntry> make_data_base(
+        std::string name, const ModelProperties& properties, unsigned line) {
+        if (!known_properties(properties,
+                              {"base", "sections", "max_size", "kinds"})) {
+            return std::nullopt;
+        }
+        DataBaseEntry result;
+        result.canonical_name = std::move(name);
+        const auto line_of = [&](const char* property) {
+            return properties.at(property).line;
+        };
+        const auto base = text_property(properties, "base", line);
+        if (!base) return std::nullopt;
+        if (std::none_of(all_targets().begin(), all_targets().end(),
+                         [&](const TargetInfo* target) {
+                             return find_register(*target, *base) != nullptr;
+                         })) {
+            fail(line_of("base"), "unknown register '" + *base + "'");
+            return std::nullopt;
+        }
+        result.base = *base;
+        result.base_source = position(line_of("base"));
+        if (!properties.contains("sections")) {
+            fail(line, "missing required model property 'sections'");
+            return std::nullopt;
+        }
+        auto sections = list_property(properties, "sections");
+        if (!sections) return std::nullopt;
+        if (sections->empty() || sections->size() > 2) {
+            fail(line_of("sections"),
+                 "data_base sections must name one or two sections");
+            return std::nullopt;
+        }
+        for (const auto& section : *sections) {
+            if (section.empty()) {
+                fail(line_of("sections"),
+                     "data_base section names cannot be empty");
+                return std::nullopt;
+            }
+        }
+        if (sections->size() == 2 && sections->front() == sections->back()) {
+            fail(line_of("sections"),
+                 "data_base sections list '" + sections->front() + "' twice");
+            return std::nullopt;
+        }
+        result.sections = std::move(*sections);
+        if (const auto size = unsigned_property(properties, "max_size")) {
+            result.max_size = *size;
+        }
+        if (const auto kinds = list_property(properties, "kinds")) {
+            result.writable = false;
+            for (const auto& kind : *kinds) {
+                bool* flag = kind == "writable" ? &result.writable
+                             : kind == "readonly" ? &result.readonly
+                             : kind == "literal"  ? &result.literal
+                                                  : nullptr;
+                if (!flag) {
+                    fail(line_of("kinds"),
+                         "unknown data_base kind '" + kind +
+                             "'; the kinds are writable, readonly, and "
+                             "literal");
+                    return std::nullopt;
+                }
+                if (*flag) {
+                    fail(line_of("kinds"),
+                         "data_base kinds list '" + kind + "' twice");
+                    return std::nullopt;
+                }
+                *flag = true;
             }
         }
         if (!error_.empty()) return std::nullopt;
@@ -2813,8 +2919,8 @@ bool ModelRegistry::load_text(std::string_view text, std::string origin,
         }
     }
 
-    // Mangling, optimization, profile, and debug names are unique within
-    // their kind.
+    // Mangling, optimization, profile, debug, and data_base names are unique
+    // within their kind.
     const auto unique_names = [&](const auto& loaded, const auto& added,
                                   std::string_view kind) {
         std::unordered_set<std::string_view> names;
@@ -2833,7 +2939,8 @@ bool ModelRegistry::load_text(std::string_view text, std::string origin,
         !unique_names(optimizations_, document->optimizations,
                       "optimization") ||
         !unique_names(profiles_, document->profiles, "profile") ||
-        !unique_names(debugs_, document->debugs, "debug")) {
+        !unique_names(debugs_, document->debugs, "debug") ||
+        !unique_names(data_bases_, document->data_bases, "data_base")) {
         return false;
     }
     // CPU names are unique per architecture.
@@ -2894,6 +3001,9 @@ bool ModelRegistry::load_text(std::string_view text, std::string origin,
     }
     for (auto& entry : document->cpus) {
         cpus_.push_back(std::move(entry));
+    }
+    for (auto& entry : document->data_bases) {
+        data_bases_.push_back(std::move(entry));
     }
     origins_.push_back(std::move(origin));
     return true;
@@ -3032,6 +3142,14 @@ const CpuEntry* ModelRegistry::find_cpu(std::string_view architecture,
     return nullptr;
 }
 
+const DataBaseEntry* ModelRegistry::find_data_base(
+    std::string_view name) const {
+    for (const auto& entry : data_bases_) {
+        if (entry.canonical_name == name) return &entry;
+    }
+    return nullptr;
+}
+
 ResolvedCpu ModelRegistry::resolve_cpu(const TargetInfo& target,
                                        const CpuEntry& entry) const {
     // Loading checked that every chain of parents ends; values apply from
@@ -3104,7 +3222,8 @@ bool check_options(std::span<const OptionAssignment> options,
                    Diagnostics& diagnostics) {
     for (const auto& option : options) {
         std::optional<std::string> problem;
-        if (option.name.starts_with("f.")) {
+        if (option.name.starts_with("f.") ||
+            option_definition(common_option_definitions(), option.name)) {
             problem =
                 option_problem(option, common_option_definitions(), preset);
         } else if (!targets.empty()) {
@@ -3297,6 +3416,81 @@ bool check_entries(const ModelRegistry& registry, Diagnostics& diagnostics) {
     return true;
 }
 
+// Resolves -mdata-bases into the contents of the entries it selects.
+bool select_data_bases(const ModelRegistry& registry, const TargetInfo& target,
+                       const AbiEntry& abi, CompilerOptions& options,
+                       Diagnostics& diagnostics) {
+    options.data_bases.clear();
+    const auto value = std::string(resolved_text(options, "m.data-bases"));
+    if (value == "none") return true;
+    const auto* resolved = find_resolved_option(options, "m.data-bases");
+    const auto fail = [&](const std::string& message) {
+        diagnostics.command_error(message + " from " + resolved->source);
+        return false;
+    };
+    std::vector<const DataBaseEntry*> entries;
+    for (std::size_t begin = 0; begin <= value.size();) {
+        const auto end = std::min(value.find(',', begin), value.size());
+        const auto name = value.substr(begin, end - begin);
+        begin = end + 1;
+        if (name.empty() || name == "none") {
+            return fail("-mdata-bases expects 'none' or data_base entry "
+                        "names separated by commas");
+        }
+        const auto* entry = registry.find_data_base(name);
+        if (!entry) return fail("unknown data_base entry '" + name + "'");
+        for (const auto* other : entries) {
+            if (other == entry) {
+                return fail("-mdata-bases lists '" + name + "' twice");
+            }
+            for (const auto& section : entry->sections) {
+                if (std::find(other->sections.begin(), other->sections.end(),
+                              section) != other->sections.end()) {
+                    return fail("data_base entries '" + other->canonical_name +
+                                "' and '" + name + "' both name section '" +
+                                section + "'");
+                }
+            }
+        }
+        if (target.data_base_registers.empty()) {
+            return fail("target " + std::string(target.architecture) +
+                        " has no base-relative data addressing; data_base '" +
+                        name + "'");
+        }
+        const auto& bases = target.data_base_registers;
+        if (std::find(bases.begin(), bases.end(), entry->base) ==
+            bases.end()) {
+            std::string names;
+            for (const auto base : bases) {
+                names += (names.empty() ? "'" : ", '") + std::string(base) +
+                         "'";
+            }
+            diagnostics.file_error(
+                entry->base_source,
+                "data_base '" + name + "' base register '" + entry->base +
+                    "' cannot hold a data base on " +
+                    std::string(target.architecture) + "; it uses " + names);
+            return false;
+        }
+        if (abi_carries_register(target, abi, entry->base)) {
+            diagnostics.file_error(
+                entry->base_source,
+                "data_base '" + name + "' base register '" + entry->base +
+                    "' carries arguments or results in ABI '" +
+                    abi.canonical_name + "'");
+            return false;
+        }
+        entries.push_back(entry);
+    }
+    for (const auto* entry : entries) {
+        options.data_bases.push_back(
+            {entry->canonical_name, entry->base, entry->sections,
+             entry->max_size, entry->writable, entry->readonly,
+             entry->literal});
+    }
+    return true;
+}
+
 } // namespace
 
 bool configure_models(CompilerOptions& options, Diagnostics& diagnostics) {
@@ -3479,6 +3673,10 @@ bool configure_models(CompilerOptions& options, Diagnostics& diagnostics) {
             return false;
         }
         options.abi = abi->canonical_name;
+        if (!select_data_bases(registry, *target, *abi, options,
+                               diagnostics)) {
+            return false;
+        }
     }
     return true;
 }

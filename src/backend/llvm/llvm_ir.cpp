@@ -469,8 +469,15 @@ private:
                    << llvm_visibility(entity.visibility)
                    << tls << storage << object_type << ' '
                    << initializer(object);
-            if (entity.section) {
-                module << ", section " << llvm_string(*entity.section);
+            const auto placed = data::data_base_section(
+                entity,
+                object.initializer == data::InitializerKind::Zero &&
+                    !object.read_only && !options_.zero_init_in_data,
+                options_.data_sections || object.retain, options_);
+            if (entity.section || placed) {
+                module << ", section "
+                       << llvm_string(entity.section ? *entity.section
+                                                     : *placed);
             } else if (object.initializer ==
                        data::InitializerKind::Uninitialized) {
                 module << ", section \".noinit\"";

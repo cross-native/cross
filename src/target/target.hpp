@@ -659,6 +659,9 @@ struct TargetInfo {
     std::vector<InstructionCostEntry> instruction_costs{};
     // The instruction of each registry form, by InstructionFormId.
     std::vector<InstructionCostId> form_instructions{};
+    // The registers that can hold the base of `data_base` model entries;
+    // none when the target has no base-relative data addressing.
+    std::vector<std::string_view> data_base_registers{};
 
     [[nodiscard]] bool matches(std::string_view triple) const;
     [[nodiscard]] std::string_view default_abi(std::string_view triple) const;
@@ -673,6 +676,10 @@ const AbiEntry* find_abi(const TargetInfo& target, std::string_view name,
                          std::string_view triple);
 const AbiEntry* find_abi(const TargetInfo& target, AbiId id);
 const RegisterEntry* find_register(const TargetInfo& target, std::string_view name);
+// Whether `abi` carries an argument or result in the register `name` names
+// or in one sharing its storage.
+bool abi_carries_register(const TargetInfo& target, const AbiEntry& abi,
+                          std::string_view name);
 const PatchValueMaterializerEntry* find_patch_value_materializer(
     const TargetInfo& target, std::string_view type_name);
 bool patch_operand_accepts_type(const InstructionOperandEntry& operand, std::string_view type_name,

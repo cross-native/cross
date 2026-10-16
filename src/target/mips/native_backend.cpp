@@ -194,6 +194,16 @@ bool is_vector(const hir::Module& module, hir::TypeId id) {
     return module.type(id).kind == hir::Type::Kind::Vector;
 }
 
+// The selected data base whose register reaches the object `symbol` names.
+const DataBaseOptions* object_data_base(const hir::Module& module,
+                                        const CompilerOptions& options,
+                                        const machine::SymbolOperand& symbol) {
+    if (symbol.is_function || !symbol.object) return nullptr;
+    const auto& entity = module.object(*symbol.object);
+    return entity.data_base ? &options.data_bases[*entity.data_base]
+                            : nullptr;
+}
+
 bool has_dynamic_stack(const machine::Function& function) {
     for (const auto& block : function.blocks) {
         for (const auto& instruction : block.instructions) {
@@ -1564,11 +1574,13 @@ private:
                 }
             }
             if (has_result(value)) result.defs.push_back(reg(value.id));
+            // A data base's register holds its base across every call.
             const auto append_clobbers =
                 [&](const std::vector<std::string>& names) {
                     for (const auto& name : names) {
                         const auto physical = physical_register_id(name);
-                        if (!physical || std::any_of(
+                        if (!physical || data_base_register(*physical) ||
+                            std::any_of(
                                 result.clobbers.begin(),
                                 result.clobbers.end(),
                                 [&](const machine::Register& present) {
@@ -1586,7 +1598,7 @@ private:
             const auto append_physical_clobbers =
                 [&](const std::vector<machine::PhysicalRegisterId>& ids) {
                     for (const auto physical : ids) {
-                        if (std::any_of(
+                        if (data_base_register(physical) || std::any_of(
                                 result.clobbers.begin(),
                                 result.clobbers.end(),
                                 [&](const machine::Register& present) {
@@ -3632,6 +3644,97 @@ private:
         return changed;
     }
 
+    // Whether a selected data base holds its base in `physical`.
+    bool data_base_register(machine::PhysicalRegisterId physical) const {
+        return std::any_of(options_.data_bases.begin(),
+                           options_.data_bases.end(),
+                           [&](const DataBaseOptions& base) {
+                               return gpr_id(base.base) == physical;
+                           });
+    }
+
+    // An access through the address of an object that a data base reaches
+    // becomes a global access, one instruction off the base register.
+    bool fold_data_base_addresses(machine::Function& function) {
+        std::unordered_map<std::uint32_t, machine::SymbolOperand> addresses;
+        for (const auto& block : function.blocks) {
+            for (const auto& value : block.instructions) {
+                const auto* symbol =
+                    decode_opcode(value.opcode) == Opcode::GlobalAddress &&
+                            value.defs.size() == 1 &&
+                            value.defs.front().kind ==
+                                machine::RegisterKind::Virtual
+                        ? std::get_if<machine::SymbolOperand>(
+                              &value.operands.front())
+                        : nullptr;
+                if (symbol && object_data_base(hir_, options_, *symbol)) {
+                    addresses.emplace(value.defs.front().id, *symbol);
+                }
+            }
+        }
+        bool changed = false;
+        for (auto& block : function.blocks) {
+            for (auto& value : block.instructions) {
+                const auto opcode = decode_opcode(value.opcode);
+                const bool store = opcode == Opcode::PointerStore ||
+                                   opcode == Opcode::FpointerStore;
+                if ((!store && opcode != Opcode::PointerLoadSigned &&
+                     opcode != Opcode::PointerLoadUnsigned &&
+                     opcode != Opcode::FpointerLoad) ||
+                    value.uses.empty() || !value.live_across_call.empty() ||
+                    value.uses.front().kind !=
+                        machine::RegisterKind::Virtual ||
+                    (store && (value.uses.size() != 2 ||
+                               value.uses[1] == value.uses[0]))) {
+                    continue;
+                }
+                // The access adds no displacement or an immediate one.
+                const auto found = addresses.find(value.uses.front().id);
+                const auto* offset =
+                    value.operands.size() == (store ? 3U : 2U)
+                        ? std::get_if<machine::ImmediateOperand>(
+                              &value.operands.back())
+                        : nullptr;
+                if (found == addresses.end() ||
+                    (!offset && value.operands.size() != (store ? 2U : 1U))) {
+                    continue;
+                }
+                // Word pairs and MIPS I doubleword FPR halves keep their
+                // address register.
+                const auto bits = store ? value.uses.back().mode.bits
+                                        : value.defs.front().mode.bits;
+                if (bits > 32 &&
+                    !subtarget_.has_feature(
+                        opcode == Opcode::FpointerLoad ||
+                                opcode == Opcode::FpointerStore
+                            ? Feature::Mips2 : Feature::Mips3)) {
+                    continue;
+                }
+                auto symbol = found->second;
+                if (offset) {
+                    symbol.addend += static_cast<std::int64_t>(offset->value);
+                }
+                if (store) {
+                    const auto source = value.uses.back();
+                    value.opcode = opcode == Opcode::PointerStore
+                        ? Opcode::GlobalStore : Opcode::FglobalStore;
+                    value.operands = {symbol, register_operand(source)};
+                    value.uses = {source};
+                } else {
+                    value.opcode = opcode == Opcode::PointerLoadSigned
+                        ? Opcode::GlobalLoadSigned
+                        : opcode == Opcode::PointerLoadUnsigned
+                              ? Opcode::GlobalLoadUnsigned
+                              : Opcode::FglobalLoad;
+                    value.operands = {symbol};
+                    value.uses.clear();
+                }
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
     // Outside the large code model a symbol address is `lui %hi` plus a
     // signed 16-bit `%lo`, and a load or store can add the low part in its
     // displacement, after any index. A scalar global access then needs only
@@ -3639,11 +3742,13 @@ private:
     // global address whose every access, direct or through one index, uses
     // one offset. Each high part keeps a `%lo` of exactly its own symbol and
     // addend, the pair that assemblers and linkers match relocations by.
+    // Objects that a data base reaches keep their global accesses.
     bool split_global_addresses(machine::Function& function) {
-        if (!options_.combine_addresses || naked_ ||
-            (hir_.address_bits > 32 &&
-             options_.code_model == CodeModel::Large)) {
-            return false;
+        if (!options_.combine_addresses || naked_) return false;
+        bool changed = fold_data_base_addresses(function);
+        if (hir_.address_bits > 32 &&
+            options_.code_model == CodeModel::Large) {
+            return changed;
         }
         // Word pairs and MIPS I doubleword FPR halves address two words.
         const auto accepts_low_part = [&](const machine::Instruction& value) {
@@ -3779,7 +3884,6 @@ private:
             }
         };
 
-        bool changed = false;
         for (auto& block : function.blocks) {
             for (auto& value : block.instructions) {
                 if (decode_opcode(value.opcode) != Opcode::GlobalAddress ||
@@ -3790,7 +3894,8 @@ private:
                     std::get_if<machine::SymbolOperand>(&value.operands[0]);
                 const auto address = value.defs.front();
                 const auto id = virtual_id(address);
-                if (!symbol || symbol->is_function || !symbol->object || !id) {
+                if (!symbol || symbol->is_function || !symbol->object || !id ||
+                    object_data_base(hir_, options_, *symbol)) {
                     continue;
                 }
                 // Accesses that add the low part, directly or after an
@@ -3859,7 +3964,8 @@ private:
                 const auto* symbol = global_access && !value.operands.empty()
                     ? std::get_if<machine::SymbolOperand>(&value.operands[0])
                     : nullptr;
-                if (!symbol || !accepts_low_part(value)) {
+                if (!symbol || !accepts_low_part(value) ||
+                    object_data_base(hir_, options_, *symbol)) {
                     rewritten.push_back(std::move(value));
                     continue;
                 }
@@ -4462,8 +4568,14 @@ private:
         case Opcode::PointerOffset:
             return sum({wide_address ? I::Daddiu : I::Addiu});
         case Opcode::GlobalAddress:
-        case Opcode::LabelAddress:
+        case Opcode::LabelAddress: {
+            const auto* symbol = std::get_if<machine::SymbolOperand>(
+                &instruction.operands.front());
+            if (symbol && object_data_base(hir_, options_, *symbol)) {
+                return sum({wide_address ? I::Daddiu : I::Addiu});
+            }
             return sum({I::Lui, wide_address ? I::Daddiu : I::Addiu});
+        }
         case Opcode::IndexedAddress:
             return sum({wide_address ? I::Dsll : I::Sll,
                         wide_address ? I::Daddu : I::Addu});
@@ -5996,16 +6108,39 @@ private:
                entity.temperature != hir::FunctionTemperature::Normal;
     }
 
+    // The first selected data base that admits the eight-byte pool
+    // constants.
+    const DataBaseOptions* literal_data_base() const {
+        for (const auto& base : options_.data_bases) {
+            if (base.literal && base.max_size >= 8) return &base;
+        }
+        return nullptr;
+    }
+
     // The function's literals follow it. In the shared read-only section,
-    // later functions of its unit use them too.
+    // or the first section of a data base that admits them, later functions
+    // of its unit use them too.
     void emit_literal_pools(const machine::Function& function) {
         if (float_literals_.empty() && integer_literals_.empty()) return;
         const auto& entity = hir_.function(function.source);
+        const bool split = !entity.section && own_section(entity);
+        const auto group =
+            entity.mergeable ? assembly_symbol(function.symbol) : std::string{};
         std::string error;
-        const auto directive = function_data_section_directive(
-            format_, function.symbol, !entity.section && own_section(entity),
-            entity.mergeable ? assembly_symbol(function.symbol) : std::string{},
-            error);
+        std::optional<std::string> directive;
+        if (const auto* base = literal_data_base()) {
+            directive = assembly_section_directive(
+                format_,
+                {base->sections.front() +
+                     (split ? "." + function.symbol : std::string{}),
+                 !base->writable ? AssemblySectionKind::ReadOnlyData
+                                 : AssemblySectionKind::WritableData,
+                 false, false, group},
+                error);
+        } else {
+            directive = function_data_section_directive(
+                format_, function.symbol, split, group, error);
+        }
         if (!directive) {
             diagnostics_.error(function.location, error);
             return;
@@ -6147,14 +6282,17 @@ private:
     }
 
     // Rewrite a memory operand so it addresses the word four bytes above.
-    // The emitter spells addresses as `imm(base)` or `%lo(sym)(base)`; any
-    // other form is left to the caller.
+    // The emitter spells addresses as `imm(base)`, `%lo(sym)(base)`, or
+    // `%gp_rel(sym)(base)`; any other form is left to the caller.
     static std::optional<std::string> next_word_address(
         std::string_view address) {
-        if (address.starts_with("%lo(")) {
+        for (const std::string_view relocation : {"%lo(", "%gp_rel("}) {
+            if (!address.starts_with(relocation)) continue;
             const auto close = address.find(")(");
             if (close == std::string_view::npos) return std::nullopt;
-            return "%lo(" + std::string(address.substr(4, close - 4)) +
+            return std::string(relocation) +
+                   std::string(address.substr(relocation.size(),
+                                              close - relocation.size())) +
                    "+4)" + std::string(address.substr(close + 1));
         }
         const auto open = address.find('(');
@@ -6843,6 +6981,19 @@ private:
 
     std::string_view address_add_immediate() const {
         return wide_addresses_ ? "daddiu" : "addiu";
+    }
+
+    // An object's address: one instruction off the register of a data base
+    // that reaches it.
+    void materialize_object_address(std::string_view destination,
+                                    const machine::SymbolOperand& symbol) {
+        if (const auto* base = object_data_base(hir_, options_, symbol)) {
+            instruction(address_add_immediate(),
+                        reg_name(destination) + "," + reg_name(base->base) +
+                            ",%gp_rel(" + symbol_expression(symbol) + ")");
+            return;
+        }
+        materialize_symbol_address(destination, assembly_symbol(symbol.name));
     }
 
     std::string_view address_shift_left() const {
@@ -10230,6 +10381,12 @@ private:
                 !legalizes_to_pair(candidate.defs.front());
         }
         const auto opcode = decode_opcode(candidate.opcode);
+        // A global load is one instruction off a data base's register.
+        const auto* symbol = candidate.operands.empty()
+            ? nullptr
+            : std::get_if<machine::SymbolOperand>(&candidate.operands.front());
+        const bool data_base =
+            symbol && object_data_base(hir_, options_, *symbol);
         // A load's MIPS I delay NOP would land on only one path, and a
         // doubleword FPR load before MIPS II is two word loads. Stores have
         // side effects and stay in place.
@@ -10237,9 +10394,12 @@ private:
             opcode == Opcode::PointerLoadUnsigned ||
             opcode == Opcode::FpointerLoad ||
             opcode == Opcode::LoadSigned ||
-            opcode == Opcode::LoadUnsigned || opcode == Opcode::Fload) {
+            opcode == Opcode::LoadUnsigned || opcode == Opcode::Fload ||
+            (data_base && (opcode == Opcode::GlobalLoadSigned ||
+                           opcode == Opcode::GlobalLoadUnsigned ||
+                           opcode == Opcode::FglobalLoad))) {
             const bool floating = opcode == Opcode::FpointerLoad ||
-                opcode == Opcode::Fload;
+                opcode == Opcode::Fload || opcode == Opcode::FglobalLoad;
             return subtarget_.has_feature(Feature::LoadInterlocks) &&
                 candidate.defs.size() == 1 &&
                 std::all_of(candidate.defs.begin(), candidate.defs.end(),
@@ -10305,7 +10465,8 @@ private:
                     wrapped <= 0xffff) &&
                 (bits <= 32 || value == wrapped);
         }
-        if (opcode == Opcode::GlobalHigh || opcode == Opcode::StackAddress) {
+        if (opcode == Opcode::GlobalHigh || opcode == Opcode::StackAddress ||
+            (opcode == Opcode::GlobalAddress && data_base)) {
             return true;
         }
         if (opcode == Opcode::PointerOffset) {
@@ -12606,7 +12767,7 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
                      slot->offset;
         } else if (const auto* symbol = std::get_if<machine::SymbolOperand>(
                        &value.operands.front())) {
-            materialize_symbol_address("t0", assembly_symbol(symbol->name));
+            materialize_object_address("t0", *symbol);
             base = "t0";
         } else if (!value.uses.empty() &&
                    value.uses.front().kind == machine::RegisterKind::Virtual &&
@@ -12703,6 +12864,13 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
             }
             if (destination && prefer_float_literal(immediate)) {
                 const auto& literal = float_literal(function, immediate);
+                if (const auto* base = literal_data_base()) {
+                    instruction(target.mode.bits == 32 ? "lwc1" : "ldc1",
+                                reg_name(*destination) + ",%gp_rel(" +
+                                    literal.label + ")(" +
+                                    reg_name(base->base) + ")");
+                    return;
+                }
                 if (large_code_model()) {
                     materialize_symbol_address("t0", literal.label);
                     instruction(target.mode.bits == 32 ? "lwc1" : "ldc1",
@@ -12728,9 +12896,15 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
             const auto destination = output_gpr(function, target, "t0");
             if (prefer_integer_literal(immediate)) {
                 const auto& literal = integer_literal(function, immediate);
-                instruction("lui", "$t0,%hi(" + literal.label + ")");
-                instruction("ld", reg_name(destination) + ",%lo(" +
-                                      literal.label + ")($t0)");
+                if (const auto* base = literal_data_base()) {
+                    instruction("ld", reg_name(destination) + ",%gp_rel(" +
+                                          literal.label + ")(" +
+                                          reg_name(base->base) + ")");
+                } else {
+                    instruction("lui", "$t0,%hi(" + literal.label + ")");
+                    instruction("ld", reg_name(destination) + ",%lo(" +
+                                          literal.label + ")($t0)");
+                }
             } else {
                 load_immediate(destination, immediate.value,
                                target.mode.bits);
@@ -12757,24 +12931,37 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
         opcode == Opcode::GlobalStore || opcode == Opcode::FglobalStore) {
         const auto& symbol =
             std::get<machine::SymbolOperand>(value.operands.front());
-        const auto name = assembly_symbol(symbol.name);
+        const auto* base = object_data_base(hir_, options_, symbol);
+        const bool load = opcode == Opcode::GlobalLoadSigned ||
+                          opcode == Opcode::GlobalLoadUnsigned;
+        const bool pair = load ? legalizes_to_pair(value.defs.front())
+            : opcode == Opcode::GlobalStore &&
+                  legalizes_to_pair(value.uses.front());
+        // A data base reaches a scalar directly off its register; word
+        // pairs and addresses go through a register.
+        const auto access = base && opcode != Opcode::GlobalAddress && !pair
+            ? "%gp_rel(" + symbol_expression(symbol) + ")(" +
+                  reg_name(base->base) + ")"
+            : std::string("0($t0)");
         const auto address = opcode == Opcode::GlobalAddress
             ? output_gpr(function, value.defs.front(), "t0")
             : std::string_view{"t0"};
-        materialize_symbol_address(address, name);
+        if (opcode == Opcode::GlobalAddress || !base || pair) {
+            materialize_object_address(address, symbol);
+        }
         if (opcode == Opcode::GlobalAddress) {
             commit_gpr(function, value.defs.front(), address,
                        value.location);
         } else if (opcode == Opcode::GlobalLoadSigned ||
                    opcode == Opcode::GlobalLoadUnsigned) {
             const auto target = value.defs.front();
-            if (legalizes_to_pair(target)) {
+            if (pair) {
                 load_pair_memory("t1", "t2", 0, "t0");
                 store_vreg_pair(function, target, "t1", "t2",
                                 value.location);
             } else {
                 const auto destination = output_gpr(function, target, "t1");
-                load_integer_memory(destination, "0($t0)", target.mode.bits,
+                load_integer_memory(destination, access, target.mode.bits,
                                     opcode == Opcode::GlobalLoadSigned);
                 commit_gpr(function, target, destination, value.location);
             }
@@ -12782,7 +12969,7 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
             const auto target = value.defs.front();
             const auto destination = output_fpr(function, target, "f0");
             instruction(target.mode.bits == 32 ? "lwc1" : "ldc1",
-                        reg_name(destination) + ",0($t0)");
+                        reg_name(destination) + "," + access);
             commit_fpr(function, target, destination, value.location);
         } else {
             const auto source = value.uses.front();
@@ -12790,18 +12977,15 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
                 const auto source_fpr = input_fpr(
                     function, source, "f0", value.location);
                 instruction(source.mode.bits == 32 ? "swc1" : "sdc1",
-                            reg_name(source_fpr) + ",0($t0)");
+                            reg_name(source_fpr) + "," + access);
+            } else if (pair) {
+                load_vreg_pair(function, source, "t1", "t2",
+                               value.location);
+                store_pair_memory("t1", "t2", 0, "t0");
             } else {
-                if (legalizes_to_pair(source)) {
-                    load_vreg_pair(function, source, "t1", "t2",
-                                   value.location);
-                    store_pair_memory("t1", "t2", 0, "t0");
-                } else {
-                    const auto source_gpr = input_gpr(
-                        function, source, "t1", value.location);
-                    store_integer_memory(source_gpr, "0($t0)",
-                                         source.mode.bits);
-                }
+                const auto source_gpr = input_gpr(
+                    function, source, "t1", value.location);
+                store_integer_memory(source_gpr, access, source.mode.bits);
             }
         }
         return;

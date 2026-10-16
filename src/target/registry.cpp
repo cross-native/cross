@@ -79,6 +79,24 @@ const RegisterEntry* find_register(const TargetInfo& target, std::string_view na
     return nullptr;
 }
 
+bool abi_carries_register(const TargetInfo& target, const AbiEntry& abi,
+                          std::string_view name) {
+    const auto* reg = find_register(target, name);
+    const auto same = [&](std::string_view other) {
+        const auto* entry = find_register(target, other);
+        return other == name ||
+               (reg && entry && entry->storage == reg->storage);
+    };
+    for (const auto& bank : abi.banks) {
+        if (std::any_of(bank.arguments.begin(), bank.arguments.end(), same) ||
+            std::any_of(bank.results.begin(), bank.results.end(), same)) {
+            return true;
+        }
+    }
+    return !abi.variadic_count_register.empty() &&
+           same(abi.variadic_count_register);
+}
+
 const PatchValueMaterializerEntry* find_patch_value_materializer(
     const TargetInfo& target, std::string_view type_name) {
     for (const auto& entry : target.patch_value_materializers) {

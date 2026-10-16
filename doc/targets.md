@@ -345,7 +345,7 @@ global void timer_vector() {
 ```
 
 Any general or floating register can hold a bound object, including `k0`,
-`k1`, `sp`, and `ra`. Temporaries use the registers of the `clobber` list,
+`k1`, `sp`, and `ra`, and `gp` unless a `data_base` entry uses it. Temporaries use the registers of the `clobber` list,
 and a bound register that the function writes anyway while its object's value
 is not needed. A naked function has
 no frame: a value that needs another register, stack storage, a call, a
@@ -365,6 +365,59 @@ argument registers that follow the named arguments and `overflow_arg_area` at
 the stack arguments that follow them; `n64` has `gp_arg_area` for its one
 sequence of argument registers and `overflow_arg_area`. Under `eabi32`,
 `arg_area` reaches only the unnamed arguments passed on the stack.
+
+### Small data
+
+`model/mips.xm` ships the `data_base` entry `mips-gp`
+([models.md](models.md#data-base-entries)). While it is selected, writable
+objects of at most 8 bytes that the compilation group defines go to `.sdata`,
+or to `.sbss` when they start as zero, and code reaches them through `$gp`
+with one instruction and a `%gp_rel` relocation. No profile selects it;
+`-mdata-bases=mips-gp` or a profile's `data_bases` property does:
+
+```sh
+cc -c -O2 -mprofile=vr4300-o32 -mdata-bases=mips-gp input.x -o input.o
+```
+
+```text
+global u32 frames;                        // .sbss, reached through $gp
+global u32 seed = 7u32;                   // .sdata
+global u32 table[64];                     // .bss: more than 8 bytes
+global const u32 limit = 64u32;           // .rodata: constants stay out
+[[section(".sdata")]] global u32 lookup[16];   // opted in
+[[section(".data")]] global u32 status = 1u32; // opted out
+[[section(".sdata")]] u32 shared;          // defined elsewhere in .sdata
+u32 elsewhere;                            // defined elsewhere: full address
+```
+
+An entry whose `kinds` list `readonly` or `literal` also places `const`
+objects or the compiler's constants, such as string literals.
+`-fdata-sections` names the sections `.sdata.NAME` and `.sbss.NAME`. An object
+defined in another compilation is reached through `$gp` only when its
+declaration names `.sdata` or `.sbss`. GCC's `-G8` objects can share the
+window: GCC places its small objects in `.sdata` and `.sbss`, and by default
+it reaches an external object of at most 8 bytes through `$gp`, so a Cross
+object that such code uses must lie in small data.
+
+While an entry is selected, Cross code reads `$gp` and never writes it: the
+register is not allocated, calls do not save it, and no register location of
+a naked function may name it. The program sets `$gp` to the address the
+linker gives `_gp` before such code runs, and its linker script keeps
+`.sdata` and `.sbss` within 32 KiB on either side of `_gp`:
+
+```text
+    .data : { *(.data .data.*) }
+    . = ALIGN(16);
+    _gp = . + 0x7ff0;
+    .sdata : { *(.sdata .sdata.*) }
+    .sbss (NOLOAD) : { *(.sbss .sbss.*) *(.scommon) }
+    .bss (NOLOAD) : { *(.bss .bss.*) *(COMMON) }
+```
+
+```text
+        lui     $gp,%hi(_gp)
+        addiu   $gp,$gp,%lo(_gp)        # daddiu with 64-bit addresses
+```
 
 ## Bit intrinsics
 

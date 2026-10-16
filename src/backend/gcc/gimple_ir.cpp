@@ -1964,8 +1964,15 @@ private:
     std::string object_attributes(const data::Object& object,
                                   const hir::Object& entity) const {
         std::vector<std::string> attributes;
-        if (entity.section) {
-            attributes.push_back("section(" + c_string(*entity.section) + ')');
+        const auto placed = data::data_base_section(
+            entity,
+            object.initializer == data::InitializerKind::Zero &&
+                !object.read_only && !options_.zero_init_in_data,
+            options_.data_sections || object.retain, options_);
+        if (entity.section || placed) {
+            attributes.push_back(
+                "section(" +
+                c_string(entity.section ? *entity.section : *placed) + ')');
         } else if (object.initializer == data::InitializerKind::Uninitialized) {
             attributes.emplace_back("section(\".noinit\")");
         }

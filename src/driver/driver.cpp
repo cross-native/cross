@@ -372,6 +372,28 @@ bool print_costs(const CompilerOptions& options, Diagnostics& diagnostics) {
     return true;
 }
 
+void print_data_bases() {
+    for (const auto& entry : model_registry().data_bases()) {
+        std::cout << entry.canonical_name << "  base: " << entry.base
+                  << "  sections:";
+        for (std::size_t index = 0; index < entry.sections.size(); ++index) {
+            std::cout << (index == 0 ? " " : ",") << entry.sections[index];
+        }
+        std::cout << "  max_size: " << entry.max_size << "  kinds:";
+        std::string kinds;
+        for (const auto& [name, enabled] :
+             {std::pair{"writable", entry.writable},
+              std::pair{"readonly", entry.readonly},
+              std::pair{"literal", entry.literal}}) {
+            if (enabled) {
+                kinds += (kinds.empty() ? " " : ",") + std::string(name);
+            }
+        }
+        std::cout << (kinds.empty() ? " none" : kinds)
+                  << "  source: " << entry.source << '\n';
+    }
+}
+
 void print_options(const CompilerOptions& options) {
     std::vector<const OptionDefinition*> definitions;
     for (const auto& definition : common_option_definitions()) {
@@ -961,6 +983,7 @@ int cc_main(int argc, char** argv) {
     if (options.print_optimizations) { print_optimizations(); return 0; }
     if (options.print_cpus) { print_cpus(options); return 0; }
     if (options.print_costs) return print_costs(options, diagnostics) ? 0 : 1;
+    if (options.print_data_bases) { print_data_bases(); return 0; }
     if (options.print_options) { print_options(options); return 0; }
     if (options.print_attributes) { print_attributes(); return 0; }
     if (options.print_registers) { print_registers(options); return 0; }
@@ -1180,6 +1203,7 @@ int cc_main(int argc, char** argv) {
         hir_module, *subtarget, options, diagnostics);
     if (options.verbose) std::cerr << "cc: lowering static data IR\n";
     auto data_module = data::lower(hir_module, *subtarget, diagnostics);
+    data::place_data_bases(hir_module, data_module, options);
     if (options.verbose) std::cerr << "cc: lowering raw MIR\n";
     auto raw_mir = backend->lower_raw(
         hir_module, *subtarget, diagnostics);

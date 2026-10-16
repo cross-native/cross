@@ -5,6 +5,7 @@
 
 #include "common/options.hpp"
 #include "middle/machine_ir.hpp"
+#include "model/model.hpp"
 #include "target/backend.hpp"
 #include "target/mips/features.hpp"
 #include "target/mips/machine_description.hpp"
@@ -57,6 +58,85 @@ unsigned type_bits(const hir::Module& module, hir::TypeId id) {
     case BuiltinType::Void: return 0;
     }
     return 0;
+}
+
+// Whether a manual location (`reg`, `*reg`, or `A=>B`) names the register
+// `name` names or one sharing its storage.
+bool names_register(const TargetInfo& target, std::string_view location,
+                    std::string_view name) {
+    const auto* reserved = find_register(target, name);
+    for (std::size_t begin = 0; begin <= location.size();) {
+        const auto end = std::min(location.find("=>", begin), location.size());
+        auto part = location.substr(begin, end - begin);
+        begin = end + 2;
+        if (part.starts_with('*')) part.remove_prefix(1);
+        const auto* entry = find_register(target, part);
+        if (part == name ||
+            (entry && reserved && entry->storage == reserved->storage)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// A selected data base reserves its register: an ABI that carries
+// arguments or results in it and a manual location that names it are
+// errors. Clobber lists cannot name it, because it is compiler-owned.
+void check_data_base_registers(const hir::Module& module,
+                               const Subtarget& subtarget,
+                               const CompilerOptions& options,
+                               Diagnostics& diagnostics) {
+    const auto& target = subtarget.target();
+    for (const auto& base : options.data_bases) {
+        const auto reserved = [&](SourceLocation location,
+                                  std::string_view what) {
+            diagnostics.error(location,
+                              std::string(what) + " names '" + base.base +
+                                  "', the base register of data_base '" +
+                                  base.name + "'");
+        };
+        const auto check_abi = [&](SourceLocation location, AbiId id) {
+            const auto* abi = find_abi(target, id);
+            if (abi && abi_carries_register(target, *abi, base.base)) {
+                diagnostics.error(
+                    location, "ABI '" + abi->canonical_name +
+                                  "' carries arguments or results in '" +
+                                  base.base + "', the base register of "
+                                  "data_base '" + base.name + "'");
+            }
+        };
+        for (const auto& function : module.functions) {
+            check_abi(function.location, function.abi);
+            if (function.result_location &&
+                names_register(target, *function.result_location, base.base)) {
+                reserved(function.location, "the result location");
+            }
+            for (const auto& parameter : function.parameters) {
+                if (parameter.physical_location &&
+                    names_register(target, *parameter.physical_location,
+                                   base.base)) {
+                    reserved(parameter.location, "the parameter location");
+                }
+            }
+        }
+        // The private convention of the compilation, chosen as
+        // managed_abi_model chooses it.
+        if (!options.private_abi) continue;
+        const unsigned carrier_bits =
+            subtarget.has_feature(Feature::Mips3) ? 64U : 32U;
+        for (const auto& abi : model_registry().abis()) {
+            if (abi.architecture == target.architecture &&
+                abi.address_bits == subtarget.abi_info().address_bits &&
+                abi.private_carrier_bits == carrier_bits &&
+                abi_carries_register(target, abi, base.base)) {
+                diagnostics.command_error(
+                    "the private ABI '" + abi.canonical_name +
+                    "' carries arguments or results in '" + base.base +
+                    "', the base register of data_base '" + base.name +
+                    "'; use -fno-private-abi");
+            }
+        }
+    }
 }
 
 bool unsupported_interface_type(const hir::Module& module, hir::TypeId id) {
@@ -330,6 +410,8 @@ public:
                     "MIPS TLS lowering is not implemented yet; Cross will not insert a hidden resolver call");
             }
         }
+        check_data_base_registers(hir_module, subtarget, options,
+                                  diagnostics);
         for (const auto& function : hir_module.functions) {
             // A per-function [[abi(...)]] selects transport, never the data
             // model: a 32-bit-address ABI on a 64-bit-address module would
@@ -437,6 +519,19 @@ public:
                          const CompilerOptions& options,
                          Diagnostics& diagnostics) const override {
         for (const auto& function : managed_module.functions) {
+            for (const auto& slot : function.slots) {
+                for (const auto& base : options.data_bases) {
+                    if (slot.physical_location &&
+                        names_register(subtarget.target(),
+                                       *slot.physical_location, base.base)) {
+                        diagnostics.error(
+                            slot.location,
+                            "the register binding names '" + base.base +
+                                "', the base register of data_base '" +
+                                base.name + "'");
+                    }
+                }
+            }
             for (const auto& value : function.values) {
                 if (value.kind == mir::ValueKind::Call && value.callee) {
                     const auto& callee = hir_module.function(*value.callee);
@@ -454,6 +549,20 @@ public:
                 }
                 const auto& signature =
                     hir_module.type(*value.call_signature).function;
+                for (const auto& base : options.data_bases) {
+                    const auto* abi =
+                        signature ? find_abi(subtarget.target(), signature->abi)
+                                  : nullptr;
+                    if (abi && abi_carries_register(subtarget.target(), *abi,
+                                                    base.base)) {
+                        diagnostics.error(
+                            value.location,
+                            "ABI '" + abi->canonical_name +
+                                "' carries arguments or results in '" +
+                                base.base + "', the base register of "
+                                "data_base '" + base.name + "'");
+                    }
+                }
                 const auto manual = [](const std::optional<std::string>& location) {
                     return location && *location != "auto";
                 };
