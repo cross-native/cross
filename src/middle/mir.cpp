@@ -7774,7 +7774,8 @@ bool verify_function(const ManagedFunction& function, const hir::Module& hir_mod
                     const bool scalar_select =
                         integer_type(hir_module, condition_type) &&
                         (integer_type(hir_module, value.type) ||
-                         pointer_type(hir_module, value.type));
+                         pointer_type(hir_module, value.type) ||
+                         floating_type(hir_module, value.type));
                     const bool vector_select =
                         vector_integer_type(hir_module, condition_type) &&
                         vector_type(hir_module, value.type) &&
@@ -9496,13 +9497,73 @@ void eliminate_dead_values(ManagedFunction& function,
         }
         for (const auto& incoming : value.incoming) mark(incoming.value);
     }
+    // The lifetime of a slot nothing else accesses or addresses marks no
+    // storage.
+    std::vector<bool> referenced(function.slots.size());
+    for (const auto& slot : function.slots) {
+        referenced[slot.id.value] = slot.is_volatile ||
+                                    slot.physical_location ||
+                                    slot.live_on_return;
+    }
+    for (const auto& value : function.values) {
+        if (!live[value.id.value]) continue;
+        if (value.slot && value.kind != ValueKind::LifetimeStart &&
+            value.kind != ValueKind::LifetimeEnd) {
+            referenced[value.slot->value] = true;
+        }
+        for (const auto& argument : value.call_arguments) {
+            if (argument.cell) referenced[argument.cell->value] = true;
+        }
+    }
+    std::unordered_set<std::uint32_t> lifetimes;
+    for (const auto& value : function.values) {
+        if ((value.kind == ValueKind::LifetimeStart ||
+             value.kind == ValueKind::LifetimeEnd) &&
+            value.slot && !referenced[value.slot->value]) {
+            lifetimes.insert(value.id.value);
+        }
+    }
     for (auto& block : function.blocks) {
         std::erase_if(block.values, [&](ValueId value) {
-            return !live[value.value];
+            return !live[value.value] && !lifetimes.contains(value.value);
         });
     }
-    compact_effects(function);
-    compact_managed_values(function);
+    if (!lifetimes.empty()) {
+        remove_effectful_values(function, lifetimes);
+    } else {
+        compact_effects(function);
+        compact_managed_values(function);
+    }
+    // A slot nothing references any more needs no storage; parameter,
+    // hard-bound, volatile, and copied-out cells stay.
+    std::vector<bool> kept(function.slots.size());
+    for (const auto& slot : function.slots) {
+        kept[slot.id.value] = slot.source_parameter || slot.physical_location ||
+                              slot.is_volatile || slot.live_on_return;
+    }
+    for (const auto& value : function.values) {
+        if (value.slot) kept[value.slot->value] = true;
+        for (const auto& argument : value.call_arguments) {
+            if (argument.cell) kept[argument.cell->value] = true;
+        }
+    }
+    if (std::find(kept.begin(), kept.end(), false) == kept.end()) return;
+    std::vector<std::optional<SlotId>> renumbered(function.slots.size());
+    std::vector<ManagedSlot> slots;
+    for (auto& slot : function.slots) {
+        if (!kept[slot.id.value]) continue;
+        renumbered[slot.id.value] =
+            SlotId{static_cast<std::uint32_t>(slots.size())};
+        slot.id = *renumbered[slot.id.value];
+        slots.push_back(std::move(slot));
+    }
+    function.slots = std::move(slots);
+    for (auto& value : function.values) {
+        if (value.slot) value.slot = renumbered[value.slot->value];
+        for (auto& argument : value.call_arguments) {
+            if (argument.cell) argument.cell = renumbered[argument.cell->value];
+        }
+    }
 }
 
 } // namespace
@@ -9840,18 +9901,110 @@ void promote_scalar_slots(ManagedFunction& function,
     }
 }
 
+// For each value, the address-taken slot it points into when every use of
+// the slot's address, through pointer copies and indexing, is the address of
+// an ordinary load or store: no call, stored or compared address, phi,
+// return, or other escape can then reach the slot's memory, so its accesses
+// are all visible.
+struct ContainedSlots {
+    std::vector<std::optional<SlotId>> pointee;
+    std::vector<bool> slots;
+};
+
+ContainedSlots contained_slot_addresses(const ManagedFunction& function) {
+    std::vector<std::optional<SlotId>> pointee(function.values.size());
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (const auto& value : function.values) {
+            if (pointee[value.id.value]) continue;
+            std::optional<SlotId> slot;
+            if (value.kind == ValueKind::SlotAddress && value.slot) {
+                slot = value.slot;
+            } else if ((value.kind == ValueKind::IndexedAddress ||
+                        (value.kind == ValueKind::Cast &&
+                         value.cast == CastOperation::Reinterpret)) &&
+                       !value.operands.empty()) {
+                slot = pointee[value.operands[0].value];
+            }
+            if (slot) {
+                pointee[value.id.value] = slot;
+                changed = true;
+            }
+        }
+    }
+    std::vector<bool> escaped(function.slots.size());
+    const auto escape = [&](ValueId id) {
+        if (const auto slot = pointee[id.value]) escaped[slot->value] = true;
+    };
+    for (const auto& value : function.values) {
+        for (std::size_t index = 0; index < value.operands.size(); ++index) {
+            const bool access =
+                index == 0 && !value.is_volatile_access &&
+                (value.kind == ValueKind::PointerLoad ||
+                 value.kind == ValueKind::IndexedLoad ||
+                 value.kind == ValueKind::PointerStore);
+            const bool derivation =
+                index == 0 &&
+                (value.kind == ValueKind::IndexedAddress ||
+                 (value.kind == ValueKind::Cast &&
+                  value.cast == CastOperation::Reinterpret));
+            if (!access && !derivation) escape(value.operands[index]);
+        }
+        for (const auto& argument : value.call_arguments) {
+            if (argument.value) escape(*argument.value);
+            if (argument.cell) escaped[argument.cell->value] = true;
+        }
+        for (const auto& incoming : value.incoming) escape(incoming.value);
+    }
+    for (const auto& block : function.blocks) {
+        if (block.terminator.value) escape(*block.terminator.value);
+    }
+    ContainedSlots result{std::move(pointee),
+                          std::vector<bool>(function.slots.size())};
+    for (auto& slot : result.pointee) {
+        if (slot && (escaped[slot->value] ||
+                     function.slots[slot->value].is_volatile ||
+                     function.slots[slot->value].physical_location ||
+                     function.slots[slot->value].live_on_return)) {
+            slot.reset();
+        }
+        if (slot) result.slots[slot->value] = true;
+    }
+    return result;
+}
+
 std::vector<bool> transfer_slot_liveness(
     const ManagedFunction& function, const ManagedBlock& block,
     std::vector<bool> needed,
+    const ContainedSlots& contained,
     std::unordered_set<std::uint32_t>* removed = nullptr) {
     for (auto item = block.values.rbegin();
          item != block.values.rend(); ++item) {
         const auto& value = function.values[item->value];
+        // A load or store through a contained slot's address reads or
+        // writes part of that slot.
+        if (!value.operands.empty() &&
+            (value.kind == ValueKind::PointerLoad ||
+             value.kind == ValueKind::IndexedLoad ||
+             value.kind == ValueKind::PointerStore)) {
+            if (const auto slot = contained.pointee[value.operands[0].value]) {
+                if (value.kind != ValueKind::PointerStore) {
+                    needed[slot->value] = true;
+                } else if (removed && !needed[slot->value]) {
+                    removed->insert(value.id.value);
+                }
+                continue;
+            }
+        }
+        const auto visible = [&](SlotId slot) {
+            return optimizable_slot(function, slot) ||
+                   contained.slots[slot.value];
+        };
         if ((value.kind == ValueKind::Load ||
              value.kind == ValueKind::Store ||
              value.kind == ValueKind::LifetimeStart ||
              value.kind == ValueKind::LifetimeEnd) &&
-            value.slot && optimizable_slot(function, *value.slot)) {
+            value.slot && visible(*value.slot)) {
             const auto slot = value.slot->value;
             if (value.kind == ValueKind::Load) {
                 needed[slot] = true;
@@ -9890,6 +10043,7 @@ std::vector<bool> transfer_slot_liveness(
 
 void eliminate_dead_stores(ManagedFunction& function) {
     const auto slots = function.slots.size();
+    const auto contained = contained_slot_addresses(function);
     std::vector<std::vector<bool>> live_in(
         function.blocks.size(), std::vector<bool>(slots));
     bool changed = true;
@@ -9910,7 +10064,7 @@ void eliminate_dead_stores(ManagedFunction& function) {
                 }
             }
             auto next = transfer_slot_liveness(
-                function, *block, std::move(live_out));
+                function, *block, std::move(live_out), contained);
             if (next != live_in[block->id.value]) {
                 live_in[block->id.value] = std::move(next);
                 changed = true;
@@ -9933,7 +10087,7 @@ void eliminate_dead_stores(ManagedFunction& function) {
             }
         }
         (void)transfer_slot_liveness(
-            function, block, std::move(live_out), &removed);
+            function, block, std::move(live_out), contained, &removed);
     }
     remove_effectful_values(function, removed);
 }
@@ -11980,6 +12134,10 @@ bool safely_speculatable_for_if_conversion(
     case ValueKind::SlotAddress:
     case ValueKind::GlobalAddress:
         return true;
+    case ValueKind::IndexedAddress:
+        return value.operands.size() == 2;
+    case ValueKind::Select:
+        return value.operands.size() == 3;
     case ValueKind::Unary:
         return value.operands.size() == 1;
     case ValueKind::Binary:
@@ -12002,6 +12160,204 @@ bool safely_speculatable_for_if_conversion(
     }
 }
 
+// The same for an operation with a floating operand or result of at most 64
+// bits, which raises no exception that ENVIRONMENT traps. A conversion to an
+// integer is excluded: it is undefined out of range.
+bool speculatable_floating_value(const ManagedValue& value,
+                                 const ManagedFunction& function,
+                                 const hir::Module& hir_module,
+                                 const floating::Environment& environment) {
+    const auto scalar = [&](hir::TypeId type) {
+        const auto bits = type_bits(hir_module, type);
+        return bits != 0 && bits <= 64 &&
+               (floating_type(hir_module, type) ||
+                integer_type(hir_module, type) ||
+                pointer_type(hir_module, type));
+    };
+    const auto floating = [&](ValueId id) {
+        return floating_type(hir_module, function.values[id.value].type);
+    };
+    if (is_effectful_value(value) || !scalar(value.type) ||
+        std::any_of(value.operands.begin(), value.operands.end(),
+                    [&](ValueId operand) {
+                        return operand.value >= function.values.size() ||
+                               !scalar(function.values[operand.value].type);
+                    }) ||
+        may_trap_floating(value, function, hir_module, environment)) {
+        return false;
+    }
+    switch (value.kind) {
+    case ValueKind::ConstantFloating:
+        return true;
+    case ValueKind::Select:
+        return value.operands.size() == 3 && floating_type(hir_module, value.type);
+    case ValueKind::Unary:
+        return value.operands.size() == 1 && floating(value.operands[0]);
+    case ValueKind::Binary:
+        return value.operands.size() == 2 && floating(value.operands[0]);
+    case ValueKind::Cast:
+        return value.operands.size() == 1 &&
+               value.cast != CastOperation::FloatToSignedInteger &&
+               value.cast != CastOperation::FloatToUnsignedInteger &&
+               (floating(value.operands[0]) ||
+                floating_type(hir_module, value.type));
+    case ValueKind::Intrinsic:
+        return floating_intrinsic_operation(value.intrinsic);
+    default:
+        return false;
+    }
+}
+
+std::optional<BinaryOperation> negated_integer_comparison(
+    BinaryOperation operation);
+
+// The exclusive unsigned bound of integer VALUE wherever BLOCK runs, from
+// a mask and from the unsigned comparisons of branches whose taken edge
+// dominates BLOCK; zero extensions keep the bound.
+std::optional<UInt128> unsigned_bound_in_block(
+    const ManagedFunction& function, const DominatorTree& dominance,
+    BlockId block, ValueId value) {
+    const auto unextended = [&](ValueId id) {
+        while (function.values[id.value].kind == ValueKind::Cast &&
+               function.values[id.value].cast == CastOperation::ZeroExtend &&
+               function.values[id.value].operands.size() == 1) {
+            id = function.values[id.value].operands[0];
+        }
+        return id;
+    };
+    const auto constant = [&](ValueId id) -> std::optional<UInt128> {
+        const auto& candidate = function.values[id.value];
+        if (candidate.kind != ValueKind::ConstantInteger) return std::nullopt;
+        return UInt128{candidate.integer, candidate.integer_high};
+    };
+    const auto index = unextended(value);
+    std::optional<UInt128> bound;
+    const auto tighten = [&](UInt128 limit) {
+        if (!bound || limit < *bound) bound = limit;
+    };
+    const auto& definition = function.values[index.value];
+    if (definition.kind == ValueKind::Binary &&
+        definition.binary == BinaryOperation::BitAnd &&
+        definition.operands.size() == 2) {
+        for (const auto operand : definition.operands) {
+            if (const auto mask = constant(operand);
+                mask && mask->high == 0 && mask->low != ~std::uint64_t{0}) {
+                tighten(UInt128{mask->low + 1U, 0});
+            }
+        }
+    }
+    for (const auto& branch : function.blocks) {
+        const auto& terminator = branch.terminator;
+        if (terminator.kind != TerminatorKind::ConditionalBranch ||
+            !terminator.value || terminator.successors.size() != 2 ||
+            terminator.successors[0] == terminator.successors[1]) {
+            continue;
+        }
+        const auto& comparison = function.values[terminator.value->value];
+        if (comparison.kind != ValueKind::Binary ||
+            comparison.operands.size() != 2) {
+            continue;
+        }
+        for (const unsigned taken : {0U, 1U}) {
+            const auto successor = terminator.successors[taken];
+            if (function.blocks[successor.value].predecessors !=
+                    std::vector<BlockId>{branch.id} ||
+                !dominance.dominates(successor, block)) {
+                continue;
+            }
+            // The relation that holds on this edge, as index < limit or
+            // index <= limit.
+            auto operation = comparison.binary;
+            if (taken == 1) {
+                const auto negated = negated_integer_comparison(operation);
+                if (!negated) continue;
+                operation = *negated;
+            }
+            const auto left = unextended(comparison.operands[0]);
+            const auto right = unextended(comparison.operands[1]);
+            std::optional<UInt128> limit;
+            bool inclusive{};
+            if (left == index) {
+                limit = constant(comparison.operands[1]);
+                inclusive = operation == BinaryOperation::UnsignedLessEqual;
+                if (operation != BinaryOperation::UnsignedLess && !inclusive) {
+                    continue;
+                }
+            } else if (right == index) {
+                limit = constant(comparison.operands[0]);
+                inclusive = operation == BinaryOperation::UnsignedGreaterEqual;
+                if (operation != BinaryOperation::UnsignedGreater && !inclusive) {
+                    continue;
+                }
+            }
+            if (!limit || (inclusive && limit->high == ~std::uint64_t{0} &&
+                           limit->low == ~std::uint64_t{0})) {
+                continue;
+            }
+            tighten(inclusive ? add(*limit, UInt128{1}) : *limit);
+        }
+    }
+    return bound;
+}
+
+// Whether a load may run where the source does not run it: an ordinary load
+// of a defined, ordinary global object, at an element its index provably
+// stays within where BLOCK runs.
+bool dereferenceable_load(const ManagedValue& load,
+                          const ManagedFunction& function,
+                          const hir::Module& hir_module,
+                          const TargetInfo& target,
+                          const DominatorTree& dominance, BlockId block) {
+    if (load.is_volatile_access) return false;
+    const auto ordinary_object = [&](const ManagedValue& address) {
+        if (address.kind != ValueKind::GlobalAddress || !address.object) {
+            return false;
+        }
+        const auto& object = hir_module.object(*address.object);
+        return object.definition && !object.weak && !object.alias_target &&
+               !object.weakref_target && !object.fixed_address;
+    };
+    if (load.kind == ValueKind::GlobalLoad) {
+        return load.object &&
+               hir_module.object(*load.object).definition &&
+               !hir_module.object(*load.object).weak &&
+               !hir_module.object(*load.object).alias_target &&
+               !hir_module.object(*load.object).weakref_target &&
+               !hir_module.object(*load.object).fixed_address;
+    }
+    if (load.kind != ValueKind::PointerLoad || load.operands.size() != 1) {
+        return false;
+    }
+    const auto& address = function.values[load.operands[0].value];
+    if (address.kind != ValueKind::IndexedAddress ||
+        address.operands.size() != 2) {
+        return false;
+    }
+    auto object_address = address.operands[0];
+    while (function.values[object_address.value].kind == ValueKind::Cast &&
+           function.values[object_address.value].cast ==
+               CastOperation::Reinterpret &&
+           function.values[object_address.value].operands.size() == 1) {
+        object_address = function.values[object_address.value].operands[0];
+    }
+    const auto& object = function.values[object_address.value];
+    if (!ordinary_object(object)) return false;
+    const auto& pointer = hir_module.type(address.type);
+    if (pointer.kind != hir::Type::Kind::Pointer || !pointer.pointee) {
+        return false;
+    }
+    const auto stride = storage_size(hir_module, *pointer.pointee, target);
+    const auto element = storage_size(hir_module, load.type, target);
+    const auto size =
+        storage_size(hir_module, hir_module.object(*object.object).type, target);
+    if (stride == 0 || element == 0 || element > stride || size < stride) {
+        return false;
+    }
+    const auto bound = unsigned_bound_in_block(function, dominance, block,
+                                               address.operands[1]);
+    return bound && bound->high == 0 && bound->low <= size / stride;
+}
+
 unsigned if_conversion_cost(const ManagedValue& value,
                             const hir::Module& hir_module,
                             const CompilerOptions& options) {
@@ -12010,8 +12366,13 @@ unsigned if_conversion_cost(const ManagedValue& value,
         const auto balance = std::min(options.risc_cisc_balance, 100U);
         return risc * (100U - balance) + cisc * balance;
     };
+    // A floating division or square root takes longer than any shipped
+    // budget allows to speculate.
+    const auto long_floating = cost_scale * 12U;
     switch (value.kind) {
     case ValueKind::Intrinsic:
+        if (value.intrinsic == IntrinsicOperation::Sqrt) return long_floating;
+        if (floating_intrinsic_operation(value.intrinsic)) return cost_scale;
         // These normally disappear into an immediate/addressing mode or are
         // pure metadata. Counting every MIR node equally used to make the
         // decision depend on front-end spelling instead of generated work.
@@ -12026,6 +12387,10 @@ unsigned if_conversion_cost(const ManagedValue& value,
     case ValueKind::Cast:
         return value.cast == CastOperation::Reinterpret ? 0U : cost_scale;
     case ValueKind::Binary:
+        if (value.binary == BinaryOperation::SignedDivide &&
+            floating_type(hir_module, value.type)) {
+            return long_floating;
+        }
         if (value.binary == BinaryOperation::Multiply) {
             return blended(4U, 3U);
         }
@@ -12039,6 +12404,9 @@ unsigned if_conversion_cost(const ManagedValue& value,
         return cost_scale;
     case ValueKind::Unary:
         return cost_scale;
+    case ValueKind::PointerLoad:
+    case ValueKind::GlobalLoad:
+        return blended(2U, 1U);
     default:
         return std::max(1U, type_bits(hir_module, value.type) / 64U) *
                cost_scale;
@@ -12214,6 +12582,7 @@ void absorb_linear_successor(
 // (from -> to); if_convert_diamonds applies both once at the end.
 bool if_convert_one_diamond(ManagedFunction& function,
                             const hir::Module& hir_module,
+                            const Subtarget& subtarget,
                             std::size_t owner_index,
                             const CompilerOptions& options,
                             std::unordered_map<std::uint32_t, EffectId>& forwarded) {
@@ -12300,6 +12669,8 @@ bool if_convert_one_diamond(ManagedFunction& function,
     const auto falsity_id = owner.terminator.successors[1];
     auto& truth = function.blocks[truth_id.value];
     auto& falsity = function.blocks[falsity_id.value];
+    // An arm runs in OWNER: pure operations, and loads OWNER may run.
+    std::optional<DominatorTree> dominance;
     const auto pure_arm = [&](const ManagedBlock& arm) {
         return arm.predecessors.size() == 1 &&
                arm.predecessors.front() == owner.id &&
@@ -12311,13 +12682,88 @@ bool if_convert_one_diamond(ManagedFunction& function,
                std::all_of(
                    arm.values.begin(), arm.values.end(),
                    [&](ValueId id) {
+                       const auto& value = function.values[id.value];
+                       if (value.kind == ValueKind::PointerLoad ||
+                           value.kind == ValueKind::GlobalLoad) {
+                           if (!dominance) dominance.emplace(function);
+                           return dereferenceable_load(
+                               value, function, hir_module,
+                               subtarget.target(), *dominance, owner.id);
+                       }
                        return safely_speculatable_for_if_conversion(
-                           function.values[id.value], function, hir_module);
+                                  value, function, hir_module) ||
+                              speculatable_floating_value(
+                                  value, function, hir_module,
+                                  options.floating_environment);
                    });
     };
-    if (!pure_arm(truth) || !pure_arm(falsity)) return false;
+    // A diamond has two arms. A triangle has one, which branches to the
+    // other successor; that block then joins the arm and OWNER itself. Each
+    // path enters the join from its source block.
+    std::vector<ManagedBlock*> arms;
+    auto truth_source = truth_id;
+    auto falsity_source = falsity_id;
+    if (pure_arm(truth) && pure_arm(falsity)) {
+        arms = {&truth, &falsity};
+    } else {
+        for (const unsigned side : {0U, 1U}) {
+            auto& arm = side == 0 ? truth : falsity;
+            const auto join_id = side == 0 ? falsity_id : truth_id;
+            const auto& join = function.blocks[join_id.value];
+            if (pure_arm(arm) &&
+                arm.terminator.kind == TerminatorKind::Branch &&
+                arm.terminator.successors == std::vector<BlockId>{join_id} &&
+                join.predecessors.size() == 2 &&
+                std::find(join.predecessors.begin(), join.predecessors.end(),
+                          owner.id) != join.predecessors.end()) {
+                arms = {&arm};
+                (side == 0 ? falsity_source : truth_source) = owner.id;
+                break;
+            }
+        }
+        if (arms.empty()) return false;
+    }
+    // The loads of the arms join OWNER's effect chain, truth arm first; the
+    // result is the effect at the end of the joined chain.
+    const auto join_arm_effects = [&] {
+        auto current = owner.terminator.effect;
+        for (const auto* arm : arms) {
+            forwarded[arm->effect.value] = current;
+            current = arm->terminator.effect;
+        }
+        return current;
+    };
 
     constexpr unsigned cost_scale = 100;
+    // A select of TYPE costs the instructions the target adds for it. A
+    // floating select needs a target that selects without a branch; an
+    // integer one is lowered everywhere and costs one operation where the
+    // target branches. A comparison in OWNER of floating values as wide as
+    // the selected ones may become the select's mask.
+    const auto select_cost =
+        [&](hir::TypeId type) -> std::optional<unsigned> {
+        const bool floating = floating_type(hir_module, type);
+        const auto bits = type_bits(hir_module, type);
+        if (bits == 0 || bits > 64 ||
+            (!floating && !if_conversion_scalar_type(hir_module, type))) {
+            return std::nullopt;
+        }
+        const auto& comparison = function.values[condition.value];
+        const bool floating_comparison =
+            floating && comparison.kind == ValueKind::Binary &&
+            comparison.operands.size() == 2 &&
+            floating_type(hir_module,
+                          function.values[comparison.operands[0].value].type) &&
+            type_bits(hir_module,
+                      function.values[comparison.operands[0].value].type) ==
+                bits &&
+            std::find(owner.values.begin(), owner.values.end(), condition) !=
+                owner.values.end();
+        const auto cost =
+            subtarget.select_cost({bits, floating, floating_comparison});
+        if (!cost && floating) return std::nullopt;
+        return cost.value_or(1U) * cost_scale;
+    };
     const auto profitable = [&](unsigned cost) {
         unsigned limit = options.if_conversion_limit * cost_scale;
         // A low-bit test of loaded data commonly has little branch
@@ -12346,7 +12792,8 @@ bool if_convert_one_diamond(ManagedFunction& function,
         disconnect_block(function, arm);
     };
 
-    if (truth.terminator.kind == TerminatorKind::Return &&
+    if (arms.size() == 2 &&
+        truth.terminator.kind == TerminatorKind::Return &&
         falsity.terminator.kind == TerminatorKind::Return &&
         truth.terminator.successors.empty() &&
         falsity.terminator.successors.empty()) {
@@ -12359,10 +12806,11 @@ bool if_convert_one_diamond(ManagedFunction& function,
             const auto truth_value = *truth.terminator.value;
             const auto falsity_value = *falsity.terminator.value;
             const auto type = function.values[truth_value.value].type;
+            const auto selection_cost = select_cost(type);
             if (function.values[falsity_value.value].type != type ||
-                !if_conversion_scalar_type(hir_module, type) ||
+                !selection_cost ||
                 !profitable(arm_cost(truth) + arm_cost(falsity) +
-                            cost_scale)) {
+                            *selection_cost)) {
                 return false;
             }
             ManagedValue value;
@@ -12382,6 +12830,7 @@ bool if_convert_one_diamond(ManagedFunction& function,
             owner.values.insert(owner.values.end(), falsity.values.begin(),
                                 falsity.values.end());
             owner.values.push_back(*selected);
+            owner.terminator.effect = join_arm_effects();
         }
         truth.values.clear();
         falsity.values.clear();
@@ -12393,26 +12842,28 @@ bool if_convert_one_diamond(ManagedFunction& function,
         return true;
     }
 
-    if (truth.terminator.kind != TerminatorKind::Branch ||
-        falsity.terminator.kind != TerminatorKind::Branch ||
-        truth.terminator.successors.size() != 1 ||
-        falsity.terminator.successors.size() != 1 ||
-        truth.terminator.successors.front() !=
-            falsity.terminator.successors.front()) {
+    if (std::any_of(arms.begin(), arms.end(), [](const ManagedBlock* arm) {
+            return arm->terminator.kind != TerminatorKind::Branch ||
+                   arm->terminator.successors.size() != 1;
+        }) ||
+        arms.front()->terminator.successors !=
+            arms.back()->terminator.successors) {
         return false;
     }
 
-    const auto merge_id = truth.terminator.successors.front();
-    if (merge_id == owner.id || merge_id == truth_id ||
-        merge_id == falsity_id) {
+    const auto merge_id = arms.front()->terminator.successors.front();
+    if (merge_id == owner.id ||
+        std::any_of(arms.begin(), arms.end(), [&](const ManagedBlock* arm) {
+            return arm->id == merge_id;
+        })) {
         return false;
     }
     auto& merge = function.blocks[merge_id.value];
     if (merge.predecessors.size() != 2 ||
         std::find(merge.predecessors.begin(), merge.predecessors.end(),
-                  truth_id) == merge.predecessors.end() ||
+                  truth_source) == merge.predecessors.end() ||
         std::find(merge.predecessors.begin(), merge.predecessors.end(),
-                  falsity_id) == merge.predecessors.end()) {
+                  falsity_source) == merge.predecessors.end()) {
         return false;
     }
 
@@ -12422,57 +12873,85 @@ bool if_convert_one_diamond(ManagedFunction& function,
         ValueId falsity;
     };
     std::vector<Selection> selections;
+    unsigned selections_cost{};
     for (const auto id : merge.values) {
         const auto& value = function.values[id.value];
         if (value.kind != ValueKind::Phi) continue;
-        if (!if_conversion_scalar_type(hir_module, value.type) ||
-            value.incoming.size() != 2) {
+        const auto selection_cost = select_cost(value.type);
+        if (!selection_cost || value.incoming.size() != 2) {
             return false;
         }
         const auto truth_value = std::find_if(
             value.incoming.begin(), value.incoming.end(),
             [&](const PhiIncoming& incoming) {
-                return incoming.predecessor == truth_id;
+                return incoming.predecessor == truth_source;
             });
         const auto falsity_value = std::find_if(
             value.incoming.begin(), value.incoming.end(),
             [&](const PhiIncoming& incoming) {
-                return incoming.predecessor == falsity_id;
+                return incoming.predecessor == falsity_source;
             });
         if (truth_value == value.incoming.end() ||
             falsity_value == value.incoming.end()) {
             return false;
+        }
+        // Phis with equal incoming values become one select once value
+        // numbering merges them, and a phi of one value needs none.
+        if (truth_value->value != falsity_value->value &&
+            std::none_of(selections.begin(), selections.end(),
+                         [&](const Selection& prior) {
+                             return prior.truth == truth_value->value &&
+                                    prior.falsity == falsity_value->value;
+                         })) {
+            selections_cost += *selection_cost;
         }
         selections.push_back(
             {id, truth_value->value, falsity_value->value});
     }
     if (selections.empty()) return false;
 
-    const auto speculative_cost =
-        arm_cost(truth) + arm_cost(falsity) +
-        static_cast<unsigned>(selections.size()) * cost_scale;
+    auto speculative_cost = selections_cost;
+    for (const auto* arm : arms) speculative_cost += arm_cost(*arm);
     if (!profitable(speculative_cost)) return false;
 
-    const auto truth_values = truth.values;
-    const auto falsity_values = falsity.values;
-    owner.values.insert(owner.values.end(), truth_values.begin(),
-                        truth_values.end());
-    owner.values.insert(owner.values.end(), falsity_values.begin(),
-                        falsity_values.end());
+    for (const auto* arm : arms) {
+        const auto values = arm->values;
+        owner.values.insert(owner.values.end(), values.begin(), values.end());
+    }
+    owner.terminator.effect = join_arm_effects();
     std::unordered_set<std::uint32_t> selected_ids;
+    const auto boolean = hir_module.builtin(BuiltinType::Bool);
+    const auto constant_bool = [&](ValueId id, std::uint64_t truth_value) {
+        const auto& candidate = function.values[id.value];
+        return candidate.kind == ValueKind::ConstantInteger &&
+               candidate.integer == truth_value && candidate.integer_high == 0;
+    };
     for (const auto& selection : selections) {
         auto& value = function.values[selection.result.value];
-        value.kind = ValueKind::Select;
-        value.operands = {condition, selection.truth, selection.falsity};
         value.incoming.clear();
+        // A boolean chosen against false or true is the condition's and or
+        // or: `a && b` and `a || b` as values.
+        if (boolean && value.type == *boolean &&
+            function.values[condition.value].type == *boolean &&
+            (constant_bool(selection.falsity, 0) ||
+             constant_bool(selection.truth, 1))) {
+            const bool conjunction = constant_bool(selection.falsity, 0);
+            value.kind = ValueKind::Binary;
+            value.binary = conjunction ? BinaryOperation::BitAnd
+                                       : BinaryOperation::BitOr;
+            value.operands = {condition, conjunction ? selection.truth
+                                                     : selection.falsity};
+        } else {
+            value.kind = ValueKind::Select;
+            value.operands = {condition, selection.truth, selection.falsity};
+        }
         owner.values.push_back(selection.result);
         selected_ids.insert(selection.result.value);
     }
     std::erase_if(merge.values, [&](ValueId id) {
         return selected_ids.contains(id.value);
     });
-    truth.values.clear();
-    falsity.values.clear();
+    for (auto* arm : arms) arm->values.clear();
 
     owner.terminator.kind = TerminatorKind::Branch;
     owner.terminator.value.reset();
@@ -12482,8 +12961,7 @@ bool if_convert_one_diamond(ManagedFunction& function,
     merge_effect.incoming = {
         {owner.id, owner.terminator.effect}};
 
-    disconnect(truth);
-    disconnect(falsity);
+    for (auto* arm : arms) disconnect(*arm);
 
     // The converted diamond leaves OWNER branching to a single-predecessor
     // merge. Fold that linear edge immediately. Besides removing a redundant
@@ -12494,8 +12972,172 @@ bool if_convert_one_diamond(ManagedFunction& function,
     return true;
 }
 
+// Combines the branches of `if (a && b)` and `if (a || b)`: OWNER branches
+// to a block whose only predecessor it is and which computes a second
+// condition and branches to OWNER's other successor or to a block of its
+// own. That work then runs in OWNER under the if-conversion budget, loads
+// only where dereferenceable_load allows them, and one branch tests both
+// conditions; the common successor's phis must take one value from both
+// paths into it. Lineage: GCC tree-ssa-ifcombine.cc, LLVM SimplifyCFG
+// FoldBranchToCommonDest.
+bool combine_branch_conditions(
+    ManagedFunction& function, const hir::Module& hir_module,
+    const Subtarget& subtarget, std::size_t owner_index,
+    const CompilerOptions& options,
+    std::unordered_map<std::uint32_t, EffectId>& forwarded) {
+    const auto& owner = function.blocks[owner_index];
+    const auto boolean = hir_module.builtin(BuiltinType::Bool);
+    if (owner.terminator.kind != TerminatorKind::ConditionalBranch ||
+        !owner.terminator.value || owner.terminator.successors.size() != 2 ||
+        owner.terminator.successors[0] == owner.terminator.successors[1] ||
+        !boolean ||
+        function.values[owner.terminator.value->value].type != *boolean) {
+        return false;
+    }
+    const auto labeled = [&](BlockId id) {
+        return std::any_of(function.labels.begin(), function.labels.end(),
+                           [&](const ManagedLabel& label) {
+                               return label.block == id;
+                           });
+    };
+    constexpr unsigned cost_scale = 100;
+    std::optional<DominatorTree> dominance;
+    // Side 0 combines `a && b` (the second test on the true edge), side 1
+    // `a || b` (on the false edge).
+    for (const unsigned side : {0U, 1U}) {
+        const auto owner_id = function.blocks[owner_index].id;
+        const auto inner_id = function.blocks[owner_index].terminator.successors[side];
+        const auto common_id =
+            function.blocks[owner_index].terminator.successors[1U - side];
+        const auto& inner = function.blocks[inner_id.value];
+        if (inner_id == owner_id ||
+            inner.predecessors != std::vector<BlockId>{owner_id} ||
+            labeled(inner_id) ||
+            inner.terminator.kind != TerminatorKind::ConditionalBranch ||
+            !inner.terminator.value || inner.terminator.successors.size() != 2 ||
+            inner.terminator.successors[1U - side] != common_id ||
+            function.values[inner.terminator.value->value].type != *boolean) {
+            continue;
+        }
+        const auto target_id = inner.terminator.successors[side];
+        const auto& target = function.blocks[target_id.value];
+        if (target_id == common_id || target_id == owner_id ||
+            target_id == inner_id ||
+            std::find(target.predecessors.begin(), target.predecessors.end(),
+                      owner_id) != target.predecessors.end()) {
+            continue;
+        }
+        const auto& common = function.blocks[common_id.value];
+        const bool distinguishes = std::any_of(
+            common.values.begin(), common.values.end(), [&](ValueId id) {
+                const auto& phi = function.values[id.value];
+                if (phi.kind != ValueKind::Phi) return false;
+                const auto from = [&](BlockId predecessor)
+                    -> std::optional<ValueId> {
+                    for (const auto& incoming : phi.incoming) {
+                        if (incoming.predecessor == predecessor) {
+                            return incoming.value;
+                        }
+                    }
+                    return std::nullopt;
+                };
+                return from(owner_id) != from(inner_id);
+            });
+        if (distinguishes) continue;
+        unsigned cost = cost_scale;
+        bool speculatable = true;
+        for (const auto id : inner.values) {
+            const auto& value = function.values[id.value];
+            if (value.kind == ValueKind::Phi) {
+                speculatable = false;
+            } else if (value.kind == ValueKind::PointerLoad ||
+                       value.kind == ValueKind::GlobalLoad) {
+                if (!dominance) dominance.emplace(function);
+                speculatable = dereferenceable_load(
+                    value, function, hir_module, subtarget.target(),
+                    *dominance, owner_id);
+            } else {
+                speculatable = safely_speculatable_for_if_conversion(
+                                   value, function, hir_module) ||
+                               speculatable_floating_value(
+                                   value, function, hir_module,
+                                   options.floating_environment);
+            }
+            if (!speculatable) break;
+            cost += if_conversion_cost(value, hir_module, options);
+        }
+        if (!speculatable) continue;
+        unsigned limit = options.if_conversion_limit * cost_scale;
+        if (unpredictable_memory_condition(function, hir_module,
+                                           *inner.terminator.value)) {
+            limit = std::max(limit,
+                             options.if_conversion_memory_limit * cost_scale);
+        }
+        if (cost > limit) continue;
+
+        ManagedValue combined;
+        combined.id = {static_cast<std::uint32_t>(function.values.size())};
+        combined.location = inner.terminator.location;
+        combined.type = *boolean;
+        combined.kind = ValueKind::Binary;
+        combined.binary = side == 0 ? BinaryOperation::BitAnd
+                                    : BinaryOperation::BitOr;
+        combined.operands = {*function.blocks[owner_index].terminator.value,
+                             *inner.terminator.value};
+        const auto combined_id = combined.id;
+        function.values.push_back(std::move(combined));
+
+        auto& merged = function.blocks[owner_index];
+        auto& dead = function.blocks[inner_id.value];
+        const auto old_effect = merged.terminator.effect;
+        merged.values.insert(merged.values.end(), dead.values.begin(),
+                             dead.values.end());
+        merged.values.push_back(combined_id);
+        dead.values.clear();
+        forwarded[dead.effect.value] = old_effect;
+        merged.terminator.effect = dead.terminator.effect;
+        merged.terminator.value = combined_id;
+        merged.terminator.successors[side] = target_id;
+
+        auto& next = function.blocks[target_id.value];
+        std::replace(next.predecessors.begin(), next.predecessors.end(),
+                     inner_id, owner_id);
+        for (auto& incoming : function.effects[next.effect.value].incoming) {
+            if (incoming.predecessor == inner_id) incoming.predecessor = owner_id;
+        }
+        for (const auto id : next.values) {
+            for (auto& incoming : function.values[id.value].incoming) {
+                if (incoming.predecessor == inner_id) {
+                    incoming.predecessor = owner_id;
+                }
+            }
+        }
+        auto& join = function.blocks[common_id.value];
+        std::erase(join.predecessors, inner_id);
+        auto& join_effect = function.effects[join.effect.value];
+        std::erase_if(join_effect.incoming, [&](const EffectIncoming& incoming) {
+            return incoming.predecessor == inner_id;
+        });
+        for (auto& incoming : join_effect.incoming) {
+            if (incoming.predecessor == owner_id) {
+                incoming.effect = merged.terminator.effect;
+            }
+        }
+        for (const auto id : join.values) {
+            std::erase_if(function.values[id.value].incoming,
+                          [&](const PhiIncoming& incoming) {
+                              return incoming.predecessor == inner_id;
+                          });
+        }
+        disconnect_block(function, dead);
+        return true;
+    }
+    return false;
+}
+
 bool if_convert_diamonds(ManagedFunction& function,
                          const hir::Module& hir_module,
+                         const Subtarget& subtarget,
                          const CompilerOptions& options) {
     // Converting a diamond can expose another one at the same owner (its
     // absorbed merge ends in a branch) or at an earlier block (an enclosing
@@ -12505,8 +13147,10 @@ bool if_convert_diamonds(ManagedFunction& function,
     for (bool converted = true; converted;) {
         converted = false;
         for (std::size_t index = 0; index < function.blocks.size(); ++index) {
-            while (if_convert_one_diamond(function, hir_module, index, options,
-                                          forwarded))
+            while (if_convert_one_diamond(function, hir_module, subtarget,
+                                          index, options, forwarded) ||
+                   combine_branch_conditions(function, hir_module, subtarget,
+                                             index, options, forwarded))
                 converted = changed = true;
         }
     }
@@ -16073,13 +16717,89 @@ bool vectorizable_reduction_term(
                value.operands[1], required, arithmetic_operations);
 }
 
+// The longest packed form, in target instructions, of the operations a
+// vectorized loop body performs at VECTOR_BITS, or no value when the target
+// computes one of them a lane at a time. Operations the target does not
+// describe count one instruction.
+std::optional<std::size_t> packed_operation_length(
+    const ManagedFunction& function, const hir::Module& hir_module,
+    const ReductionLoopPattern& pattern,
+    const std::vector<std::optional<BlockId>>& definitions,
+    const std::unordered_set<std::uint32_t>& required,
+    unsigned vector_bits, const Subtarget& subtarget) {
+    std::size_t longest = 1;
+    bool lanewise = false;
+    const auto query = [&](CostedVectorOperation operation, hir::TypeId type,
+                           bool uniform_shift = false) {
+        const auto instructions = subtarget.vector_operation(
+            {operation, type_bits(hir_module, type), vector_bits,
+             floating_type(hir_module, type), uniform_shift});
+        if (!instructions) return;
+        if (instructions->empty()) lanewise = true;
+        longest = std::max(longest, instructions->size());
+    };
+    const auto binary_operation = [](BinaryOperation operation)
+        -> std::optional<CostedVectorOperation> {
+        using C = CostedVectorOperation;
+        switch (operation) {
+        case BinaryOperation::Add: return C::Add;
+        case BinaryOperation::Subtract: return C::Subtract;
+        case BinaryOperation::Multiply: return C::Multiply;
+        case BinaryOperation::SignedDivide:
+        case BinaryOperation::UnsignedDivide: return C::Divide;
+        case BinaryOperation::BitAnd: return C::BitAnd;
+        case BinaryOperation::BitOr: return C::BitOr;
+        case BinaryOperation::BitXor: return C::BitXor;
+        case BinaryOperation::ShiftLeft: return C::ShiftLeft;
+        case BinaryOperation::ShiftRightArithmetic:
+            return C::ShiftRightArithmetic;
+        case BinaryOperation::ShiftRightLogical: return C::ShiftRightLogical;
+        default:
+            if (comparison(operation)) return C::Compare;
+            return std::nullopt;
+        }
+    };
+    if (const auto operation = binary_operation(pattern.reduction_operation)) {
+        query(*operation, function.values[pattern.reduction.value].type);
+    }
+    for (const auto raw : required) {
+        if (!definitions[raw] ||
+            !pattern.loop.blocks.contains(definitions[raw]->value)) {
+            continue;
+        }
+        const auto& value = function.values[raw];
+        if (value.kind == ValueKind::Select) {
+            query(CostedVectorOperation::Select, value.type);
+        } else if (value.kind == ValueKind::Unary &&
+                   value.operands.size() == 1) {
+            const auto type = function.values[value.operands[0].value].type;
+            query(value.unary == UnaryOperation::IsZero
+                      ? CostedVectorOperation::Compare
+                      : value.unary == UnaryOperation::Negate &&
+                                !floating_type(hir_module, type)
+                            ? CostedVectorOperation::Subtract
+                            : CostedVectorOperation::BitXor,
+                  type);
+        } else if (value.kind == ValueKind::Binary &&
+                   value.operands.size() == 2) {
+            const auto operation = binary_operation(value.binary);
+            if (!operation) continue;
+            const auto& amount = function.values[value.operands[1].value];
+            query(*operation, function.values[value.operands[0].value].type,
+                  amount.kind == ValueKind::ConstantInteger);
+        }
+    }
+    if (lanewise) return std::nullopt;
+    return longest;
+}
+
 bool vectorize_reduction_loop(
     ManagedFunction& function, hir::Module& hir_module,
     const ReductionLoopPattern& pattern,
     const std::vector<std::optional<BlockId>>& definitions,
     const std::unordered_set<std::uint32_t>& required,
     unsigned vector_bits,
-    const Subtarget& subtarget,
+    std::size_t packed_length,
     const CompilerOptions& options) {
     const auto scalar_type =
         function.values[pattern.reduction.value].type;
@@ -16113,27 +16833,16 @@ bool vectorize_reduction_loop(
     const auto conditional_depth = select_depth(pattern.term);
     // Independent accumulators hide packed-add latency and let targets issue
     // several loads per cycle. The model-defined vector-interleave budget can
-    // permit four streams for store loops too. AVX2 i64 multiplication is the
-    // exception:
-    // without AVX-512DQ every multiply expands into a long instruction chain,
-    // and four simultaneous chains exceed the sixteen-register AVX2 file.
-    // Keep that form at two streams to avoid hot-loop spills. A profile may
-    // likewise select a smaller budget to limit code size and
-    // preserved-register pressure. A vector select has substantially higher
-    // live pressure and remains capped at two streams.
+    // permit four streams for store loops too. A packed operation that the
+    // target expands into a long instruction chain (x86-64 AVX2 i64
+    // multiplication without AVX-512DQ) is the exception: four simultaneous
+    // chains exceed the register file, so that form keeps two streams to
+    // avoid hot-loop spills. A profile may likewise select a smaller budget
+    // to limit code size and preserved-register pressure. A vector select has
+    // substantially higher live pressure and remains capped at two streams.
     // Strict floating reductions retain a single carrier because changing
     // their addition order is observable.
-    const bool expanded_avx2_qword_multiply =
-        subtarget.target().architecture == "x86-64" &&
-        subtarget.has_feature("avx2") &&
-        !subtarget.has_feature("avx512dq") && element_bits == 64 &&
-        std::any_of(required.begin(), required.end(),
-                    [&](std::uint32_t raw_id) {
-                        const auto& value = function.values[raw_id];
-                        return value.kind == ValueKind::Binary &&
-                               value.binary == BinaryOperation::Multiply;
-                    });
-    const unsigned memory_interleave = expanded_avx2_qword_multiply
+    const unsigned memory_interleave = packed_length > 4
         ? std::min(options.vector_interleave, 2U)
         : options.vector_interleave;
     unsigned interleave = reassociate
@@ -17711,11 +18420,15 @@ void vectorize_reduction_loops(ManagedFunction& function,
         const auto width = preferred_vector_bits(
             subtarget, options, floating,
             type_bits(hir_module, scalar_type));
-        if (width != 0) {
-            (void)vectorize_reduction_loop(
-                function, hir_module, *pattern, definitions,
-                required, width, subtarget, options);
-        }
+        if (width == 0) continue;
+        // Lanes computed one at a time cost more than the scalar loop.
+        const auto packed_length = packed_operation_length(
+            function, hir_module, *pattern, definitions, required, width,
+            subtarget);
+        if (!packed_length) continue;
+        (void)vectorize_reduction_loop(
+            function, hir_module, *pattern, definitions, required, width,
+            *packed_length, options);
     }
 }
 
@@ -19070,8 +19783,17 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
     }
     // A diamond arm that reloads what its branch condition read is pure
     // once the load is forwarded, so forward memory before conditional
-    // replacement and if-conversion as well.
+    // replacement and if-conversion as well, after value numbering has made
+    // the arm's address the one the condition read.
     if (options.tree_fre) {
+        pipeline.add(
+            PassId::RedundantExpressionElimination,
+            [&](ManagedFunction& function, FunctionAnalysisManager&) {
+                eliminate_fully_redundant_expressions(
+                    function, hir_module, subtarget,
+                    options.floating_environment);
+                return PassResult::changed_values();
+            });
         pipeline.add(
             PassId::MemoryValueForwarding,
             [&](ManagedFunction& function, FunctionAnalysisManager&) {
@@ -19094,8 +19816,8 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
         pipeline.add(
             PassId::IfConversion,
             [&](ManagedFunction& function, FunctionAnalysisManager&) {
-                const bool changed =
-                    if_convert_diamonds(function, hir_module, options);
+                const bool changed = if_convert_diamonds(
+                    function, hir_module, subtarget, options);
                 if (changed && options.tree_copy_prop) {
                     propagate_trivial_copies(function);
                 }
@@ -19137,6 +19859,15 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
                                              subtarget.target())
                     ? PassResult::changed_values()
                     : PassResult::unchanged();
+            });
+    }
+    // Forwarding leaves the stores whose every load it replaced.
+    if (options.tree_dse && options.tree_fre) {
+        pipeline.add(
+            PassId::DeadStoreElimination,
+            [](ManagedFunction& function, FunctionAnalysisManager&) {
+                eliminate_dead_stores(function);
+                return PassResult::changed_values();
             });
     }
     if (options.ivopts) {

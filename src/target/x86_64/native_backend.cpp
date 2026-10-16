@@ -15,7 +15,9 @@
 #include "target/x86_64/features.hpp"
 #include "target/x86_64/instructions.hpp"
 #include "target/x86_64/machine_description.hpp"
+#include "target/x86_64/select_operations.hpp"
 #include "target/x86_64/target.hpp"
+#include "target/x86_64/vector_operations.hpp"
 
 #include "model/model.hpp"
 
@@ -84,6 +86,7 @@ enum class LoweringPass : std::uint16_t {
     FuseScalarDivisionResults,
     PropagateCopiesLate,
     FuseCompareSelects,
+    FuseCompareFloatSelects,
     FuseVectorSignSelects,
     FuseCompareBranches,
     HoistVectorComparisonSignMasks,
@@ -770,71 +773,26 @@ bool packed_integer_operation_supported(const Subtarget& subtarget,
                                         unsigned element_bits,
                                         unsigned width,
                                         bool immediate_shift) {
-    const bool add_sub = opcode == Opcode::Vadd ||
-                         opcode == Opcode::Vsub;
-    const bool bitwise = opcode == Opcode::Vand ||
-                         opcode == Opcode::Vor ||
-                         opcode == Opcode::Vxor;
-    const bool multiply = opcode == Opcode::Vmul ||
-                          opcode == Opcode::VmulImm;
-    const bool shift = opcode == Opcode::Vshl ||
-                       opcode == Opcode::VshrS ||
-                       opcode == Opcode::VshrU;
-    const bool comparison = packed_vector_compare_predicate(opcode).has_value();
-    if (!add_sub && !bitwise && !multiply && !shift && !comparison) {
-        return false;
+    using O = CostedVectorOperation;
+    O operation{};
+    switch (decode_opcode(opcode)) {
+    case Opcode::Vadd: operation = O::Add; break;
+    case Opcode::Vsub: operation = O::Subtract; break;
+    case Opcode::Vand: operation = O::BitAnd; break;
+    case Opcode::Vor: operation = O::BitOr; break;
+    case Opcode::Vxor: operation = O::BitXor; break;
+    case Opcode::Vmul:
+    case Opcode::VmulImm: operation = O::Multiply; break;
+    case Opcode::Vshl: operation = O::ShiftLeft; break;
+    case Opcode::VshrS: operation = O::ShiftRightArithmetic; break;
+    case Opcode::VshrU: operation = O::ShiftRightLogical; break;
+    default:
+        if (!packed_vector_compare_predicate(opcode)) return false;
+        operation = O::Compare;
+        break;
     }
-    if (width == 512) {
-        if (!subtarget.has_feature(Feature::Avx512f)) return false;
-        if (comparison) {
-            return element_bits >= 32 ||
-                   subtarget.has_feature(Feature::Avx512bw);
-        }
-        if (shift) {
-            return element_bits >= 32 ||
-                   (element_bits == 16 &&
-                    subtarget.has_feature(Feature::Avx512bw));
-        }
-        if (bitwise) return true;
-        if (element_bits == 8 || element_bits == 16) {
-            return subtarget.has_feature(Feature::Avx512bw) &&
-                   (add_sub || (multiply && element_bits == 16));
-        }
-        return add_sub ||
-               (multiply && element_bits == 32) ||
-               (multiply && element_bits == 64 &&
-                subtarget.has_feature(Feature::Avx512dq));
-    }
-    if (width == 256) {
-        const bool packed_shift = shift &&
-            ((immediate_shift && element_bits == 16) ||
-             element_bits == 32 ||
-              (element_bits == 64 && opcode != Opcode::VshrS));
-        return subtarget.has_feature(Feature::Avx2) &&
-               (add_sub || bitwise || comparison || packed_shift ||
-               (multiply && (element_bits == 16 ||
-                              element_bits == 32 ||
-                              element_bits == 64)));
-    }
-    if (comparison) {
-        return element_bits <= 32 ||
-               subtarget.has_feature(Feature::Avx2);
-    }
-    if (shift) {
-        if (immediate_shift) {
-            return element_bits == 16 || element_bits == 32 ||
-                   (element_bits == 64 && opcode != Opcode::VshrS);
-        }
-        return subtarget.has_feature(Feature::Avx2) &&
-               (element_bits == 32 ||
-                (element_bits == 64 && opcode != Opcode::VshrS));
-    }
-    return add_sub || bitwise ||
-           (multiply && element_bits == 16) ||
-           (multiply && element_bits == 32 &&
-            subtarget.has_feature(Feature::Sse41)) ||
-           (multiply && element_bits == 64 &&
-            subtarget.has_feature(Feature::Avx2));
+    return packed_integer_operation(subtarget, operation, element_bits,
+                                    width, immediate_shift);
 }
 
 // Packed-integer selection uses VEX or EVEX forms, which accept any memory
@@ -2135,6 +2093,23 @@ private:
             }
             return instruction;
         }
+        if (value.kind == ValueKind::Select && is_floating(hir_, value.type)) {
+            // The mask forms in XMM0 and frame-resident operands stage
+            // through XMM1/XMM2; a boolean becomes the mask through RAX.
+            auto instruction = target_instruction(Opcode::Fselect,
+                                                  value.location);
+            for (const auto operand : value.operands) {
+                const auto source = reg(operand);
+                instruction.operands.push_back(register_operand(source));
+                instruction.uses.push_back(source);
+            }
+            instruction.defs.push_back(reg(value.id));
+            append_fixed_clobber(instruction, "rax", machine::i64);
+            for (const auto name : {"xmm0", "xmm1", "xmm2"}) {
+                append_fixed_clobber(instruction, name, machine::i128);
+            }
+            return instruction;
+        }
         if (value.kind == ValueKind::Select) {
             const bool vector = is_vector(hir_, value.type);
             auto instruction = target_instruction(
@@ -2261,11 +2236,10 @@ private:
             has_property(instruction.opcode, OpcodeProperty::Comparison)) {
             const bool wide = instruction.uses.front().mode.bits > 64;
             if (wide || instruction.opcode == Opcode::FcmpEq ||
-                instruction.opcode == Opcode::FcmpNe ||
-                instruction.opcode == Opcode::FcmpLt ||
-                instruction.opcode == Opcode::FcmpLe) {
-                // Every ordered comparison folds a parity term staged in
-                // %dl into its condition byte.
+                instruction.opcode == Opcode::FcmpNe) {
+                // An equality folds a parity term staged in %dl into its
+                // condition byte, and so does every x87 and binary128
+                // comparison.
                 append_fixed_clobber(instruction, "rdx", machine::i64);
             }
             if (wide) {
@@ -4771,6 +4745,123 @@ private:
         }
     }
 
+    // A floating select whose boolean comes from a comparison of values as
+    // wide as the selected ones in its block forms its mask from that
+    // comparison (CMPSS/CMPSD instead of COMISS and SETcc). The comparison
+    // is duplicated into several selects only when it cannot trap.
+    void fuse_compare_float_selects() {
+        if (!options_.compare_select_fusion) return;
+        std::vector<unsigned> uses(current_.virtual_registers.size());
+        for (const auto& block : current_.blocks) {
+            for (const auto& instruction : block.instructions) {
+                for (const auto& use : instruction.uses) {
+                    if (use.kind == machine::RegisterKind::Virtual &&
+                        use.id < uses.size()) {
+                        ++uses[use.id];
+                    }
+                }
+            }
+        }
+        for (auto& block : current_.blocks) {
+            auto& instructions = block.instructions;
+            std::unordered_map<std::uint32_t, std::size_t> definitions;
+            std::unordered_map<std::uint32_t, unsigned> selects;
+            for (std::size_t index = 0; index < instructions.size(); ++index) {
+                const auto& instruction = instructions[index];
+                if (instruction.opcode == Opcode::Fselect &&
+                    instruction.condition_predicate.empty() &&
+                    instruction.uses.size() == 3 &&
+                    instruction.uses.front().kind ==
+                        machine::RegisterKind::Virtual) {
+                    ++selects[instruction.uses.front().id];
+                }
+                if (instruction.defs.size() == 1 &&
+                    instruction.defs.front().kind ==
+                        machine::RegisterKind::Virtual) {
+                    definitions.emplace(instruction.defs.front().id, index);
+                }
+            }
+            std::vector<bool> erased(instructions.size());
+            for (std::size_t index = 0; index < instructions.size(); ++index) {
+                auto& selection = instructions[index];
+                if (selection.opcode != Opcode::Fselect ||
+                    !selection.condition_predicate.empty() ||
+                    selection.uses.size() != 3 ||
+                    selection.uses.front().kind !=
+                        machine::RegisterKind::Virtual ||
+                    selection.uses.front().id >= uses.size()) {
+                    continue;
+                }
+                const auto condition = selection.uses.front();
+                const auto found = definitions.find(condition.id);
+                if (found == definitions.end() || found->second >= index ||
+                    erased[found->second]) {
+                    continue;
+                }
+                const auto& comparison = instructions[found->second];
+                const auto opcode = comparison.opcode;
+                const bool scalar_comparison =
+                    opcode == Opcode::FcmpEq || opcode == Opcode::FcmpNe ||
+                    opcode == Opcode::FcmpLt || opcode == Opcode::FcmpLe ||
+                    opcode == Opcode::FcmpGt || opcode == Opcode::FcmpGe;
+                if (!scalar_comparison || comparison.uses.size() != 2 ||
+                    comparison.uses.front().mode.bits !=
+                        selection.defs.front().mode.bits ||
+                    comparison.patch ||
+                    selects[condition.id] != uses[condition.id] ||
+                    (uses[condition.id] > 1 &&
+                     comparison.has_side_effects)) {
+                    continue;
+                }
+                selection.condition_predicate = opcode;
+                const auto truth = selection.uses[1];
+                const auto falsity = selection.uses[2];
+                selection.uses = comparison.uses;
+                selection.uses.push_back(truth);
+                selection.uses.push_back(falsity);
+                selection.operands.clear();
+                for (const auto use : selection.uses) {
+                    selection.operands.push_back(register_operand(use));
+                }
+                // The comparison's mask needs no boolean scratch.
+                std::erase_if(selection.clobbers,
+                              [&](const machine::Register& clobber) {
+                                  const auto* view =
+                                      canonical_storage_view(
+                                          machine::PhysicalRegisterId{
+                                              clobber.id});
+                                  return view &&
+                                         view->register_class ==
+                                             RegisterClass::integer;
+                              });
+                for (const auto use : comparison.uses) {
+                    if (use.kind == machine::RegisterKind::Virtual &&
+                        use.id < uses.size()) {
+                        ++uses[use.id];
+                    }
+                }
+                if (--uses[condition.id] == 0) {
+                    for (const auto use : comparison.uses) {
+                        if (use.kind == machine::RegisterKind::Virtual &&
+                            use.id < uses.size()) {
+                            --uses[use.id];
+                        }
+                    }
+                    erased[found->second] = true;
+                }
+            }
+            if (std::find(erased.begin(), erased.end(), true) == erased.end()) {
+                continue;
+            }
+            std::vector<machine::Instruction> kept;
+            kept.reserve(instructions.size());
+            for (std::size_t index = 0; index < instructions.size(); ++index) {
+                if (!erased[index]) kept.push_back(std::move(instructions[index]));
+            }
+            instructions = std::move(kept);
+        }
+    }
+
     void fuse_vector_sign_selects() {
         if (!options_.compare_select_fusion ||
             !subtarget_.has_feature(Feature::Avx)) {
@@ -6078,239 +6169,15 @@ private:
     }
 
     void schedule_block_layout() {
-        if (!options_.reorder_blocks || current_.layout.size() < 2) {
-            return;
-        }
-        const auto original = current_.layout;
-        std::unordered_set<std::uint32_t> placed;
-        std::vector<machine::BlockId> layout;
-        layout.reserve(original.size());
-        // Compute ordinary block dominance once for trace selection.  A path
-        // from a nested-loop exit can eventually return to an inner header
-        // through the enclosing loop, but it is not the inner loop's
-        // continuing path. Restricting preferred back paths to blocks
-        // dominated by the header distinguishes those two cases.
-        const auto block_count = current_.blocks.size();
-        const Dominance dominance(
-            block_count, current_.entry.value,
-            [&](std::uint32_t block) -> const std::vector<machine::BlockId>& {
-                return current_.blocks[block].successors;
-            },
-            [&](std::uint32_t block) -> const std::vector<machine::BlockId>& {
-                return current_.blocks[block].predecessors;
+        if (!options_.reorder_blocks) return;
+        (void)native::schedule_block_layout(
+            current_, [&](machine::BlockId block) {
+                return std::any_of(
+                    current_.labels.begin(), current_.labels.end(),
+                    [&](const machine::Function::LocalLabel& label) {
+                        return label.block == block;
+                    });
             });
-        // A successor leads back to its block exactly when both lie on one
-        // cycle.
-        const auto components = strongly_connected_components(
-            block_count,
-            [&](std::uint32_t block) -> const std::vector<machine::BlockId>& {
-                return current_.blocks[block].successors;
-            });
-        const auto natural_back_distance =
-            [&](machine::BlockId source, machine::BlockId header)
-            -> std::optional<std::size_t> {
-            if (components[source.value] != components[header.value] ||
-                !dominance.dominates(header.value, source.value)) {
-                return std::nullopt;
-            }
-            std::vector<std::pair<machine::BlockId, std::size_t>> pending{
-                {source, 0}};
-            std::unordered_set<std::uint32_t> visited;
-            for (std::size_t cursor = 0; cursor < pending.size(); ++cursor) {
-                const auto [item, distance] = pending[cursor];
-                if (item == header) return distance;
-                if (!visited.insert(item.value).second) continue;
-                for (const auto successor :
-                     current_.blocks.at(item.value).successors) {
-                    if (successor == header ||
-                        dominance.dominates(header.value, successor.value)) {
-                        pending.emplace_back(successor, distance + 1);
-                    }
-                }
-            }
-            return std::nullopt;
-        };
-        const auto append_trace = [&](machine::BlockId seed) {
-            auto current = seed;
-            while (!placed.contains(current.value)) {
-                placed.insert(current.value);
-                layout.push_back(current);
-                const auto& owner = current_.blocks.at(current.value);
-                std::optional<machine::BlockId> successor;
-                if (owner.successors.size() == 1) {
-                    if (!placed.contains(owner.successors.front().value)) {
-                        successor = owner.successors.front();
-                    }
-                } else {
-                    // A loop's continuing edge is normally much hotter than
-                    // its exit. Prefer it before the ordinary false-edge
-                    // heuristic so the body becomes fallthrough.
-                    const auto ready = [&](machine::BlockId candidate) {
-                        const auto& destination =
-                            current_.blocks.at(candidate.value);
-                        return destination.predecessors.size() <= 1 ||
-                            std::all_of(
-                                destination.predecessors.begin(),
-                                destination.predecessors.end(),
-                                [&](machine::BlockId predecessor) {
-                                    return predecessor == current ||
-                                           placed.contains(predecessor.value);
-                                });
-                    };
-                    std::optional<std::size_t> shortest_back_path;
-                    for (auto item = owner.successors.rbegin();
-                         item != owner.successors.rend(); ++item) {
-                        if (placed.contains(item->value) || !ready(*item)) {
-                            continue;
-                        }
-                        const auto distance =
-                            natural_back_distance(*item, current);
-                        if (distance &&
-                            (!shortest_back_path ||
-                             *distance < *shortest_back_path)) {
-                            successor = *item;
-                            shortest_back_path = *distance;
-                        }
-                    }
-                    if (!successor) {
-                        for (auto item = owner.successors.rbegin();
-                             item != owner.successors.rend(); ++item) {
-                            if (!placed.contains(item->value) && ready(*item) &&
-                                components[item->value] != components[current.value]) {
-                                successor = *item;
-                                break;
-                            }
-                        }
-                    }
-                }
-                if (!successor) break;
-                current = *successor;
-            }
-        };
-
-        append_trace(current_.entry);
-        for (const auto seed : original) append_trace(seed);
-        if (layout.size() != original.size()) return;
-
-        // A shared latch reached by several switch/if arms is the natural
-        // place for induction updates, but it is not necessarily discovered
-        // as part of the header trace (indirect branches in particular have
-        // no single obvious successor). Place that latch immediately before
-        // its dominated header so its backedge becomes fallthrough. The
-        // entry path still branches over the latch to preserve zero-trip
-        // behavior.
-        const auto addressable = [&](machine::BlockId id) {
-            return source_ && std::any_of(
-                source_->labels.begin(), source_->labels.end(),
-                [&](const mir::ManagedLabel& label) {
-                    return label.block.value == id.value;
-                });
-        };
-        // The latch of each header: the dominated single-successor block with
-        // the most predecessors, the earliest one on ties.
-        std::vector<std::optional<machine::BlockId>> latches(block_count);
-        for (const auto& candidate : current_.blocks) {
-            if (candidate.id == current_.entry ||
-                candidate.predecessors.size() < 2 ||
-                candidate.successors.size() != 1 ||
-                addressable(candidate.id)) {
-                continue;
-            }
-            const auto header = candidate.successors.front();
-            if (!dominance.dominates(header.value, candidate.id.value)) continue;
-            auto& latch = latches[header.value];
-            if (!latch ||
-                candidate.predecessors.size() >
-                    current_.blocks[latch->value].predecessors.size()) {
-                latch = candidate.id;
-            }
-        }
-        for (const auto& header : current_.blocks) {
-            const auto latch = latches[header.id.value];
-            if (!latch) continue;
-            auto header_position = std::find(
-                layout.begin(), layout.end(), header.id);
-            auto latch_position = std::find(
-                layout.begin(), layout.end(), *latch);
-            if (header_position == layout.end() ||
-                latch_position == layout.end() ||
-                (latch_position + 1 == header_position)) {
-                continue;
-            }
-            const auto latch_id = *latch_position;
-            layout.erase(latch_position);
-            header_position = std::find(
-                layout.begin(), layout.end(), header.id);
-            layout.insert(header_position, latch_id);
-        }
-
-        // Rotate canonical header/body loops in layout only. The external
-        // predecessor jumps over the body to the test, while the body then
-        // falls through to that test and its continuing conditional edge
-        // jumps back. This removes one unconditional branch per iteration
-        // without changing SSA, phi edges, or the loop's zero-trip behavior.
-        for (std::size_t index = 0; index + 1 < layout.size(); ++index) {
-            const auto header_id = layout[index];
-            if (header_id == current_.entry) continue;
-            const auto& header = current_.blocks[header_id.value];
-            if (header.successors.size() != 2) continue;
-            const auto body_id = layout[index + 1];
-            if (std::find(header.successors.begin(),
-                          header.successors.end(), body_id) ==
-                    header.successors.end()) {
-                continue;
-            }
-            const auto& body = current_.blocks[body_id.value];
-            if (body.predecessors.size() != 1 ||
-                body.predecessors.front() != header_id ||
-                body.successors.size() != 1 ||
-                body.successors.front() != header_id) {
-                continue;
-            }
-            std::swap(layout[index], layout[index + 1]);
-            ++index;
-        }
-
-        // A rotated inner loop has its body immediately before the test.  Its
-        // non-continuing successor should immediately follow the test as well.
-        // Trace construction can otherwise put an enclosing-loop exit there,
-        // leaving the inner test to jump over that unrelated block to a
-        // single-predecessor latch.  Moving that true CFG successor beside the
-        // test removes the redundant unconditional exit jump while preserving
-        // the body-to-test fallthrough and the conditional backedge.
-        for (std::size_t index = 1; index + 1 < layout.size(); ++index) {
-            const auto body_id = layout[index - 1];
-            const auto header_id = layout[index];
-            const auto& body = current_.blocks[body_id.value];
-            const auto& header = current_.blocks[header_id.value];
-            if (body.successors.size() != 1 ||
-                body.successors.front() != header_id ||
-                header.successors.size() != 2 ||
-                std::find(header.successors.begin(), header.successors.end(),
-                          body_id) == header.successors.end()) {
-                continue;
-            }
-            const auto exit = header.successors.front() == body_id
-                ? header.successors.back()
-                : header.successors.front();
-            if (layout[index + 1] == exit || addressable(exit)) continue;
-            const auto& exit_block = current_.blocks[exit.value];
-            if (exit_block.predecessors.size() != 1 ||
-                exit_block.predecessors.front() != header_id) {
-                continue;
-            }
-            const auto exit_position =
-                std::find(layout.begin() +
-                              static_cast<std::ptrdiff_t>(index + 1),
-                          layout.end(), exit);
-            if (exit_position == layout.end()) continue;
-            const auto exit_id = *exit_position;
-            layout.erase(exit_position);
-            layout.insert(layout.begin() +
-                              static_cast<std::ptrdiff_t>(index + 1),
-                          exit_id);
-        }
-        current_.layout = std::move(layout);
     }
 
     static bool safely_speculatable_across_branch(
@@ -6350,6 +6217,9 @@ private:
                     return label.block.value == id.value;
                 });
         };
+        // Work pulled across a branch that leaves a loop would run on every
+        // iteration instead of once.
+        const auto depths = native::loop_depths(current_);
         // Walk traces backward so a pure prefix pulled across a linear edge
         // can immediately become the candidate prefix for its predecessor.
         for (std::size_t tail = current_.layout.size(); tail-- > 1;) {
@@ -6377,7 +6247,8 @@ private:
                 kind == machine::InstructionKind::ConditionalBranch &&
                 std::find(predecessor.successors.begin(),
                           predecessor.successors.end(), successor.id) !=
-                    predecessor.successors.end();
+                    predecessor.successors.end() &&
+                depths[successor.id.value] >= depths[predecessor.id.value];
             if (!linear && !speculate) continue;
 
             std::vector<std::size_t> candidates;
@@ -9803,6 +9674,9 @@ private:
             &MachineLowerer::propagate_machine_copies);
         add(LoweringPass::FuseCompareSelects, Stage::InstructionCombining,
             "fuse-compare-selects", &MachineLowerer::fuse_compare_selects);
+        add(LoweringPass::FuseCompareFloatSelects,
+            Stage::InstructionCombining, "fuse-compare-float-selects",
+            &MachineLowerer::fuse_compare_float_selects);
         add(LoweringPass::FuseVectorSignSelects,
             Stage::InstructionCombining, "fuse-vector-sign-selects",
             &MachineLowerer::fuse_vector_sign_selects);
@@ -16343,17 +16217,22 @@ private:
         const auto left_register = source_register(left, "xmm0");
         const auto right_register = right == left
             ? left_register : source_register(right, "xmm1");
-        // The relational operators are signaling comparisons.
+        // The relational operators are signaling comparisons. A less-than
+        // compares the swapped operands with an above condition, which an
+        // unordered pair fails, so only equality needs the parity flag.
         const bool quiet = value.opcode == Opcode::FcmpEq ||
                            value.opcode == Opcode::FcmpNe;
+        const bool swapped = value.opcode == Opcode::FcmpLt ||
+                             value.opcode == Opcode::FcmpLe;
         instruction(std::string(subtarget_.has_feature(Feature::Avx) ? "v" : "") +
                         (quiet ? "ucomi" : "comi") + suffix,
-                    "%" + right_register + ", %" + left_register);
+                    swapped ? "%" + left_register + ", %" + right_register
+                            : "%" + right_register + ", %" + left_register);
         std::string condition;
         if (value.opcode == Opcode::FcmpEq) condition = "e";
         else if (value.opcode == Opcode::FcmpNe) condition = "ne";
-        else if (value.opcode == Opcode::FcmpLt) condition = "b";
-        else if (value.opcode == Opcode::FcmpLe) condition = "be";
+        else if (value.opcode == Opcode::FcmpLt) condition = "a";
+        else if (value.opcode == Opcode::FcmpLe) condition = "ae";
         else if (value.opcode == Opcode::FcmpGt) condition = "a";
         else if (value.opcode == Opcode::FcmpGe) condition = "ae";
         else {
@@ -16372,7 +16251,7 @@ private:
         if (value.opcode == Opcode::FcmpNe) {
             instruction("setp", "%dl");
             instruction("orb", "%dl, " + register_name(destination, 8));
-        } else if (value.opcode != Opcode::FcmpGt && value.opcode != Opcode::FcmpGe) {
+        } else if (value.opcode == Opcode::FcmpEq) {
             instruction("setnp", "%dl");
             instruction("andb", "%dl, " + register_name(destination, 8));
         }
@@ -19791,6 +19670,142 @@ private:
             }
             store_vector_from(function, target, destination, chunk, width);
         }
+    }
+
+    // A scalar f32 or f64 select through a mask in XMM0: a fused comparison
+    // forms it with CMPSS/CMPSD (VCMPSS/VCMPSD with AVX), a boolean with NEG
+    // and MOVD. The mask then blends the operands with the form
+    // select_instructions chooses; XMM1 and XMM2 stage the operands that
+    // live in their frame homes.
+    void emit_float_select(const machine::Function& function,
+                           const machine::Instruction& value) {
+        const bool fused = !value.condition_predicate.empty();
+        if (value.defs.size() != 1 ||
+            value.uses.size() != (fused ? 4U : 3U)) {
+            diagnostics_.error(value.location,
+                               "malformed x86 floating select instruction");
+            return;
+        }
+        const auto target = value.defs.front();
+        const auto truth = value.uses[value.uses.size() - 2];
+        const auto falsity = value.uses.back();
+        const unsigned bits = target.mode.bits;
+        if ((bits != 32 && bits != 64) || truth.mode.bits != bits ||
+            falsity.mode.bits != bits) {
+            diagnostics_.error(value.location,
+                               "x86 floating select requires equal f32 or "
+                               "f64 operands");
+            return;
+        }
+        const bool avx = subtarget_.has_feature(Feature::Avx);
+        const std::string scalar = bits == 32 ? "ss" : "sd";
+        const std::string packed = bits == 32 ? "ps" : "pd";
+        const auto plan = select_instructions(subtarget_, {bits, true, fused});
+        const auto planned = [&](Instruction instruction) {
+            return std::find(plan.begin(), plan.end(),
+                             InstructionCostId{instruction}) != plan.end();
+        };
+        const bool vex_blend =
+            planned(Instruction::Vblendvps) || planned(Instruction::Vblendvpd);
+        const bool legacy_blend =
+            planned(Instruction::Blendvps) || planned(Instruction::Blendvpd);
+        const auto source = [&](machine::Register reg,
+                                std::string_view scratch) {
+            if (const auto* assigned = assigned_simd_register(function, reg)) {
+                return std::string(assigned->name);
+            }
+            load_float(function, reg, scratch);
+            return std::string(scratch);
+        };
+
+        if (fused) {
+            auto left = value.uses[0];
+            auto right = value.uses[1];
+            std::string predicate;
+            switch (decode_opcode(value.condition_predicate)) {
+            case Opcode::FcmpEq: predicate = "eq"; break;
+            case Opcode::FcmpNe: predicate = "neq"; break;
+            case Opcode::FcmpLt: predicate = "lt"; break;
+            case Opcode::FcmpLe: predicate = "le"; break;
+            case Opcode::FcmpGt: predicate = "lt"; std::swap(left, right); break;
+            case Opcode::FcmpGe: predicate = "le"; std::swap(left, right); break;
+            default:
+                diagnostics_.error(value.location,
+                                   "malformed fused x86 floating select");
+                return;
+            }
+            if (avx) {
+                const auto lhs = source(left, "xmm1");
+                const auto rhs = source(right, "xmm2");
+                instruction("vcmp" + predicate + scalar,
+                            "%" + rhs + ", %" + lhs + ", %xmm0");
+            } else {
+                load_float(function, left, "xmm0");
+                const auto rhs = source(right, "xmm1");
+                instruction("cmp" + predicate + scalar,
+                            "%" + rhs + ", %xmm0");
+            }
+        } else {
+            const auto condition = value.uses.front();
+            load(function, condition, "rax");
+            if (condition.mode.bits == 8) {
+                instruction("movzbl", "%al, %eax");
+            } else if (condition.mode.bits == 16) {
+                instruction("movzwl", "%ax, %eax");
+            }
+            instruction(bits == 32 ? "negl" : "negq",
+                        bits == 32 ? "%eax" : "%rax");
+            instruction(std::string(avx ? "v" : "") +
+                            (bits == 32 ? "movd" : "movq"),
+                        bits == 32 ? "%eax, %xmm0" : "%rax, %xmm0");
+        }
+
+        const auto* assigned_target = assigned_simd_register(function, target);
+        if (vex_blend) {
+            const auto selected = source(truth, "xmm1");
+            const auto otherwise = source(falsity, "xmm2");
+            const auto destination = assigned_target
+                ? std::string(assigned_target->name) : std::string("xmm1");
+            // AT&T orders the VEX blend mask, src2, src1, dest: set mask
+            // bits take src2.
+            instruction("vblendv" + packed,
+                        "%xmm0, %" + selected + ", %" + otherwise + ", %" +
+                            destination);
+            store_float(function, target, destination);
+            return;
+        }
+        if (legacy_blend) {
+            // BLENDVPS takes its mask in XMM0: dest = mask ? src : dest.
+            const auto selected = source(truth, "xmm2");
+            const auto destination =
+                assigned_target &&
+                        !same_physical_assignment(function, target, truth)
+                    ? std::string(assigned_target->name)
+                    : std::string("xmm1");
+            load_float(function, falsity, destination);
+            instruction("blendv" + packed,
+                        "%xmm0, %" + selected + ", %" + destination);
+            store_float(function, target, destination);
+            return;
+        }
+        // (mask & truth) | (~mask & falsity) in XMM0.
+        const auto otherwise = source(falsity, "xmm2");
+        if (avx) {
+            instruction("vandn" + packed,
+                        "%" + otherwise + ", %xmm0, %xmm1");
+        } else {
+            instruction("movaps", "%xmm0, %xmm1");
+            instruction("andn" + packed, "%" + otherwise + ", %xmm1");
+        }
+        const auto selected = source(truth, "xmm2");
+        if (avx) {
+            instruction("vand" + packed, "%" + selected + ", %xmm0, %xmm0");
+            instruction("vor" + packed, "%xmm1, %xmm0, %xmm0");
+        } else {
+            instruction("and" + packed, "%" + selected + ", %xmm0");
+            instruction("or" + packed, "%xmm1, %xmm0");
+        }
+        store_float(function, target, "xmm0");
     }
 
     void emit_select(const machine::Function& function,
@@ -24376,6 +24391,8 @@ private:
             emit_vector_select(function, value);
         } else if (value.opcode == Opcode::Select) {
             emit_select(function, value);
+        } else if (value.opcode == Opcode::Fselect) {
+            emit_float_select(function, value);
         } else if (value.opcode == Opcode::Neg ||
                    value.opcode == Opcode::Not ||
                    value.opcode == Opcode::Iszero) {
@@ -24680,11 +24697,37 @@ private:
         plan_speculative_vector_advances(function);
         loop_headers_.clear();
         if (options_.loop_alignment > 1) {
+            // A block a later block branches back to starts a loop in the
+            // layout. It is aligned when its padding runs once per entry:
+            // it is the loop's header, or nothing falls through into it.
             std::unordered_map<std::uint32_t, std::size_t> layout_position;
             for (std::size_t index = 0; index < function.layout.size();
                  ++index) {
                 layout_position.emplace(function.layout[index].value, index);
             }
+            static const std::vector<machine::BlockId> no_edges;
+            const Dominance dominance(
+                blocks_by_id_.size(), function.entry.value,
+                [&](std::uint32_t id) -> const std::vector<machine::BlockId>& {
+                    return blocks_by_id_[id] ? blocks_by_id_[id]->successors
+                                             : no_edges;
+                },
+                [&](std::uint32_t id) -> const std::vector<machine::BlockId>& {
+                    return blocks_by_id_[id] ? blocks_by_id_[id]->predecessors
+                                             : no_edges;
+                });
+            const auto entered_by_fallthrough = [&](std::size_t index) {
+                if (index == 0) return false;
+                const auto& previous =
+                    block(function, function.layout[index - 1]);
+                const auto target = function.layout[index];
+                return (previous.instructions.empty() ||
+                        previous.instructions.back().kind !=
+                            machine::InstructionKind::IndirectBranch) &&
+                       std::find(previous.successors.begin(),
+                                 previous.successors.end(),
+                                 target) != previous.successors.end();
+            };
             for (std::size_t index = 0; index < function.layout.size();
                  ++index) {
                 const auto& source =
@@ -24693,7 +24736,10 @@ private:
                     const auto found =
                         layout_position.find(successor.value);
                     if (found != layout_position.end() &&
-                        found->second <= index) {
+                        found->second <= index &&
+                        (dominance.dominates(successor.value,
+                                             source.id.value) ||
+                         !entered_by_fallthrough(found->second))) {
                         loop_headers_.insert(successor.value);
                     }
                 }

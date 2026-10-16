@@ -159,9 +159,17 @@ expect("o32 -O0 epilogue" "${assembly}"
     "\n\tmove\t[$]sp,[$]fp\n[.]cfi_def_cfa_register 29\n\tlw\t[$]fp,[0-9]+[(][$]sp[)]\n\tnop\n[.]cfi_restore 30\n")
 file(READ "${OUTPUT}/o32-be-frames-O2-g.s" assembly)
 string(REGEX MATCH "\nearly:\n.*\n[.]end early\n" early "${assembly}")
-expect("shrink-wrapped early" "${early}"
-    "\n[.]Lcross[.]mips[.][0-9_]+[.]bb[.][0-9]+:\n[.]cfi_def_cfa_offset 0\n[.]cfi_restore 31\n"
-    "\n[.]Lcross[.]mips[.][0-9_]+[.]return:\n[.]cfi_def_cfa_offset 32\n[.]cfi_offset 31, -[0-9]+\n")
+# The uncovered early exit either precedes the prologue and runs in the
+# entry state, or follows the body and resets to it.
+string(FIND "${early}" "\n.cfi_def_cfa_offset 32\n" prologue)
+string(FIND "${early}" "\n\tjr\t$ra\n" uncovered)
+if(uncovered EQUAL -1 OR prologue EQUAL -1 OR uncovered GREATER prologue)
+    expect("shrink-wrapped early" "${early}"
+        "\n[.]Lcross[.]mips[.][0-9_]+[.]bb[.][0-9]+:\n[.]cfi_def_cfa_offset 0\n[.]cfi_restore 31\n"
+        "\n[.]Lcross[.]mips[.][0-9_]+[.]return:\n[.]cfi_def_cfa_offset 32\n[.]cfi_offset 31, -[0-9]+\n")
+else()
+    reject("shrink-wrapped early" "${early}" "[.]cfi_def_cfa_offset 0\n")
+endif()
 string(REGEX MATCH "\nrelay:\n.*\n[.]end relay\n" relay "${assembly}")
 expect("sibling call" "${relay}"
     "\n[.]cfi_remember_state\n(.loc[^\n]*\n)?\tlw\t[$]ra,[0-9]+[(][$]sp[)]\n\tnop\n[.]cfi_restore 31\n\tj\tsink\n\taddiu\t[$]sp,[$]sp,[0-9]+\n[.]cfi_restore_state\n")

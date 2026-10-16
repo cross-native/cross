@@ -567,6 +567,41 @@ enum class CostedBitOperation {
     RotateRight,
 };
 
+// A choice between two computed values of one scalar type. The condition is
+// a boolean or, with `floating_comparison`, a comparison of two floating
+// values as wide as the selected ones, which the target may fuse into it.
+struct SelectCostQuery {
+    unsigned bits{};
+    bool floating{};
+    bool floating_comparison{};
+};
+
+// A packed operation that target-independent vectorization creates on
+// vectors of `vector_bits` holding lanes of `element_bits`; a uniform shift
+// moves every lane by one immediate amount.
+enum class CostedVectorOperation {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    BitAnd,
+    BitOr,
+    BitXor,
+    ShiftLeft,
+    ShiftRightArithmetic,
+    ShiftRightLogical,
+    Compare,
+    Select,
+};
+
+struct VectorOperationCostQuery {
+    CostedVectorOperation operation{CostedVectorOperation::Add};
+    unsigned element_bits{};
+    unsigned vector_bits{};
+    bool floating{};
+    bool uniform_shift{};
+};
+
 struct TargetCostModel {
     using IntegerConstantMaterializationCost =
         unsigned (*)(const Subtarget&, const IntegerConstantCostQuery&);
@@ -584,11 +619,22 @@ struct TargetCostModel {
         const Subtarget&, CostedBitOperation, unsigned bits);
     // The width of a general register; a wider integer is a register pair.
     using IntegerRegisterBits = unsigned (*)(const Subtarget&);
+    // The instructions a select adds to its condition and operands without
+    // a branch, the cheapest the -march CPU has by the -mtune costs, or none
+    // when the target branches.
+    using SelectInstructions = std::vector<InstructionCostId> (*)(
+        const Subtarget&, const SelectCostQuery&);
+    // The instructions of the target's packed form of a vector operation, or
+    // none when it computes the lanes one at a time.
+    using VectorOperationInstructions = std::vector<InstructionCostId> (*)(
+        const Subtarget&, const VectorOperationCostQuery&);
 
     IntegerConstantMaterializationCost integer_constant_materialization{};
     IntegerOperationInstructions integer_operation{};
     BitOperationInstructions bit_operation{};
     IntegerRegisterBits integer_register_bits{};
+    SelectInstructions select{};
+    VectorOperationInstructions vector_operation{};
 };
 
 // Direct typed instruction-memory addressing. These are encoding constraints,

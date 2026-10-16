@@ -61,6 +61,35 @@ global u32 mips_successor_delay(in volatile u32 *cell,
     return (value ^ 255u32) + 3u32;
 }
 
+// One arm jumps to the join, whose fused signed comparison can fill that
+// jump's delay slot.
+[[abi("o32"), noinline]]
+global i32 mips_successor_compare(in volatile i32 *cell, in i32 a,
+                                  in i32 b) {
+    if (a != 0) {
+        *cell = b;
+    } else {
+        *cell = a;
+    }
+    if (a < b) {
+        *cell = 7;
+    }
+    return 3;
+}
+
+// Unrolled, its remainder loop's exit branch encodes the copy-free edge, so
+// the back edge's copies follow a filled delay slot.
+[[abi("o32"), noinline]]
+global u32 mips_copy_edge_delay(in u32 seed, in u32 count) {
+    u32 value = seed;
+    u32 step = 1u32;
+    for (u32 index = 0u32; index < count; ++index) {
+        value = (value ^ (value >> 7u32)) * 2654435761u32 + step;
+        step = step + 3u32;
+    }
+    return value ^ step;
+}
+
 [[abi("o32"), noinline]]
 global u32 mips_integer_immediates(in u32 value) {
     u32 result = value + 17u32;

@@ -17,6 +17,7 @@
 #include "target/mips/features.hpp"
 #include "target/mips/instructions.hpp"
 #include "target/mips/machine_description.hpp"
+#include "target/mips/select_operations.hpp"
 
 #include <algorithm>
 #include <array>
@@ -81,6 +82,7 @@ enum class LoweringPass : std::uint16_t {
     EliminateRedundantExpressions,
     EliminateRedundantLoads,
     FuseDivisionResults,
+    FuseCompareSelects,
     FuseCompareBranches,
     EliminateDeadValues,
     ScheduleBlockLayout,
@@ -1830,7 +1832,10 @@ private:
             return result;
         }
         if (value.kind == ValueKind::Select) {
-            auto result = target_instruction(Opcode::Select, value.location);
+            auto result = target_instruction(
+                is_floating(hir_, value.type) ? Opcode::Fselect
+                                              : Opcode::Select,
+                value.location);
             for (const auto operand : value.operands) {
                 const auto source = reg(operand);
                 result.operands.push_back(register_operand(source));
@@ -3122,6 +3127,7 @@ private:
             case Opcode::FcmpGe:
             case Opcode::Uitofp:
             case Opcode::Select:
+            case Opcode::Fselect:
                 return true;
             default:
                 return false;
@@ -5354,6 +5360,78 @@ private:
         return changed;
     }
 
+    // A floating select whose boolean is the only use of a comparison of
+    // values as wide as the selected ones in its block emits that comparison
+    // itself and selects on the condition code with MOVT.fmt or MOVF.fmt.
+    bool fuse_compare_selects(machine::Function& function) {
+        if (!options_.compare_select_fusion) return false;
+        std::vector<unsigned> uses(function.virtual_registers.size());
+        for (const auto& block : function.blocks) {
+            for (const auto& instruction : block.instructions) {
+                for (const auto use : instruction.uses) {
+                    if (use.kind == machine::RegisterKind::Virtual &&
+                        use.id < uses.size()) {
+                        ++uses[use.id];
+                    }
+                }
+            }
+        }
+        bool changed = false;
+        for (auto& block : function.blocks) {
+            for (std::size_t index = 0; index < block.instructions.size();
+                 ++index) {
+                auto& selection = block.instructions[index];
+                if (decode_opcode(selection.opcode) != Opcode::Fselect ||
+                    !selection.condition_predicate.empty() ||
+                    selection.uses.size() != 3 ||
+                    selection.defs.size() != 1) {
+                    continue;
+                }
+                const auto condition = selection.uses.front();
+                const auto bits = selection.defs.front().mode.bits;
+                if (condition.kind != machine::RegisterKind::Virtual ||
+                    condition.id >= uses.size() || uses[condition.id] != 1 ||
+                    select_instructions(subtarget_, {bits, true, true})
+                        .empty()) {
+                    continue;
+                }
+                const auto found = std::find_if(
+                    block.instructions.begin(),
+                    block.instructions.begin() +
+                        static_cast<std::ptrdiff_t>(index),
+                    [&](const machine::Instruction& candidate) {
+                        return candidate.defs.size() == 1 &&
+                               candidate.defs.front() == condition;
+                    });
+                if (found == block.instructions.begin() +
+                                 static_cast<std::ptrdiff_t>(index) ||
+                    found->kind != machine::InstructionKind::Target ||
+                    found->uses.size() != 2 || found->patch ||
+                    found->uses.front().mode.bits != bits) {
+                    continue;
+                }
+                const auto opcode = decode_opcode(found->opcode);
+                if (opcode < Opcode::FcmpEq || opcode > Opcode::FcmpGe) {
+                    continue;
+                }
+                selection.condition_predicate = found->opcode;
+                const auto truth = selection.uses[1];
+                const auto falsity = selection.uses[2];
+                selection.uses = found->uses;
+                selection.uses.push_back(truth);
+                selection.uses.push_back(falsity);
+                selection.operands.clear();
+                for (const auto use : selection.uses) {
+                    selection.operands.push_back(register_operand(use));
+                }
+                block.instructions.erase(found);
+                --index;
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
     bool fuse_compare_branches(machine::Function& function) {
         if (!options_.compare_branch_fusion) return false;
         std::vector<unsigned> uses(function.virtual_registers.size());
@@ -5584,6 +5662,12 @@ private:
                             opcode == Opcode::Sdiv || opcode == Opcode::Srem};
                     },
                     Opcode::Sdivrem, Opcode::Udivrem);
+            });
+        passes.add(
+            {{LoweringPass::FuseCompareSelects},
+              Stage::InstructionCombining, "fuse-compare-selects"},
+            [this](machine::Function& function) {
+                return fuse_compare_selects(function);
             });
         passes.add(
             {{LoweringPass::FuseCompareBranches},
@@ -10570,14 +10654,20 @@ private:
             const bool no_copies =
                 edge_has_phi_copies(function, predecessor, no);
             const auto next = layout_successor(function, predecessor);
-            // Conditional edge copies are emitted after the architectural
-            // delay slot only on the directly encoded edge. Keep the
-            // candidate before any stub that must perform copies for the
-            // other edge.
-            if ((yes_copies || no_copies) &&
-                !((next == yes && !no_copies) ||
-                  (next == no && !yes_copies))) {
-                return false;
+            // When only one edge has copies, the branch encodes the other
+            // edge and the copies follow the architectural delay slot,
+            // unless a branch-likely form puts that edge's single copy in
+            // the slot. Keep the candidate before stubs for both edges.
+            if (yes_copies || no_copies) {
+                const bool copy_in_slot =
+                    options_.schedule_insns2 && selects_branch_likely() &&
+                    ((next == yes && !yes_copies &&
+                      single_assigned_gpr_phi_copy(function, predecessor,
+                                                   no)) ||
+                     (next == no && !no_copies &&
+                      single_assigned_gpr_phi_copy(function, predecessor,
+                                                   yes)));
+                if (yes_copies == no_copies || copy_in_slot) return false;
             }
             for (const auto definition : candidate.defs) {
                 if (std::any_of(
@@ -11195,6 +11285,8 @@ private:
     void emit_select_group(
         const machine::Function& function,
         std::span<const machine::Instruction> values);
+    void emit_float_select(const machine::Function& function,
+                           const machine::Instruction& value);
     std::optional<bool> emit_fused_order_compare(
         const machine::Function& function,
         const machine::Instruction& branch);
@@ -13487,6 +13579,10 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
         output_ << done << ":\n";
         return;
     }
+    if (opcode == Opcode::Fselect) {
+        emit_float_select(function, value);
+        return;
+    }
     if (opcode == Opcode::Expect) {
         if (!value.uses.empty() && !value.defs.empty()) {
             copy_vreg(function, value.defs.front(), value.uses.front(),
@@ -13515,6 +13611,90 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
     }
     diagnostics_.error(value.location,
                        "unknown MIPS target opcode in assembly emission");
+}
+
+// MOVT.fmt or MOVF.fmt after the fused comparison's C.cond.fmt, MOVN.fmt or
+// MOVZ.fmt on a boolean, where the FPU has them; otherwise a branch diamond.
+// The destination starts as one operand and conditionally takes the other,
+// whichever it already holds.
+void AssemblyEmitter::emit_float_select(const machine::Function& function,
+                                        const machine::Instruction& value) {
+    const bool fused = !value.condition_predicate.empty();
+    if (value.defs.size() != 1 || value.uses.size() != (fused ? 4U : 3U)) {
+        diagnostics_.error(value.location,
+                           "malformed MIPS floating select instruction");
+        return;
+    }
+    const auto target = value.defs.front();
+    const auto truth = value.uses[value.uses.size() - 2];
+    const auto falsity = value.uses.back();
+    const auto bits = target.mode.bits;
+    const std::string suffix = bits == 32 ? ".s" : ".d";
+    if (select_instructions(subtarget_, {bits, true, fused}).empty()) {
+        const auto otherwise = local_label(function);
+        const auto done = local_label(function);
+        const auto condition = input_gpr(function, value.uses.front(), "t0",
+                                         value.location);
+        instruction("beq", reg_name(condition) + ",$zero," + otherwise);
+        instruction("nop");
+        copy_vreg(function, target, truth, value.location);
+        instruction("b", done);
+        instruction("nop");
+        output_ << otherwise << ":\n";
+        copy_vreg(function, target, falsity, value.location);
+        output_ << done << ":\n";
+        return;
+    }
+    // Whether the move happens when the condition holds, and its operands.
+    bool move_on_true = true;
+    std::string condition_operand;
+    if (fused) {
+        const auto left = input_fpr(function, value.uses[0], "f0",
+                                    value.location);
+        const auto right = input_fpr(function, value.uses[1], "f2",
+                                     value.location);
+        const auto ordered = reg_name(left) + "," + reg_name(right);
+        const auto swapped = reg_name(right) + "," + reg_name(left);
+        switch (decode_opcode(value.condition_predicate)) {
+        case Opcode::FcmpEq: instruction("c.eq" + suffix, ordered); break;
+        case Opcode::FcmpNe:
+            instruction("c.eq" + suffix, ordered);
+            move_on_true = false;
+            break;
+        case Opcode::FcmpLt: instruction("c.lt" + suffix, ordered); break;
+        case Opcode::FcmpLe: instruction("c.le" + suffix, ordered); break;
+        case Opcode::FcmpGt: instruction("c.lt" + suffix, swapped); break;
+        case Opcode::FcmpGe: instruction("c.le" + suffix, swapped); break;
+        default:
+            diagnostics_.error(value.location,
+                               "malformed fused MIPS floating select");
+            return;
+        }
+        condition_operand = "$fcc0";
+    } else {
+        condition_operand = reg_name(input_gpr(function, value.uses.front(),
+                                               "t0", value.location));
+    }
+    const auto selected = input_fpr(function, truth, "f0", value.location);
+    const auto otherwise = input_fpr(function, falsity, "f2", value.location);
+    const auto destination = output_fpr(function, target, "f4");
+    // The destination holds the value the move replaces.
+    std::string_view moved = selected;
+    if (destination == selected && destination != otherwise) {
+        moved = otherwise;
+        move_on_true = !move_on_true;
+    } else if (destination != otherwise) {
+        instruction("mov" + suffix,
+                    reg_name(destination) + "," + reg_name(otherwise));
+    }
+    if (moved != destination) {
+        const auto mnemonic = fused ? (move_on_true ? "movt" : "movf")
+                                    : (move_on_true ? "movn" : "movz");
+        instruction(std::string(mnemonic) + suffix,
+                    reg_name(destination) + "," + reg_name(moved) + "," +
+                        condition_operand);
+    }
+    commit_fpr(function, target, destination, value.location);
 }
 
 void AssemblyEmitter::emit_select_group(

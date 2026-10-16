@@ -6,6 +6,7 @@
 #include "target/mips/bit_operations.hpp"
 #include "target/mips/features.hpp"
 #include "target/mips/instructions.hpp"
+#include "target/mips/select_operations.hpp"
 #include "target/subtarget.hpp"
 #include "target/target.hpp"
 
@@ -536,8 +537,7 @@ std::vector<OptionDefinition> target_options() {
             OptionImplementation::Partial);
     boolean("single-float", false,
             "limit hardware floating point to single precision");
-    boolean("cond-move", false,
-            "enable integer conditional-move selection");
+    boolean("cond-move", false, "enable conditional-move selection");
     boolean("rotate", false, "enable native variable rotates");
     boolean("vfpu", false, "enable the Allegrex VFPU extension",
             OptionImplementation::Partial);
@@ -599,7 +599,7 @@ TargetInfo make_target(ByteOrder order,
         &subtargets,
         {integer_constant_materialization_cost,
          integer_operation_instructions, mips::bit_operation_instructions,
-         integer_register_bits},
+         integer_register_bits, mips::select_instructions},
         {{0, 0, 0, 0, true, true, true, true, false, true, true}},
         // Instruction memory operands are a GPR base plus a signed 16-bit
         // displacement; MIPS has no scaled index.

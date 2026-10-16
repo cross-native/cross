@@ -98,6 +98,14 @@ public:
     // The same for the target's own lowering of a bit operation.
     [[nodiscard]] std::optional<unsigned> bit_operation_cost(
         CostedBitOperation operation, unsigned bits) const;
+    // The same for a select without a branch.
+    [[nodiscard]] std::optional<unsigned> select_cost(
+        const SelectCostQuery& query) const;
+    // The instructions of the target's packed form of a vector operation:
+    // none when it computes the lanes one at a time or the -march CPU lacks
+    // one of them, and no value when the target does not describe it.
+    [[nodiscard]] std::optional<std::vector<InstructionCostId>>
+    vector_operation(const VectorOperationCostQuery& query) const;
     [[nodiscard]] unsigned integer_register_bits() const;
     [[nodiscard]] floating::NanEncoding nan_encoding() const;
     [[nodiscard]] const std::vector<std::string>& enabled_features() const {
@@ -125,6 +133,10 @@ public:
 
 private:
     Subtarget() = default;
+    // The summed -mtune latencies of an instruction path, or no value when
+    // it is empty or the -march CPU lacks one of its instructions.
+    [[nodiscard]] std::optional<unsigned> path_latency(
+        const std::vector<InstructionCostId>& instructions) const;
     friend std::optional<Subtarget> resolve_subtarget(const TargetInfo&, const CompilerOptions&,
                                                        const SubtargetTable&, Diagnostics&);
     const TargetInfo* target_{};

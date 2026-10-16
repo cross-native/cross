@@ -3139,6 +3139,216 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/middle/loop_peeling_codegen.cmake")
     set_tests_properties(cross_loop_peeling_codegen PROPERTIES
         LABELS "check.compile;arch.x86_64;arch.mips;middle;backend.native;feature.optimization;isa.vr4300;opt.O1;opt.O2;opt.O3;opt.Os")
+    # Floating selects from if-conversion: SSE logic, SSE4.1 BLENDV, and AVX
+    # VBLENDV masks, a boolean mask, and the branches they replace.
+    foreach(select_mode O0 O2 O3 Os O2-sse41 O2-avx O3-avx O2-no-if-conversion
+                        O2-no-compare-select-fusion)
+        string(REGEX MATCH "^O[0-9s]" select_level "${select_mode}")
+        if(select_mode STREQUAL "O2-sse41")
+            set(select_flags "-O2;-march=x86-64-v2")
+        elseif(select_mode MATCHES "^(O[0-9])-avx$")
+            set(select_flags "-${CMAKE_MATCH_1};-march=x86-64-v3")
+        elseif(select_mode MATCHES "^O[0-9s]-no-(.*)$")
+            set(select_flags "-${select_level};-fno-${CMAKE_MATCH_1}")
+        else()
+            set(select_flags "-${select_mode}")
+        endif()
+        add_test(NAME cross_runtime_floating_select_${select_mode}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/floating_select.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-floating-select-${select_mode}
+                -DENTRY=test_entry -DEXPECTED=0 "-DCC_FLAGS=${select_flags};-fno-eval-calls"
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_floating_select_${select_mode} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;middle;feature.optimization;feature.floating;opt.${select_level}")
+    endforeach()
+    foreach(select_level O2 O3)
+        add_test(NAME cross_runtime_floating_select_mips_${select_level}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/floating_select.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-floating-select-mips-${select_level}
+                -DEXPECTED=P "-DCC_FLAGS=-${select_level};-fno-eval-calls"
+                -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(cross_runtime_floating_select_mips_${select_level} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;middle;feature.optimization;feature.floating;isa.vr4300;isa.r3000;endian.big;endian.little;opt.${select_level}"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS")
+    endforeach()
+    # MIPS IV and MIPS32 select floating values with MOVT/MOVN.fmt; the MIPS
+    # profiles leave ordinary if-conversion off, so the tests set a budget.
+    foreach(select_mode mips4-O2 mips4-O3 mips4-O2-no-compare-select-fusion
+                        mips32-O2)
+        string(REGEX MATCH "^(mips[0-9]+)-(O[0-9])" select_match "${select_mode}")
+        set(select_cpu "${CMAKE_MATCH_1}")
+        set(select_level "${CMAKE_MATCH_2}")
+        set(select_flags "-${select_level};-fif-conversion-limit=6;-fno-eval-calls")
+        if(select_mode MATCHES "-no-(.*)$")
+            list(APPEND select_flags "-fno-${CMAKE_MATCH_1}")
+        endif()
+        if(select_cpu STREQUAL "mips4")
+            # The startup and transport wrapper use the o32 FP32 registers.
+            list(APPEND select_flags "-mno-fp64" "-mfp32")
+        endif()
+        add_test(NAME cross_runtime_floating_select_${select_mode}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/floating_select.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-floating-select-${select_mode}
+                -DEXPECTED=P "-DCC_FLAGS=${select_flags}"
+                -DMIPS_CPUS=${select_cpu} -DQEMU_CPU=MIPS64R2-generic
+                -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(cross_runtime_floating_select_${select_mode} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;middle;feature.optimization;feature.floating;isa.${select_cpu};endian.big;endian.little;opt.${select_level}"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS")
+    endforeach()
+    # Reductions whose packed operations a CPU may lack.
+    foreach(packed_mode O2 O2-sse41 O2-avx2 O3-avx2)
+        string(REGEX MATCH "^O[0-9]" packed_level "${packed_mode}")
+        set(packed_flags "-${packed_level}")
+        if(packed_mode MATCHES "-sse41$")
+            list(APPEND packed_flags "-march=x86-64-v2")
+        elseif(packed_mode MATCHES "-avx2$")
+            list(APPEND packed_flags "-march=x86-64-v3")
+        endif()
+        add_test(NAME cross_runtime_vector_packed_operations_${packed_mode}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/vector_packed_operations.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-vector-packed-operations-${packed_mode}
+                -DENTRY=test_entry -DEXPECTED=0 "-DCC_FLAGS=${packed_flags};-fno-eval-calls"
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_vector_packed_operations_${packed_mode} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;middle;feature.optimization;feature.vector;opt.${packed_level}")
+    endforeach()
+    add_test(NAME cross_vector_packed_operations_codegen
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/vector_packed_operations.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/vector-packed-operations-codegen
+                -P "${CMAKE_SOURCE_DIR}/test/middle/vector_packed_operations.cmake")
+    set_tests_properties(cross_vector_packed_operations_codegen PROPERTIES
+        LABELS "check.compile;arch.x86_64;middle;backend.native;feature.optimization;feature.vector;opt.O2")
+    # Stores into local unions and records that nothing observes.
+    foreach(store_level O0 O1 O2 O3 Os)
+        add_test(NAME cross_runtime_dead_local_stores_${store_level}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/dead_local_stores.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-dead-local-stores-${store_level}
+                -DENTRY=test_entry -DEXPECTED=0 "-DCC_FLAGS=-${store_level};-fno-eval-calls"
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_dead_local_stores_${store_level} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;middle;feature.optimization;opt.${store_level}")
+    endforeach()
+    foreach(store_level O2 O3)
+        add_test(NAME cross_runtime_dead_local_stores_mips_${store_level}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/dead_local_stores.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-dead-local-stores-mips-${store_level}
+                -DEXPECTED=P "-DCC_FLAGS=-${store_level};-fno-eval-calls"
+                -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(cross_runtime_dead_local_stores_mips_${store_level} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;middle;feature.optimization;isa.vr4300;isa.r3000;endian.big;endian.little;opt.${store_level}"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS")
+    endforeach()
+    add_test(NAME cross_dead_local_stores_codegen
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/dead_local_stores.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/dead-local-stores-codegen
+                -P "${CMAKE_SOURCE_DIR}/test/middle/dead_local_stores.cmake")
+    set_tests_properties(cross_dead_local_stores_codegen PROPERTIES
+        LABELS "check.compile;arch.x86_64;arch.mips;middle;backend.native;feature.optimization;isa.vr4300;opt.O2")
+    # Conditions joined by && and || that combine into one branch or none.
+    foreach(combine_mode O0 O2 O3 Os O3-avx2 O3-no-if-conversion)
+        string(REGEX MATCH "^O[0-9s]" combine_level "${combine_mode}")
+        set(combine_flags "-${combine_level}")
+        if(combine_mode MATCHES "-avx2$")
+            list(APPEND combine_flags "-march=x86-64-v3")
+        elseif(combine_mode MATCHES "-no-(.*)$")
+            list(APPEND combine_flags "-fno-${CMAKE_MATCH_1}")
+        endif()
+        add_test(NAME cross_runtime_branch_combining_${combine_mode}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/branch_combining.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-branch-combining-${combine_mode}
+                -DENTRY=test_entry -DEXPECTED=0 "-DCC_FLAGS=${combine_flags};-fno-eval-calls"
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_branch_combining_${combine_mode} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;middle;feature.optimization;opt.${combine_level}")
+    endforeach()
+    foreach(combine_level O2 O3)
+        add_test(NAME cross_runtime_branch_combining_mips_${combine_level}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/branch_combining.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-branch-combining-mips-${combine_level}
+                -DEXPECTED=P "-DCC_FLAGS=-${combine_level};-fif-conversion-limit=12;-fno-eval-calls"
+                -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(cross_runtime_branch_combining_mips_${combine_level} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;middle;feature.optimization;isa.vr4300;isa.r3000;endian.big;endian.little;opt.${combine_level}"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS")
+    endforeach()
+    add_test(NAME cross_branch_combining_codegen
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/branch_combining.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/branch-combining-codegen
+                -P "${CMAKE_SOURCE_DIR}/test/middle/branch_combining.cmake")
+    set_tests_properties(cross_branch_combining_codegen PROPERTIES
+        LABELS "check.compile;arch.x86_64;middle;backend.native;feature.optimization;opt.O3")
+    add_test(NAME cross_floating_select_codegen
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/floating_select_codegen.x
+                -DMODEL=${CMAKE_SOURCE_DIR}/test/middle/floating_environment/environments.xm
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/floating-select-codegen
+                -P "${CMAKE_SOURCE_DIR}/test/middle/floating_select_codegen.cmake")
+    set_tests_properties(cross_floating_select_codegen PROPERTIES
+        LABELS "check.compile;arch.x86_64;arch.mips;middle;backend.native;feature.optimization;feature.floating;feature.model;isa.mips4;isa.vr4300;opt.O0;opt.O2")
+    # Loop exits that carry work and phi copies after block layout.
+    foreach(exit_mode O2 O3 O3-unroll O3-no-reorder-blocks
+                      O3-no-schedule-insns2)
+        string(REGEX MATCH "^O[0-9s]" exit_level "${exit_mode}")
+        set(exit_flags "-${exit_level}")
+        if(exit_mode MATCHES "-unroll$")
+            list(APPEND exit_flags "-funroll-loops" "-funroll-factor=4")
+        elseif(exit_mode MATCHES "-no-(.*)$")
+            list(APPEND exit_flags "-fno-${CMAKE_MATCH_1}")
+        endif()
+        add_test(NAME cross_runtime_loop_exits_${exit_mode}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/machine/loop_exits.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-loop-exits-${exit_mode}
+                -DENTRY=test_entry -DEXPECTED=0 "-DCC_FLAGS=${exit_flags};-fno-eval-calls"
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_loop_exits_${exit_mode} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;feature.optimization;feature.control;opt.${exit_level}")
+        add_test(NAME cross_runtime_loop_exits_mips_${exit_mode}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/machine/loop_exits.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-loop-exits-mips-${exit_mode}
+                -DEXPECTED=P "-DCC_FLAGS=${exit_flags};-fno-eval-calls"
+                -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(cross_runtime_loop_exits_mips_${exit_mode} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;feature.optimization;feature.control;isa.vr4300;isa.r3000;endian.big;endian.little;opt.${exit_level}"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS")
+    endforeach()
     # Unsigned-to-floating conversions of values with a clear top bit.
     foreach(conversion_mode O0 O2 Os O2-no-tree-bit-ccp)
         string(REGEX MATCH "^O[0-9s]" conversion_level "${conversion_mode}")

@@ -3,8 +3,11 @@
 
 #include "backend/native/machine_transform.hpp"
 
+#include "common/control_flow.hpp"
+
 #include <algorithm>
 #include <iterator>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -119,291 +122,374 @@ bool eliminate_redundancy(machine::Function& function,
     return erase_replaced_definitions(function, removed, is_eligible);
 }
 
+Dominance block_dominance(const machine::Function& function) {
+    return Dominance(
+        function.blocks.size(), function.entry.value,
+        [&](std::uint32_t block) -> const std::vector<machine::BlockId>& {
+            return function.blocks[block].successors;
+        },
+        [&](std::uint32_t block) -> const std::vector<machine::BlockId>& {
+            return function.blocks[block].predecessors;
+        });
+}
+
+// Natural loops, one per header, holding every block that reaches one of
+// the header's back edges without passing through the header.
+struct NaturalLoop {
+    std::uint32_t header{};
+    std::vector<bool> members;
+    std::size_t size{};
+};
+
+std::vector<NaturalLoop> natural_loops(const machine::Function& function,
+                                       const Dominance& dominance) {
+    const auto count = function.blocks.size();
+    std::vector<NaturalLoop> loops;
+    std::vector<std::optional<std::size_t>> header_loop(count);
+    for (std::uint32_t source = 0; source < count; ++source) {
+        if (!dominance.reachable(source)) continue;
+        for (const auto successor : function.blocks[source].successors) {
+            const auto header = successor.value;
+            if (header >= count || !dominance.dominates(header, source)) {
+                continue;
+            }
+            if (!header_loop[header]) {
+                header_loop[header] = loops.size();
+                loops.push_back({header, std::vector<bool>(count), 1});
+                loops.back().members[header] = true;
+            }
+            auto& loop = loops[*header_loop[header]];
+            std::vector<std::uint32_t> pending{source};
+            while (!pending.empty()) {
+                const auto block = pending.back();
+                pending.pop_back();
+                if (loop.members[block]) continue;
+                loop.members[block] = true;
+                ++loop.size;
+                for (const auto predecessor :
+                     function.blocks[block].predecessors) {
+                    if (dominance.reachable(predecessor.value)) {
+                        pending.push_back(predecessor.value);
+                    }
+                }
+            }
+        }
+    }
+    return loops;
+}
+
 } // namespace
+
+std::vector<unsigned> loop_depths(const machine::Function& function) {
+    std::vector<unsigned> depths(function.blocks.size());
+    if (function.entry.value >= function.blocks.size()) return depths;
+    for (const auto& loop : natural_loops(function, block_dominance(function))) {
+        for (std::size_t block = 0; block < depths.size(); ++block) {
+            if (loop.members[block]) ++depths[block];
+        }
+    }
+    return depths;
+}
 
 bool schedule_block_layout(
     machine::Function& function,
     const MachineBlockPredicate& is_addressable) {
-    if (function.layout.size() < 2) return false;
+    const auto count = function.blocks.size();
+    const auto entry = function.entry.value;
+    if (function.layout.size() < 2 || entry >= count) return false;
+    const auto addressable = [&](std::uint32_t block) {
+        return is_addressable && is_addressable({block});
+    };
+    std::vector<bool> placeable(count);
+    std::vector<std::size_t> position(count, count);
+    for (std::size_t index = 0; index < function.layout.size(); ++index) {
+        const auto block = function.layout[index].value;
+        if (block >= count) return false;
+        placeable[block] = true;
+        position[block] = index;
+    }
+    // Distinct successors in branch order. A block can fall through only
+    // to the target of its branch or conditional branch.
+    std::vector<std::vector<std::uint32_t>> successors(count);
+    std::vector<bool> falls_through(count);
+    std::vector<bool> traps(count);
+    for (const auto& block : function.blocks) {
+        const auto id = block.id.value;
+        if (id >= count) return false;
+        for (const auto successor : block.successors) {
+            auto& list = successors[id];
+            if (successor.value < count &&
+                std::find(list.begin(), list.end(), successor.value) ==
+                    list.end()) {
+                list.push_back(successor.value);
+            }
+        }
+        const auto* last = block.instructions.empty()
+            ? nullptr : &block.instructions.back();
+        falls_through[id] =
+            successors[id].size() <= 2 &&
+            (!last || last->kind != machine::InstructionKind::IndirectBranch);
+        traps[id] = block.successors.empty() && last &&
+            (last->kind == machine::InstructionKind::Trap ||
+             last->kind == machine::InstructionKind::Unreachable);
+    }
 
-    const auto original = function.layout;
-    std::unordered_set<std::uint32_t> placed;
+    const auto dominance = block_dominance(function);
+    const auto back_edge = [&](std::uint32_t source, std::uint32_t target) {
+        return dominance.dominates(target, source);
+    };
+    const auto loops = natural_loops(function, dominance);
+    std::vector<std::optional<std::size_t>> header_loop(count);
+    for (std::size_t index = 0; index < loops.size(); ++index) {
+        header_loop[loops[index].header] = index;
+    }
+    std::vector<std::optional<std::size_t>> innermost(count);
+    for (std::size_t index = 0; index < loops.size(); ++index) {
+        for (std::uint32_t block = 0; block < count; ++block) {
+            if (loops[index].members[block] &&
+                (!innermost[block] ||
+                 loops[index].size < loops[*innermost[block]].size)) {
+                innermost[block] = index;
+            }
+        }
+    }
+
+    // Static branch probabilities (Ball and Larus; LLVM's
+    // BranchProbabilityInfo) in units of 2^-20: an edge that stays in the
+    // innermost loop is taken 31 times in 32 against one that leaves it, an
+    // edge into a block that traps almost never, and other edges evenly.
+    // Integers keep the layout independent of the host's floating point.
+    constexpr std::uint64_t certain = std::uint64_t{1} << 20;
+    constexpr std::uint64_t leave = certain / 32;
+    constexpr std::uint64_t cold = 1;
+    std::vector<std::vector<std::uint64_t>> probability(count);
+    for (std::uint32_t block = 0; block < count; ++block) {
+        const auto& list = successors[block];
+        probability[block].assign(
+            list.size(), list.empty() ? 0 : certain / list.size());
+        if (list.size() != 2) continue;
+        auto& odds = probability[block];
+        if (traps[list[0]] != traps[list[1]]) {
+            const auto unlikely = traps[list[0]] ? 0U : 1U;
+            odds[unlikely] = cold;
+            odds[1U - unlikely] = certain - cold;
+        } else if (innermost[block]) {
+            const auto& loop = loops[*innermost[block]];
+            if (loop.members[list[0]] != loop.members[list[1]]) {
+                const auto leaving = loop.members[list[0]] ? 1U : 0U;
+                odds[leaving] = leave;
+                odds[1U - leaving] = certain - leave;
+            }
+        }
+    }
+    const auto edge_probability = [&](std::uint32_t source,
+                                      std::uint32_t target) {
+        const auto& list = successors[source];
+        const auto found = std::find(list.begin(), list.end(), target);
+        return found == list.end()
+            ? std::uint64_t{0}
+            : probability[source][static_cast<std::size_t>(
+                  found - list.begin())];
+    };
+
+    // Block frequencies in units of 2^-20 entries, in reverse postorder; a
+    // loop header runs once per expected iteration of its loop. They
+    // saturate at 2^43, so a frequency times a probability fits 64 bits.
+    std::vector<std::uint32_t> order;
+    {
+        std::vector<bool> seen(count);
+        std::vector<std::pair<std::uint32_t, std::size_t>> stack{{entry, 0}};
+        seen[entry] = true;
+        while (!stack.empty()) {
+            auto& [block, next] = stack.back();
+            if (next < successors[block].size()) {
+                const auto successor = successors[block][next++];
+                if (!seen[successor]) {
+                    seen[successor] = true;
+                    stack.push_back({successor, 0});
+                }
+                continue;
+            }
+            order.push_back(block);
+            stack.pop_back();
+        }
+        std::reverse(order.begin(), order.end());
+    }
+    constexpr std::uint64_t saturated = std::uint64_t{1} << 43;
+    const auto weight = [](std::uint64_t frequency, std::uint64_t odds) {
+        return frequency * odds >> 20;
+    };
+    std::vector<std::uint64_t> frequency(count);
+    for (const auto block : order) {
+        std::uint64_t incoming = block == entry ? certain : 0;
+        for (const auto predecessor : function.blocks[block].predecessors) {
+            if (predecessor.value < count &&
+                !back_edge(predecessor.value, block)) {
+                incoming = std::min(
+                    incoming + weight(frequency[predecessor.value],
+                                      edge_probability(predecessor.value,
+                                                       block)),
+                    saturated);
+            }
+        }
+        frequency[block] = std::min(
+            header_loop[block] ? incoming * (certain / leave) : incoming,
+            saturated);
+    }
+
+    // Bottom-up chain formation (Pettis and Hansen): visit fallthrough
+    // candidates by decreasing weight and join a source that ends its chain
+    // to a target that starts another. Among edges of equal weight, one that
+    // would otherwise need an unconditional jump comes first, and back edges
+    // come last so a loop's chain starts at its header.
+    struct Edge {
+        std::uint32_t source{};
+        std::uint32_t target{};
+        std::uint64_t weight{};
+        bool conditional{};
+        bool back{};
+        std::size_t order{};
+    };
+    std::vector<Edge> edges;
+    for (std::uint32_t source = 0; source < count; ++source) {
+        if (!placeable[source] || !falls_through[source]) continue;
+        for (std::size_t index = 0; index < successors[source].size();
+             ++index) {
+            const auto target = successors[source][index];
+            if (target == source || target == entry || !placeable[target]) {
+                continue;
+            }
+            edges.push_back(
+                {source, target,
+                 weight(frequency[source], probability[source][index]),
+                 successors[source].size() > 1, back_edge(source, target),
+                 position[source] * 4U + index});
+        }
+    }
+    std::stable_sort(edges.begin(), edges.end(),
+                     [](const Edge& left, const Edge& right) {
+                         if (left.weight != right.weight) {
+                             return left.weight > right.weight;
+                         }
+                         if (left.conditional != right.conditional) {
+                             return !left.conditional;
+                         }
+                         if (left.back != right.back) return !left.back;
+                         return left.order < right.order;
+                     });
+    std::vector<std::uint32_t> chain_of(count);
+    std::vector<std::vector<std::uint32_t>> chains(count);
+    for (std::uint32_t block = 0; block < count; ++block) {
+        chain_of[block] = block;
+        if (placeable[block]) chains[block] = {block};
+    }
+    // A block with a source-visible label keeps its original neighbors: it
+    // falls through only to the block after it and is reached only from the
+    // block before it.
+    const auto original_neighbors = [&](const Edge& edge) {
+        return position[edge.source] + 1 == position[edge.target];
+    };
+    const auto join_chains = [&] {
+        for (const auto& edge : edges) {
+            const auto first = chain_of[edge.source];
+            const auto second = chain_of[edge.target];
+            if (first == second || chains[first].back() != edge.source ||
+                chains[second].front() != edge.target ||
+                ((addressable(edge.source) || addressable(edge.target)) &&
+                 !original_neighbors(edge))) {
+                continue;
+            }
+            for (const auto block : chains[second]) chain_of[block] = first;
+            chains[first].insert(chains[first].end(), chains[second].begin(),
+                                 chains[second].end());
+            chains[second].clear();
+        }
+    };
+    join_chains();
+
+    // A loop whose header tests and exits, and whose blocks form one run of
+    // a chain with the header falling through to the loop, rotates that run
+    // so the header comes last when the run's last block reaches its first
+    // by a jump: by its only edge, or by the less likely one while its
+    // conditional branch keeps the other. That edge becomes a fallthrough,
+    // the header's branch to the loop forms the backedge, and the header can
+    // fall through to its exit.
+    std::vector<std::size_t> nest(loops.size());
+    for (std::size_t index = 0; index < nest.size(); ++index) nest[index] = index;
+    std::stable_sort(nest.begin(), nest.end(),
+                     [&](std::size_t left, std::size_t right) {
+                         return loops[left].size < loops[right].size;
+                     });
+    for (const auto index : nest) {
+        const auto& loop = loops[index];
+        const auto header = loop.header;
+        const auto& exits = successors[header];
+        if (!placeable[header] || exits.size() != 2 ||
+            loop.members[exits[0]] == loop.members[exits[1]]) {
+            continue;
+        }
+        const auto inside = loop.members[exits[0]] ? exits[0] : exits[1];
+        auto& chain = chains[chain_of[header]];
+        const auto at = static_cast<std::size_t>(
+            std::find(chain.begin(), chain.end(), header) - chain.begin());
+        auto first = at;
+        while (first > 0 && loop.members[chain[first - 1]]) --first;
+        auto last = at;
+        while (last + 1 < chain.size() && loop.members[chain[last + 1]]) ++last;
+        const auto begin = chain.begin() + static_cast<std::ptrdiff_t>(first);
+        const auto end = chain.begin() + static_cast<std::ptrdiff_t>(last + 1);
+        const auto& wrap = successors[chain[last]];
+        if (at == last || chain[at + 1] != inside ||
+            std::find(wrap.begin(), wrap.end(), chain[first]) == wrap.end() ||
+            (wrap.size() > 1 &&
+             edge_probability(chain[last], chain[first]) >= certain / 2) ||
+            std::find(begin, end, entry) != end ||
+            std::any_of(begin, end, addressable)) {
+            continue;
+        }
+        std::rotate(begin, chain.begin() + static_cast<std::ptrdiff_t>(at + 1),
+                    end);
+    }
+    // A rotated test can now fall through to its exit.
+    join_chains();
+
+    // The entry chain first, then the others by their earliest original
+    // block, with chains that only lead to traps last.
+    std::vector<std::uint32_t> placed;
+    for (std::uint32_t chain = 0; chain < count; ++chain) {
+        if (!chains[chain].empty()) placed.push_back(chain);
+    }
+    const auto earliest = [&](std::uint32_t chain) {
+        std::size_t result = count;
+        for (const auto block : chains[chain]) {
+            result = std::min(result, position[block]);
+        }
+        return result;
+    };
+    const auto trapping = [&](std::uint32_t chain) {
+        return std::all_of(chains[chain].begin(), chains[chain].end(),
+                           [&](std::uint32_t block) {
+                               return frequency[block] < cold;
+                           });
+    };
+    std::stable_sort(placed.begin(), placed.end(),
+                     [&](std::uint32_t left, std::uint32_t right) {
+                         const bool left_entry = left == chain_of[entry];
+                         const bool right_entry = right == chain_of[entry];
+                         if (left_entry != right_entry) return left_entry;
+                         const bool left_cold = trapping(left);
+                         const bool right_cold = trapping(right);
+                         if (left_cold != right_cold) return right_cold;
+                         return earliest(left) < earliest(right);
+                     });
     std::vector<machine::BlockId> layout;
-    layout.reserve(original.size());
-
-    // Compute ordinary block dominance once for trace selection. A path from
-    // a nested-loop exit can eventually return to an inner header through the
-    // enclosing loop, but it is not the inner loop's continuing path.
-    const auto block_count = function.blocks.size();
-    std::vector<std::vector<bool>> dominates(
-        block_count, std::vector<bool>(block_count, true));
-    if (function.entry.value < block_count) {
-        std::fill(dominates[function.entry.value].begin(),
-                  dominates[function.entry.value].end(), false);
-        dominates[function.entry.value][function.entry.value] = true;
+    layout.reserve(function.layout.size());
+    for (const auto chain : placed) {
+        for (const auto block : chains[chain]) layout.push_back({block});
     }
-    bool dominance_changed = true;
-    while (dominance_changed) {
-        dominance_changed = false;
-        for (const auto& candidate : function.blocks) {
-            if (candidate.id == function.entry ||
-                candidate.id.value >= block_count) {
-                continue;
-            }
-            std::vector<bool> next(block_count, true);
-            if (candidate.predecessors.empty()) {
-                std::fill(next.begin(), next.end(), false);
-            } else {
-                for (const auto predecessor : candidate.predecessors) {
-                    if (predecessor.value >= block_count) continue;
-                    for (std::size_t index = 0; index < block_count;
-                         ++index) {
-                        next[index] = next[index] &&
-                            dominates[predecessor.value][index];
-                    }
-                }
-            }
-            next[candidate.id.value] = true;
-            if (next != dominates[candidate.id.value]) {
-                dominates[candidate.id.value] = std::move(next);
-                dominance_changed = true;
-            }
-        }
+    if (layout.size() != function.layout.size() || layout == function.layout) {
+        return false;
     }
-
-    const auto distance_to = [&](machine::BlockId source,
-                                 machine::BlockId target)
-        -> std::optional<std::size_t> {
-        std::vector<std::pair<machine::BlockId, std::size_t>> pending{
-            {source, 0}};
-        std::unordered_set<std::uint32_t> visited;
-        for (std::size_t cursor = 0; cursor < pending.size(); ++cursor) {
-            const auto [item, distance] = pending[cursor];
-            if (item == target) return distance;
-            if (!visited.insert(item.value).second ||
-                item.value >= block_count) {
-                continue;
-            }
-            for (const auto successor :
-                 function.blocks[item.value].successors) {
-                pending.emplace_back(successor, distance + 1);
-            }
-        }
-        return std::nullopt;
-    };
-    const auto natural_back_distance =
-        [&](machine::BlockId source, machine::BlockId header)
-        -> std::optional<std::size_t> {
-        if (source.value >= block_count || header.value >= block_count ||
-            !dominates[source.value][header.value]) {
-            return std::nullopt;
-        }
-        std::vector<std::pair<machine::BlockId, std::size_t>> pending{
-            {source, 0}};
-        std::unordered_set<std::uint32_t> visited;
-        for (std::size_t cursor = 0; cursor < pending.size(); ++cursor) {
-            const auto [item, distance] = pending[cursor];
-            if (item == header) return distance;
-            if (!visited.insert(item.value).second ||
-                item.value >= block_count) {
-                continue;
-            }
-            for (const auto successor :
-                 function.blocks[item.value].successors) {
-                if (successor == header ||
-                    (successor.value < block_count &&
-                     dominates[successor.value][header.value])) {
-                    pending.emplace_back(successor, distance + 1);
-                }
-            }
-        }
-        return std::nullopt;
-    };
-    const auto append_trace = [&](machine::BlockId seed) {
-        auto current = seed;
-        while (!placed.contains(current.value) &&
-               current.value < block_count) {
-            placed.insert(current.value);
-            layout.push_back(current);
-            const auto& owner = function.blocks[current.value];
-            std::optional<machine::BlockId> successor;
-            if (owner.successors.size() == 1) {
-                if (!placed.contains(owner.successors.front().value)) {
-                    successor = owner.successors.front();
-                }
-            } else {
-                // A loop's continuing edge is normally much hotter than its
-                // exit. Prefer it before the ordinary false-edge heuristic so
-                // the body becomes fallthrough.
-                const auto ready = [&](machine::BlockId candidate) {
-                    if (candidate.value >= block_count) return false;
-                    const auto& destination =
-                        function.blocks[candidate.value];
-                    return destination.predecessors.size() <= 1 ||
-                        std::all_of(
-                            destination.predecessors.begin(),
-                            destination.predecessors.end(),
-                            [&](machine::BlockId predecessor) {
-                                return predecessor == current ||
-                                    placed.contains(predecessor.value);
-                            });
-                };
-                std::optional<std::size_t> shortest_back_path;
-                for (auto item = owner.successors.rbegin();
-                     item != owner.successors.rend(); ++item) {
-                    if (placed.contains(item->value) || !ready(*item)) {
-                        continue;
-                    }
-                    const auto distance =
-                        natural_back_distance(*item, current);
-                    if (distance &&
-                        (!shortest_back_path ||
-                         *distance < *shortest_back_path)) {
-                        successor = *item;
-                        shortest_back_path = *distance;
-                    }
-                }
-                if (!successor) {
-                    for (auto item = owner.successors.rbegin();
-                         item != owner.successors.rend(); ++item) {
-                        if (!placed.contains(item->value) && ready(*item) &&
-                            !distance_to(*item, current)) {
-                            successor = *item;
-                            break;
-                        }
-                    }
-                }
-            }
-            if (!successor) break;
-            current = *successor;
-        }
-    };
-
-    append_trace(function.entry);
-    for (const auto seed : original) append_trace(seed);
-    if (layout.size() != original.size()) return false;
-
-    const auto addressable = [&](machine::BlockId id) {
-        return is_addressable && is_addressable(id);
-    };
-
-    // A shared latch reached by several arms belongs immediately before its
-    // dominated header so the backedge becomes fallthrough.
-    for (const auto& header : function.blocks) {
-        std::optional<machine::BlockId> latch;
-        std::size_t latch_inputs{};
-        for (const auto& candidate : function.blocks) {
-            if (candidate.id == function.entry ||
-                candidate.predecessors.size() < 2 ||
-                candidate.successors.size() != 1 ||
-                candidate.successors.front() != header.id ||
-                addressable(candidate.id) ||
-                candidate.id.value >= block_count ||
-                header.id.value >= block_count ||
-                !dominates[candidate.id.value][header.id.value]) {
-                continue;
-            }
-            if (!latch || candidate.predecessors.size() > latch_inputs) {
-                latch = candidate.id;
-                latch_inputs = candidate.predecessors.size();
-            }
-        }
-        if (!latch) continue;
-        auto header_position =
-            std::find(layout.begin(), layout.end(), header.id);
-        auto latch_position = std::find(layout.begin(), layout.end(), *latch);
-        if (header_position == layout.end() ||
-            latch_position == layout.end() ||
-            latch_position + 1 == header_position) {
-            continue;
-        }
-        const auto latch_id = *latch_position;
-        layout.erase(latch_position);
-        header_position = std::find(layout.begin(), layout.end(), header.id);
-        layout.insert(header_position, latch_id);
-    }
-
-    // Rotate a test-first, single-body loop in layout only. The external
-    // predecessor jumps to the test once; thereafter the body falls through
-    // to the test and its conditional branch forms the backedge.
-    for (std::size_t index = 0; index + 1 < layout.size(); ++index) {
-        const auto header_id = layout[index];
-        if (header_id == function.entry || header_id.value >= block_count) {
-            continue;
-        }
-        const auto& header = function.blocks[header_id.value];
-        if (header.successors.size() != 2) continue;
-        const auto body_id = layout[index + 1];
-        if (body_id.value >= block_count ||
-            std::find(header.successors.begin(), header.successors.end(),
-                      body_id) == header.successors.end()) {
-            continue;
-        }
-        const auto& body = function.blocks[body_id.value];
-        const bool has_dedicated_preheader = std::any_of(
-            header.predecessors.begin(), header.predecessors.end(),
-            [&](machine::BlockId predecessor) {
-                if (predecessor == body_id ||
-                    predecessor.value >= block_count) {
-                    return false;
-                }
-                const auto& owner = function.blocks[predecessor.value];
-                return owner.successors.size() == 1 &&
-                    owner.successors.front() == header_id;
-            });
-        if (body.predecessors.size() != 1 ||
-            body.predecessors.front() != header_id ||
-            body.successors.size() != 1 ||
-            body.successors.front() != header_id || addressable(body_id)) {
-            continue;
-        }
-        if (!has_dedicated_preheader) continue;
-        std::swap(layout[index], layout[index + 1]);
-        ++index;
-    }
-
-    // Keep the non-continuing successor next to the rotated test when it is a
-    // movable single-predecessor block.
-    for (std::size_t index = 1; index + 1 < layout.size(); ++index) {
-        const auto body_id = layout[index - 1];
-        const auto header_id = layout[index];
-        if (body_id.value >= block_count || header_id.value >= block_count) {
-            continue;
-        }
-        const auto& body = function.blocks[body_id.value];
-        const auto& header = function.blocks[header_id.value];
-        if (body.successors.size() != 1 ||
-            body.successors.front() != header_id ||
-            header.successors.size() != 2 ||
-            std::find(header.successors.begin(), header.successors.end(),
-                      body_id) == header.successors.end()) {
-            continue;
-        }
-        const auto exit = header.successors.front() == body_id
-            ? header.successors.back()
-            : header.successors.front();
-        if (layout[index + 1] == exit || addressable(exit) ||
-            exit.value >= block_count) {
-            continue;
-        }
-        const auto& exit_block = function.blocks[exit.value];
-        if (exit_block.predecessors.size() != 1 ||
-            exit_block.predecessors.front() != header_id) {
-            continue;
-        }
-        const auto exit_position =
-            std::find(layout.begin() +
-                          static_cast<std::ptrdiff_t>(index + 1),
-                      layout.end(), exit);
-        if (exit_position == layout.end()) continue;
-        const auto exit_id = *exit_position;
-        layout.erase(exit_position);
-        layout.insert(layout.begin() +
-                          static_cast<std::ptrdiff_t>(index + 1),
-                      exit_id);
-    }
-
-    if (layout == original) return false;
     function.layout = std::move(layout);
     return true;
 }

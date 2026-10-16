@@ -67,22 +67,38 @@ std::optional<unsigned> Subtarget::integer_operation_cost(
     CostedIntegerOperation operation,
     const IntegerOperationCostQuery& query) const {
     if (!target_ || !target_->cost_model.integer_operation) return std::nullopt;
-    const auto instructions =
-        target_->cost_model.integer_operation(*this, operation, query);
-    if (instructions.empty()) return std::nullopt;
-    unsigned cost{};
-    for (const auto instruction : instructions) {
-        if (!has_instruction(instruction)) return std::nullopt;
-        cost += latency(instruction);
-    }
-    return cost;
+    return path_latency(
+        target_->cost_model.integer_operation(*this, operation, query));
 }
 
 std::optional<unsigned> Subtarget::bit_operation_cost(
     CostedBitOperation operation, unsigned bits) const {
     if (!target_ || !target_->cost_model.bit_operation) return std::nullopt;
-    const auto instructions =
-        target_->cost_model.bit_operation(*this, operation, bits);
+    return path_latency(
+        target_->cost_model.bit_operation(*this, operation, bits));
+}
+
+std::optional<unsigned> Subtarget::select_cost(
+    const SelectCostQuery& query) const {
+    if (!target_ || !target_->cost_model.select) return std::nullopt;
+    return path_latency(target_->cost_model.select(*this, query));
+}
+
+std::optional<std::vector<InstructionCostId>> Subtarget::vector_operation(
+    const VectorOperationCostQuery& query) const {
+    if (!target_ || !target_->cost_model.vector_operation) return std::nullopt;
+    auto instructions = target_->cost_model.vector_operation(*this, query);
+    if (std::any_of(instructions.begin(), instructions.end(),
+                    [&](InstructionCostId instruction) {
+                        return !has_instruction(instruction);
+                    })) {
+        instructions.clear();
+    }
+    return instructions;
+}
+
+std::optional<unsigned> Subtarget::path_latency(
+    const std::vector<InstructionCostId>& instructions) const {
     if (instructions.empty()) return std::nullopt;
     unsigned cost{};
     for (const auto instruction : instructions) {

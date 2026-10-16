@@ -265,6 +265,33 @@ bool block_layout_test() {
     return ok;
 }
 
+// entry -> outer header 1 -> inner header 2 <-> inner body 3; the inner
+// exit 4 branches back to 1, whose exit is 5.
+bool loop_depth_test() {
+    machine::Function function;
+    function.entry = {0};
+    function.blocks.resize(6);
+    for (std::uint32_t index = 0; index < 6; ++index) {
+        function.blocks[index].id = {index};
+        function.blocks[index].reachable = true;
+        function.layout.push_back({index});
+    }
+    const auto edge = [&](std::uint32_t from, std::uint32_t to) {
+        function.blocks[from].successors.push_back({to});
+        function.blocks[to].predecessors.push_back({from});
+    };
+    edge(0, 1);
+    edge(1, 2);
+    edge(1, 5);
+    edge(2, 3);
+    edge(2, 4);
+    edge(3, 2);
+    edge(4, 1);
+    return expect(native::loop_depths(function) ==
+                      std::vector<unsigned>{0, 1, 2, 2, 1, 0},
+                  "nested loop depths should count enclosing natural loops");
+}
+
 } // namespace
 
 int main() {
@@ -276,5 +303,6 @@ int main() {
     ok &= spill_elision_test();
     ok &= entry_capture_test();
     ok &= block_layout_test();
+    ok &= loop_depth_test();
     return ok ? 0 : 1;
 }

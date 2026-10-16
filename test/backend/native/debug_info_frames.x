@@ -31,15 +31,16 @@ struct wide_cell [[aligned(64)]] {
     i32 value;
 };
 
-// An over-aligned local realigns $fp; the CFA stays on $sp.
+[[noinline]] global i32 peek(i32 *cell) {
+    return *cell;
+}
+
+// An over-aligned local whose address escapes realigns $fp; the CFA stays
+// on $sp.
 global i32 aligned(i32 v) {
     struct wide_cell cell;
     cell.value = v;
-    return sink(cell.value);
-}
-
-[[noinline]] global i32 peek(i32 *cell) {
-    return *cell;
+    return sink(peek(&cell.value));
 }
 
 // Shrink-wrapped with a local in the frame, which is described from the CFA.

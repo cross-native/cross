@@ -127,6 +127,31 @@ if(multiply_position EQUAL -1 OR branch_position EQUAL -1 OR
         "O3 did not schedule a safe integer multiply across the trace branch\n"
         "${scheduled_body}")
 endif()
+# The inner loop's exit work, `outer * 5u64`, runs once per outer iteration:
+# no block that ends in the inner loop's test computes it.
+string(REGEX MATCH
+    "nested_layout:[^#]*[.]size nested_layout"
+    o3_nested_body "${o3_assembly}")
+string(REPLACE "\n" ";" o3_nested_lines "${o3_nested_body}")
+set(exit_work_seen FALSE)
+set(exit_work_in_block FALSE)
+set(exit_work_hoisted FALSE)
+foreach(line IN LISTS o3_nested_lines)
+    if(line MATCHES "^[.]Lcross[.]machine[.][^:]+:$")
+        set(exit_work_in_block FALSE)
+    elseif(line MATCHES "leaq[\t ]+[(]%([a-z0-9]+),%([a-z0-9]+),4[)]" AND
+           CMAKE_MATCH_1 STREQUAL CMAKE_MATCH_2)
+        set(exit_work_seen TRUE)
+        set(exit_work_in_block TRUE)
+    elseif(line MATCHES "^[\t ]*jb[\t ]" AND exit_work_in_block)
+        set(exit_work_hoisted TRUE)
+    endif()
+endforeach()
+if(NOT exit_work_seen OR exit_work_hoisted)
+    message(FATAL_ERROR
+        "O3 speculated a loop exit's work into the loop's test\n"
+        "${o3_nested_body}")
+endif()
 
 if(WIN32)
     set(HOST_ABI ms_abi)

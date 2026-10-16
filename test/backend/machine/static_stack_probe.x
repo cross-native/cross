@@ -1,13 +1,14 @@
 // Copyright (C) 2026 Cross contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+// The frames hold volatile bytes, so optimization cannot remove them.
 struct large_aligned_frame [[aligned(64)]] {
-    u8 bytes[12288];
+    volatile u8 bytes[12288];
 };
 
 [[runtime_only, noinline]]
 static i32 probe_plain_static_frame() {
-    u8 bytes[12288];
+    volatile u8 bytes[12288];
     bytes[0] = 1u8;
     bytes[4096] = 2u8;
     bytes[8192] = 3u8;
@@ -29,7 +30,7 @@ static i32 probe_aligned_static_frame() {
 [[runtime_only, noinline]]
 static i32 probe_manual_input_frame(in i32 left "r10d",
                                     in i32 right "r11d") {
-    u8 bytes[8192];
+    volatile u8 bytes[8192];
     bytes[0] = 1u8;
     bytes[8191] = 2u8;
     return left + right + bytes[0] + bytes[8191];

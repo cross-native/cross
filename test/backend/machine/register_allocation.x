@@ -53,12 +53,13 @@ global u64 allocated_vla_split(in u64 value, in uptr count) {
     return product + allocation_callee(count) + bytes[0];
 }
 
+// Volatile values keep the over-aligned cells, and so their realigned frames.
 struct allocated_aligned_cell [[aligned(64)]] {
-    u64 value;
+    volatile u64 value;
 };
 
 struct allocated_aligned_float_cell [[aligned(64)]] {
-    f64 value;
+    volatile f64 value;
 };
 
 [[noinline]]

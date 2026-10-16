@@ -227,13 +227,13 @@ if(NOT scheduled_successor MATCHES
 endif()
 
 function_body("${OUTPUT}.enabled.s"
-              mips_reassociation_pressure scheduled_successor_compare)
+              mips_successor_compare scheduled_successor_compare)
 function_body("${OUTPUT}.no_delay.s"
-              mips_reassociation_pressure empty_successor_compare)
+              mips_successor_compare empty_successor_compare)
 if(NOT scheduled_successor_compare MATCHES
-       "[\t ]b[\t ]+\\.Lcross[.]mips[.][0-9_]+[.]tmp[.][0-9]+\n[\t ]+sltu[\t ]" OR
+       "[\t ]b[\t ]+\\.Lcross[.]mips[.][0-9_]+[.]tmp[.][0-9]+\n[\t ]+sltu?[\t ]" OR
    NOT scheduled_successor_compare MATCHES
-       "[\t ]sltu[^\n]*\n\\.Lcross[.]mips[.][0-9_]+[.]tmp[.][0-9]+:\n[\t ]+b(eq|ne)z?l?[\t ]" OR
+       "[\t ]sltu?[^\n]*\n\\.Lcross[.]mips[.][0-9_]+[.]tmp[.][0-9]+:\n[\t ]+b(eq|ne)z?l?[\t ]" OR
    NOT empty_successor_compare MATCHES
        "[\t ]b[\t ]+\\.Lcross[.]mips[.][0-9_]+[.]bb[.][0-9]+\n[\t ]+nop")
     message(FATAL_ERROR
@@ -241,6 +241,20 @@ if(NOT scheduled_successor_compare MATCHES
         "delay slot or -fno-schedule-insns2 was ignored\n"
         "scheduled:\n${scheduled_successor_compare}\n"
         "disabled:\n${empty_successor_compare}")
+endif()
+
+function_body("${OUTPUT}.unroll_risc.s"
+              mips_copy_edge_delay scheduled_copy_edge)
+function_body("${OUTPUT}.unroll_risc_no_delay.s"
+              mips_copy_edge_delay empty_copy_edge)
+if(NOT scheduled_copy_edge MATCHES
+       "[\t ]beq[\t ][^\n]*\n[\t ]+addu[\t ][^\n]*\n[\t ]+move[\t ]" OR
+   NOT empty_copy_edge MATCHES
+       "[\t ]beq[\t ][^\n]*\n[\t ]+nop\n[\t ]+move[\t ]")
+    message(FATAL_ERROR
+        "a branch whose other edge carries copies did not fill its delay "
+        "slot or -fno-schedule-insns2 was ignored\n"
+        "scheduled:\n${scheduled_copy_edge}\ndisabled:\n${empty_copy_edge}")
 endif()
 
 function_body("${OUTPUT}.enabled.s"

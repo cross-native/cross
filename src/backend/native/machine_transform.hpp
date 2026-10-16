@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <functional>
 #include <optional>
+#include <vector>
 
 namespace cross::native {
 
@@ -25,6 +26,10 @@ using MachineBlockPredicate = std::function<bool(machine::BlockId)>;
 [[nodiscard]] bool schedule_block_layout(
     machine::Function& function,
     const MachineBlockPredicate& is_addressable = {});
+
+// The number of natural loops that contain each block, by block id.
+[[nodiscard]] std::vector<unsigned>
+loop_depths(const machine::Function& function);
 
 [[nodiscard]] bool
 propagate_virtual_register_copies(machine::Function& function,

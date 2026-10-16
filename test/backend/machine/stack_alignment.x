@@ -1,8 +1,9 @@
 // Copyright (C) 2026 Cross contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+// The value is volatile, so optimization keeps the over-aligned frame.
 struct aligned_frame_value [[aligned(64)]] {
-    i32 value;
+    volatile i32 value;
 };
 
 [[abi("sysv_abi"), noinline]]
