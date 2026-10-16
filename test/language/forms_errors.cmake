@@ -154,6 +154,10 @@ reject(region_empty "attribute 'abi' of this region is valid for none of its dec
     "[[abi(\"sysv_abi\")]] {}")
 reject(region_unknown "unknown attribute 'bogus'"
     "[[bogus]] { u32 f(); }")
+reject(parameter_unknown "unknown attribute 'bogus'"
+    "global u32 f(in u32 [[bogus]] value) { return value; }")
+reject(parameter_trailing_unknown "unknown attribute 'bogus'"
+    "typedef u32 (*unary)(in u32 value [[bogus]]);")
 reject(region_statement "attribute 'aligned' is not valid on this statement"
     "global u32 f() { [[aligned(8)]] { } return 0; }")
 set(ms "typedef u32 (*ms_unary)(in u32 value) [[abi(\"ms_abi\")]];")

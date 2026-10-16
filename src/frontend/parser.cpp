@@ -6742,7 +6742,9 @@ EvaluationTask<ParameterDecl> Parser::parse_parameter_async(unsigned ordinal) {
     const auto validate_parameter_attributes = [&](const std::vector<Attribute>& entries) {
         if (parsing_public_fragment_ || preparing_header_) return;
         for (const auto& attribute : entries)
-            if (attribute.name == "aligned" || attribute.name == "packed" || attribute.name == "underlying")
+            if (!is_known_attribute(attribute.name))
+                diagnostics_.error(attribute.location, "unknown attribute '" + attribute.name + "'");
+            else if (attribute.name == "aligned" || attribute.name == "packed" || attribute.name == "underlying")
                 diagnostics_.error(attribute.location,
                     "attribute '" + attribute.name + "' is not valid on a parameter");
     };
