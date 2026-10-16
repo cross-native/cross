@@ -156,8 +156,13 @@ have `out` or `inout` parameters.
 
 `[[naked]]` functions can inline `[[raw_inline]]` functions whose locals,
 control flow, pointer accesses, and integer, `f32`, and `f64` operations fit
-in the naked function's bound registers and declared clobbers. Anything that
-would need a call, a spill, or a stack object is an error.
+in the naked function's bound registers and declared clobbers. Both can read,
+write, and take the address of a static-duration object: one at a fixed
+address through its sign-extended 32-bit absolute address, any other relative
+to `%rip`. A thread-local object, a fixed address outside that range, an
+object that needs a GOT entry under `-fpic`, and `%rip`-relative access under
+the medium and large code models are errors. Anything that would need a call,
+a spill, or a stack object is an error.
 
 ## MIPS
 

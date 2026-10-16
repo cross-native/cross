@@ -40,6 +40,9 @@ struct MemoryOperand {
     unsigned bits{};
     bool is_volatile{};
     bool is_atomic{};
+    // A static-duration object, addressed relative to the instruction
+    // pointer or at its fixed address; base and index are then unused.
+    std::optional<hir::ObjectId> object;
 };
 
 struct Operand {
@@ -93,6 +96,8 @@ struct RawModule {
     std::vector<RawFunction> functions;
     std::unordered_set<std::uint32_t> definitions;
     std::unordered_set<std::uint32_t> object_definitions;
+    // Objects that raw bodies read, write, or take the address of.
+    std::unordered_set<std::uint32_t> object_references;
 };
 
 // The stack a function uses itself: the most bytes below its caller's

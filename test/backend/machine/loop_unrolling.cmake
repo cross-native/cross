@@ -88,9 +88,10 @@ if(NOT unrolled_read MATCHES "andq[\t ]+[$]-2" OR
 endif()
 # The two cloned unsigned-add iterations must form one independent group and
 # update the loop-carried accumulator once.  The second update below belongs
-# to the scalar cleanup loop.  A left-deep recurrence has four updates in the
-# unrolled body and loses the memory-level parallelism exposed by cloning.
-string(REGEX MATCHALL "addq[\t ]+[^,\n]+,[\t ]*%rdx"
+# to the scalar cleanup loop, whose accumulator may be the result register.
+# A left-deep recurrence has four updates in the unrolled body and loses the
+# memory-level parallelism exposed by cloning.
+string(REGEX MATCHALL "addq[\t ]+[^,\n]+,[\t ]*%r[ad]x"
        add_recurrence_updates "${unrolled_add_read}")
 list(LENGTH add_recurrence_updates add_recurrence_update_count)
 if(NOT unrolled_add_read MATCHES "andq[\t ]+[$]-2" OR

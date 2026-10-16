@@ -928,6 +928,7 @@ bool discard_write_only_objects(ManagedModule& module,
             targets.contains(entity.link_symbol) ||
             module.object_definitions.contains(object.source.value) ||
             raw_module.object_definitions.contains(object.source.value) ||
+            raw_module.object_references.contains(object.source.value) ||
             volatile_storage(hir_module, entity.type);
     }
     // Each function's values that only store to an object: its direct

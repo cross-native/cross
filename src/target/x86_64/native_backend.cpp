@@ -87,6 +87,7 @@ enum class LoweringPass : std::uint16_t {
     PropagateCopiesLate,
     FuseCompareSelects,
     FuseCompareFloatSelects,
+    FoldFloatSelectConstants,
     FuseVectorSignSelects,
     FuseCompareBranches,
     HoistVectorComparisonSignMasks,
@@ -912,12 +913,63 @@ private:
         result.kind = machine::InstructionKind::Target;
         result.opcode = opcode;
         result.location = location;
-        // Symbol-address emission always materializes through RAX, including
-        // function/object addresses and nonlocal code labels. This scratch is
-        // independent of the virtual destination and the selected ABI result.
-        if (opcode == Opcode::GlobalAddress)
-            append_fixed_clobber(result, "rax", machine::i64);
         return result;
+    }
+
+    // Whether materializing the address of `symbol` takes a second register
+    // besides its destination: medium/large ELF PIC and COFF thread-local
+    // forms do.
+    bool symbol_address_scratch(const machine::SymbolOperand& symbol) const {
+        const auto format = subtarget_.object_format();
+        if (symbol.object && hir_.object(*symbol.object).is_thread_local) {
+            return format == ObjectFormat::Coff;
+        }
+        return options_.position_independent &&
+               format == ObjectFormat::Elf &&
+               (options_.code_model == CodeModel::Medium ||
+                options_.code_model == CodeModel::Large);
+    }
+
+    // A symbol address is formed in its own register, with R10/R11 as the
+    // address scratch where the code model needs one, and a home-resident
+    // result is staged through RAX.
+    void declare_symbol_address_scratch(machine::Instruction& instruction,
+                                        const machine::SymbolOperand& symbol) {
+        if (symbol_address_scratch(symbol)) {
+            append_fixed_clobber(instruction, "r10", machine::i64);
+            append_fixed_clobber(instruction, "r11", machine::i64);
+        }
+        declare_home_staging(instruction);
+    }
+
+    // A global access is RIP-relative, except that thread-local, PIC, and
+    // medium/large-model data address their symbol through R11, which
+    // itself may take R10 as its scratch.
+    void declare_symbol_access_scratch(machine::Instruction& instruction,
+                                       const machine::SymbolOperand& symbol) {
+        if ((symbol.object && hir_.object(*symbol.object).is_thread_local) ||
+            options_.position_independent ||
+            options_.code_model == CodeModel::Medium ||
+            options_.code_model == CodeModel::Large) {
+            append_fixed_clobber(instruction, "r11", machine::i64);
+            if (symbol_address_scratch(symbol)) {
+                append_fixed_clobber(instruction, "r10", machine::i64);
+            }
+        }
+    }
+
+    // An instruction that stages home-resident values through `scratch`
+    // declares the registers its boundary preserves, so that preservation
+    // planning saves them; allocation handles the staging itself.
+    void declare_home_staging(
+        machine::Instruction& instruction,
+        std::initializer_list<std::string_view> scratch = {"rax"}) {
+        for (const auto name : scratch) {
+            const auto* view = find_register_view(name);
+            if (view && !current_function_may_clobber(*view)) {
+                append_fixed_clobber(instruction, name, machine::i64);
+            }
+        }
     }
 
     // A selected expansion that writes a fixed register besides its own
@@ -1343,11 +1395,10 @@ private:
             instruction.operands.push_back(immediate_operand(
                 value.integer, value.integer_high, reg(value.id).mode));
             instruction.defs.push_back(reg(value.id));
-            // Scalar constants emit directly into their allocated color.  If
-            // pressure leaves any scalar unallocated, the allocator's final
-            // scratch audit withdraws every RAX/RCX color before emission.
-            // Only the two-register i128 path has an unconditional RAX
-            // scratch and must advertise it here.
+            // Scalar constants emit directly into their allocated color; one
+            // in a home may stage through RAX, which the allocator's scratch
+            // audit keeps clear of live values. Only the two-register i128
+            // path has an unconditional RAX scratch and must advertise it.
             if (reg(value.id).mode.bits > 64 || value.integer_high != 0) {
                 if (const auto* scratch = find_register_view("rax")) {
                     instruction.clobbers.push_back(
@@ -1395,6 +1446,9 @@ private:
                 instruction.operands.push_back(machine::SymbolOperand{
                     symbol, 0, true, std::nullopt, label->owner, label->id});
                 instruction.defs.push_back(reg(value.id));
+                declare_symbol_address_scratch(
+                    instruction, std::get<machine::SymbolOperand>(
+                                     instruction.operands.front()));
                 return instruction;
             }
             const auto found = std::find_if(
@@ -1427,6 +1481,9 @@ private:
                 machine::SymbolOperand{hir_.function(*value.callee).link_symbol,
                                        0, true, std::nullopt, value.callee});
             instruction.defs.push_back(reg(value.id));
+            declare_symbol_address_scratch(
+                instruction,
+                std::get<machine::SymbolOperand>(instruction.operands.front()));
             return instruction;
         }
         if (value.kind == ValueKind::GlobalAddress) {
@@ -1436,6 +1493,9 @@ private:
                 hir_.object(*value.object).link_symbol, 0, false,
                 value.object});
             instruction.defs.push_back(reg(value.id));
+            declare_symbol_address_scratch(
+                instruction,
+                std::get<machine::SymbolOperand>(instruction.operands.front()));
             return instruction;
         }
         if (value.kind == ValueKind::IndexedAddress) {
@@ -1454,15 +1514,17 @@ private:
             instruction.operands.push_back(
                 immediate_operand(scale, 0, machine::i64));
             instruction.defs.push_back(reg(value.id));
-            // emit_indexed_address materializes through these fixed scratch
-            // registers even when the virtual result has another color.
-            // A call result or loop-carried value may still be live in RAX.
-            append_fixed_clobber(instruction, "rax", machine::i64);
-            append_fixed_clobber(instruction, "rcx", machine::i64);
+            // An index whose scale LEA cannot encode is scaled in RCX, with
+            // a scale wider than 32 bits in RDX; home-resident operands and
+            // results are staged through RAX and RCX.
+            if (scale != 1 && scale != 2 && scale != 4 && scale != 8) {
+                append_fixed_clobber(instruction, "rcx", machine::i64);
+            }
             if (scale > static_cast<std::uint64_t>(
                             std::numeric_limits<std::int32_t>::max())) {
                 append_fixed_clobber(instruction, "rdx", machine::i64);
             }
+            declare_home_staging(instruction, {"rax", "rcx"});
             return instruction;
         }
         if (value.kind == ValueKind::DynamicStackSave) {
@@ -1601,13 +1663,19 @@ private:
             // Pointer-access expansion stages its address and some results
             // through fixed physical scratch. A live call result may occupy
             // any model-selected register, including those scratch locations.
+            // A scalar access stages only a home-resident address or result.
             if (instruction.opcode == Opcode::AggregatePointerLoad) {
                 append_fixed_clobber(instruction, "r10", machine::i64);
                 const auto bytes = value_size(hir_, value.type);
                 if (bytes % 16U != 0) append_fixed_clobber(instruction, "rax", machine::i64);
                 if (bytes >= 16U) append_fixed_clobber(instruction, "xmm0", machine::i128);
             } else {
-                append_fixed_clobber(instruction, "rax", machine::i64);
+                if (instruction.opcode == Opcode::VpointerLoad ||
+                    reg(value.id).mode.bits > 64) {
+                    append_fixed_clobber(instruction, "rax", machine::i64);
+                } else {
+                    declare_home_staging(instruction);
+                }
                 if (instruction.opcode == Opcode::PointerLoad && reg(value.id).mode.bits > 64) {
                     append_fixed_clobber(instruction, "rdx", machine::i64);
                     append_fixed_clobber(instruction, "rcx", machine::i64);
@@ -1634,6 +1702,12 @@ private:
             instruction.uses = {address, source};
             instruction.may_store = true;
             instruction.has_side_effects = true;
+            // A scalar store stages a home-resident address through RAX and
+            // a home-resident value through RCX.
+            if (instruction.opcode == Opcode::PointerStore ||
+                instruction.opcode == Opcode::FpointerStore) {
+                declare_home_staging(instruction, {"rax", "rcx"});
+            }
             return instruction;
         }
         if (value.kind == ValueKind::IndexedLoad) {
@@ -1658,6 +1732,11 @@ private:
             instruction.defs.push_back(reg(value.id));
             instruction.may_load = true;
             instruction.has_side_effects = value.is_volatile_access;
+            // A scale the addressing mode cannot encode is applied in RCX.
+            if (scale != 1 && scale != 2 && scale != 4 && scale != 8) {
+                append_fixed_clobber(instruction, "rcx", machine::i64);
+            }
+            declare_home_staging(instruction, {"rax", "rcx"});
             return instruction;
         }
         if (value.kind == ValueKind::GlobalLoad) {
@@ -1675,16 +1754,19 @@ private:
             instruction.defs.push_back(reg(value.id));
             instruction.may_load = true;
             instruction.has_side_effects = value.is_volatile_access;
-            // PIC, TLS, and absolute-data forms may materialize a symbol
-            // through R11, with R10 as a second address scratch.
-            append_fixed_clobber(instruction, "r10", machine::i64);
-            append_fixed_clobber(instruction, "r11", machine::i64);
-            // The global-access emitter stages scalar values through fixed
-            // scratch even when their result has a different allocation.
+            declare_symbol_access_scratch(
+                instruction,
+                std::get<machine::SymbolOperand>(instruction.operands.front()));
+            // A scalar value in a register is loaded there directly; the
+            // emitter stages a home-resident or 128-bit one through fixed
+            // scratch.
             if (instruction.opcode == Opcode::GlobalLoad) {
-                append_fixed_clobber(instruction, "rax", machine::i64);
-                if (reg(value.id).mode.bits > 64)
+                if (reg(value.id).mode.bits > 64) {
+                    append_fixed_clobber(instruction, "rax", machine::i64);
                     append_fixed_clobber(instruction, "rdx", machine::i64);
+                } else {
+                    declare_home_staging(instruction);
+                }
             } else if (instruction.opcode == Opcode::FglobalLoad && reg(value.id).mode.bits != 80) {
                 append_fixed_clobber(instruction, "xmm0", machine::i128);
             }
@@ -1711,12 +1793,16 @@ private:
             instruction.uses.push_back(source);
             instruction.may_store = true;
             instruction.has_side_effects = true;
-            append_fixed_clobber(instruction, "r10", machine::i64);
-            append_fixed_clobber(instruction, "r11", machine::i64);
+            declare_symbol_access_scratch(
+                instruction,
+                std::get<machine::SymbolOperand>(instruction.operands.front()));
             if (instruction.opcode == Opcode::GlobalStore) {
-                append_fixed_clobber(instruction, "rax", machine::i64);
-                if (source.mode.bits > 64)
+                if (source.mode.bits > 64) {
+                    append_fixed_clobber(instruction, "rax", machine::i64);
                     append_fixed_clobber(instruction, "rdx", machine::i64);
+                } else {
+                    declare_home_staging(instruction);
+                }
             } else if (instruction.opcode == Opcode::FglobalStore && source.mode.bits != 80) {
                 append_fixed_clobber(instruction, "xmm0", machine::i128);
             }
@@ -3546,6 +3632,19 @@ private:
                     instruction.operands.size() < 2) {
                     continue;
                 }
+                // 0 - x is NEG, which needs no register for the zero.
+                if (const auto zero = instruction.uses.front();
+                    instruction.opcode == Opcode::Sub &&
+                    zero.kind == machine::RegisterKind::Virtual &&
+                    zero.id < constants.size() && constants[zero.id] &&
+                    constants[zero.id]->value == 0 &&
+                    constants[zero.id]->high == 0 && zero.mode.bits <= 64) {
+                    instruction.opcode = Opcode::Neg;
+                    instruction.uses.erase(instruction.uses.begin());
+                    instruction.operands.erase(instruction.operands.begin());
+                    if (uses[zero.id] != 0) --uses[zero.id];
+                    continue;
+                }
                 if (immediate_commutative_opcode(instruction.opcode) &&
                     instruction.uses.front().kind ==
                         machine::RegisterKind::Virtual &&
@@ -4749,6 +4848,97 @@ private:
     // wide as the selected ones in its block forms its mask from that
     // comparison (CMPSS/CMPSD instead of COMISS and SETcc). The comparison
     // is duplicated into several selects only when it cannot trap.
+    // A select between two floating constants on a boolean takes them as
+    // immediates where select_instructions prefers selecting their bit
+    // patterns in a general register, so neither constant needs a register
+    // or a load.
+    void fold_float_select_constants() {
+        if (!options_.machine_combine) return;
+        const auto count = current_.virtual_registers.size();
+        std::vector<std::optional<machine::ImmediateOperand>> constants(count);
+        std::vector<unsigned> uses(count);
+        for (const auto& block : current_.blocks) {
+            for (const auto& instruction : block.instructions) {
+                if (instruction.opcode == Opcode::Fconstant &&
+                    instruction.defs.size() == 1 &&
+                    instruction.defs.front().kind ==
+                        machine::RegisterKind::Virtual &&
+                    instruction.operands.size() == 1) {
+                    if (const auto* immediate =
+                            std::get_if<machine::ImmediateOperand>(
+                                &instruction.operands.front())) {
+                        constants[instruction.defs.front().id] = *immediate;
+                    }
+                }
+                for (const auto& use : instruction.uses) {
+                    if (use.kind == machine::RegisterKind::Virtual &&
+                        use.id < count) {
+                        ++uses[use.id];
+                    }
+                }
+            }
+        }
+        const auto constant = [&](machine::Register value)
+            -> const machine::ImmediateOperand* {
+            return value.kind == machine::RegisterKind::Virtual &&
+                           value.id < count && constants[value.id]
+                ? &*constants[value.id] : nullptr;
+        };
+        bool folded = false;
+        for (auto& block : current_.blocks) {
+            for (auto& instruction : block.instructions) {
+                if (instruction.opcode != Opcode::Fselect ||
+                    !instruction.condition_predicate.empty() ||
+                    instruction.uses.size() != 3 ||
+                    instruction.defs.size() != 1) {
+                    continue;
+                }
+                // The f32 bit patterns are 32-bit immediates; f64 ones
+                // rarely fit a sign-extended one.
+                const auto* truth = constant(instruction.uses[1]);
+                const auto* falsity = constant(instruction.uses[2]);
+                if (instruction.defs.front().mode.bits != 32 || !truth ||
+                    !falsity) {
+                    continue;
+                }
+                const auto plan =
+                    select_instructions(subtarget_, {32, true, false, true});
+                if (std::find(plan.begin(), plan.end(),
+                              InstructionCostId{Instruction::Xorl}) ==
+                    plan.end()) {
+                    continue;
+                }
+                --uses[instruction.uses[1].id];
+                --uses[instruction.uses[2].id];
+                instruction.operands = {instruction.operands.front(), *truth,
+                                        *falsity};
+                instruction.uses.resize(1);
+                // RAX forms the result, which a home receives through XMM0.
+                std::erase_if(instruction.clobbers,
+                              [](const machine::Register& clobber) {
+                                  const auto* view = canonical_storage_view(
+                                      machine::PhysicalRegisterId{clobber.id});
+                                  return view && view->name != "rax" &&
+                                         view->name != "xmm0";
+                              });
+                folded = true;
+            }
+        }
+        if (!folded) return;
+        for (auto& block : current_.blocks) {
+            std::erase_if(
+                block.instructions,
+                [&](const machine::Instruction& instruction) {
+                    return instruction.opcode == Opcode::Fconstant &&
+                           instruction.defs.size() == 1 &&
+                           instruction.defs.front().kind ==
+                               machine::RegisterKind::Virtual &&
+                           instruction.defs.front().id < count &&
+                           uses[instruction.defs.front().id] == 0;
+                });
+        }
+    }
+
     void fuse_compare_float_selects() {
         if (!options_.compare_select_fusion) return;
         std::vector<unsigned> uses(current_.virtual_registers.size());
@@ -6443,6 +6633,15 @@ private:
                                    OpcodeProperty::Vector)))) {
                     vector_register_safe = true;
                 }
+                // A 128-bit comparison without AVX2 reads its operands where
+                // they are and computes in XMM0 or XMM1.
+                if (has_property(instruction.opcode,
+                                 OpcodeProperty::Comparison) &&
+                    has_property(instruction.opcode, OpcodeProperty::Vector) &&
+                    !instruction.uses.empty() &&
+                    instruction.uses.front().mode.bits == 128) {
+                    vector_register_safe = true;
+                }
                 if (has_property(instruction.opcode,
                                  OpcodeProperty::Reduction)) {
                     vector_register_safe = true;
@@ -6917,12 +7116,15 @@ private:
                      opcode == Opcode::Fphi ||
                      opcode == Opcode::FindexedLoad ||
                      opcode == Opcode::FindexedStore ||
+                     opcode == Opcode::FglobalLoad ||
+                     opcode == Opcode::FglobalStore ||
                      base == Opcode::Fadd || base == Opcode::Fsub ||
                      base == Opcode::Fmul || base == Opcode::Fdiv) &&
                     scalar_simd()) {
                     // Ordinary f32/f64 paths use SIMD and, when needed,
                     // RAX/RCX. R10/R11 are only implicit in the wide-float
-                    // and indirect-memory paths excluded here.
+                    // and indirect-memory paths excluded here; a global
+                    // access declares its address scratch.
                     return true;
                 }
                 if (opcode == Opcode::Vphi ||
@@ -6970,6 +7172,8 @@ private:
                     opcode == Opcode::LifetimeEnd ||
                     opcode == Opcode::Load || opcode == Opcode::Store ||
                     opcode == Opcode::IndexedLoad ||
+                    opcode == Opcode::GlobalLoad ||
+                    opcode == Opcode::GlobalStore ||
                     opcode == Opcode::LabelAddress ||
                     opcode == Opcode::StackAddress ||
                     opcode == Opcode::GlobalAddress ||
@@ -7300,8 +7504,8 @@ private:
                        std::any_of(instruction.defs.begin(),
                                    instruction.defs.end(), matches);
             };
-        // The narrow leaf proof below admits RAX/RCX as general colors only
-        // when every instruction passes this test.
+        // These expansions write RAX/RCX only to stage a home-resident
+        // operand or result.
         const auto leaf_scratch_free =
             [&](const machine::Instruction& instruction) {
                 if (has_operand_of_class(
@@ -7380,35 +7584,64 @@ private:
                     instruction.opcode == Opcode::Udivrem ||
                     instruction.opcode == Opcode::Mulhs ||
                     instruction.opcode == Opcode::Mulhu ||
-                    has_property(base, OpcodeProperty::Comparison) ||
+                    (has_property(base, OpcodeProperty::Comparison) &&
+                     !has_property(base, OpcodeProperty::Vector)) ||
                     instruction.opcode == Opcode::Vphi ||
                     instruction.opcode == Opcode::VsignMask ||
                     instruction.opcode == Opcode::Vsplat ||
-                    instruction.opcode == Opcode::Vadd ||
-                    instruction.opcode == Opcode::Vsub ||
-                    instruction.opcode == Opcode::Vxor ||
-                    instruction.opcode == Opcode::Vmul ||
-                    instruction.opcode == Opcode::VmulImm ||
-                    instruction.opcode == Opcode::Vsdiv ||
                     instruction.opcode == Opcode::VindexedLoad ||
                     instruction.opcode == Opcode::VindexedStore ||
                     instruction.opcode == Opcode::Vload ||
                     instruction.opcode == Opcode::Vstore ||
                     has_property(instruction.opcode,
-                                 OpcodeProperty::Reduction) ||
-                    instruction.opcode == Opcode::Vextract) {
+                                 OpcodeProperty::Reduction)) {
                     return true;
                 }
-                if (instruction.opcode == Opcode::Vxor) {
-                    return instruction.uses.size() == 2 &&
-                           instruction.uses[0] == instruction.uses[1];
+                const machine::ImmediateOperand* shape = nullptr;
+                for (auto operand = instruction.operands.rbegin();
+                     !shape && operand != instruction.operands.rend();
+                     ++operand) {
+                    shape = std::get_if<machine::ImmediateOperand>(&*operand);
                 }
+                // A 512-bit comparison forms its mask from RAX, and so does
+                // the sign bias of an unsigned one.
+                if (has_property(base, OpcodeProperty::Comparison) &&
+                    (instruction.uses.empty() ||
+                     instruction.uses.front().mode.bits > 256 ||
+                     base == Opcode::VcmpUlt || base == Opcode::VcmpUle ||
+                     base == Opcode::VcmpUgt || base == Opcode::VcmpUge)) {
+                    return false;
+                }
+                // An integer operation without a packed form is expanded lane
+                // by lane through RAX and RCX.
+                if (instruction.opcode == Opcode::Vadd ||
+                    instruction.opcode == Opcode::Vsub ||
+                    instruction.opcode == Opcode::Vxor ||
+                    instruction.opcode == Opcode::Vmul ||
+                    instruction.opcode == Opcode::VmulImm ||
+                    instruction.opcode == Opcode::Vsdiv ||
+                    has_property(base, OpcodeProperty::Comparison)) {
+                    return shape && ((shape->high & (1ULL << 32U)) != 0 ||
+                                     packed_integer_operation_supported(
+                                         subtarget_, instruction.opcode,
+                                         static_cast<unsigned>(shape->value),
+                                         128, false));
+                }
+                // A variable lane is read through RCX into RAX.
+                if (instruction.opcode == Opcode::Vextract) {
+                    return instruction.operands.size() >= 2 &&
+                           std::holds_alternative<machine::ImmediateOperand>(
+                               instruction.operands[1]);
+                }
+                // A nonzero integer splat is formed in RAX.
                 if (instruction.opcode == Opcode::VsplatConstant &&
-                    instruction.operands.size() >= 2) {
-                    const auto* shape =
+                    !instruction.operands.empty()) {
+                    const auto* constant =
                         std::get_if<machine::ImmediateOperand>(
-                            &instruction.operands.back());
-                    return shape && (shape->high & (1ULL << 32U)) == 0;
+                            &instruction.operands.front());
+                    return shape && (shape->high & (1ULL << 32U)) == 0 &&
+                           constant && constant->value == 0 &&
+                           constant->high == 0;
                 }
                 return false;
             };
@@ -7435,7 +7668,17 @@ private:
                        instruction.opcode == Opcode::Not ||
                        instruction.opcode == Opcode::Iszero ||
                        instruction.opcode == Opcode::StackAddress ||
-                       instruction.opcode == Opcode::LabelAddress;
+                       instruction.opcode == Opcode::LabelAddress ||
+                       instruction.opcode == Opcode::GlobalAddress ||
+                       instruction.opcode == Opcode::IndexedAddress ||
+                       instruction.opcode == Opcode::PointerLoad ||
+                       instruction.opcode == Opcode::PointerStore ||
+                       instruction.opcode == Opcode::FpointerLoad ||
+                       instruction.opcode == Opcode::FpointerStore ||
+                       instruction.opcode == Opcode::GlobalLoad ||
+                       instruction.opcode == Opcode::GlobalStore ||
+                       instruction.opcode == Opcode::FglobalLoad ||
+                       instruction.opcode == Opcode::FglobalStore;
             };
         std::vector<std::unordered_set<std::uint32_t>> forbidden(count);
         // Colors a crossed call clobbers. A value may still take one and be
@@ -8253,13 +8496,8 @@ private:
             {"xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8",
              "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14",
              "xmm15"}, true);
-        // RAX/RCX are ordinary volatile colors once all scalar integer
-        // operands are resident and the function contains none of the
-        // emitter paths that require them implicitly (calls, division,
-        // atomics, wide integers, variable legacy shifts, or indirect
-        // memory forms). This deliberately narrow leaf proof covers hot
-        // indexed kernels while preserving the conservative fallback for
-        // general code until every fixed-register use is explicit Machine IR.
+        // A function whose every instruction is in the leaf set uses RDX
+        // only for division, which reserves it per instruction.
         const bool integer_opcode_set_safe = std::all_of(
             current_.blocks.begin(), current_.blocks.end(),
             [&](const machine::Block& block) {
@@ -8272,11 +8510,16 @@ private:
             direct_result_view->register_class == RegisterClass::integer &&
             (direct_result_view->storage_name == "rax" ||
              direct_result_view->storage_name == "rcx");
-        const bool extra_integer_colors_safe =
+        // RDX is a general color here or where rdx_color_safe holds.
+        const bool rdx_leaf_safe =
             (selects_bmi2_shifts(subtarget_) ||
              dynamic_integer_endpoint_safe) &&
             integer_opcode_set_safe;
-        if (extra_integer_colors_safe) {
+        // RAX and RCX are ordinary volatile colors. An instruction that may
+        // write them implicitly keeps the values live across it, and its
+        // operands, out of both (above); one that writes them only to stage
+        // a home-resident value releases conflicting colors after coloring.
+        {
             const auto extra = collect_colors({"rax", "rcx"}, true);
             if (options_.optimize_for == OptimizationGoal::Size ||
                 options_.optimize_for == OptimizationGoal::MinimumSize) {
@@ -8510,8 +8753,8 @@ private:
                       return interference[left].size() >
                              interference[right].size();
                   });
-        for (const auto id : order) {
-            if (current_.virtual_register_assignments[id]) continue;
+        const auto color_value = [&](std::uint32_t id) {
+            if (current_.virtual_register_assignments[id]) return;
             const bool simd_class =
                 current_.virtual_register_classes[id] ==
                     machine::VirtualRegisterClass::Floating ||
@@ -8637,7 +8880,7 @@ private:
                     }
                     const auto* color_view =
                         canonical_storage_view(color);
-                    if (!rdx_color_safe && !extra_integer_colors_safe &&
+                    if (!rdx_color_safe && !rdx_leaf_safe &&
                         color_view &&
                         color_view->storage_name == "rdx") {
                         return false;
@@ -8691,7 +8934,7 @@ private:
                 }
             }
             if (!selected) selected = fallback;
-            if (!selected) continue;
+            if (!selected) return;
             current_.virtual_register_assignments[id] = *selected;
             const bool selected_may_propagate =
                 std::find(colors.begin(), colors.end(), *selected) !=
@@ -8705,7 +8948,7 @@ private:
                 // call/result endpoint is writable and remains eligible for
                 // the normal coalescing path even when it is not a general
                 // color.
-                continue;
+                return;
             }
             if (direct_return_endpoints[id]) {
                 // A return phi is the root of a copy/destructive-update
@@ -8826,6 +9069,174 @@ private:
                 }
                 current_.virtual_register_assignments[neighbor] = *selected;
             }
+        };
+        for (const auto id : order) color_value(id);
+
+        if (rax && rcx) {
+            // An instruction that stages a home-resident integer operand or
+            // result may write RAX and RCX, so a value in either register
+            // must not be live across it, nor be read or written by it.
+            // Phi copies stage only between two homes, a direct dynamic
+            // call loads home arguments straight into their endpoints, and
+            // a parameter captured from the stack or through a pointer
+            // always stages.
+            const auto in_home = [&](const machine::Register& reg) {
+                return reg.kind == machine::RegisterKind::Virtual &&
+                       reg.id < count &&
+                       current_.virtual_register_classes[reg.id] ==
+                           machine::VirtualRegisterClass::Integer &&
+                       !current_.virtual_register_assignments[reg.id];
+            };
+            const auto staged_capture =
+                [&](const machine::Instruction& instruction) {
+                    if (instruction.opcode != Opcode::Parameter ||
+                        instruction.operands.empty()) {
+                        return false;
+                    }
+                    const auto index = std::get<machine::ImmediateOperand>(
+                                           instruction.operands.front())
+                                           .value;
+                    return index >= incoming.scratch_free_capture.size() ||
+                           !incoming.scratch_free_capture[index];
+                };
+            const auto phi_sources = [](const machine::Instruction& phi) {
+                std::vector<machine::Register> result;
+                for (std::size_t index = 1; index < phi.operands.size();
+                     index += 2) {
+                    if (const auto* source =
+                            std::get_if<machine::RegisterOperand>(
+                                &phi.operands[index])) {
+                        result.push_back(source->value);
+                    }
+                }
+                return result;
+            };
+            // Calls `conflict` for every value whose RAX or RCX color a
+            // staging instruction would overwrite; `conflict` may withdraw
+            // the color, which the rest of the scan then sees as a home.
+            const auto scan_conflicts = [&](const auto& conflict) {
+                const auto check = [&](std::uint32_t id) {
+                    if (id >= count) return;
+                    const auto& assignment =
+                        current_.virtual_register_assignments[id];
+                    if (assignment && (assignment->value == rax->storage_id ||
+                                       assignment->value == rcx->storage_id)) {
+                        conflict(id);
+                    }
+                };
+                const auto check_register = [&](const machine::Register& reg) {
+                    if (reg.kind == machine::RegisterKind::Virtual) {
+                        check(reg.id);
+                    }
+                };
+                for (const auto& block : current_.blocks) {
+                    const bool staged_copy = std::any_of(
+                        block.instructions.begin(), block.instructions.end(),
+                        [&](const machine::Instruction& instruction) {
+                            if (instruction.opcode != Opcode::Phi ||
+                                instruction.defs.empty() ||
+                                !in_home(instruction.defs.front())) {
+                                return false;
+                            }
+                            const auto sources = phi_sources(instruction);
+                            return std::any_of(sources.begin(), sources.end(),
+                                               in_home);
+                        });
+                    if (staged_copy) {
+                        for (const auto id : live_in[block.id.value]) {
+                            check(id);
+                        }
+                        for (const auto& instruction : block.instructions) {
+                            if (!is_phi(instruction)) continue;
+                            for (const auto& reg : instruction.defs) {
+                                check_register(reg);
+                            }
+                            for (const auto& reg : phi_sources(instruction)) {
+                                check_register(reg);
+                            }
+                        }
+                    }
+                    auto live = live_out[block.id.value];
+                    for (auto item = block.instructions.rbegin();
+                         item != block.instructions.rend(); ++item) {
+                        const bool phi = is_phi(*item);
+                        for (const auto& definition : item->defs) {
+                            if (definition.kind ==
+                                machine::RegisterKind::Virtual) {
+                                live.erase(definition.id);
+                            }
+                        }
+                        // An indexed store stages a stored value in R10.
+                        const auto staged_uses_end =
+                            item->opcode == Opcode::IndexedStore &&
+                                    item->uses.size() == 3
+                                ? item->uses.begin() + 2
+                                : item->uses.end();
+                        if (!phi &&
+                            item->kind != machine::InstructionKind::Call &&
+                            scratch_only_for_homes(*item) &&
+                            (std::any_of(item->uses.begin(), staged_uses_end,
+                                         in_home) ||
+                             std::any_of(item->defs.begin(), item->defs.end(),
+                                         in_home) ||
+                             staged_capture(*item))) {
+                            for (const auto id : live) check(id);
+                            for (const auto& reg : item->uses) {
+                                check_register(reg);
+                            }
+                            for (const auto& reg : item->defs) {
+                                check_register(reg);
+                            }
+                        }
+                        if (phi) continue;
+                        for (const auto& use : item->uses) {
+                            if (use.kind == machine::RegisterKind::Virtual) {
+                                live.insert(use.id);
+                            }
+                        }
+                    }
+                }
+            };
+            const auto forbid_scratch = [&](std::uint32_t id) {
+                forbidden[id].insert(rax->storage_id);
+                forbidden[id].insert(rcx->storage_id);
+            };
+            // Recolor from the start with the conflicting values kept out of
+            // RAX and RCX, so that the other colors go to the values that
+            // weigh most; a few rounds suffice in practice.
+            for (unsigned round = 0; round < 4; ++round) {
+                bool conflicts = false;
+                scan_conflicts([&](std::uint32_t id) {
+                    // Its copy partners follow it, so that they can still
+                    // share one color.
+                    forbid_scratch(id);
+                    for (const auto partner : affinity[id]) {
+                        forbid_scratch(partner);
+                    }
+                    for (const auto partner : backedge_affinity[id]) {
+                        forbid_scratch(partner);
+                    }
+                    conflicts = true;
+                });
+                if (!conflicts) break;
+                for (auto& assignment :
+                     current_.virtual_register_assignments) {
+                    assignment.reset();
+                }
+                for (const auto id : order) color_value(id);
+            }
+            // Then withdraw any conflict that remains; a withdrawn value
+            // takes another color or its home, which can stage in turn.
+            std::vector<std::uint32_t> displaced;
+            do {
+                displaced.clear();
+                scan_conflicts([&](std::uint32_t id) {
+                    current_.virtual_register_assignments[id].reset();
+                    forbid_scratch(id);
+                    displaced.push_back(id);
+                });
+                for (const auto id : displaced) color_value(id);
+            } while (!displaced.empty());
         }
 
         // The audited leaf path assumes every SIMD operand is resident. If
@@ -8861,34 +9272,6 @@ private:
                 }
             }
         }
-        {
-            // Fixed call/result endpoint affinity can assign RAX/RCX even
-            // when the opcode-set audit did not admit them as general colors.
-            // Any scalar fallback home, including that of a value never
-            // eligible for a register, still needs those emitter scratches;
-            // audit all assignments, not only the extra-color path.
-            bool unassigned_integer = false;
-            for (std::uint32_t id = 0; id < count; ++id) {
-                if (current_.virtual_register_classes[id] ==
-                        machine::VirtualRegisterClass::Integer &&
-                    !current_.rematerialized_immediates[id] &&
-                    !current_.virtual_register_assignments[id]) {
-                    unassigned_integer = true;
-                    break;
-                }
-            }
-            if (unassigned_integer) {
-                for (auto& assignment :
-                     current_.virtual_register_assignments) {
-                    if (!assignment) continue;
-                    if ((rax && assignment->value == rax->storage_id) ||
-                        (rcx && assignment->value == rcx->storage_id)) {
-                        assignment.reset();
-                    }
-                }
-            }
-        }
-
         // Color fallback homes independently from physical registers.  A
         // value allocated to a register may still need its home at a call, so
         // all SSA values participate; finalize_frame later elides colors whose
@@ -9677,6 +10060,9 @@ private:
         add(LoweringPass::FuseCompareFloatSelects,
             Stage::InstructionCombining, "fuse-compare-float-selects",
             &MachineLowerer::fuse_compare_float_selects);
+        add(LoweringPass::FoldFloatSelectConstants,
+            Stage::InstructionCombining, "fold-float-select-constants",
+            &MachineLowerer::fold_float_select_constants);
         add(LoweringPass::FuseVectorSignSelects,
             Stage::InstructionCombining, "fuse-vector-sign-selects",
             &MachineLowerer::fuse_vector_sign_selects);
@@ -9764,6 +10150,58 @@ bool safe_assembly_text(std::string_view text) {
 
 char suffix(unsigned bits) {
     return bits <= 8 ? 'b' : bits <= 16 ? 'w' : bits <= 32 ? 'l' : 'q';
+}
+
+// The VEX spelling of a 128-bit SSE instruction, with the same effect on
+// the low 128 bits: an instruction that writes its whole destination keeps
+// its operands, and one that merges into its destination names it twice.
+std::optional<std::pair<std::string, std::string>> vex_spelling(
+    std::string_view opcode, std::string_view operands) {
+    static const std::unordered_set<std::string_view> whole{
+        "movd", "movq", "movaps", "movapd", "movups", "movupd", "movdqa",
+        "movdqu", "comiss", "comisd", "ucomiss", "ucomisd", "cvttss2si",
+        "cvttss2sil", "cvttss2siq", "cvttsd2si", "cvttsd2sil", "cvttsd2siq",
+        "cvtss2si", "cvtss2sil", "cvtss2siq", "cvtsd2si", "cvtsd2sil",
+        "cvtsd2siq", "cvtdq2ps", "cvtps2dq", "cvttps2dq", "cvtdq2pd",
+        "cvtps2pd", "cvtpd2ps", "sqrtps", "sqrtpd", "pshufd", "pshuflw",
+        "pshufhw", "movmskps", "movmskpd", "pmovmskb", "ptest", "pextrb",
+        "pextrw", "pextrd", "pextrq", "extractps", "movddup", "movshdup",
+        "movsldup", "roundps", "roundpd"};
+    static const std::unordered_set<std::string_view> merging{
+        "xorps", "xorpd", "andps", "andpd", "andnps", "andnpd", "orps",
+        "orpd", "pxor", "pand", "pandn", "por", "addss", "addsd", "subss",
+        "subsd", "mulss", "mulsd", "divss", "divsd", "minss", "minsd",
+        "maxss", "maxsd", "sqrtss", "sqrtsd", "addps", "addpd", "subps",
+        "subpd", "mulps", "mulpd", "divps", "divpd", "minps", "minpd",
+        "maxps", "maxpd", "cvtss2sd", "cvtsd2ss", "cvtsi2ss", "cvtsi2ssl",
+        "cvtsi2ssq", "cvtsi2sd", "cvtsi2sdl", "cvtsi2sdq", "unpcklps",
+        "unpcklpd", "unpckhps", "unpckhpd", "shufps", "shufpd", "punpcklbw",
+        "punpcklwd", "punpckldq", "punpcklqdq", "punpckhbw", "punpckhwd",
+        "punpckhdq", "punpckhqdq", "packsswb", "packssdw", "packuswb",
+        "packusdw", "paddb", "paddw", "paddd", "paddq", "psubb", "psubw",
+        "psubd", "psubq", "pmullw", "pmulld", "pmuludq", "pcmpeqb",
+        "pcmpeqw", "pcmpeqd", "pcmpeqq", "pcmpgtb", "pcmpgtw", "pcmpgtd",
+        "pcmpgtq", "psllw", "pslld", "psllq", "psrlw", "psrld", "psrlq",
+        "psraw", "psrad", "pslldq", "psrldq", "pshufb", "insertps", "pinsrb",
+        "pinsrw", "pinsrd", "pinsrq", "blendps", "blendpd", "pblendw",
+        "blendvps", "blendvpd", "pblendvb", "roundss", "roundsd"};
+    if (operands.find("%xmm") == std::string_view::npos) return std::nullopt;
+    const bool memory = operands.find('(') != std::string_view::npos;
+    const bool scalar_move = opcode == "movss" || opcode == "movsd";
+    const bool comparison = opcode.size() >= 5 && opcode.starts_with("cmp") &&
+                            (opcode.ends_with("ss") || opcode.ends_with("sd") ||
+                             opcode.ends_with("ps") || opcode.ends_with("pd"));
+    if (whole.contains(opcode) || (scalar_move && memory)) {
+        return std::pair{"v" + std::string(opcode), std::string(operands)};
+    }
+    const auto last = operands.rfind(", ");
+    if ((merging.contains(opcode) || scalar_move || comparison) &&
+        last != std::string_view::npos) {
+        return std::pair{"v" + std::string(opcode),
+                         std::string(operands) + ", " +
+                             std::string(operands.substr(last + 2))};
+    }
+    return std::nullopt;
 }
 
 unsigned masked_test_bits(unsigned source_bits,
@@ -11780,6 +12218,15 @@ private:
                                    "' does not have");
         }
         if (debug_) debug_->row(output_, pending_location_, pending_site_);
+        // While a function's 256- or 512-bit registers are live, a legacy SSE
+        // instruction merges with their upper halves (and on some cores
+        // stalls), so such a function spells its SSE instructions with VEX.
+        if (uses_wide_vectors_ && subtarget_.has_feature(Feature::Avx)) {
+            if (const auto vex = vex_spelling(opcode, operands)) {
+                output_ << '\t' << vex->first << '\t' << vex->second << '\n';
+                return;
+            }
+        }
         output_ << '\t' << opcode;
         if (!operands.empty()) output_ << '\t' << operands;
         output_ << '\n';
@@ -12952,30 +13399,49 @@ private:
                 }
                 continue;
             }
+            // The destructive compare runs in XMM0 or XMM1 (where a home
+            // operand was loaded), so an operand in its register survives.
+            auto first = swap && !equal ? right_register : left_register;
+            auto second = swap && !equal ? left_register : right_register;
             if (unsigned_compare && !equal) {
                 emit_vector_compare_sign_bias(width, shape.element_bits);
+                if (left_register != "xmm0") {
+                    instruction("movdqa", "%" + left_register + ", %xmm0");
+                }
                 instruction("pxor", "%xmm2, %xmm0");
+                if (right_register != "xmm1") {
+                    instruction("movdqa", "%" + right_register + ", %xmm1");
+                }
                 instruction("pxor", "%xmm2, %xmm1");
+                first = swap ? "xmm1" : "xmm0";
+                second = swap ? "xmm0" : "xmm1";
+            }
+            auto accumulator = first;
+            if (!test_none &&
+                vector_is_assigned(function, value.defs.front(), width) &&
+                vector_register(value.defs.front(), 2, width) != second) {
+                accumulator = vector_register(value.defs.front(), 2, width);
+            } else if (first != "xmm0" && first != "xmm1") {
+                accumulator = second == "xmm0" ? "xmm1" : "xmm0";
+            }
+            if (accumulator != first) {
+                instruction("movdqa", "%" + first + ", %" + accumulator);
             }
             const auto compare = std::string(equal ? "pcmpeq" : "pcmpgt") +
                                  packed_lane_suffix(shape.element_bits);
-            if (swap && !equal) {
-                instruction(compare, "%xmm0, %xmm1");
-                instruction("movdqa", "%xmm1, %xmm0");
-            } else {
-                instruction(compare, "%xmm1, %xmm0");
-            }
+            instruction(compare, "%" + second + ", %" + accumulator);
             if (invert && !test_all) {
                 instruction("pcmpeqd", "%xmm2, %xmm2");
-                instruction("pxor", "%xmm2, %xmm0");
+                instruction("pxor", "%xmm2, %" + accumulator);
             }
             if (test_none) {
                 const auto tested = test_all
                     ? vector_register(value.uses[2], 2, width)
-                    : std::string("xmm0");
-                instruction("vptest", "%" + tested + ", %xmm0");
+                    : accumulator;
+                instruction("vptest", "%" + tested + ", %" + accumulator);
             } else {
-                store_vector(function, value.defs.front(), 0, chunk, width);
+                store_vector_from(function, value.defs.front(), accumulator,
+                                  chunk, width);
             }
         }
     }
@@ -13135,13 +13601,20 @@ private:
             if (constant) {
                 materialize_constant(destination);
             } else {
-                load(function, source, "rax");
+                std::string integer_register = "rax";
+                if (const auto* assigned =
+                        assigned_integer_register(function, source)) {
+                    integer_register = assigned->storage_name;
+                } else {
+                    load(function, source, integer_register);
+                }
                 const auto move = subtarget_.has_feature(Feature::Avx)
                     ? (shape.element_bits == 64 ? "vmovq" : "vmovd")
                     : (shape.element_bits == 64 ? "movq" : "movd");
                 instruction(move,
                             register_name(
-                                "rax", shape.element_bits == 64 ? 64 : 32) +
+                                integer_register,
+                                shape.element_bits == 64 ? 64 : 32) +
                                 ", %" + destination);
             }
             if (shape.element_bits == 8) {
@@ -14498,37 +14971,59 @@ private:
                             std::string(opcode_name(value.opcode)) + "'");
                     return;
                 }
+                // The mask goes to the result's register, never over an
+                // operand that stays live.
+                const auto destination = vector_register(
+                    value.defs.front(), 2, width);
                 if (width == 512 && swap) {
                     instruction(std::string("vcmp") + suffix,
                                 "$" + std::to_string(predicate) + ", %" +
                                     left_register + ", %" + right_register +
                                     ", %k1");
                     materialize_avx512_mask(shape.element_bits);
+                    result_register = "zmm0";
                 } else if (width == 512) {
                     instruction(std::string("vcmp") + suffix,
                                 "$" + std::to_string(predicate) + ", %" +
                                     right_register + ", %" + left_register +
                                     ", %k1");
                     materialize_avx512_mask(shape.element_bits);
+                    result_register = "zmm0";
                 } else if (vex && swap) {
                     instruction(std::string("vcmp") + suffix,
                                 "$" + std::to_string(predicate) + ", %" +
                                     left_register + ", %" + right_register +
-                                    ", %" + left_register);
+                                    ", %" + destination);
+                    result_register = destination;
                 } else if (vex) {
                     instruction(std::string("vcmp") + suffix,
                                 "$" + std::to_string(predicate) + ", %" +
                                     right_register + ", %" + left_register +
-                                    ", %" + left_register);
-                } else if (swap) {
-                    instruction(std::string("cmp") + suffix,
-                                "$" + std::to_string(predicate) +
-                                    ", %xmm0, %xmm1");
-                    instruction("movdqa", "%xmm1, %xmm0");
+                                    ", %" + destination);
+                    result_register = destination;
                 } else {
+                    // The destructive compare runs in XMM0 or XMM1, so an
+                    // operand in its register survives.
+                    const auto first = swap ? right_register : left_register;
+                    const auto second = swap ? left_register : right_register;
+                    auto accumulator = first;
+                    if (vector_is_assigned(function, value.defs.front(),
+                                           width) &&
+                        vector_register(value.defs.front(), 2, width) !=
+                            second) {
+                        accumulator =
+                            vector_register(value.defs.front(), 2, width);
+                    } else if (first != "xmm0" && first != "xmm1") {
+                        accumulator = second == "xmm0" ? "xmm1" : "xmm0";
+                    }
+                    if (accumulator != first) {
+                        instruction("movaps",
+                                    "%" + first + ", %" + accumulator);
+                    }
                     instruction(std::string("cmp") + suffix,
-                                "$" + std::to_string(predicate) +
-                                    ", %xmm1, %xmm0");
+                                "$" + std::to_string(predicate) + ", %" +
+                                    second + ", %" + accumulator);
+                    result_register = accumulator;
                 }
             }
             store_vector_from(function, value.defs.front(),
@@ -17644,8 +18139,12 @@ private:
                              const machine::Instruction& value) {
         const auto& source =
             std::get<machine::SymbolOperand>(value.operands.front());
-        materialize_symbol_address(source, "rax");
-        store(function, value.defs.front(), "rax");
+        const auto* assigned =
+            assigned_integer_register(function, value.defs.front());
+        const auto destination = assigned
+            ? std::string(assigned->storage_name) : std::string("rax");
+        materialize_symbol_address(source, destination);
+        store(function, value.defs.front(), destination);
     }
 
     void emit_indexed_address(const machine::Function& function,
@@ -19680,18 +20179,26 @@ private:
     void emit_float_select(const machine::Function& function,
                            const machine::Instruction& value) {
         const bool fused = !value.condition_predicate.empty();
+        // Two constants folded into immediates leave the boolean as the
+        // only use.
+        const bool constant_operands = !fused && value.uses.size() == 1 &&
+                                       value.operands.size() == 3;
         if (value.defs.size() != 1 ||
-            value.uses.size() != (fused ? 4U : 3U)) {
+            value.uses.size() != (fused ? 4U : constant_operands ? 1U : 3U)) {
             diagnostics_.error(value.location,
                                "malformed x86 floating select instruction");
             return;
         }
         const auto target = value.defs.front();
-        const auto truth = value.uses[value.uses.size() - 2];
-        const auto falsity = value.uses.back();
         const unsigned bits = target.mode.bits;
-        if ((bits != 32 && bits != 64) || truth.mode.bits != bits ||
-            falsity.mode.bits != bits) {
+        // The selected values; for folded constants these name the boolean
+        // and are not read.
+        const auto falsity = value.uses.back();
+        const auto truth =
+            value.uses[value.uses.size() - (constant_operands ? 1U : 2U)];
+        if ((bits != 32 && bits != 64) ||
+            (!constant_operands &&
+             (truth.mode.bits != bits || falsity.mode.bits != bits))) {
             diagnostics_.error(value.location,
                                "x86 floating select requires equal f32 or "
                                "f64 operands");
@@ -19746,18 +20253,50 @@ private:
                             "%" + rhs + ", %xmm0");
             }
         } else {
+            // The boolean, negated, is the mask in RAX.
             const auto condition = value.uses.front();
-            load(function, condition, "rax");
-            if (condition.mode.bits == 8) {
-                instruction("movzbl", "%al, %eax");
-            } else if (condition.mode.bits == 16) {
-                instruction("movzwl", "%ax, %eax");
+            if (condition.mode.bits == 8 || condition.mode.bits == 16) {
+                const auto* assigned =
+                    assigned_integer_register(function, condition);
+                instruction(condition.mode.bits == 8 ? "movzbl" : "movzwl",
+                            (assigned
+                                 ? register_name(assigned->storage_name,
+                                                 condition.mode.bits)
+                                 : memory(vreg_offset(function, condition))) +
+                                ", %eax");
+            } else {
+                load(function, condition, "rax");
             }
-            instruction(bits == 32 ? "negl" : "negq",
-                        bits == 32 ? "%eax" : "%rax");
-            instruction(std::string(avx ? "v" : "") +
-                            (bits == 32 ? "movd" : "movq"),
-                        bits == 32 ? "%eax, %xmm0" : "%rax, %xmm0");
+            const std::string accumulator = bits == 32 ? "%eax" : "%rax";
+            instruction(bits == 32 ? "negl" : "negq", accumulator);
+            const auto move =
+                std::string(avx ? "v" : "") + (bits == 32 ? "movd" : "movq");
+            if (constant_operands) {
+                // F ^ (mask & (T ^ F)) in EAX, then into the destination.
+                const auto truth_bits = static_cast<std::uint32_t>(
+                    std::get<machine::ImmediateOperand>(value.operands[1])
+                        .value);
+                const auto falsity_bits = static_cast<std::uint32_t>(
+                    std::get<machine::ImmediateOperand>(value.operands[2])
+                        .value);
+                const auto difference = truth_bits ^ falsity_bits;
+                if (difference != std::numeric_limits<std::uint32_t>::max()) {
+                    instruction("andl", "$" + std::to_string(difference) +
+                                            ", %eax");
+                }
+                if (falsity_bits != 0) {
+                    instruction("xorl", "$" + std::to_string(falsity_bits) +
+                                            ", %eax");
+                }
+                const auto* assigned_target =
+                    assigned_simd_register(function, target);
+                const auto destination = assigned_target
+                    ? std::string(assigned_target->name) : std::string("xmm0");
+                instruction(move, accumulator + ", %" + destination);
+                store_float(function, target, destination);
+                return;
+            }
+            instruction(move, accumulator + ", %xmm0");
         }
 
         const auto* assigned_target = assigned_simd_register(function, target);
@@ -22932,6 +23471,126 @@ private:
         reload_call_live_registers(function, value);
     }
 
+    // The scalar phi copies of the edge from `predecessor` to `successor`,
+    // as (source, phi) pairs.
+    std::vector<std::pair<machine::Register, const machine::Instruction*>>
+    scalar_edge_copies(const machine::Function& function,
+                       machine::BlockId predecessor,
+                       machine::BlockId successor) const {
+        std::vector<std::pair<machine::Register, const machine::Instruction*>>
+            result;
+        for (const auto& value : block(function, successor).instructions) {
+            if (value.kind != machine::InstructionKind::Target ||
+                (value.opcode != Opcode::Phi && value.opcode != Opcode::Fphi &&
+                 value.opcode != Opcode::Vphi)) {
+                continue;
+            }
+            for (std::size_t index = 0;
+                 index + 1 < value.operands.size(); index += 2) {
+                if (std::get<machine::BlockOperand>(value.operands[index])
+                        .target != predecessor) {
+                    continue;
+                }
+                result.emplace_back(std::get<machine::RegisterOperand>(
+                                        value.operands[index + 1]).value,
+                                    &value);
+                break;
+            }
+        }
+        return result;
+    }
+
+    // A phi copy that both edges of a conditional branch perform runs once
+    // before the branch, when no other copy of either edge reads its
+    // destination, the branch operands are in registers other than that
+    // destination, and one side of the copy is a register. The edges then
+    // skip it.
+    void hoist_shared_edge_copies(const machine::Function& function,
+                                  machine::BlockId predecessor,
+                                  const machine::Instruction& branch,
+                                  machine::BlockId truth,
+                                  machine::BlockId falsity) {
+        if (truth == falsity ||
+            branch.condition_predicate == Opcode::VcmpNone ||
+            branch.condition_predicate == Opcode::VtestNone) {
+            return;
+        }
+        const auto& location = *copy_locations_;
+        const auto in_register = [&](machine::Register reg) {
+            return assigned_integer_register(function, reg) ||
+                   assigned_simd_register(function, reg);
+        };
+        if (!std::all_of(branch.uses.begin(), branch.uses.end(),
+                         in_register)) {
+            return;
+        }
+        const auto truth_copies =
+            scalar_edge_copies(function, predecessor, truth);
+        const auto falsity_copies =
+            scalar_edge_copies(function, predecessor, falsity);
+        const auto reads = [&](const auto& copies, const CopyLocation& target,
+                               const machine::Instruction* phi) {
+            return std::any_of(
+                copies.begin(), copies.end(), [&](const auto& copy) {
+                    return copy.second != phi &&
+                           location(copy.first) == target;
+                });
+        };
+        for (const auto& [source, phi] : truth_copies) {
+            const auto target = phi->defs.front();
+            const bool scalar =
+                (phi->opcode == Opcode::Phi ||
+                 (phi->opcode == Opcode::Fphi &&
+                  (target.mode.bits == 32 || target.mode.bits == 64))) &&
+                target.mode.bits <= 64;
+            if (!scalar || location(source) == location(target) ||
+                (!in_register(source) && !in_register(target))) {
+                continue;
+            }
+            const auto shared = std::find_if(
+                falsity_copies.begin(), falsity_copies.end(),
+                [&](const auto& copy) {
+                    return copy.second->opcode == phi->opcode &&
+                           copy.second->defs.front().mode == target.mode &&
+                           location(copy.first) == location(source) &&
+                           location(copy.second->defs.front()) ==
+                               location(target);
+                });
+            if (shared == falsity_copies.end() ||
+                reads(truth_copies, location(target), phi) ||
+                reads(falsity_copies, location(target), shared->second) ||
+                std::any_of(branch.uses.begin(), branch.uses.end(),
+                            [&](machine::Register use) {
+                                return location(use) == location(target);
+                            })) {
+                continue;
+            }
+            if (phi->opcode == Opcode::Fphi) {
+                const auto* from = assigned_simd_register(function, source);
+                const auto* to = assigned_simd_register(function, target);
+                if (from && to) {
+                    instruction("mov" + float_suffix(target),
+                                "%" + std::string(from->name) + ", %" +
+                                    std::string(to->name));
+                } else if (from) {
+                    store_float(function, target, from->name);
+                } else {
+                    load_float(function, source, to->name);
+                }
+            } else if (const auto* from =
+                           assigned_integer_register(function, source)) {
+                store(function, target, from->storage_name);
+            } else {
+                load(function, source,
+                     assigned_integer_register(function, target)
+                         ->storage_name);
+            }
+            hoisted_edge_copies_.insert({predecessor.value, target.id});
+            hoisted_edge_copies_.insert(
+                {predecessor.value, shared->second->defs.front().id});
+        }
+    }
+
     bool edge_requires_copies(const machine::Function& function,
                               machine::BlockId predecessor,
                               machine::BlockId successor) const {
@@ -22953,7 +23612,9 @@ private:
                         value.operands[index + 1]).value;
                 if (source != value.defs.front() &&
                     !same_physical_assignment(
-                        function, source, value.defs.front())) {
+                        function, source, value.defs.front()) &&
+                    !hoisted_edge_copies_.contains(
+                        {predecessor.value, value.defs.front().id})) {
                     return true;
                 }
                 break;
@@ -22990,7 +23651,9 @@ private:
                     std::get<machine::RegisterOperand>(
                         value.operands[index + 1]).value;
                 if (source == value.defs.front() ||
-                    location_key(source) == location_key(value.defs.front())) {
+                    location_key(source) == location_key(value.defs.front()) ||
+                    hoisted_edge_copies_.contains(
+                        {predecessor.value, value.defs.front().id})) {
                     break;
                 }
                 copies.push_back({source, value.defs.front(),
@@ -23060,7 +23723,7 @@ private:
                     register_name(target->storage_name, 64) + ", %xmm2");
             } else {
                 instruction(
-                    "movq",
+                    copy.target.mode.bits > 32 ? "movq" : "movd",
                     memory(vreg_offset(function, copy.target)) + ", %xmm2");
             }
         };
@@ -23162,20 +23825,33 @@ private:
                                                   copy.target.mode.bits));
                     return;
                 }
-                load(function, copy.source, "rax");
-                store(function, copy.target, "rax");
+                // Only a copy between two homes stages through RAX.
+                if (source) {
+                    store(function, copy.target, source->storage_name);
+                } else if (target) {
+                    load(function, copy.source, target->storage_name);
+                } else {
+                    load(function, copy.source, "rax");
+                    store(function, copy.target, "rax");
+                }
             } else {
+                // A home receives exactly its width; an 8- or 16-bit home
+                // stages through RAX, which the cycle point chosen below
+                // keeps to a copy between two homes.
                 if (const auto* target =
                         assigned_integer_register(function, copy.target)) {
                     instruction(
                         "movq",
                         "%xmm2, " +
                             register_name(target->storage_name, 64));
-                } else {
+                } else if (copy.target.mode.bits > 16) {
                     instruction(
-                        "movq",
+                        copy.target.mode.bits > 32 ? "movq" : "movd",
                         "%xmm2, " +
                             memory(vreg_offset(function, copy.target)));
+                } else {
+                    instruction("movd", "%xmm2, %eax");
+                    store(function, copy.target, "rax");
                 }
             }
         };
@@ -23248,6 +23924,27 @@ private:
             // Every remaining destination is also a source: break one cycle
             // with a class-specific scratch register, or the single wide
             // frame temporary when the value cannot fit a scalar scratch.
+            // The restore lands in the target of the copy that reads the
+            // saved location; RAX is free for a narrow home there only when
+            // the whole cycle lives in homes, so prefer another point.
+            const auto narrow_home = [&](const Copy& copy) {
+                return !copy.floating && !copy.vector &&
+                       copy.target.mode.bits <= 16 &&
+                       !assigned_integer_register(function, copy.target);
+            };
+            for (auto& candidate : copies) {
+                const auto saved_key = location_key(candidate.target, false);
+                const auto reader = std::find_if(
+                    copies.begin(), copies.end(), [&](const Copy& copy) {
+                        return location_key(copy.source,
+                                            copy.source_temporary) ==
+                               saved_key;
+                    });
+                if (reader != copies.end() && !narrow_home(*reader)) {
+                    std::swap(copies.front(), candidate);
+                    break;
+                }
+            }
             const auto preserved = location_key(copies.front().target, false);
             // The location still holds the value another copy in this set
             // reads, and that consumer, not the copy about to overwrite it,
@@ -23866,6 +24563,10 @@ private:
             const auto* speculative_advance =
                 advance_found == speculative_vector_advances_.end()
                     ? nullptr : &advance_found->second;
+            if (!speculative_advance) {
+                hoist_shared_edge_copies(function, owner.id, value, truth,
+                                         falsity);
+            }
             std::string truth_code = "ne";
             std::string falsity_code = "e";
             if (value.condition_predicate == Opcode::VcmpNone) {
@@ -25140,6 +25841,7 @@ private:
         copy_locations_.emplace(function);
         edge_temporaries_ = edge_offsets(function);
         deferred_edge_stubs_.clear();
+        hoisted_edge_copies_.clear();
         for (std::size_t index = 0; index < function.layout.size(); ++index) {
             const auto next = index + 1 < function.layout.size()
                 ? std::optional<machine::BlockId>(function.layout[index + 1])
@@ -25286,6 +25988,9 @@ private:
     std::vector<const machine::Block*> blocks_by_id_;
     std::optional<CopyLocations> copy_locations_;
     std::vector<std::int32_t> edge_temporaries_;
+    // Phi copies already run before their predecessor's branch, by
+    // (predecessor block, phi result).
+    std::set<std::pair<std::uint32_t, std::uint32_t>> hoisted_edge_copies_;
     std::unordered_map<const machine::Instruction*,
                        const machine::Instruction*> fused_adds_;
     std::unordered_set<const machine::Instruction*>

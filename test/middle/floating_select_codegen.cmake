@@ -47,7 +47,18 @@ foreach(march x86-64 x86-64-v2 x86-64-v3)
     foreach(function distance wrap64 pick_ne pick_sign)
         expect(x86-${march} ${function} "${x86_branch}" FALSE)
     endforeach()
+    # Two constants on an integer condition: 0.75 is 0x3f400000 and -0.5 is
+    # 0xbf000000, selected in EAX with no mask, blend, or constant load.
+    compile(x86-${march}-O3 -O3 ${x86} -march=${march})
+    expect(x86-${march}-O3 offset "${x86_branch}" FALSE)
+    expect(x86-${march}-O3 offset "\tandl\t[$]2151677952, %eax" TRUE)
+    expect(x86-${march}-O3 offset "\txorl\t[$]3204448256, %eax" TRUE)
+    expect(x86-${march}-O3 offset "blendv|andnps|movss\t[.]L" FALSE)
 endforeach()
+# Without machine combining the constants are loaded and blended.
+compile(x86-no-combine -O3 ${x86} -march=x86-64-v3 -fno-machine-combine)
+expect(x86-no-combine offset "\tvblendvps\t" TRUE)
+expect(x86-no-combine offset "\tandl\t[$]2151677952, %eax" FALSE)
 compile(x86-sse2 -O2 ${x86} -march=x86-64)
 expect(x86-sse2 distance "\tcmpltss\t" TRUE)
 expect(x86-sse2 distance "\tandnps\t" TRUE)

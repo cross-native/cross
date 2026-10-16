@@ -574,6 +574,8 @@ struct SelectCostQuery {
     unsigned bits{};
     bool floating{};
     bool floating_comparison{};
+    // Both selected values are constants the target can encode directly.
+    bool constant_operands{};
 };
 
 // A packed operation that target-independent vectorization creates on

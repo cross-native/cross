@@ -15,8 +15,10 @@ namespace cross::x86_64 {
 // f64 a mask blend, VBLENDVPS/PD with AVX or BLENDVPS/PD with SSE4.1 where
 // cheaper than ANDPS, ANDNPS, and ORPS. A comparison of the selected type
 // forms the mask with CMPSS/CMPSD in place of the COMISS a branch needs; a
-// boolean becomes the mask through NEG and MOVD. The emitter selects the
-// blend form this returns.
+// boolean becomes the mask through NEG and MOVD. Between two constants a
+// boolean selects their bit patterns in a general register instead,
+// F ^ (-c & (T ^ F)), where that costs no more than the blend, which also
+// loads both constants. The emitter selects the form this returns.
 inline std::vector<InstructionCostId> select_instructions(
     const Subtarget& subtarget, const SelectCostQuery& query) {
     using I = Instruction;
@@ -53,6 +55,11 @@ inline std::vector<InstructionCostId> select_instructions(
     List result;
     if (!query.floating_comparison) result = {single ? I::Negl : I::Negq, I::Movd};
     result.insert(result.end(), chosen.begin(), chosen.end());
+    if (query.constant_operands && !query.floating_comparison) {
+        const List integer{single ? I::Negl : I::Negq, I::Andl, I::Xorl,
+                           I::Movd};
+        if (usable(integer) && cost(integer) <= cost(result)) return integer;
+    }
     return result;
 }
 

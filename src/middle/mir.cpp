@@ -13678,6 +13678,11 @@ struct ReductionLoopPattern {
     std::vector<AffineLoopValue> affine_values;
     std::vector<VectorLoopStore> stores;
     std::vector<ValueId> load_bases;
+    // A conditional update, select(condition, reduction op term,
+    // reduction), with the arms exchanged when update_on_false, which
+    // combines the term only where it is selected.
+    std::optional<ValueId> condition;
+    bool update_on_false{};
 };
 
 std::optional<ValueId> phi_value_from(const ManagedValue& phi,
@@ -16342,6 +16347,16 @@ bool scalar_vector_element(const hir::Module& hir_module,
            value.builtin == BuiltinType::F64;
 }
 
+// Integer and floating elements of one width share the lanes of a packed
+// loop, as a floating comparison selects integer lanes.
+bool vector_lane_compatible(const hir::Module& hir_module, hir::TypeId left,
+                            hir::TypeId right) {
+    return vector_element_compatible(hir_module, left, right) ||
+           (scalar_vector_element(hir_module, left) &&
+            scalar_vector_element(hir_module, right) &&
+            type_bits(hir_module, left) == type_bits(hir_module, right));
+}
+
 std::optional<ReductionLoopPattern> find_reduction_loop(
     const ManagedFunction& function, const hir::Module& hir_module,
     const CanonicalLoop& loop) {
@@ -16466,6 +16481,8 @@ std::optional<ReductionLoopPattern> find_reduction_loop(
         ValueId term;
         ValueId next;
         BinaryOperation operation;
+        std::optional<ValueId> condition;
+        bool update_on_false{};
     };
     std::optional<ReductionCandidate> reduction;
     std::vector<AffineLoopValue> affine_values;
@@ -16480,7 +16497,29 @@ std::optional<ReductionLoopPattern> find_reduction_loop(
         const auto initial = phi_value_from(phi, loop.preheader);
         const auto carried = phi_value_from(phi, backedge_id);
         if (!initial || !carried || *carried == id) continue;
-        const auto& update = function.values[carried->value];
+        // An integer update selected against the unchanged phi applies
+        // only where its condition picks it; its arm has no other use.
+        std::optional<ValueId> update_condition;
+        bool update_on_false = false;
+        auto updated = *carried;
+        if (const auto& select = function.values[carried->value];
+            select.kind == ValueKind::Select && select.operands.size() == 3 &&
+            integer_type(hir_module, phi.type) &&
+            (select.operands[1] == id) != (select.operands[2] == id)) {
+            update_on_false = select.operands[1] == id;
+            update_condition = select.operands[0];
+            updated = select.operands[update_on_false ? 2 : 1];
+            std::size_t arm_uses = 0;
+            for (const auto& value : function.values) {
+                arm_uses += static_cast<std::size_t>(std::count(
+                    value.operands.begin(), value.operands.end(), updated));
+                for (const auto& incoming : value.incoming) {
+                    arm_uses += incoming.value == updated ? 1U : 0U;
+                }
+            }
+            if (arm_uses != 1 || !loop_values.contains(updated.value)) continue;
+        }
+        const auto& update = function.values[updated.value];
         const bool associative_integer =
             integer_type(hir_module, phi.type) &&
             (update.binary == BinaryOperation::Add ||
@@ -16502,7 +16541,7 @@ std::optional<ReductionLoopPattern> find_reduction_loop(
         // induction, not a second reduction. Keeping that distinction lets
         // map/reduce loops form packed lane values without changing the
         // source iteration order or dropping recurrence updates.
-        if (update.binary == BinaryOperation::Add &&
+        if (!update_condition && update.binary == BinaryOperation::Add &&
             integer_type(hir_module, phi.type) && loop_invariant(*term)) {
             affine_values.push_back(
                 {id, *initial, *carried, *term});
@@ -16510,7 +16549,8 @@ std::optional<ReductionLoopPattern> find_reduction_loop(
         }
         if (reduction) return std::nullopt;
         reduction = ReductionCandidate{
-            id, *initial, *term, *carried, update.binary};
+            id, *initial, *term, *carried, update.binary, update_condition,
+            update_on_false};
     }
     if (!reduction) return std::nullopt;
 
@@ -16519,7 +16559,8 @@ std::optional<ReductionLoopPattern> find_reduction_loop(
         condition.operands[1], reduction->phi, reduction->initial,
         reduction->term, *index_next, reduction->next,
         reduction->operation,
-        std::move(affine_values), {}, {}};
+        std::move(affine_values), {}, {}, reduction->condition,
+        reduction->update_on_false};
 
     for (const auto& affine : result.affine_values) {
         if (!vector_element_compatible(
@@ -16602,12 +16643,106 @@ unsigned preferred_vector_bits(const Subtarget& subtarget,
     return result;
 }
 
+bool loop_invariant_value(const ReductionLoopPattern& pattern,
+                          const std::vector<std::optional<BlockId>>& definitions,
+                          const ManagedFunction& function, ValueId id) {
+    return !definitions[id.value] ||
+           !pattern.loop.blocks.contains(definitions[id.value]->value) ||
+           function.values[id.value].kind == ValueKind::ConstantInteger;
+}
+
+// Whether COMPARISON of the index with a loop invariant may compare lanes
+// as wide as the reduction's elements instead: the index counts up from
+// zero to a constant bound such a lane holds, so clamping the invariant to
+// the bound keeps equality and unsigned order.
+bool narrowable_index_comparison(
+    const ManagedFunction& function, const hir::Module& hir_module,
+    const ReductionLoopPattern& pattern,
+    const std::vector<std::optional<BlockId>>& definitions,
+    const ManagedValue& comparison) {
+    const auto index_type = function.values[pattern.index.value].type;
+    const auto element_bits = type_bits(
+        hir_module, function.values[pattern.reduction.value].type);
+    if (comparison.kind != ValueKind::Binary ||
+        comparison.operands.size() != 2 ||
+        type_bits(hir_module, index_type) <= element_bits ||
+        (comparison.binary != BinaryOperation::Equal &&
+         comparison.binary != BinaryOperation::NotEqual &&
+         comparison.binary != BinaryOperation::UnsignedLess &&
+         comparison.binary != BinaryOperation::UnsignedLessEqual &&
+         comparison.binary != BinaryOperation::UnsignedGreater &&
+         comparison.binary != BinaryOperation::UnsignedGreaterEqual)) {
+        return false;
+    }
+    const bool index_left = comparison.operands[0] == pattern.index;
+    const auto other = comparison.operands[index_left ? 1 : 0];
+    if (!index_left && comparison.operands[1] != pattern.index) return false;
+    const auto bound = folded_integer_constant(function, hir_module,
+                                               pattern.bound);
+    return function.values[other.value].type == index_type &&
+           loop_invariant_value(pattern, definitions, function, other) &&
+           bound && bound->high == 0 && element_bits < 64 &&
+           bound->low < (std::uint64_t{1} << element_bits);
+}
+
 bool vectorizable_reduction_term(
     const ManagedFunction& function, const hir::Module& hir_module,
     const ReductionLoopPattern& pattern,
     const std::vector<std::optional<BlockId>>& definitions,
     ValueId id, std::unordered_set<std::uint32_t>& required,
-    unsigned& arithmetic_operations) {
+    unsigned& arithmetic_operations,
+    std::unordered_set<std::uint32_t>& narrowed);
+
+// Whether the boolean ID vectorizes into a lane mask: a comparison of
+// lane-compatible values, a narrowable comparison of the index, or the and,
+// or, or exclusive or of such masks.
+bool vectorizable_reduction_mask(
+    const ManagedFunction& function, const hir::Module& hir_module,
+    const ReductionLoopPattern& pattern,
+    const std::vector<std::optional<BlockId>>& definitions,
+    ValueId id, std::unordered_set<std::uint32_t>& required,
+    unsigned& arithmetic_operations,
+    std::unordered_set<std::uint32_t>& narrowed) {
+    const auto& value = function.values[id.value];
+    if (loop_invariant_value(pattern, definitions, function, id) ||
+        value.kind != ValueKind::Binary || value.operands.size() != 2) {
+        return false;
+    }
+    if (!required.insert(id.value).second) return true;
+    ++arithmetic_operations;
+    if (value.binary == BinaryOperation::BitAnd ||
+        value.binary == BinaryOperation::BitOr ||
+        value.binary == BinaryOperation::BitXor) {
+        return vectorizable_reduction_mask(
+                   function, hir_module, pattern, definitions,
+                   value.operands[0], required, arithmetic_operations,
+                   narrowed) &&
+               vectorizable_reduction_mask(
+                   function, hir_module, pattern, definitions,
+                   value.operands[1], required, arithmetic_operations,
+                   narrowed);
+    }
+    if (!comparison(value.binary)) return false;
+    if (narrowable_index_comparison(function, hir_module, pattern,
+                                    definitions, value)) {
+        narrowed.insert(id.value);
+        return true;
+    }
+    return vectorizable_reduction_term(
+               function, hir_module, pattern, definitions, value.operands[0],
+               required, arithmetic_operations, narrowed) &&
+           vectorizable_reduction_term(
+               function, hir_module, pattern, definitions, value.operands[1],
+               required, arithmetic_operations, narrowed);
+}
+
+bool vectorizable_reduction_term(
+    const ManagedFunction& function, const hir::Module& hir_module,
+    const ReductionLoopPattern& pattern,
+    const std::vector<std::optional<BlockId>>& definitions,
+    ValueId id, std::unordered_set<std::uint32_t>& required,
+    unsigned& arithmetic_operations,
+    std::unordered_set<std::uint32_t>& narrowed) {
     if (!required.insert(id.value).second) return true;
     if (id == pattern.reduction) return false;
     if (id == pattern.index ||
@@ -16622,12 +16757,12 @@ bool vectorizable_reduction_term(
     }
     if (!definitions[id.value] ||
         !pattern.loop.blocks.contains(definitions[id.value]->value)) {
-        return vector_element_compatible(
+        return vector_lane_compatible(
             hir_module, function.values[id.value].type,
             function.values[pattern.reduction.value].type);
     }
     const auto& value = function.values[id.value];
-    if (!vector_element_compatible(
+    if (!vector_lane_compatible(
             hir_module, value.type,
             function.values[pattern.reduction.value].type)) {
         return false;
@@ -16641,7 +16776,7 @@ bool vectorizable_reduction_term(
         value.operands.size() == 1) {
         return vectorizable_reduction_term(
             function, hir_module, pattern, definitions,
-            value.operands.front(), required, arithmetic_operations);
+            value.operands.front(), required, arithmetic_operations, narrowed);
     }
     if (value.kind == ValueKind::PointerLoad &&
         !value.is_volatile_access && value.operands.size() == 1) {
@@ -16669,7 +16804,7 @@ bool vectorizable_reduction_term(
     if (value.kind == ValueKind::Unary && value.operands.size() == 1) {
         return vectorizable_reduction_term(
             function, hir_module, pattern, definitions,
-            value.operands.front(), required, arithmetic_operations);
+            value.operands.front(), required, arithmetic_operations, narrowed);
     }
     if (value.kind == ValueKind::Cast && value.operands.size() == 1 &&
         (value.cast == CastOperation::Reinterpret ||
@@ -16678,34 +16813,21 @@ bool vectorizable_reduction_term(
          value.cast == CastOperation::SignExtend)) {
         return vectorizable_reduction_term(
             function, hir_module, pattern, definitions,
-            value.operands.front(), required, arithmetic_operations);
+            value.operands.front(), required, arithmetic_operations, narrowed);
     }
     if (value.kind == ValueKind::Select && value.operands.size() == 3) {
-        const auto condition_id = value.operands[0];
-        const auto& condition = function.values[condition_id.value];
-        if (condition.kind != ValueKind::Binary ||
-            !comparison(condition.binary) ||
-            condition.operands.size() != 2) {
-            return false;
-        }
-        required.insert(condition_id.value);
-        ++arithmetic_operations;
-        return vectorizable_reduction_term(
+        return vectorizable_reduction_mask(
                    function, hir_module, pattern, definitions,
-                   condition.operands[0], required,
-                   arithmetic_operations) &&
-               vectorizable_reduction_term(
-                   function, hir_module, pattern, definitions,
-                   condition.operands[1], required,
-                   arithmetic_operations) &&
+                   value.operands[0], required, arithmetic_operations,
+                   narrowed) &&
                vectorizable_reduction_term(
                    function, hir_module, pattern, definitions,
                    value.operands[1], required,
-                   arithmetic_operations) &&
+                   arithmetic_operations, narrowed) &&
                vectorizable_reduction_term(
                    function, hir_module, pattern, definitions,
                    value.operands[2], required,
-                   arithmetic_operations);
+                   arithmetic_operations, narrowed);
     }
     if (value.kind != ValueKind::Binary || value.operands.size() != 2) {
         return false;
@@ -16725,10 +16847,10 @@ bool vectorizable_reduction_term(
     ++arithmetic_operations;
     return vectorizable_reduction_term(
                function, hir_module, pattern, definitions,
-               value.operands[0], required, arithmetic_operations) &&
+               value.operands[0], required, arithmetic_operations, narrowed) &&
            vectorizable_reduction_term(
                function, hir_module, pattern, definitions,
-               value.operands[1], required, arithmetic_operations);
+               value.operands[1], required, arithmetic_operations, narrowed);
 }
 
 // The longest packed form, in target instructions, of the operations a
@@ -16740,6 +16862,7 @@ std::optional<std::size_t> packed_operation_length(
     const ReductionLoopPattern& pattern,
     const std::vector<std::optional<BlockId>>& definitions,
     const std::unordered_set<std::uint32_t>& required,
+    const std::unordered_set<std::uint32_t>& narrowed,
     unsigned vector_bits, const Subtarget& subtarget) {
     std::size_t longest = 1;
     bool lanewise = false;
@@ -16773,9 +16896,11 @@ std::optional<std::size_t> packed_operation_length(
             return std::nullopt;
         }
     };
+    const auto reduction_type = function.values[pattern.reduction.value].type;
     if (const auto operation = binary_operation(pattern.reduction_operation)) {
-        query(*operation, function.values[pattern.reduction.value].type);
+        query(*operation, reduction_type);
     }
+    if (pattern.condition) query(CostedVectorOperation::Select, reduction_type);
     for (const auto raw : required) {
         if (!definitions[raw] ||
             !pattern.loop.blocks.contains(definitions[raw]->value)) {
@@ -16798,8 +16923,15 @@ std::optional<std::size_t> packed_operation_length(
                    value.operands.size() == 2) {
             const auto operation = binary_operation(value.binary);
             if (!operation) continue;
+            // A narrowed comparison, and a mask combining comparisons,
+            // work on lanes of the reduction's width.
             const auto& amount = function.values[value.operands[1].value];
-            query(*operation, function.values[value.operands[0].value].type,
+            const bool lane_mask = narrowed.contains(raw) ||
+                function.values[value.operands[0].value].type ==
+                    *hir_module.builtin(BuiltinType::Bool);
+            query(*operation,
+                  lane_mask ? reduction_type
+                            : function.values[value.operands[0].value].type,
                   amount.kind == ValueKind::ConstantInteger);
         }
     }
@@ -16812,6 +16944,7 @@ bool vectorize_reduction_loop(
     const ReductionLoopPattern& pattern,
     const std::vector<std::optional<BlockId>>& definitions,
     const std::unordered_set<std::uint32_t>& required,
+    const std::unordered_set<std::uint32_t>& narrowed,
     unsigned vector_bits,
     std::size_t packed_length,
     const CompilerOptions& options) {
@@ -16844,7 +16977,11 @@ bool vectorize_reduction_loop(
         select_depths.emplace(id.value, result);
         return result;
     };
-    const auto conditional_depth = select_depth(pattern.term);
+    // A conditional update selects once more, after its condition.
+    const auto conditional_depth = pattern.condition
+        ? std::max(select_depth(pattern.term),
+                   select_depth(*pattern.condition)) + 1U
+        : select_depth(pattern.term);
     // Independent accumulators hide packed-add latency and let targets issue
     // several loads per cycle. The model-defined vector-interleave budget can
     // permit four streams for store loops too. A packed operation that the
@@ -17150,6 +17287,39 @@ bool vectorize_reduction_loop(
     index_lane_step_splat.operands = {lanes_constant};
     const auto index_lane_step = append_value(
         preheader_values, std::move(index_lane_step_splat));
+    // Narrowed comparisons of the index read lanes of the reduction's width,
+    // which count from zero like the index.
+    const auto narrow_type = *hir_module.builtin(
+        element_bits == 8 ? BuiltinType::U8
+        : element_bits == 16 ? BuiltinType::U16
+        : element_bits == 32 ? BuiltinType::U32 : BuiltinType::U64);
+    std::optional<ValueId> narrow_lane_offsets;
+    std::optional<ValueId> narrow_lane_step;
+    if (!narrowed.empty()) {
+        ManagedValue offsets;
+        offsets.location = vector_header.location;
+        offsets.type = vector_type_for(narrow_type);
+        offsets.kind = ValueKind::Splat;
+        offsets.operands = {add_integer_constant(narrow_type, 0)};
+        narrow_lane_offsets =
+            append_value(preheader_values, std::move(offsets));
+        for (unsigned lane = 1; lane < lanes; ++lane) {
+            ManagedValue insert;
+            insert.location = vector_header.location;
+            insert.type = vector_type_for(narrow_type);
+            insert.kind = ValueKind::InsertElement;
+            insert.operands = {*narrow_lane_offsets, lane_constants[lane],
+                               add_integer_constant(narrow_type, lane)};
+            narrow_lane_offsets =
+                append_value(preheader_values, std::move(insert));
+        }
+        ManagedValue step;
+        step.location = vector_header.location;
+        step.type = vector_type_for(narrow_type);
+        step.kind = ValueKind::Splat;
+        step.operands = {add_integer_constant(narrow_type, lanes)};
+        narrow_lane_step = append_value(preheader_values, std::move(step));
+    }
 
     ValueId vector_identity{};
     if (reassociate) {
@@ -17306,6 +17476,17 @@ bool vectorize_reduction_loop(
         {vector_body_id, ValueId{}}};
     const auto vector_lane_index = append_value(
         vector_header.values, std::move(vector_lane_index_phi));
+    std::optional<ValueId> narrow_lane_index;
+    if (narrow_lane_offsets) {
+        ManagedValue phi;
+        phi.location = vector_header.location;
+        phi.type = vector_type_for(narrow_type);
+        phi.kind = ValueKind::Phi;
+        phi.incoming = {{vector_entry_id, *narrow_lane_offsets},
+                        {vector_body_id, ValueId{}}};
+        narrow_lane_index =
+            append_value(vector_header.values, std::move(phi));
+    }
     std::vector<ValueId> carriers;
     carriers.reserve(interleave);
     for (unsigned group = 0; group < interleave; ++group) {
@@ -17365,6 +17546,46 @@ bool vectorize_reduction_loop(
     std::unordered_map<std::uint32_t, ValueId> comparison_zeroes;
     ValueId active_vector_index = vector_index;
     ValueId active_lane_index = vector_lane_index;
+    std::optional<ValueId> active_narrow_lane_index = narrow_lane_index;
+    std::unordered_map<std::uint32_t, ValueId> narrow_invariants;
+    // An invariant compared with the index, clamped to the constant bound
+    // and narrowed to a lane.
+    const auto narrow_invariant = [&](ValueId original) {
+        if (const auto found = narrow_invariants.find(original.value);
+            found != narrow_invariants.end()) {
+            return found->second;
+        }
+        ManagedValue below;
+        below.location = vector_header.location;
+        below.type = bool_type;
+        below.kind = ValueKind::Binary;
+        below.binary = BinaryOperation::UnsignedLess;
+        below.operands = {original, bound};
+        const auto below_id = append_value(preheader_values, std::move(below));
+        ManagedValue minimum;
+        minimum.location = vector_header.location;
+        minimum.type = function.values[original.value].type;
+        minimum.kind = ValueKind::Select;
+        minimum.operands = {below_id, original, bound};
+        const auto clamped =
+            append_value(preheader_values, std::move(minimum));
+        ManagedValue narrow;
+        narrow.location = vector_header.location;
+        narrow.type = narrow_type;
+        narrow.kind = ValueKind::Cast;
+        narrow.cast = CastOperation::Truncate;
+        narrow.operands = {clamped};
+        const auto narrow_id =
+            append_value(preheader_values, std::move(narrow));
+        ManagedValue splat;
+        splat.location = vector_header.location;
+        splat.type = vector_type_for(narrow_type);
+        splat.kind = ValueKind::Splat;
+        splat.operands = {narrow_id};
+        const auto result = append_value(preheader_values, std::move(splat));
+        narrow_invariants.emplace(original.value, result);
+        return result;
+    };
     // Rebuild an access's address index, the loop index or its extension.
     // The vector indices do not wrap, so an extension of the vector index
     // plus the group's offset in address width equals the extended group
@@ -17542,11 +17763,20 @@ bool vectorize_reduction_loop(
                 return std::nullopt;
             }
         };
+        // A narrowed comparison compares the narrow lane index with the
+        // clamped invariant.
+        const bool narrow = narrowed.contains(id.value);
+        const auto operand_vector = [&](std::size_t position) {
+            if (!narrow) return vectorize_value(source.operands[position]);
+            return source.operands[position] == pattern.index
+                ? *active_narrow_lane_index
+                : narrow_invariant(source.operands[position]);
+        };
         if (source.kind == ValueKind::Binary &&
             source.operands.size() == 2) {
             const auto signed_operation = signed_ordering(source.binary);
-            const auto element_type =
-                function.values[source.operands.front().value].type;
+            const auto element_type = narrow ? narrow_type
+                : function.values[source.operands.front().value].type;
             const auto bits = type_bits(hir_module, element_type);
             const auto mask_element = bits == 8
                 ? hir_module.builtin(BuiltinType::I8)
@@ -17562,7 +17792,7 @@ bool vectorize_reduction_loop(
             // that canonical form so targets can consume the sign bit
             // directly in a select without materializing a compare mask.
             std::optional<BinaryOperation> boundary_operation;
-            if (integer_type(hir_module, element_type) &&
+            if (!narrow && integer_type(hir_module, element_type) &&
                 bits >= 8 && bits <= 64) {
                 const auto& right =
                     function.values[source.operands[1].value];
@@ -17606,19 +17836,19 @@ bool vectorize_reduction_loop(
             if (signed_operation && integer_type(hir_module, element_type) &&
                 bits >= 8 && bits <= 64) {
                 const auto bias = comparison_bias(element_type);
-                const auto append_biased = [&](ValueId operand) {
+                const auto append_biased = [&](std::size_t position) {
                     ManagedValue biased;
                     biased.location = source.location;
                     biased.inline_site = source.inline_site;
                     biased.type = vector_type_for(element_type);
                     biased.kind = ValueKind::Binary;
                     biased.binary = BinaryOperation::BitXor;
-                    biased.operands = {vectorize_value(operand), bias};
+                    biased.operands = {operand_vector(position), bias};
                     return append_value(
                         vector_body.values, std::move(biased));
                 };
-                const auto left = append_biased(source.operands[0]);
-                const auto right = append_biased(source.operands[1]);
+                const auto left = append_biased(0);
+                const auto right = append_biased(1);
                 ManagedValue compare;
                 compare.location = source.location;
                 compare.inline_site = source.inline_site;
@@ -17638,7 +17868,7 @@ bool vectorize_reduction_loop(
         transformed.type = vector_type_for(source.type);
         if (source.kind == ValueKind::Binary &&
             comparison(source.binary) && !source.operands.empty()) {
-            const auto bits = type_bits(
+            const auto bits = narrow ? element_bits : type_bits(
                 hir_module,
                 function.values[source.operands.front().value].type);
             const auto mask_element = bits == 8
@@ -17654,8 +17884,16 @@ bool vectorize_reduction_loop(
         transformed.unary = source.unary;
         transformed.binary = source.binary;
         transformed.cast = source.cast;
-        for (const auto operand : source.operands) {
-            transformed.operands.push_back(vectorize_value(operand));
+        for (std::size_t position = 0; position < source.operands.size();
+             ++position) {
+            transformed.operands.push_back(operand_vector(position));
+        }
+        // Booleans combine as the lane masks of their comparisons.
+        if (source.kind == ValueKind::Binary &&
+            source.type == *hir_module.builtin(BuiltinType::Bool) &&
+            !comparison(source.binary) && !transformed.operands.empty()) {
+            transformed.type =
+                function.values[transformed.operands.front().value].type;
         }
         const auto result =
             append_value(vector_body.values, std::move(transformed));
@@ -17699,6 +17937,18 @@ bool vectorize_reduction_loop(
                 active_lane_index, index_lane_step};
             active_lane_index = append_value(
                 vector_body.values, std::move(group_lane_index));
+            if (active_narrow_lane_index) {
+                ManagedValue narrow_lanes;
+                narrow_lanes.location =
+                    function.values[pattern.index_next.value].location;
+                narrow_lanes.type = vector_type_for(narrow_type);
+                narrow_lanes.kind = ValueKind::Binary;
+                narrow_lanes.binary = BinaryOperation::Add;
+                narrow_lanes.operands = {*active_narrow_lane_index,
+                                         *narrow_lane_step};
+                active_narrow_lane_index = append_value(
+                    vector_body.values, std::move(narrow_lanes));
+            }
         }
         vector_values.clear();
 
@@ -17723,14 +17973,49 @@ bool vectorize_reduction_loop(
             active_affine_values.emplace(
                 affine.source.phi.value, active);
         }
-        const auto vector_term = vectorize_value(pattern.term);
+        auto vector_term = vectorize_value(pattern.term);
+        auto update_operation = pattern.reduction_operation;
+        if (pattern.condition) {
+            const auto lane_mask = vectorize_value(*pattern.condition);
+            const auto& step = function.values[pattern.term.value];
+            if (!pattern.update_on_false &&
+                update_operation == BinaryOperation::Add &&
+                step.kind == ValueKind::ConstantInteger &&
+                step.integer == 1 && step.integer_high == 0) {
+                // A selected lane's mask is all ones, -1, so a count
+                // subtracts the mask.
+                ManagedValue lanes_selected;
+                lanes_selected.location =
+                    function.values[pattern.reduction_next.value].location;
+                lanes_selected.type = vector_type;
+                lanes_selected.kind = ValueKind::Cast;
+                lanes_selected.cast = CastOperation::Reinterpret;
+                lanes_selected.operands = {lane_mask};
+                vector_term = append_value(vector_body.values,
+                                           std::move(lanes_selected));
+                update_operation = BinaryOperation::Subtract;
+            } else {
+                // Where the update is not selected, combine the identity.
+                ManagedValue selected;
+                selected.location =
+                    function.values[pattern.reduction_next.value].location;
+                selected.type = vector_type;
+                selected.kind = ValueKind::Select;
+                selected.operands = {
+                    lane_mask,
+                    pattern.update_on_false ? vector_identity : vector_term,
+                    pattern.update_on_false ? vector_term : vector_identity};
+                vector_term =
+                    append_value(vector_body.values, std::move(selected));
+            }
+        }
         if (reassociate) {
             ManagedValue update;
             update.location =
                 function.values[pattern.reduction_next.value].location;
             update.type = vector_type;
             update.kind = ValueKind::Binary;
-            update.binary = pattern.reduction_operation;
+            update.binary = update_operation;
             update.operands = {carriers[group], vector_term};
             carrier_next.push_back(
                 append_value(vector_body.values, std::move(update)));
@@ -17818,6 +18103,16 @@ bool vectorize_reduction_loop(
         vector_body.values, std::move(vector_lane_index_next));
     function.values[vector_lane_index.value].incoming[1].value =
         vector_lane_index_next_id;
+    if (narrow_lane_index) {
+        ManagedValue next;
+        next.location = function.values[pattern.index_next.value].location;
+        next.type = vector_type_for(narrow_type);
+        next.kind = ValueKind::Binary;
+        next.binary = BinaryOperation::Add;
+        next.operands = {*active_narrow_lane_index, *narrow_lane_step};
+        function.values[narrow_lane_index->value].incoming[1].value =
+            append_value(vector_body.values, std::move(next));
+    }
     for (unsigned group = 0; group < interleave; ++group) {
         function.values[carriers[group].value].incoming[1].value =
             carrier_next[group];
@@ -18359,16 +18654,22 @@ void vectorize_reduction_loops(ManagedFunction& function,
         const bool floating = floating_type(hir_module, scalar_type);
         unsigned arithmetic_operations{};
         std::unordered_set<std::uint32_t> required;
+        std::unordered_set<std::uint32_t> narrowed;
         bool term_vectorizable = vectorizable_reduction_term(
                 function, hir_module, *pattern, definitions,
-                pattern->term, required, arithmetic_operations);
+                pattern->term, required, arithmetic_operations, narrowed) &&
+            (!pattern->condition ||
+             vectorizable_reduction_mask(
+                 function, hir_module, *pattern, definitions,
+                 *pattern->condition, required, arithmetic_operations,
+                 narrowed));
         for (const auto& store : pattern->stores) {
             required.insert(store.store.value);
             required.insert(store.address.value);
             term_vectorizable = term_vectorizable &&
                 vectorizable_reduction_term(
                     function, hir_module, *pattern, definitions,
-                    store.value, required, arithmetic_operations);
+                    store.value, required, arithmetic_operations, narrowed);
         }
         if (!term_vectorizable) continue;
         pattern->load_bases.clear();
@@ -18437,12 +18738,12 @@ void vectorize_reduction_loops(ManagedFunction& function,
         if (width == 0) continue;
         // Lanes computed one at a time cost more than the scalar loop.
         const auto packed_length = packed_operation_length(
-            function, hir_module, *pattern, definitions, required, width,
-            subtarget);
+            function, hir_module, *pattern, definitions, required, narrowed,
+            width, subtarget);
         if (!packed_length) continue;
         (void)vectorize_reduction_loop(
-            function, hir_module, *pattern, definitions, required, width,
-            *packed_length, options);
+            function, hir_module, *pattern, definitions, required, narrowed,
+            width, *packed_length, options);
     }
 }
 

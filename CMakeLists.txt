@@ -432,7 +432,7 @@ if(BUILD_TESTING)
         set_tests_properties(cross_runtime_int128_shifts_${level} PROPERTIES
             LABELS "backend.native;arch.x86_64;check.runtime;feature.integer128;opt.${level}")
     endforeach()
-    foreach(variant O0 O2 O3 O2_noalloc)
+    foreach(variant O0 O2 O3 Oz O2_noalloc)
         string(REPLACE "_noalloc" ";-fno-register-allocation" phi_frame_flags "-${variant}")
         add_test(NAME cross_runtime_phi_frame_copies_${variant}
                  COMMAND "${CMAKE_COMMAND}"
@@ -2581,6 +2581,58 @@ if(BUILD_TESTING)
     set_tests_properties(cross_raw_naked_diagnostics PROPERTIES
         LABELS "check.compile;diagnostics;arch.x86_64;backend.native;feature.raw")
     set_tests_properties(cross_raw_naked_diagnostics PROPERTIES TIMEOUT 10)
+    # Naked and raw_inline bodies reading, writing, and addressing
+    # static-duration objects.
+    foreach(raw_static_level O0 O2)
+        add_test(NAME cross_runtime_raw_static_objects_${raw_static_level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/raw/raw_static_objects.x
+                    -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-raw-static-objects-${raw_static_level}
+                    -DENTRY=test_entry -DEXPECTED=0
+                    "-DCC_FLAGS=-${raw_static_level};-fno-eval-calls"
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_raw_static_objects_${raw_static_level} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;feature.raw;opt.${raw_static_level}")
+    endforeach()
+    add_test(NAME cross_raw_static_object_diagnostics
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/raw/raw_static_object_errors.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/raw-static-object-errors
+                -P "${CMAKE_SOURCE_DIR}/test/backend/raw/raw_static_object_errors.cmake")
+    set_tests_properties(cross_raw_static_object_diagnostics PROPERTIES
+        LABELS "check.compile;diagnostics;arch.x86_64;backend.native;feature.raw")
+    # RAX and RCX as ordinary allocation colors under pressure.
+    foreach(scratch_mode O0 O1 O2 O3 Os Oz O2-avx2 O2-no-register-allocation)
+        string(REGEX MATCH "^O[0-9sz]" scratch_level "${scratch_mode}")
+        set(scratch_flags "-${scratch_level}")
+        if(scratch_mode MATCHES "-avx2$")
+            list(APPEND scratch_flags "-march=x86-64-v3")
+        elseif(scratch_mode MATCHES "-no-(.*)$")
+            list(APPEND scratch_flags "-fno-${CMAKE_MATCH_1}")
+        endif()
+        add_test(NAME cross_runtime_scratch_colors_${scratch_mode}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/scratch_colors.x
+                    -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-scratch-colors-${scratch_mode}
+                    -DENTRY=test_entry -DEXPECTED=0
+                    "-DCC_FLAGS=${scratch_flags};-fno-eval-calls"
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_scratch_colors_${scratch_mode} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;feature.optimization;opt.${scratch_level}")
+    endforeach()
+    add_test(NAME cross_scratch_colors_codegen
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/scratch_colors.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/scratch-colors-codegen
+                -P "${CMAKE_SOURCE_DIR}/test/backend/native/scratch_colors.cmake")
+    set_tests_properties(cross_scratch_colors_codegen PROPERTIES
+        LABELS "check.compile;arch.x86_64;backend.native;feature.optimization;opt.O2")
     add_test(NAME cross_raw_cfg
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
@@ -3205,6 +3257,33 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/middle/store_motion_codegen.cmake")
     set_tests_properties(cross_store_motion_codegen PROPERTIES
         LABELS "check.compile;arch.x86_64;arch.mips;middle;backend.native;feature.optimization;feature.object;feature.floating;feature.model;isa.vr4300;opt.O2;opt.O3;opt.Os")
+    # Conditional reductions over floating and narrowed index comparisons.
+    foreach(reduction_mode O0 O2 O3 O3-avx2)
+        string(REGEX MATCH "^O[0-9s]" reduction_level "${reduction_mode}")
+        set(reduction_flags "-${reduction_level}")
+        if(reduction_mode MATCHES "-avx2$")
+            list(APPEND reduction_flags "-march=x86-64-v3")
+        endif()
+        add_test(NAME cross_runtime_conditional_reductions_${reduction_mode}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/conditional_reductions.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-conditional-reductions-${reduction_mode}
+                -DENTRY=test_entry -DEXPECTED=0
+                "-DCC_FLAGS=${reduction_flags};-fno-eval-calls"
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_conditional_reductions_${reduction_mode} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;middle;feature.optimization;feature.vector;opt.${reduction_level}")
+    endforeach()
+    add_test(NAME cross_conditional_reduction_codegen
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/conditional_reductions.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/conditional-reduction-codegen
+                -P "${CMAKE_SOURCE_DIR}/test/middle/conditional_reductions.cmake")
+    set_tests_properties(cross_conditional_reduction_codegen PROPERTIES
+        LABELS "check.compile;arch.x86_64;backend.native;middle;feature.optimization;feature.vector;opt.O3")
     # Loop bounds computed inside a vectorized reduction loop.
     foreach(level O0 O1 O2 O3 Os Oz)
         add_test(NAME cross_runtime_loop_invariant_bounds_${level}
@@ -3457,6 +3536,14 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/middle/floating_select_codegen.cmake")
     set_tests_properties(cross_floating_select_codegen PROPERTIES
         LABELS "check.compile;arch.x86_64;arch.mips;middle;backend.native;feature.optimization;feature.floating;feature.model;isa.mips4;isa.vr4300;opt.O0;opt.O2")
+    add_test(NAME cross_x86_64_shared_edge_copies
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/machine/loop_exits.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/shared-edge-copies
+                -P "${CMAKE_SOURCE_DIR}/test/backend/machine/edge_copies.cmake")
+    set_tests_properties(cross_x86_64_shared_edge_copies PROPERTIES
+        LABELS "check.compile;arch.x86_64;backend.native;feature.optimization;feature.control;opt.O2")
     # Loop exits that carry work and phi copies after block layout.
     foreach(exit_mode O2 O3 O3-unroll O3-no-reorder-blocks
                       O3-no-schedule-insns2)
@@ -6156,6 +6243,14 @@ if(BUILD_TESTING)
                 LABELS "check.runtime;arch.x86_64;backend.native;feature.abi;feature.calls;opt.${manual_pointer_level}")
         endforeach()
     endforeach()
+    add_test(NAME cross_manual_indirect_call_codegen
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/abi/manual_indirect_call.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/manual-indirect-call-codegen
+                -P "${CMAKE_SOURCE_DIR}/test/backend/abi/manual_indirect_codegen.cmake")
+    set_tests_properties(cross_manual_indirect_call_codegen PROPERTIES
+        LABELS "check.compile;arch.x86_64;backend.native;feature.abi;feature.register_allocation;opt.O2")
     add_test(NAME cross_runtime_manual_adapter
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

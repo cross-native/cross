@@ -16,3 +16,8 @@
 [[noinline]] global f32 pick_sign(in i32 i, in f32 x, in f32 y) {
     return i < 0 ? x : y;
 }
+
+// Two constants on an integer condition select their bit patterns.
+[[noinline]] global f32 offset(in u64 n, in f32 x) {
+    return x + ((n & 2u64) != 0u64 ? 0.75f32 : -0.5f32);
+}

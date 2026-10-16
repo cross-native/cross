@@ -165,6 +165,8 @@ private:
         unsigned scale{1};
         TypePtr pointee;
         std::int64_t displacement{};
+        // A static-duration object in place of the base register.
+        std::optional<hir::ObjectId> object;
     };
 
     std::optional<RawMemoryAddress> memory_address(
@@ -250,8 +252,9 @@ private:
         const auto displacement = relocation_addend_i64(selected.displacement);
         if (selected.deferred || !displacement)
             return fail(source.location, "raw memory address has no concrete representable displacement");
-        return RawMemoryAddress{
-            binding->second, index_register, selected.scale, type->second->pointee, *displacement};
+        return RawMemoryAddress{binding->second, index_register,
+                                selected.scale, type->second->pointee,
+                                *displacement, std::nullopt};
     }
 
     bool operand_matches(const Expr& original_expression,
@@ -1126,9 +1129,12 @@ private:
         mir::Operand operand;
         operand.kind = mir::Operand::Kind::Memory;
         operand.location = location;
-        operand.memory.base = {
-            std::string(address.base->name),
-            std::string(address.base->storage), address.base->bits};
+        operand.memory.object = address.object;
+        if (address.base) {
+            operand.memory.base = {
+                std::string(address.base->name),
+                std::string(address.base->storage), address.base->bits};
+        }
         if (address.index) {
             operand.memory.index = mir::RegisterOperand{
                 std::string(address.index->name),
@@ -1142,29 +1148,61 @@ private:
         return operand;
     }
 
+    // The static-duration object a name in the current raw body denotes:
+    // the unit's own static object, else the group's.
+    const hir::Object* resolve_object(NameUse name) const {
+        if (!current_function_) return nullptr;
+        const auto* source = current_function_->definition;
+        for (const auto& candidate : namespace_candidates(name,
+                source ? source->source_namespace : std::string{},
+                source ? source->imports : std::vector<std::string>{})) {
+            const hir::Object* result{};
+            for (const auto& object : hir_.objects) {
+                if (object.source_name != candidate) continue;
+                if (object.linkage == Linkage::Static) {
+                    if (object.source_unit == current_function_->source_unit) return &object;
+                } else result = &object;
+            }
+            if (result) return result;
+            for (const auto& function : hir_.functions)
+                if (function.source_name == candidate &&
+                    (function.linkage != Linkage::Static ||
+                     function.source_unit == current_function_->source_unit)) return nullptr;
+        }
+        return nullptr;
+    }
+
+    // The memory of a static-duration object that `expression` names and no
+    // register object shadows. Raw code reads, writes, and addresses it like
+    // a pointer access, relative to the instruction pointer.
+    std::optional<RawMemoryAddress> object_address(const Expr& expression) {
+        const auto& source = unparenthesized(expression);
+        if (source.kind != Expr::Kind::Name ||
+            bindings_.contains(name_key(source))) {
+            return std::nullopt;
+        }
+        const auto* object = resolve_object(NameUse(source));
+        if (!object) return std::nullopt;
+        const auto* declaration = object->definition ? object->definition
+            : object->declarations.empty() ? nullptr
+                                           : object->declarations.front();
+        if (!declaration || !declaration->type) return std::nullopt;
+        if (object->is_thread_local) {
+            diagnostics_.error(source.location,
+                               "raw code cannot address thread-local object '" +
+                                   source.text + "'");
+        }
+        module_.object_references.insert(object->id.value);
+        RawMemoryAddress result;
+        result.pointee = declaration->type;
+        result.object = object->id;
+        return result;
+    }
+
     std::optional<mir::PatchSink> resolve_patch_sink(
         const Expr& expression, PatchAddressRepresentation representation) {
         if (!current_function_) return std::nullopt;
-        auto resolve = [&](NameUse name) -> const hir::Object* {
-            const auto* source = current_function_->definition;
-            for (const auto& candidate : namespace_candidates(name,
-                    source ? source->source_namespace : std::string{},
-                    source ? source->imports : std::vector<std::string>{})) {
-                const hir::Object* result{};
-                for (const auto& object : hir_.objects) {
-                    if (object.source_name != candidate) continue;
-                    if (object.linkage == Linkage::Static) {
-                        if (object.source_unit == current_function_->source_unit) return &object;
-                    } else result = &object;
-                }
-                if (result) return result;
-                for (const auto& function : hir_.functions)
-                    if (function.source_name == candidate &&
-                        (function.linkage != Linkage::Static ||
-                         function.source_unit == current_function_->source_unit)) return nullptr;
-            }
-            return nullptr;
-        };
+        auto resolve = [&](NameUse name) { return resolve_object(name); };
         auto sink = mir::resolve_patch_sink_designator(
             expression, hir_, target_, representation, resolve, diagnostics_);
         if (!sink) return std::nullopt;
@@ -1601,6 +1639,22 @@ private:
         mir::Instruction instruction{location, form, {}};
         instruction.operands.push_back(memory_operand(destination, location));
         instruction.operands.push_back(register_operand(source, location));
+        append_instruction(std::move(instruction));
+        return true;
+    }
+
+    bool emit_address(const RegisterEntry& destination,
+                      const RawMemoryAddress& source,
+                      SourceLocation location) {
+        const auto* form = register_memory_form("$::_lea", destination, source);
+        if (!form) {
+            diagnostics_.error(location,
+                               "raw-compatible address has no legal target form");
+            return false;
+        }
+        mir::Instruction instruction{location, form, {}};
+        instruction.operands.push_back(register_operand(destination, location));
+        instruction.operands.push_back(memory_operand(source, location));
         append_instruction(std::move(instruction));
         return true;
     }
@@ -2168,6 +2222,12 @@ private:
         if (source.kind == Expr::Kind::Name) {
             const auto found = bindings_.find(name_key(source));
             const auto found_type = binding_types_.find(name_key(source));
+            if (found == bindings_.end()) {
+                if (const auto address = object_address(source)) {
+                    return emit_float_load(destination, *address, type,
+                                           source.location);
+                }
+            }
             if (found == bindings_.end() ||
                 found_type == binding_types_.end() ||
                 !raw_scalar_float_type(found_type->second) ||
@@ -2320,6 +2380,9 @@ private:
         if (source.kind == Expr::Kind::Name) {
             const auto found = bindings_.find(name_key(source));
             if (found == bindings_.end()) {
+                if (const auto address = object_address(source)) {
+                    return emit_load(destination, *address, source.location);
+                }
                 diagnostics_.error(source.location,
                                    "raw-compatible value refers to unavailable object '" +
                                        source.text + "'");
@@ -2346,9 +2409,14 @@ private:
         }
         if (source.kind == Expr::Kind::Unary && source.left) {
             if (source.text == "&") {
+                if (const auto address = object_address(*source.left)) {
+                    return emit_address(destination, *address,
+                                        source.location);
+                }
                 diagnostics_.error(
                     source.location,
-                    "raw_inline cannot take the address of an automatic scalar local");
+                    "raw-compatible code can take only the address of a "
+                    "static-duration object");
                 return false;
             }
             if (source.text == "+") {
@@ -2432,7 +2500,8 @@ private:
         }
         const auto& destination_expression =
             unparenthesized(*expression.left);
-        if (destination_expression.kind == Expr::Kind::Name) {
+        auto object = object_address(destination_expression);
+        if (destination_expression.kind == Expr::Kind::Name && !object) {
             const auto found = bindings_.find(name_key(destination_expression));
             const auto type_found =
                 binding_types_.find(name_key(destination_expression));
@@ -2478,16 +2547,18 @@ private:
             return emit_value_move(*value_destination, *view,
                                    type_found->second, expression.location);
         }
-        if (!((destination_expression.kind == Expr::Kind::Unary &&
+        if (!object &&
+            !((destination_expression.kind == Expr::Kind::Unary &&
                destination_expression.text == "*") ||
               (destination_expression.kind == Expr::Kind::Binary &&
                destination_expression.text == "index"))) {
             diagnostics_.error(
                 destination_expression.location,
-                "raw-compatible assignment requires a scalar local/register or pointer lvalue");
+                "raw-compatible assignment requires a scalar local/register, static object, or pointer lvalue");
             return false;
         }
-        const auto address = memory_address(destination_expression, true);
+        const auto address = object ? object
+            : memory_address(destination_expression, true);
         if (!address) return false;
         if (expression.text != "=" && !is_integer(address->pointee) &&
             !raw_scalar_float_type(address->pointee)) {
@@ -3754,7 +3825,10 @@ private:
                     }
                 }
                 for (const auto& operand : instruction.operands) {
-                    if (operand.kind != mir::Operand::Kind::Memory) continue;
+                    if (operand.kind != mir::Operand::Kind::Memory ||
+                        operand.memory.object) {
+                        continue;
+                    }
                     diagnose_undefined(operand.memory.base.storage,
                                        operand.location);
                     if (operand.memory.index) {
@@ -4200,6 +4274,49 @@ private:
         }
     }
 
+    // A static-duration object's memory: its fixed address, or its symbol
+    // relative to the instruction pointer, which the small and kernel code
+    // models reach and which a symbol needing a GOT entry cannot use.
+    std::string object_memory(hir::ObjectId id, std::int64_t displacement,
+                              SourceLocation location) {
+        const auto& object = hir_.object(id);
+        if (object.fixed_address) {
+            const auto address = static_cast<std::int64_t>(
+                *object.fixed_address + static_cast<std::uint64_t>(displacement));
+            if (address < std::numeric_limits<std::int32_t>::min() ||
+                address > std::numeric_limits<std::int32_t>::max()) {
+                diagnostics_.error(location,
+                                   "raw code reaches fixed-address object '" +
+                                       object.source_name +
+                                       "' only through a 32-bit absolute address");
+            }
+            return std::to_string(address);
+        }
+        const bool preemptible =
+            options_.position_independent &&
+            object.linkage != Linkage::Static &&
+            !options_.direct_external_data &&
+            (format_ == ObjectFormat::Elf || format_ == ObjectFormat::MachO) &&
+            (!object.definition ||
+             (object.linkage == Linkage::Global && !options_.pie &&
+              options_.semantic_interposition));
+        if (options_.code_model == CodeModel::Medium ||
+            options_.code_model == CodeModel::Large) {
+            diagnostics_.error(location,
+                               "raw code addresses object '" + object.source_name +
+                                   "' relative to the instruction pointer, which "
+                                   "needs the small or kernel code model");
+        } else if (preemptible) {
+            diagnostics_.error(location,
+                               "raw code cannot address preemptible object '" +
+                                   object.source_name + "' without a GOT entry");
+        }
+        auto text = assembly_symbol(format_, object.link_symbol);
+        if (displacement > 0) text += '+';
+        if (displacement != 0) text += std::to_string(displacement);
+        return text + "(%rip)";
+    }
+
     void emit_instruction(const mir::RawFunction& function,
                            const mir::Instruction& instruction) {
         if (debug_) debug_->row(output_, instruction.location);
@@ -4228,12 +4345,15 @@ private:
                                               ? std::string{}
                                               : std::to_string(
                                                     value.memory.displacement);
-                auto address = displacement + "(%" + value.memory.base.name;
+                auto address = value.memory.object
+                    ? object_memory(*value.memory.object,
+                                    value.memory.displacement, value.location)
+                    : displacement + "(%" + value.memory.base.name;
                 if (value.memory.index) {
                     address += ",%" + value.memory.index->name + ',' +
                                std::to_string(value.memory.scale);
                 }
-                address += ')';
+                if (!value.memory.object) address += ')';
                 if (instruction.form->assembly_broadcast_operand == index) {
                     address += "{1to" + std::to_string(
                         instruction.form->assembly_broadcast_count) + '}';
