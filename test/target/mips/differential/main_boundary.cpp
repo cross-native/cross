@@ -20,6 +20,12 @@ unsigned k_b_whole(unsigned, unsigned, unsigned);
 unsigned k_b_fold(unsigned, unsigned, unsigned);
 unsigned k_b_stacked(unsigned, unsigned, unsigned);
 unsigned k_b_mask(unsigned, unsigned, unsigned);
+unsigned k_b_chain(unsigned, unsigned, unsigned);
+unsigned k_b_one_half(unsigned, unsigned, unsigned);
+unsigned k_b_constant(unsigned, unsigned, unsigned);
+unsigned k_b_tail(unsigned, unsigned, unsigned);
+unsigned k_b_straddle(unsigned, unsigned, unsigned);
+unsigned k_b_across(unsigned, unsigned, unsigned);
 }
 
 int main() {
@@ -95,5 +101,41 @@ int main() {
     std::printf("%08x\n", k_b_mask(0x12345678u, 0x9abcdef0u, 0x2bu)); std::fflush(stdout);
     std::printf("%08x\n", k_b_mask(0x80000000u, 0xffffffffu, 0x10u)); std::fflush(stdout);
     std::printf("%08x\n", k_b_mask(0xfu, 0x10u, 0x21u)); std::fflush(stdout);
+    std::printf("%08x\n", k_b_chain(0x1u, 0x3u, 0x5u)); std::fflush(stdout);
+    std::printf("%08x\n", k_b_chain(0x7u, 0x2u, 0x0u)); std::fflush(stdout);
+    std::printf("%08x\n", k_b_chain(0xffffffffu, 0x80000000u, 0x7fffffffu)); std::fflush(stdout);
+    std::printf("%08x\n", k_b_chain(0x12345678u, 0x9abcdef0u, 0x2bu)); std::fflush(stdout);
+    std::printf("%08x\n", k_b_chain(0x80000000u, 0xffffffffu, 0x10u)); std::fflush(stdout);
+    std::printf("%08x\n", k_b_chain(0xfu, 0x10u, 0x21u)); std::fflush(stdout);
+    std::printf("%08x\n", k_b_one_half(0x1u, 0x3u, 0x5u)); std::fflush(stdout);
+    std::printf("%08x\n", k_b_one_half(0x7u, 0x2u, 0x0u)); std::fflush(stdout);
+    std::printf("%08x\n", k_b_one_half(0xffffffffu, 0x80000000u, 0x7fffffffu)); std::fflush(stdout);
+    std::printf("%08x\n", k_b_one_half(0x12345678u, 0x9abcdef0u, 0x2bu)); std::fflush(stdout);
+    std::printf("%08x\n", k_b_one_half(0x80000000u, 0xffffffffu, 0x10u)); std::fflush(stdout);
+    std::printf("%08x\n", k_b_one_half(0xfu, 0x10u, 0x21u)); std::fflush(stdout);
+    std::printf("%08x\n", k_b_constant(0x1u, 0x3u, 0x5u)); std::fflush(stdout);
+    std::printf("%08x\n", k_b_constant(0x7u, 0x2u, 0x0u)); std::fflush(stdout);
+    std::printf("%08x\n", k_b_constant(0xffffffffu, 0x80000000u, 0x7fffffffu)); std::fflush(stdout);
+    std::printf("%08x\n", k_b_constant(0x12345678u, 0x9abcdef0u, 0x2bu)); std::fflush(stdout);
+    std::printf("%08x\n", k_b_constant(0x80000000u, 0xffffffffu, 0x10u)); std::fflush(stdout);
+    std::printf("%08x\n", k_b_constant(0xfu, 0x10u, 0x21u)); std::fflush(stdout);
+    std::printf("%08x\n", k_b_tail(0x1u, 0x3u, 0x5u)); std::fflush(stdout);
+    std::printf("%08x\n", k_b_tail(0x7u, 0x2u, 0x0u)); std::fflush(stdout);
+    std::printf("%08x\n", k_b_tail(0xffffffffu, 0x80000000u, 0x7fffffffu)); std::fflush(stdout);
+    std::printf("%08x\n", k_b_tail(0x12345678u, 0x9abcdef0u, 0x2bu)); std::fflush(stdout);
+    std::printf("%08x\n", k_b_tail(0x80000000u, 0xffffffffu, 0x10u)); std::fflush(stdout);
+    std::printf("%08x\n", k_b_tail(0xfu, 0x10u, 0x21u)); std::fflush(stdout);
+    std::printf("%08x\n", k_b_straddle(0x1u, 0x3u, 0x5u)); std::fflush(stdout);
+    std::printf("%08x\n", k_b_straddle(0x7u, 0x2u, 0x0u)); std::fflush(stdout);
+    std::printf("%08x\n", k_b_straddle(0xffffffffu, 0x80000000u, 0x7fffffffu)); std::fflush(stdout);
+    std::printf("%08x\n", k_b_straddle(0x12345678u, 0x9abcdef0u, 0x2bu)); std::fflush(stdout);
+    std::printf("%08x\n", k_b_straddle(0x80000000u, 0xffffffffu, 0x10u)); std::fflush(stdout);
+    std::printf("%08x\n", k_b_straddle(0xfu, 0x10u, 0x21u)); std::fflush(stdout);
+    std::printf("%08x\n", k_b_across(0x1u, 0x3u, 0x5u)); std::fflush(stdout);
+    std::printf("%08x\n", k_b_across(0x7u, 0x2u, 0x0u)); std::fflush(stdout);
+    std::printf("%08x\n", k_b_across(0xffffffffu, 0x80000000u, 0x7fffffffu)); std::fflush(stdout);
+    std::printf("%08x\n", k_b_across(0x12345678u, 0x9abcdef0u, 0x2bu)); std::fflush(stdout);
+    std::printf("%08x\n", k_b_across(0x80000000u, 0xffffffffu, 0x10u)); std::fflush(stdout);
+    std::printf("%08x\n", k_b_across(0xfu, 0x10u, 0x21u)); std::fflush(stdout);
     return 0;
 }

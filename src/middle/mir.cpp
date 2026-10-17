@@ -11298,6 +11298,70 @@ void simplify_demanded_bits(ManagedFunction& function,
             }
         }
     }
+
+    // A truncated right shift by c whose users read only bits below
+    // `width - c` truncates first: those bits of trunc(x >> c) are the bits
+    // of trunc(x) >> c, so `(u32)(x >> 16)` read through its low 16 bits
+    // reads only the low word of x. The shift must have no other user.
+    const UseLists uses(function);
+    for (auto& block : function.blocks) {
+        for (std::size_t position = 0; position < block.values.size();
+             ++position) {
+            const auto id = block.values[position];
+            const auto& value = function.values[id.value];
+            if (id.value >= count || value.kind != ValueKind::Cast ||
+                value.cast != CastOperation::Truncate ||
+                value.operands.size() != 1) {
+                continue;
+            }
+            const auto shift_id = value.operands.front();
+            const auto& shift = function.values[shift_id.value];
+            const auto width = widths[id.value];
+            if (shift_id.value >= count || shift.kind != ValueKind::Binary ||
+                (shift.binary != BinaryOperation::ShiftRightLogical &&
+                 shift.binary != BinaryOperation::ShiftRightArithmetic) ||
+                shift.operands.size() != 2 ||
+                uses.uses(shift_id).size() != 1 || width == 0 ||
+                widths[shift_id.value] <= width) {
+                continue;
+            }
+            const auto amount = shift_amount(shift);
+            if (!amount || *amount == 0 || *amount >= width ||
+                demanded[id.value] == UInt128{} ||
+                bit_and(demanded[id.value],
+                        bit_not(mask_to(bit_not(UInt128{}),
+                                        width - *amount))) != UInt128{}) {
+                continue;
+            }
+            const auto append = [&](ManagedValue added) {
+                added.id = {static_cast<std::uint32_t>(function.values.size())};
+                added.type = function.values[id.value].type;
+                added.location = function.values[id.value].location;
+                added.inline_site = function.values[id.value].inline_site;
+                function.values.push_back(std::move(added));
+                return function.values.back().id;
+            };
+            ManagedValue truncation;
+            truncation.kind = ValueKind::Cast;
+            truncation.cast = CastOperation::Truncate;
+            truncation.operands = {shift.operands.front()};
+            const auto narrow = append(std::move(truncation));
+            ManagedValue constant;
+            make_integer_constant(constant, UInt128{*amount});
+            const auto distance = append(std::move(constant));
+            auto& rewritten = function.values[id.value];
+            rewritten.kind = ValueKind::Binary;
+            rewritten.binary =
+                unsigned_integer_type(hir_module, rewritten.type)
+                ? BinaryOperation::ShiftRightLogical
+                : BinaryOperation::ShiftRightArithmetic;
+            rewritten.operands = {narrow, distance};
+            block.values.insert(
+                block.values.begin() + static_cast<std::ptrdiff_t>(position),
+                {narrow, distance});
+            position += 2;
+        }
+    }
 }
 
 } // namespace

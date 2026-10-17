@@ -11,6 +11,17 @@ global i32 allegrex_choose(in i32 condition, in i32 yes, in i32 no) {
     return condition ? yes : no;
 }
 
+// A select of an integer against zero moves on the integer itself.
+[[noinline]]
+global u32 allegrex_nonzero(in u32 value, in u32 yes, in u32 no) {
+    return value != 0u32 ? yes : no;
+}
+
+[[noinline]]
+global u32 allegrex_zero(in u32 value, in u32 yes, in u32 no) {
+    return value == 0u32 ? yes : no;
+}
+
 [[noinline]]
 global i32 allegrex_eabi_mix(in f32 first, in i32 integer,
                              in f32 second, in i32 other) {

@@ -14,6 +14,8 @@
 [[noinline]] global u32 right(in u32 a, in u32 b) { return a >> b; }
 [[noinline]] global u32 left(in u32 a, in u32 b) { return a << b; }
 [[noinline]] global i32 right_signed(in i32 a, in u32 b) { return a >> b; }
+[[noinline]] global u64 right_wide(in u64 a, in u32 b) { return a >> b; }
+[[noinline]] global i64 right_wide_signed(in i64 a, in u32 b) { return a >> b; }
 
 // A 16-bit heading and turn rate that the loop keeps masked; its users read
 // only their low bits.
@@ -56,6 +58,32 @@
 [[noinline]] global u32 truncated(in u32 x) { return (u32)(u8)((x + 768u32) | 65536u32); }
 [[noinline]] global u64 widened(in u32 x) { return (u64)((x & 4095u32) + 1u32) << 52; }
 
+// A truncated right shift read only through bits below the truncated width
+// less the shift truncates first, so it reads only the low word.
+[[noinline]] global u32 narrowed_shift(in u64 x) {
+    return ((u32)(x >> 16) & 65535u32) | 1u32;
+}
+[[noinline]] global u32 wide_shift(in u64 x) { return (u32)(x >> 16) & 16777215u32; }
+[[noinline]] global i32 narrowed_signed(in i64 x) { return (i32)(x >> 8) & 255; }
+[[noinline]] global u32 turns(in u64 state, in uptr steps) {
+    u32 turn = ((u32)(state >> 16) & 65535u32) | 1u32;
+    u32 heading = (u32)state & 65535u32;
+    for (uptr n = 0; n < steps; ++n) {
+        heading = (heading + turn) & 65535u32;
+        turn = (turn + 97u32) & 65535u32;
+    }
+    return heading;
+}
+[[noinline]] global u32 turns_reference(in u64 state, in uptr steps) {
+    u32 turn = set(mask((u32)right_wide(state, 16u32), 65535u32), 1u32);
+    u32 heading = mask((u32)state, 65535u32);
+    for (uptr n = 0; n < steps; ++n) {
+        heading = mask(plus(heading, turn), 65535u32);
+        turn = mask(plus(turn, 97u32), 65535u32);
+    }
+    return heading;
+}
+
 // Tests of shifted bits read the bits in place.
 [[noinline]] global bool bit_fourteen(in u32 x) { return ((x >> 14) & 1u32) != 0u32; }
 [[noinline]] global bool two_bits(in u32 x) { return ((x >> 16) & 3u32) == 0u32; }
@@ -95,6 +123,15 @@ global u32 test_entry() {
         if (signed_bits((i32)x) != ((right_signed((i32)x, 4u32) & 12) != 0)) return 21u32;
         if (shifted_out(x) != (mask(right(x, 28u32), 255u32) != 0u32)) return 22u32;
         if (sign_copies((i32)x) != ((right_signed((i32)x, 28u32) & 255) != 0)) return 23u32;
+        const u64 wide = ((u64)(x * 2654435761u32) << 32) | (u64)(x ^ 1431655765u32);
+        if (narrowed_shift(wide) != set(mask((u32)right_wide(wide, 16u32), 65535u32), 1u32)) {
+            return 24u32;
+        }
+        if (wide_shift(wide) != mask((u32)right_wide(wide, 16u32), 16777215u32)) return 25u32;
+        if (narrowed_signed((i64)wide) != ((i32)right_wide_signed((i64)wide, 8u32) & 255)) {
+            return 26u32;
+        }
+        if (turns(wide, 37) != turns_reference(wide, 37)) return 27u32;
     }
     return 0u32;
 }

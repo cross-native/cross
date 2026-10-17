@@ -156,7 +156,7 @@ endforeach()
 # array keeps the CFA on $fp, and a realigned frame keeps it on $sp.
 file(READ "${OUTPUT}/o32-be-O0-g.s" assembly)
 expect("o32 -O0 epilogue" "${assembly}"
-    "\n\tmove\t[$]sp,[$]fp\n[.]cfi_def_cfa_register 29\n\tlw\t[$]fp,[0-9]+[(][$]sp[)]\n\tnop\n[.]cfi_restore 30\n")
+    "\n\tmove\t[$]sp,[$]fp\n[.]cfi_def_cfa_register 29\n\tlw\t[$]fp,[0-9]+[(][$]sp[)]\n[.]cfi_restore 30\n")
 file(READ "${OUTPUT}/o32-be-frames-O2-g.s" assembly)
 string(REGEX MATCH "\nearly:\n.*\n[.]end early\n" early "${assembly}")
 # The uncovered early exit either precedes the prologue and runs in the
@@ -172,7 +172,7 @@ else()
 endif()
 string(REGEX MATCH "\nrelay:\n.*\n[.]end relay\n" relay "${assembly}")
 expect("sibling call" "${relay}"
-    "\n[.]cfi_remember_state\n(.loc[^\n]*\n)?\tlw\t[$]ra,[0-9]+[(][$]sp[)]\n\tnop\n[.]cfi_restore 31\n\tj\tsink\n\taddiu\t[$]sp,[$]sp,[0-9]+\n[.]cfi_restore_state\n")
+    "\n[.]cfi_remember_state\n(.loc[^\n]*\n)?\tlw\t[$]ra,[0-9]+[(][$]sp[)]\n[.]cfi_restore 31\n\tj\tsink\n\taddiu\t[$]sp,[$]sp,[0-9]+\n[.]cfi_restore_state\n")
 string(REGEX MATCH "\ndynamic:\n.*\n[.]end dynamic\n" dynamic "${assembly}")
 expect("dynamic frame" "${dynamic}"
     "\n\tmove\t[$]fp,[$]sp\n[.]cfi_def_cfa_register 30\n"

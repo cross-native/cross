@@ -111,6 +111,22 @@ function_body("${assembly}" mixed body)
 if(NOT body MATCHES "mtc1\t[$]t1,[$]f[0-9]*[13579]\n")
     message(FATAL_ERROR "MIPS I did not move an o32 high word into the odd half\n${body}")
 endif()
+# A value split around consecutive calls stores to its home once, and one
+# that nothing reads between the calls is reloaded only after the second.
+function_body("${assembly}" across body)
+string(REGEX MATCHALL "swc1\t[$]f[0-9]+,[0-9]+[(][$]sp[)]" stores "${body}")
+set(stored "")
+foreach(store IN LISTS stores)
+    if(store IN_LIST stored)
+        message(FATAL_ERROR "MIPS I stores a split value's home twice: ${store}\n${body}")
+    endif()
+    list(APPEND stored "${store}")
+endforeach()
+string(REGEX MATCHALL "lwc1\t" reloads "${body}")
+list(LENGTH reloads reload_count)
+if(reload_count GREATER 8)
+    message(FATAL_ERROR "MIPS I reloads split values between calls that do not read them\n${body}")
+endif()
 
 # MIPS32 Release 2 moves a double's high word with MTHC1/MFHC1; MIPS II
 # code, which may not name the odd half, goes through the value's home.

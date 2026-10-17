@@ -96,6 +96,21 @@ if(assembly MATCHES "[	 ](daddu|dsubu|ld|sd|ldc1|sdc1)[	 ]")
         "Allegrex assembly contains a MIPS-III/64-bit instruction\n${assembly}")
 endif()
 
+# A select against zero moves on the tested integer, without computing
+# a boolean and without staging the result in $at.
+foreach(symbol allegrex_nonzero allegrex_zero)
+    string(FIND "${assembly}" "\n${symbol}:" start)
+    string(SUBSTRING "${assembly}" ${start} -1 body)
+    string(FIND "${body}" "\n.end ${symbol}" end)
+    string(SUBSTRING "${body}" 0 ${end} body)
+    if(body MATCHES "[\t ](sltu|sltiu|xori)[\t ]" OR
+       body MATCHES "[$]1[^0-9]" OR
+       NOT body MATCHES "\\.word[^\n]*# mov[nz] [$]2,[$][0-9]+,[$]4\n")
+        message(FATAL_ERROR
+            "Allegrex select against zero did not move on the integer\n${body}")
+    endif()
+endforeach()
+
 file(READ "${pair_assembly}" pair)
 # GNU as reads $t0-$t3 as registers 12-15 in EABI objects, so their GPRs
 # are spelled by number.

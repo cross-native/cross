@@ -119,16 +119,20 @@ global i32 mips_successor_call_compare(in i32 a, in i32 b) {
 }
 
 // Unrolled, its remainder loop's exit branch encodes the copy-free edge, so
-// the back edge's copies follow a filled delay slot.
+// the back edge's copies (of a value that the next pass also keeps as the
+// previous one) follow a filled delay slot.
 [[abi("o32"), noinline]]
 global u32 mips_copy_edge_delay(in u32 seed, in u32 count) {
     u32 value = seed;
     u32 step = 1u32;
+    u32 previous = 5u32;
     for (u32 index = 0u32; index < count; ++index) {
-        value = (value ^ (value >> 7u32)) * 2654435761u32 + step;
+        const u32 next = (value ^ (value >> 7u32)) * 2654435761u32 + step;
+        previous = value;
+        value = next;
         step = step + 3u32;
     }
-    return value ^ step;
+    return value ^ step ^ previous;
 }
 
 [[abi("o32"), noinline]]
@@ -246,6 +250,147 @@ global u64 mips_call_result(in u32 high, in u32 low) {
 [[abi("o32"), noinline]]
 global u64 mips_tail_doubleword(in u64 x) {
     return mips_result_halves((u32)x, (u32)(x >> 32));
+}
+
+// A u64 argument passes one operand per o32 piece, each from the value that
+// holds its bits, and a result's halves come from its result registers;
+// neither doubleword is assembled.
+[[abi("o32"), noinline]]
+global u64 mips_piece_callee(in u64 x, in u32 y) {
+    return ((u64)((u32)(x >> 32) + y) << 32) | (u64)((u32)x ^ y);
+}
+
+[[abi("o32"), noinline]]
+global u32 mips_piece_caller(in u32 a, in u32 b) {
+    const u64 r = mips_piece_callee(((u64)a << 32) | (u64)b, a);
+    return (u32)(r >> 32) ^ (u32)r;
+}
+
+// Incoming stack pieces load into the argument registers, and outgoing
+// stack pieces store their words.
+[[abi("o32"), noinline]]
+global u32 mips_piece_stack(in u32 a, in u64 b, in u64 c) {
+    return (u32)mips_piece_callee(c, a) + (u32)b;
+}
+
+[[abi("o32"), noinline]]
+global u32 mips_piece_outgoing(in u32 a, in u32 b) {
+    return mips_piece_stack(a, (u64)b, ((u64)b << 32) | (u64)a);
+}
+
+// Two doubles that rotate through a loop copy once each per pass, with no
+// swap through a scratch register.
+[[abi("o32"), noinline]]
+global f64 mips_rotate_doubles(in const f64 *data, in u32 count) {
+    f64 first = 0.125f64;
+    f64 second = -0.25f64;
+    for (u32 index = 0u32; index < count; ++index) {
+        const f64 next = data[index] + first * 0.625f64 - second * 0.125f64;
+        second = first;
+        first = next;
+    }
+    return first + second;
+}
+
+// A constant-initialized counter and a value from the parameters enter the
+// loop without a swap.
+[[abi("o32"), noinline]]
+global u64 mips_entry_counter(in u64 state, in u32 iterations) {
+    u64 x = state;
+    u64 count = 0u64;
+    for (u32 n = 0u32; n < iterations; ++n) {
+        x = ((x ^ (x >> 12)) * 2685821657736338717u64) + count;
+        count = count + 1u64;
+    }
+    return x;
+}
+
+static const f32 mips_quarter[17] = {
+    0.0f32, 0.09801714f32, 0.19509032f32, 0.29028467f32, 0.38268343f32,
+    0.47139674f32, 0.55557023f32, 0.63439328f32, 0.70710678f32,
+    0.77301045f32, 0.83146961f32, 0.88192126f32, 0.92387953f32,
+    0.95694034f32, 0.98078528f32, 0.99518473f32, 1.0f32,
+};
+
+[[noinline]]
+static f32 mips_sine(in u32 angle) {
+    u32 quadrant = (angle >> 14) & 3u32;
+    u32 position = angle & 16383u32;
+    if ((quadrant & 1u32) != 0u32) position = 16384u32 - position;
+    u32 index = position >> 10;
+    f32 fraction = (f32)(position & 1023u32) * (1.0f32 / 1024.0f32);
+    f32 low = mips_quarter[index];
+    f32 high = index < 16u32 ? mips_quarter[index + 1u32] : low;
+    f32 value = low + (high - low) * fraction;
+    return (quadrant & 2u32) != 0u32 ? 0.0f32 - value : value;
+}
+
+// A heading carried around a loop across private calls keeps a register
+// the calls preserve, with no split around the calls and no copy on the
+// loop's path.
+[[abi("o32"), noinline]]
+global f32 mips_carried_call(in u64 state, in u32 iterations) {
+    u32 heading = (u32)state & 65535u32;
+    u32 turn = ((u32)(state >> 16) & 65535u32) | 1u32;
+    f32 x = 0.0f32;
+    f32 y = 0.0f32;
+    for (u32 n = 0u32; n < iterations; ++n) {
+        heading = (heading + turn) & 65535u32;
+        turn = (turn + 97u32) & 65535u32;
+        x = x + mips_sine((heading + 16384u32) & 65535u32) * 1.5f32;
+        y = y + mips_sine(heading) * 1.5f32;
+    }
+    return x + y;
+}
+
+// An x32 parameter arrives without a canonical word; one that nothing
+// reads is not canonicalized.
+[[abi("x32"), noinline]]
+global u32 mips_unread_parameter(in u32 a, in u32 unread, in u32 b) {
+    return a + b;
+}
+
+// Without load interlocks (MIPS I), only an instruction that reads a loaded
+// register right after the load pays a NOP.
+[[abi("o32"), noinline]]
+global u32 mips_load_use(in const u32 *p, in u32 x) {
+    if (p[0] != 0u32) return x * 3u32;
+    return x;
+}
+
+// A constant argument that no argument move needs fills the call's delay
+// slot.
+global u64 mips_piece_sink;
+
+[[abi("o32"), noinline]]
+global void mips_piece_store(in u64 b) {
+    mips_piece_sink = mips_piece_callee(b, 7u32);
+}
+
+// MIR demanded bits drops the mask of a loop's 16-bit turn rate and then
+// truncates before shifting, so the o32 entry reads only the low word.
+[[abi("o32"), noinline]]
+global u32 mips_turn_rate(in u64 state, in u32 steps) {
+    u32 turn = ((u32)(state >> 16) & 65535u32) | 1u32;
+    u32 heading = 0u32;
+    for (u32 n = 0u32; n < steps; ++n) {
+        heading = (heading + turn) & 65535u32;
+        turn = (turn + 97u32) & 65535u32;
+    }
+    return heading;
+}
+
+// x32 result words are not sign-canonical, so each one read is
+// canonicalized.
+[[abi("x32"), noinline]]
+global u64 mips_piece_x32_callee(in u64 x) {
+    return x + 1u64;
+}
+
+[[abi("x32"), noinline]]
+global u32 mips_piece_x32_caller(in u32 a, in u32 b) {
+    const u64 r = mips_piece_x32_callee(((u64)a << 32) | (u64)b);
+    return (u32)(r >> 32) + (u32)r;
 }
 
 // The slot of a loop's top test starts the multiply of the next pass,

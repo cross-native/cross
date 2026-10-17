@@ -898,3 +898,82 @@ global u32 k_q_ordered(in u32 a, in u32 b, in u32 c) {
     }
     return sum;
 }
+
+// Loop-carried values whose PHI copies could form cycles: two values that
+// rotate (`second = first; first = next`), a constant-initialized counter
+// beside a value from the parameters, and a value carried across private
+// calls, integer and f64 (built from bits, read back as bits).
+[[abi("@ABI@"), noinline]]
+global u32 k_q_rotate(in u32 a, in u32 b, in u32 c) {
+    u32 first = a;
+    u32 second = b;
+    for (u32 i = 0u32; i < (c & 15u32) + 3u32; ++i) {
+        const u32 next = first * 5u32 - second * 3u32 + i;
+        second = first;
+        first = next;
+    }
+    return first ^ (second << 1);
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_entry_swap(in u32 a, in u32 b, in u32 c) {
+    u32 x = a ^ b;
+    u32 count = 0u32;
+    for (u32 i = 0u32; i < (c & 31u32); ++i) {
+        x = (x << 3) ^ (x >> 5) ^ count;
+        count = count + 7u32;
+    }
+    return x + count;
+}
+
+[[noinline]]
+static u32 q_private(in u32 x, in u32 y) {
+    return (x ^ y) * 9u32 + (x >> 2);
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_carried_call(in u32 a, in u32 b, in u32 c) {
+    u32 heading = a;
+    u32 total = 0u32;
+    for (u32 i = 0u32; i < (c & 7u32) + 1u32; ++i) {
+        heading = heading + b;
+        total = total + q_private(heading & 1023u32, i) +
+                q_private(heading >> 3, total);
+    }
+    return total ^ heading;
+}
+
+union QBits {
+    f64 value;
+    u64 bits;
+};
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_rotate_f64(in u32 a, in u32 b, in u32 c) {
+    union QBits first;
+    union QBits second;
+    union QBits data;
+    first.bits = 0x3ff0000000000000u64 | ((u64)(a & 0xfffffu32) << 32);
+    second.bits = 0xbfd0000000000000u64 | ((u64)(b & 0xfffffu32) << 32);
+    data.bits = 0x3fe0000000000000u64 | (u64)c;
+    for (u32 i = 0u32; i < (c & 7u32) + 2u32; ++i) {
+        const f64 next = data.value + first.value * 0.625f64 -
+                         second.value * 0.125f64;
+        second.value = first.value;
+        first.value = next;
+    }
+    return (u32)(first.bits >> 32) ^ (u32)first.bits ^
+           (u32)(second.bits >> 29);
+}
+
+// Selects of integers against zero, which conditional moves test directly,
+// also of a doubleword.
+[[abi("@ABI@"), noinline]]
+global u32 k_q_select_zero(in u32 a, in u32 b, in u32 c) {
+    const u32 x = a & c;
+    const u32 first = x != 0u32 ? b : c;
+    const u32 second = (b ^ c) == 0u32 ? a : x;
+    const u64 wide = ((u64)a << 32) | (u64)b;
+    const u64 third = (wide & 0xffff0000ffffu64) != 0u64 ? wide >> 7 : (u64)c;
+    return first + second * 3u32 + ((u32)third ^ (u32)(third >> 32));
+}

@@ -70,6 +70,28 @@ global u64 b_mask(in u64 x, in u64 y) {
     return (x & 4294967295u64) ^ (y & 18446744069414584320u64);
 }
 
+// A helper that passes its argument pieces on and returns its callee's
+// result as is, as a tail call.
+[[noinline]]
+global u64 b_tail(in u64 x, in u32 y) {
+    return b_halves((x << 8) ^ (u64)y, y + 1u32);
+}
+
+// Twenty-one words before a u64: x32 carries it in its last argument
+// register and on the stack, o32 entirely on the stack.
+[[noinline]]
+global u64 b_straddle(in u32 p0, in u32 p1, in u32 p2, in u32 p3, in u32 p4,
+                      in u32 p5, in u32 p6, in u32 p7, in u32 p8, in u32 p9,
+                      in u32 p10, in u32 p11, in u32 p12, in u32 p13,
+                      in u32 p14, in u32 p15, in u32 p16, in u32 p17,
+                      in u32 p18, in u32 p19, in u32 p20, in u64 x) {
+    const u32 sum = p0 + p1 * 3u32 + p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9 +
+        p10 + p11 + p12 + p13 + p14 + p15 + p16 + p17 + p18 + p19 + p20;
+    return x ^ ((u64)(p0 + p20) << 32) ^ (u64)sum;
+}
+
+global u64 b_sink;
+
 [[abi("@ABI@"), noinline]]
 global u32 k_b_pass(in u32 a, in u32 b, in u32 c) {
     const u64 r = b_pass(((u64)a << 32) | (u64)(b ^ c));
@@ -140,4 +162,51 @@ global u32 k_b_stacked(in u32 a, in u32 b, in u32 c) {
 global u32 k_b_mask(in u32 a, in u32 b, in u32 c) {
     const u64 r = b_mask(((u64)a << 32) | (u64)b, ((u64)c << 32) | (u64)a);
     return (u32)(r >> 32) + (u32)r * 19u32;
+}
+
+// Call results read whole, stored, and passed on as arguments.
+[[abi("@ABI@"), noinline]]
+global u32 k_b_chain(in u32 a, in u32 b, in u32 c) {
+    const u64 r = b_halves(b_swap(((u64)a << 32) | (u64)b), c);
+    b_sink = r * 5u64;
+    return (u32)(b_sink >> 32) ^ (u32)b_sink ^ (u32)(r >> 3);
+}
+
+// Only one half of each result is read.
+[[abi("@ABI@"), noinline]]
+global u32 k_b_one_half(in u32 a, in u32 b, in u32 c) {
+    return (u32)(b_whole(((u64)a << 32) | (u64)c, (u64)b) >> 32) +
+           (u32)b_swap((u64)c);
+}
+
+// Constant pieces and pieces of a constant and a value.
+[[abi("@ABI@"), noinline]]
+global u32 k_b_constant(in u32 a, in u32 b, in u32 c) {
+    const u64 r = b_whole(81985529216486895u64,
+                          ((u64)(a ^ b) << 32) | 4294967295u64);
+    return (u32)(r >> 32) - (u32)r + c;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_b_tail(in u32 a, in u32 b, in u32 c) {
+    const u64 r = b_tail(((u64)a << 32) | (u64)b, c);
+    return (u32)(r >> 32) ^ (u32)r;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_b_straddle(in u32 a, in u32 b, in u32 c) {
+    const u64 r = b_straddle(a, b, c, a ^ b, b ^ c, a + 1u32, b + 2u32,
+                             c + 3u32, a * 5u32, b * 7u32, c * 9u32, a, b, c,
+                             a - b, b - c, c - a, a | b, b | c, c | a,
+                             a & b, ((u64)c << 32) | (u64)(a ^ c));
+    return (u32)(r >> 32) * 23u32 ^ (u32)r;
+}
+
+// A u64 value live across calls passes its pieces to each of them.
+[[abi("@ABI@"), noinline]]
+global u32 k_b_across(in u32 a, in u32 b, in u32 c) {
+    const u64 v = ((u64)a << 32) | (u64)b;
+    const u32 first = b_fold(v);
+    const u32 second = b_fold(v ^ (u64)c);
+    return first + second * 3u32 + (u32)(v >> 16);
 }

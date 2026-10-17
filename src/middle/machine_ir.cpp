@@ -183,10 +183,26 @@ bool verify_instruction(const Instruction& instruction, const Function& function
                       "indirect machine call signature requires a register "
                       "target and no direct identity");
         }
-        if (instruction.call_argument_types.size() + 1 !=
-            instruction.operands.size()) {
+        if (!instruction.call_argument_pieces.empty() &&
+            (instruction.call_argument_pieces.size() !=
+                 instruction.call_argument_types.size() ||
+             std::ranges::find(instruction.call_argument_pieces, 0U) !=
+                 instruction.call_argument_pieces.end())) {
             ok = fail(diagnostics, instruction.location,
-                      "machine call argument type metadata disagrees with operands");
+                      "machine call argument pieces disagree with its "
+                      "arguments");
+        } else {
+            std::size_t argument_operands = 0;
+            for (std::size_t index = 0;
+                 index < instruction.call_argument_types.size(); ++index) {
+                argument_operands +=
+                    call_argument_operands(instruction, index).count;
+            }
+            if (argument_operands + 1 != instruction.operands.size()) {
+                ok = fail(diagnostics, instruction.location,
+                          "machine call argument type metadata disagrees "
+                          "with operands");
+            }
         }
         break;
     case InstructionKind::Branch:
@@ -235,6 +251,7 @@ bool verify_instruction(const Instruction& instruction, const Function& function
     }
     if (instruction.kind != InstructionKind::Call &&
         (!instruction.call_argument_types.empty() ||
+         !instruction.call_argument_pieces.empty() ||
          instruction.call_signature)) {
         ok = fail(diagnostics, instruction.location,
                   "call argument types may appear only on a machine call");
@@ -266,13 +283,15 @@ bool verify_instruction(const Instruction& instruction, const Function& function
                   "machine result extension requires one return value");
     }
     if (instruction.result_composition != ResultComposition::None &&
-        (instruction.kind != InstructionKind::Return ||
-         instruction.uses.size() < 2 ||
-         instruction.result_extension != ExtensionKind::None)) {
+        (instruction.kind == InstructionKind::Call
+             ? instruction.defs.size() < 2
+             : instruction.kind != InstructionKind::Return ||
+                   instruction.uses.size() < 2 ||
+                   instruction.result_extension != ExtensionKind::None)) {
         ok = fail(
             diagnostics, instruction.location,
-            "machine result composition requires a return of several "
-            "pieces and no result extension");
+            "machine result composition requires a return or call of "
+            "several pieces and no result extension");
     }
     if (instruction.patch) {
         if (instruction.kind != InstructionKind::Target ||
@@ -287,6 +306,16 @@ bool verify_instruction(const Instruction& instruction, const Function& function
 }
 
 } // namespace
+
+CallArgumentOperands call_argument_operands(const Instruction& call,
+                                            std::size_t index) {
+    if (call.call_argument_pieces.empty()) return {index + 1, 1};
+    std::size_t first = 1;
+    for (std::size_t argument = 0; argument < index; ++argument) {
+        first += call.call_argument_pieces[argument];
+    }
+    return {first, call.call_argument_pieces[index]};
+}
 
 bool verify(const Function& function, Diagnostics& diagnostics) {
     bool ok = true;

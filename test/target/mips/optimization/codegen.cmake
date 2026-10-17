@@ -79,6 +79,7 @@ compile_variant(grouped_select_no_fusion -fif-conversion-limit=12
 compile_variant(no_delay -fno-schedule-insns2)
 compile_variant(no_schedule -fno-schedule-insns)
 compile_variant(no_machine_combine -fno-machine-combine)
+compile_variant(no_machine_dce -fno-machine-dce)
 compile_variant(no_address_combine -fno-combine-addresses)
 compile_variant(no_slsr -fno-tree-slsr)
 compile_variant(no_ccp -fno-tree-ccp)
@@ -637,7 +638,7 @@ if(NOT parameter_halves MATCHES "[\t ]xor[\t ]+\\$v0,(\\$a0,\\$a1|\\$a1,\\$a0)\n
    NOT result_widened MATCHES "[\t ]sra[\t ]+\\$v0,\\$a0,31\n" OR
    NOT result_widened MATCHES "[\t ]move[\t ]+\\$v1,\\$a0\n" OR
    NOT call_result MATCHES
-       "[\t ]jal[\t ]+mips_result_halves\n[^\n]*\n[\t ]+dsll32[\t ]+(\\$[a-z0-9]+),\\$v0,0\n[\t ]+dsll32[\t ]+\\$at,\\$v1,0\n[\t ]+dsrl32[\t ]+\\$at,\\$at,0\n[\t ]+or[\t ]+" OR
+       "[\t ]jal[\t ]+mips_result_halves\n[^\n]*\n[\t ]+dsll32[\t ]+\\$[a-z0-9]+,\\$v0,0\n[\t ]+dsll32[\t ]+(\\$[a-z0-9]+),\\$v1,0\n[\t ]+dsrl32[\t ]+\\$[a-z0-9]+,\\$[a-z0-9]+,0\n[\t ]+or[\t ]+" OR
    NOT tail_doubleword MATCHES "[\t ]j[\t ]+mips_result_halves\n" OR
    tail_doubleword MATCHES "[\t ]jal[\t ]")
     message(FATAL_ERROR
@@ -648,6 +649,121 @@ if(NOT parameter_halves MATCHES "[\t ]xor[\t ]+\\$v0,(\\$a0,\\$a1|\\$a1,\\$a0)\n
         "result:\n${result_halves}\n${result_halves_little}\n"
         "${result_halves_whole}\nwidened:\n${result_widened}\n"
         "call:\n${call_result}\ntail:\n${tail_doubleword}")
+endif()
+
+# u64 call boundaries: each argument piece is an operand taken from the
+# value that holds its bits, each result piece a definition; the
+# doubleword is assembled only with -fno-machine-combine.
+function_body("${OUTPUT}.enabled.s" mips_piece_caller piece_caller)
+function_body("${OUTPUT}.little.s" mips_piece_caller piece_caller_little)
+function_body("${OUTPUT}.no_machine_combine.s" mips_piece_caller
+              piece_caller_whole)
+function_body("${OUTPUT}.enabled.s" mips_piece_stack piece_stack)
+function_body("${OUTPUT}.enabled.s" mips_piece_outgoing piece_outgoing)
+function_body("${OUTPUT}.enabled.s" mips_piece_x32_caller piece_x32)
+function_body("${OUTPUT}.r3000.s" mips_piece_caller piece_caller_r3000)
+# PHI copies: two rotating doubles copy once each per pass, with no swap
+# through a scratch; a constant counter and a value from the parameters
+# enter their loop without a swap; a heading carried across private calls
+# is not split around them.
+function_body("${OUTPUT}.size.s" mips_rotate_doubles rotate_doubles)
+function_body("${OUTPUT}.enabled.s" mips_entry_counter entry_counter)
+function_body("${OUTPUT}.size.s" mips_entry_counter entry_counter_size)
+function_body("${OUTPUT}.size.s" mips_carried_call carried_call)
+string(REGEX MATCHALL "[\t ]mov\\.d[\t ]" rotate_moves "${rotate_doubles}")
+list(LENGTH rotate_moves rotate_move_count)
+string(REGEX MATCHALL "[\t ](sw|lw)[\t ]" carried_memory "${carried_call}")
+list(LENGTH carried_memory carried_memory_count)
+if(rotate_doubles MATCHES "[\t ]mov\\.d[\t ]+\\$f2," OR
+   rotate_move_count GREATER 3 OR
+   entry_counter MATCHES "[\t ]move[\t ]+\\$at," OR
+   entry_counter_size MATCHES "[\t ]move[\t ]+\\$at," OR
+   NOT carried_memory_count EQUAL 2)
+    message(FATAL_ERROR
+        "MIPS PHI copies swapped through a scratch or split a loop-carried "
+        "value\nrotate:\n${rotate_doubles}\nentry:\n${entry_counter}\n"
+        "${entry_counter_size}\ncarried:\n${carried_call}")
+endif()
+# MIPS I: the epilogue reloads $ra first and its restores fill each
+# other's load delays; a load whose register the next instruction reads
+# keeps its NOP.
+function_body("${OUTPUT}.r3000.s" mips_successor_call_compare
+              r3000_restores)
+function_body("${OUTPUT}.r3000.s" mips_load_use r3000_load_use)
+string(REGEX MATCH "\\.return:\n.*\n[\t ]+jr[\t ]+\\$ra\n" r3000_epilogue
+       "${r3000_restores}")
+string(REGEX REPLACE "\\.cfi_restore [0-9]+\n" "" r3000_epilogue
+       "${r3000_epilogue}")
+if(NOT r3000_epilogue MATCHES
+       "\\.return:\n[\t ]+lw[\t ]+\\$ra,[0-9]+\\(\\$sp\\)\n[\t ]+lw[\t ]+\\$s[0-7],[0-9]+\\(\\$sp\\)\n[\t ]+lw[\t ]+\\$s[0-7],[0-9]+\\(\\$sp\\)\n[\t ]+jr[\t ]+\\$ra\n" OR
+   NOT r3000_load_use MATCHES
+       "[\t ]lw[\t ]+(\\$[a-z0-9]+),0\\(\\$a0\\)\n[\t ]+nop\n[\t ]+beq[\t ]")
+    message(FATAL_ERROR
+        "MIPS I epilogue restores paid load-delay NOPs, or a used load lost "
+        "its NOP\n${r3000_restores}\n${r3000_load_use}")
+endif()
+function_body("${OUTPUT}.enabled.s" mips_piece_store piece_store)
+function_body("${OUTPUT}.no_delay.s" mips_piece_store piece_store_no_delay)
+if(NOT piece_store MATCHES
+       "[\t ]jal[\t ]+mips_piece_callee\n[\t ]+li[\t ]+\\$a2,7\n" OR
+   NOT piece_store_no_delay MATCHES
+       "[\t ]li[\t ]+\\$a2,7\n[\t ]+jal[\t ]+mips_piece_callee\n[\t ]+nop\n")
+    message(FATAL_ERROR
+        "a call's delay slot did not take an earlier constant argument or "
+        "-fno-schedule-insns2 was ignored\n${piece_store}\n"
+        "${piece_store_no_delay}")
+endif()
+function_body("${OUTPUT}.enabled.s" mips_unread_parameter unread_parameter)
+function_body("${OUTPUT}.no_machine_dce.s" mips_unread_parameter
+              unread_parameter_kept)
+if(unread_parameter MATCHES "[\t ]sll[\t ]+\\$a1,\\$a1,0\n" OR
+   NOT unread_parameter MATCHES "[\t ]sll[\t ]+\\$a0,\\$a0,0\n" OR
+   NOT unread_parameter_kept MATCHES "[\t ]sll[\t ]+\\$a1,\\$a1,0\n")
+    message(FATAL_ERROR
+        "MIPS canonicalized an unread x32 parameter or ignored "
+        "-fno-machine-dce\n${unread_parameter}\n${unread_parameter_kept}")
+endif()
+function_body("${OUTPUT}.enabled.s" mips_turn_rate turn_rate)
+function_body("${OUTPUT}.little.s" mips_turn_rate turn_rate_little)
+function_body("${OUTPUT}.no_ccp.s" mips_turn_rate turn_rate_masked)
+if(NOT turn_rate MATCHES "[\t ]srl[\t ]+\\$[a-z0-9]+,\\$a1,16\n" OR
+   turn_rate MATCHES "[\t ](d?s[lr]l32|dsrl|or)[\t ]" OR
+   NOT turn_rate_little MATCHES "[\t ]srl[\t ]+\\$[a-z0-9]+,\\$a0,16\n" OR
+   turn_rate_little MATCHES "[\t ](d?s[lr]l32|dsrl|or)[\t ]")
+    message(FATAL_ERROR
+        "MIPS truncated shift under a dropped mask still reads the "
+        "doubleword\nbig:\n${turn_rate}\nlittle:\n${turn_rate_little}\n"
+        "-fno-tree-ccp:\n${turn_rate_masked}")
+endif()
+foreach(body piece_caller piece_caller_little piece_stack piece_outgoing
+             piece_x32)
+    if(${body} MATCHES "[\t ](d?s[lr]l32|dsrl|dsll|or)[\t ]")
+        message(FATAL_ERROR
+            "MIPS u64 call boundary assembled or split a doubleword\n"
+            "${${body}}")
+    endif()
+endforeach()
+string(REGEX MATCHALL "[\t ]sw[\t ]+\\$[a-z0-9]+,(16|20)\\(\\$sp\\)"
+       piece_outgoing_stores "${piece_outgoing}")
+string(REGEX MATCHALL "[\t ]lw[\t ]+\\$[atv][0-9],[0-9]+\\(\\$sp\\)"
+       piece_stack_loads "${piece_stack}")
+list(LENGTH piece_outgoing_stores piece_outgoing_store_count)
+list(LENGTH piece_stack_loads piece_stack_load_count)
+if(NOT piece_caller MATCHES "[\t ]jal[\t ]+mips_piece_callee\n[\t ]+move[\t ]+\\$a2,\\$a0\n" OR
+   NOT piece_caller MATCHES "[\t ]xor[\t ]+\\$v0,(\\$v0,\\$v1|\\$v1,\\$v0)\n" OR
+   NOT piece_caller_little MATCHES "[\t ]xor[\t ]+\\$v0,(\\$v0,\\$v1|\\$v1,\\$v0)\n" OR
+   NOT piece_caller_whole MATCHES "[\t ]dsrl32[\t ]" OR
+   NOT piece_caller_r3000 MATCHES "[\t ]jal[\t ]+mips_piece_callee\n" OR
+   NOT piece_outgoing_store_count EQUAL 2 OR
+   NOT piece_stack_load_count EQUAL 2 OR
+   NOT piece_x32 MATCHES "[\t ]sll[\t ]+\\$v0,\\$v0,0\n" OR
+   NOT piece_x32 MATCHES "[\t ]sll[\t ]+\\$v1,\\$v1,0\n")
+    message(FATAL_ERROR
+        "MIPS u64 call pieces regressed or -fno-machine-combine was ignored\n"
+        "caller:\n${piece_caller}\nlittle:\n${piece_caller_little}\n"
+        "whole:\n${piece_caller_whole}\nr3000:\n${piece_caller_r3000}\n"
+        "stack:\n${piece_stack}\noutgoing:\n${piece_outgoing}\n"
+        "x32:\n${piece_x32}")
 endif()
 # A loop's top test runs the next pass's multiply in its slot, on MIPS I
 # too, and -fno-schedule-insns2 keeps the slot empty.

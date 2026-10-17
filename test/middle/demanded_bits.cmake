@@ -66,3 +66,10 @@ foreach(function bit_fourteen two_bits signed_bits)
     lacks(${function} "\t(shr|sar)")
     has(${function} "\ttest[bwlq]\t[$]")
 endforeach()
+# A truncated right shift whose users read only bits below the narrow width
+# less the shift shifts the truncated value; one whose users read higher
+# bits keeps the wide shift.
+has(narrowed_shift "\tshrl\t[$]16,")
+lacks(narrowed_shift "\tshrq\t")
+has(wide_shift "\tshrq\t[$]16,")
+lacks(narrowed_signed "\t(shr|sar)q\t")

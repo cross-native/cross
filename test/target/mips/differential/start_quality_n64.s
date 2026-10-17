@@ -1741,8 +1741,8 @@ _start:
 	jal print_hex
 	nop
 	li $4,15
-	li $5,-129
-	li $6,6
+	li $5,16
+	li $6,33
 	jal k_q_static_search
 	nop
 	move $4,$2
@@ -1936,6 +1936,246 @@ _start:
 	li $5,16
 	li $6,33
 	jal k_q_ordered
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,1
+	li $5,3
+	li $6,5
+	jal k_q_rotate
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,7
+	li $5,2
+	li $6,0
+	jal k_q_rotate
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,-1
+	li $5,-2147483648
+	li $6,2147483647
+	jal k_q_rotate
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,305419896
+	li $5,-1698898192
+	li $6,43
+	jal k_q_rotate
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,-2147483648
+	li $5,-1
+	li $6,16
+	jal k_q_rotate
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,15
+	li $5,16
+	li $6,33
+	jal k_q_rotate
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,1
+	li $5,3
+	li $6,5
+	jal k_q_entry_swap
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,7
+	li $5,2
+	li $6,0
+	jal k_q_entry_swap
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,-1
+	li $5,-2147483648
+	li $6,2147483647
+	jal k_q_entry_swap
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,305419896
+	li $5,-1698898192
+	li $6,43
+	jal k_q_entry_swap
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,-2147483648
+	li $5,-1
+	li $6,16
+	jal k_q_entry_swap
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,15
+	li $5,16
+	li $6,33
+	jal k_q_entry_swap
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,1
+	li $5,3
+	li $6,5
+	jal k_q_carried_call
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,7
+	li $5,2
+	li $6,0
+	jal k_q_carried_call
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,-1
+	li $5,-2147483648
+	li $6,2147483647
+	jal k_q_carried_call
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,305419896
+	li $5,-1698898192
+	li $6,43
+	jal k_q_carried_call
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,-2147483648
+	li $5,-1
+	li $6,16
+	jal k_q_carried_call
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,15
+	li $5,16
+	li $6,33
+	jal k_q_carried_call
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,1
+	li $5,3
+	li $6,5
+	jal k_q_rotate_f64
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,7
+	li $5,2
+	li $6,0
+	jal k_q_rotate_f64
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,-1
+	li $5,-2147483648
+	li $6,2147483647
+	jal k_q_rotate_f64
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,305419896
+	li $5,-1698898192
+	li $6,43
+	jal k_q_rotate_f64
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,-2147483648
+	li $5,-1
+	li $6,16
+	jal k_q_rotate_f64
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,15
+	li $5,16
+	li $6,33
+	jal k_q_rotate_f64
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,1
+	li $5,3
+	li $6,5
+	jal k_q_select_zero
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,7
+	li $5,2
+	li $6,0
+	jal k_q_select_zero
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,-1
+	li $5,-2147483648
+	li $6,2147483647
+	jal k_q_select_zero
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,305419896
+	li $5,-1698898192
+	li $6,43
+	jal k_q_select_zero
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,-2147483648
+	li $5,-1
+	li $6,16
+	jal k_q_select_zero
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,15
+	li $5,16
+	li $6,33
+	jal k_q_select_zero
 	nop
 	move $4,$2
 	jal print_hex

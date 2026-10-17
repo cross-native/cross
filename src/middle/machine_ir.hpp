@@ -258,8 +258,9 @@ enum class ExtensionKind : std::uint8_t { None, Zero, Sign };
 
 // A result that its ABI carries in several pieces may be returned piece by
 // piece, so that each piece comes from the cheapest value that holds its
-// bits.  Pieces means that uses[i] holds the value bits of the i-th piece of
-// the function's result layout, in a register as wide as those bits.
+// bits.  Pieces means that uses[i] of a return, or defs[i] of a call, holds
+// the value bits of the i-th piece of the result layout, in a register as
+// wide as those bits.
 enum class ResultComposition : std::uint8_t { None, Pieces };
 
 // A selected boundary value may consume only a contiguous bit range of its
@@ -308,6 +309,11 @@ struct Instruction {
     // selection.  Width/register class alone cannot distinguish every
     // variadic floating, vector, pointer, and by-reference boundary value.
     std::vector<hir::TypeId> call_argument_types;
+    // An argument that its ABI carries in several pieces may take one
+    // operand per piece, in layout order, each holding the value bits of its
+    // piece in a register as wide as those bits: argument i then has
+    // call_argument_pieces[i] operands. Empty means one operand each.
+    std::vector<std::uint16_t> call_argument_pieces;
     // Dense identity of model-provided incoming variadic state. It is local
     // to the function's ABI model and never appears in the operand stream.
     AbiStateId variadic_state;
@@ -324,6 +330,14 @@ struct Instruction {
     bool must_tail{};
     std::optional<FrameEffect> frame_effect;
 };
+
+// The operands of argument `index` of a call: the first and their count.
+struct CallArgumentOperands {
+    std::size_t first{};
+    std::size_t count{};
+};
+[[nodiscard]] CallArgumentOperands call_argument_operands(
+    const Instruction& call, std::size_t index);
 
 struct FrameProgram {
     Register stack_pointer;
