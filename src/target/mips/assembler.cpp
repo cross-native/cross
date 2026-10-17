@@ -3,6 +3,7 @@
 #include "target/mips/assembler.hpp"
 
 #include "assembler/assembler.hpp"
+#include "target/mips/elf.hpp"
 #include "target/mips/features.hpp"
 #include "target/subtarget.hpp"
 #include "target/target.hpp"
@@ -115,32 +116,6 @@ enum : std::uint16_t {
     fixup_signed16,
     fixup_unsigned16,
 };
-
-constexpr std::uint32_t r_mips_16 = 1;
-constexpr std::uint32_t r_mips_32 = 2;
-constexpr std::uint32_t r_mips_26 = 4;
-constexpr std::uint32_t r_mips_hi16 = 5;
-constexpr std::uint32_t r_mips_lo16 = 6;
-constexpr std::uint32_t r_mips_gprel16 = 7;
-constexpr std::uint32_t r_mips_pc16 = 10;
-constexpr std::uint32_t r_mips_64 = 18;
-constexpr std::uint32_t r_mips_higher = 28;
-constexpr std::uint32_t r_mips_highest = 29;
-constexpr std::uint32_t r_mips_pc32 = 248;
-
-constexpr std::uint32_t sht_mips_reginfo = 0x70000006;
-constexpr std::uint32_t sht_mips_options = 0x7000000d;
-constexpr std::uint32_t sht_mips_dwarf = 0x7000001e;
-constexpr std::uint32_t sht_mips_abiflags = 0x7000002a;
-constexpr std::uint64_t shf_mips_nostrip = 0x08000000;
-
-constexpr std::uint32_t ef_mips_noreorder = 0x1;
-constexpr std::uint32_t ef_mips_pic = 0x2;
-constexpr std::uint32_t ef_mips_cpic = 0x4;
-constexpr std::uint32_t ef_mips_32bitmode = 0x100;
-constexpr std::uint32_t ef_mips_nan2008 = 0x400;
-constexpr std::uint32_t ef_mips_abi_o32 = 0x1000;
-constexpr std::uint32_t ef_mips_abi_eabi32 = 0x3000;
 
 enum class Abi : std::uint8_t { O32, N64, Eabi32 };
 
@@ -1468,33 +1443,29 @@ void MipsTarget::finish(Assembler& as) {
 
 bool MipsTarget::apply_fixup(Assembler& as, const assembler::Fixup& fixup, std::int64_t value,
                              std::span<std::uint8_t> bytes, bool relocated) const {
-    auto word = static_cast<std::uint32_t>(as.read_integer(bytes));
+    const auto word = static_cast<std::uint32_t>(as.read_integer(bytes));
     const auto unsigned_value = static_cast<std::uint64_t>(value);
     std::uint32_t field = 0;
     std::uint32_t mask = 0xffff;
     switch (fixup.kind.value) {
-    case fixup_hi16: field = static_cast<std::uint32_t>(((unsigned_value + 0x8000) >> 16U) & 0xffffU); break;
-    case fixup_lo16: field = static_cast<std::uint32_t>(unsigned_value & 0xffffU); break;
+    case fixup_hi16: field = high16(unsigned_value); break;
+    case fixup_lo16: field = low16(unsigned_value); break;
     case fixup_gprel16:
         if (!relocated) {
             as.error(fixup.location, "%gp_rel needs a symbol");
             return false;
         }
-        field = static_cast<std::uint32_t>(unsigned_value & 0xffffU);
+        field = low16(unsigned_value);
         break;
-    case fixup_higher:
-        field = static_cast<std::uint32_t>(((unsigned_value + 0x80008000ULL) >> 32U) & 0xffffU);
-        break;
-    case fixup_highest:
-        field = static_cast<std::uint32_t>(((unsigned_value + 0x800080008000ULL) >> 48U) & 0xffffU);
-        break;
+    case fixup_higher: field = higher16(unsigned_value); break;
+    case fixup_highest: field = highest16(unsigned_value); break;
     case fixup_jump26:
         if (!relocated && (value & 3) != 0) {
             as.error(fixup.location, "jump target is not word aligned");
             return false;
         }
-        field = static_cast<std::uint32_t>((unsigned_value >> 2U) & 0x3ffffffU);
-        mask = 0x3ffffff;
+        field = jump26(unsigned_value);
+        mask = jump26_mask;
         break;
     case fixup_branch16: {
         const auto displacement = value - 4;
@@ -1524,8 +1495,7 @@ bool MipsTarget::apply_fixup(Assembler& as, const assembler::Fixup& fixup, std::
     default:
         return false;
     }
-    word = (word & ~mask) | field;
-    as.write_integer(bytes, word);
+    as.write_integer(bytes, insert_field(word, field, mask));
     return true;
 }
 

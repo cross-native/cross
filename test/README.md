@@ -25,7 +25,8 @@ A test's fixtures (`.x` sources, assembly startup files, linker scripts, and
 models) live beside the CMake script that drives it. Most tests compile Cross
 sources and check the output or the diagnostics. Runtime tests link generated
 code with a small host runner or run it under QEMU and compare the result with
-an expected value.
+an expected value; MIPS images are linked with `ld.lld`, or with the Cross
+`ld` when the build sets `CROSS_TEST_CROSS_LD`.
 
 ## Selecting tests
 

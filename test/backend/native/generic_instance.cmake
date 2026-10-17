@@ -11,7 +11,8 @@ foreach(required CC FIRST SECOND OUTPUT TARGETS)
     endif()
 endforeach()
 find_program(LLVM_READOBJ NAMES llvm-readobj REQUIRED)
-find_program(LLD NAMES ld.lld REQUIRED)
+find_program(HOST_LLD NAMES ld.lld REQUIRED)
+include("${CMAKE_CURRENT_LIST_DIR}/../../support/mips_linker.cmake")
 
 function(run_checked label)
     execute_process(COMMAND ${ARGN}
@@ -62,7 +63,9 @@ foreach(target IN LISTS TARGETS)
             message(FATAL_ERROR
                 "${target} jump table is not in the instance group\n${run_output}")
         endif()
+        set(linker "${LLD}")
         if(target MATCHES "^x86_64")
+            set(linker "${HOST_LLD}")
             set(emulation elf_x86_64)
         elseif(target MATCHES "^mips64el")
             set(emulation elf64ltsmip)
@@ -73,7 +76,7 @@ foreach(target IN LISTS TARGETS)
         else()
             set(emulation elf32btsmip)
         endif()
-        run_checked("${target} link" "${LLD}" -m ${emulation}
+        run_checked("${target} link" "${linker}" -m ${emulation}
                     -e generic_instance_entry ${objects}
                     -o "${OUTPUT}-${target}.elf")
     endif()

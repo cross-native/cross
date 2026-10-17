@@ -11,6 +11,8 @@ set(CROSS_DEFAULT_TARGET "" CACHE STRING
     "Target triple used without -target or -mprofile; empty selects the host")
 set(CROSS_PPSSPP_HEADLESS "" CACHE FILEPATH
     "Optional PPSSPPHeadless executable for Allegrex runtime tests")
+option(CROSS_TEST_CROSS_LD
+       "Link the MIPS test images with the Cross ld instead of ld.lld" OFF)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -101,6 +103,18 @@ add_library(cross_assembler
 target_link_libraries(cross_assembler PUBLIC cross_common)
 cross_component(cross_assembler)
 
+add_library(cross_linker
+    src/linker/input.cpp
+    src/linker/layout.cpp
+    src/linker/link.cpp
+    src/linker/merge.cpp
+    src/linker/output.cpp
+    src/linker/relocatable.cpp
+    src/linker/script.cpp
+)
+target_link_libraries(cross_linker PUBLIC cross_assembler)
+cross_component(cross_linker)
+
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
              "${CMAKE_CURRENT_SOURCE_DIR}/model/common.xm"
              "${CMAKE_CURRENT_SOURCE_DIR}/model/x86_64.xm"
@@ -126,11 +140,12 @@ add_library(cross_targets
     src/target/registry.cpp
     src/target/subtarget.cpp
     src/target/mips/assembler.cpp
+    src/target/mips/linker.cpp
     src/target/mips/target.cpp
     src/target/x86_64/manual_endpoint.cpp
     src/target/x86_64/target.cpp
 )
-target_link_libraries(cross_targets PUBLIC cross_common cross_assembler)
+target_link_libraries(cross_targets PUBLIC cross_common cross_assembler cross_linker)
 cross_component(cross_targets)
 
 add_library(cross_frontend
@@ -264,6 +279,11 @@ add_executable(cross_as src/driver/as_main.cpp)
 target_link_libraries(cross_as PRIVATE cross_targets)
 set_target_properties(cross_as PROPERTIES OUTPUT_NAME as)
 cross_tool(cross_as)
+
+add_executable(cross_ld src/driver/ld_main.cpp)
+target_link_libraries(cross_ld PRIVATE cross_targets)
+set_target_properties(cross_ld PROPERTIES OUTPUT_NAME ld)
+cross_tool(cross_ld)
 
 include(CTest)
 if(BUILD_TESTING)
@@ -1724,6 +1744,28 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/target/mips/assembler/linkers.cmake")
     set_tests_properties(cross_mips_assembler_linkers PROPERTIES
         LABELS "feature.assembler;arch.mips;backend.native;check.compile;endian.big;endian.little")
+    # The Cross ld: relocations, the --just-symbols KSEG0 case, linker
+    # scripts, archives, options and diagnostics, relocatable output, and
+    # images that GNU ld links the same.
+    foreach(linker_test relocations just_symbols scripts archives tool relocatable)
+        add_test(NAME cross_mips_linker_${linker_test}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DAS=$<TARGET_FILE:cross_as>
+                    -DLD=$<TARGET_FILE:cross_ld>
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-linker/${linker_test}
+                    -P "${CMAKE_SOURCE_DIR}/test/target/mips/linker/${linker_test}.cmake")
+        set_tests_properties(cross_mips_linker_${linker_test} PROPERTIES
+            LABELS "feature.linker;arch.mips;check.compile;endian.big;endian.little")
+    endforeach()
+    add_test(NAME cross_mips_linker_gnu_ld
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DLD=$<TARGET_FILE:cross_ld>
+                "-DSOURCES=${CMAKE_SOURCE_DIR}/test/target/mips/gnu_as.x;${CMAKE_SOURCE_DIR}/test/target/mips/i64_pair.x;${CMAKE_SOURCE_DIR}/test/target/mips/vla.x"
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-linker/gnu-ld
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/linker/gnu_ld.cmake")
+    set_tests_properties(cross_mips_linker_gnu_ld PROPERTIES
+        LABELS "feature.linker;arch.mips;backend.native;check.compile;endian.big;endian.little")
     add_test(NAME cross_mips_allegrex
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
@@ -1780,6 +1822,24 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/target/mips/runtime.cmake")
     set_tests_properties(cross_mips_vr4300_runtime_as PROPERTIES
         LABELS "check.runtime;arch.mips;backend.native;feature.codegen;feature.assembler")
+    # The same image assembled by Cross as and linked by Cross ld.
+    add_test(NAME cross_mips_vr4300_runtime_ld
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DAS=$<TARGET_FILE:cross_as>
+                -DLD=$<TARGET_FILE:cross_ld>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/vr4300_o32.x
+                -DMEMORY_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/memory_atomic.x
+                -DPAIR_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/i64_pair.x
+                -DMIPS1_FLOAT_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/mips1_float.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/runtime.s
+                -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare.ld
+                -DWRAPPER_TEMPLATE=${CMAKE_SOURCE_DIR}/test/target/mips/runtime64.s.in
+                -DWRAPPER_LINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare64.ld
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-vr4300-runtime-ld
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/runtime.cmake")
+    set_tests_properties(cross_mips_vr4300_runtime_ld PROPERTIES
+        LABELS "check.runtime;arch.mips;backend.native;feature.codegen;feature.assembler;feature.linker")
     # Machine-instruction built-ins, coprocessor 0 hazards, and naked
     # functions on the VR4300.
     add_test(NAME cross_mips_machine_instructions COMMAND "${CMAKE_COMMAND}"
@@ -1891,6 +1951,35 @@ if(BUILD_TESTING)
         -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
     set_tests_properties(cross_mips_small_data_gcc PROPERTIES
         LABELS "check.runtime;arch.mips;endian.big;endian.little;backend.native;feature.small_data;feature.interop;opt.O2")
+    # GNU as objects of GCC -G8 output and Cross objects, linked by Cross ld,
+    # in o32 (which LLD rejects) and n64.
+    add_test(NAME cross_mips_small_data_gcc_ld COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc>
+        -DLD=$<TARGET_FILE:cross_ld>
+        -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/small_data_runtime.x
+        -DGCC_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/small_data_partner.c
+        -DGCC_FLAGS=-G8
+        -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/small_data_start.s
+        -DMIPS_LINKER=${CMAKE_SOURCE_DIR}/test/target/mips/small-data.ld
+        -DCC_FLAGS=-mdata-bases=mips-gp
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-small-data-gcc-ld
+        -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+    set_tests_properties(cross_mips_small_data_gcc_ld PROPERTIES
+        LABELS "check.runtime;arch.mips;endian.big;endian.little;backend.native;feature.small_data;feature.interop;feature.linker;opt.O2")
+    add_test(NAME cross_mips_small_data_n64_gcc_ld COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc>
+        -DLD=$<TARGET_FILE:cross_ld>
+        -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/small_data_runtime.x
+        -DGCC_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/small_data_partner.c
+        -DGCC_FLAGS=-G8
+        -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/small_data_n64_start.s
+        -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/small-data-n64.ld
+        -DN64_ENDIAN=big
+        -DEXTRA_FLAGS=-mdata-bases=mips-gp
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-small-data-n64-gcc-ld
+        -P "${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.cmake")
+    set_tests_properties(cross_mips_small_data_n64_gcc_ld PROPERTIES
+        LABELS "check.runtime;arch.mips;endian.big;backend.native;feature.small_data;feature.interop;feature.linker;profile.n64;opt.O2")
     foreach(small_data_endian big little)
         add_test(NAME cross_mips_small_data_n64_gcc_${small_data_endian} COMMAND "${CMAKE_COMMAND}"
             -DCC=$<TARGET_FILE:cross_cc>
@@ -2209,6 +2298,22 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/target/mips/differential/differential.cmake")
     set_tests_properties(cross_mips_differential_int_vr4300 PROPERTIES
         LABELS "check.runtime;arch.mips;backend.native;feature.optimization")
+    add_test(NAME cross_mips_differential_int_vr4300_ld
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DLD=$<TARGET_FILE:cross_ld>
+                -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DTEMPLATE=${CMAKE_SOURCE_DIR}/test/target/mips/differential/int_kernels.x.in
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/differential/start_int.s
+                -DHOST_MAIN=${CMAKE_SOURCE_DIR}/test/target/mips/differential/main_int.cpp
+                -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare.ld
+                -DWRAPPER_TEMPLATE=${CMAKE_SOURCE_DIR}/test/target/mips/runtime64.s.in
+                -DWRAPPER_LINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare64.ld
+                -DTARGET_FLAGS=-mprofile=vr4300-o32
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-differential-int-vr4300-ld
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/differential/differential.cmake")
+    set_tests_properties(cross_mips_differential_int_vr4300_ld PROPERTIES
+        LABELS "check.runtime;arch.mips;backend.native;feature.optimization;feature.linker")
     add_test(NAME cross_mips_differential_int_r3000
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
@@ -8173,4 +8278,9 @@ if(BUILD_TESTING)
             endforeach()
         endif()
     endforeach()
+    # test/support/mips_linker.cmake links with CROSS_TEST_LD when set.
+    if(CROSS_TEST_CROSS_LD)
+        set_property(TEST ${cross_registered_tests} APPEND PROPERTY
+                     ENVIRONMENT "CROSS_TEST_LD=$<TARGET_FILE:cross_ld>")
+    endif()
 endif()

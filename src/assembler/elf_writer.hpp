@@ -5,6 +5,7 @@
 #include "assembler/assembler.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -61,12 +62,36 @@ struct ElfSection {
     std::vector<std::uint8_t> data;
     // The size of a NOBITS section, which has no data.
     std::uint64_t size{};
+    std::uint64_t address{};
+    // The file offset; without one the section follows the previous one at
+    // its alignment.
+    std::optional<std::uint64_t> offset;
 };
 
-// Writes an ELF relocatable file. `sections` excludes the null section at
-// index 0; `names` is the index of the section-name string table.
+struct ElfSegment {
+    std::uint32_t type{};
+    std::uint32_t flags{};
+    std::uint64_t offset{};
+    std::uint64_t address{};
+    std::uint64_t physical_address{};
+    std::uint64_t file_size{};
+    std::uint64_t memory_size{};
+    std::uint64_t alignment{};
+};
+
+// The header facts of an executable, whose program headers follow the ELF
+// header.
+struct ElfExecutable {
+    std::uint64_t entry{};
+    std::vector<ElfSegment> segments;
+};
+
+// Writes an ELF file: a relocatable file, or an executable when `executable`
+// is given. `sections` excludes the null section at index 0; `names` is the
+// index of the section-name string table.
 [[nodiscard]] std::vector<std::uint8_t> write_elf(
     const ObjectInfo& object, std::uint32_t flags,
-    std::span<const ElfSection> sections, std::uint32_t names);
+    std::span<const ElfSection> sections, std::uint32_t names,
+    const ElfExecutable* executable = nullptr);
 
 } // namespace cross::assembler

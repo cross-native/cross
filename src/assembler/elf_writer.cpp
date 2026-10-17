@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "assembler/elf_writer.hpp"
 
+#include <algorithm>
+
 namespace cross::assembler {
 
 void ByteWriter::integer(std::uint64_t value, unsigned size) {
@@ -30,20 +32,38 @@ std::uint32_t StringTable::add(std::string_view text) {
 std::vector<std::uint8_t> write_elf(const ObjectInfo& object,
                                     std::uint32_t flags,
                                     std::span<const ElfSection> sections,
-                                    std::uint32_t names) {
+                                    std::uint32_t names,
+                                    const ElfExecutable* executable) {
     ByteWriter out(object.big_endian);
     const bool wide = object.elf64;
     const unsigned header_size = wide ? 64 : 52;
+    const unsigned segment_header_size = wide ? 56 : 32;
     const unsigned section_header_size = wide ? 64 : 40;
-    out.data().resize(header_size);
+    const std::size_t segment_count = executable ? executable->segments.size() : 0;
+    auto& data = out.data();
+    data.resize(header_size + segment_count * segment_header_size);
 
     std::vector<std::uint64_t> offsets(sections.size());
+    std::uint64_t end = data.size();
     for (std::size_t index = 0; index < sections.size(); ++index) {
         const auto& section = sections[index];
-        out.align(section.alignment);
-        offsets[index] = out.size();
-        if (section.type != elf::sht_nobits) out.bytes(section.data);
+        std::uint64_t offset = end;
+        if (section.offset) {
+            offset = *section.offset;
+        } else {
+            if (section.alignment > 1) {
+                offset = (offset + section.alignment - 1) / section.alignment * section.alignment;
+            }
+            end = offset;
+        }
+        offsets[index] = offset;
+        if (section.type == elf::sht_nobits) continue;
+        if (data.size() < offset + section.data.size()) data.resize(offset + section.data.size());
+        std::copy(section.data.begin(), section.data.end(),
+                  data.begin() + static_cast<std::ptrdiff_t>(offset));
+        end = std::max<std::uint64_t>(end, offset + section.data.size());
     }
+    data.resize(end);
     out.align(wide ? 8 : 4);
     const auto section_headers = out.size();
     for (unsigned index = 0; index < section_header_size; ++index) out.u8(0);
@@ -56,12 +76,12 @@ std::vector<std::uint8_t> write_elf(const ObjectInfo& object,
         out.u32(section.type);
         if (wide) {
             out.u64(section.flags);
-            out.u64(0);
+            out.u64(section.address);
             out.u64(offsets[index]);
             out.u64(size);
         } else {
             out.u32(section.flags);
-            out.u32(0);
+            out.u32(section.address);
             out.u32(offsets[index]);
             out.u32(size);
         }
@@ -85,25 +105,49 @@ std::vector<std::uint8_t> write_elf(const ObjectInfo& object,
     header.u8(object.big_endian ? 2 : 1);
     header.u8(1);
     for (unsigned index = 0; index < 9; ++index) header.u8(0);
-    header.u16(1); // ET_REL
+    header.u16(executable ? 2 : 1); // ET_EXEC or ET_REL
     header.u16(object.machine);
     header.u32(1);
+    const std::uint64_t entry = executable ? executable->entry : 0;
+    const std::uint64_t segment_headers = segment_count != 0 ? header_size : 0;
     if (wide) {
-        header.u64(0);
-        header.u64(0);
+        header.u64(entry);
+        header.u64(segment_headers);
         header.u64(section_headers);
     } else {
-        header.u32(0);
-        header.u32(0);
+        header.u32(entry);
+        header.u32(segment_headers);
         header.u32(section_headers);
     }
     header.u32(flags);
     header.u16(header_size);
-    header.u16(0);
-    header.u16(0);
+    header.u16(segment_count != 0 ? segment_header_size : 0);
+    header.u16(segment_count);
     header.u16(section_header_size);
     header.u16(sections.size() + 1);
     header.u16(names);
+    if (executable) {
+        for (const auto& segment : executable->segments) {
+            header.u32(segment.type);
+            if (wide) {
+                header.u32(segment.flags);
+                header.u64(segment.offset);
+                header.u64(segment.address);
+                header.u64(segment.physical_address);
+                header.u64(segment.file_size);
+                header.u64(segment.memory_size);
+                header.u64(segment.alignment);
+            } else {
+                header.u32(segment.offset);
+                header.u32(segment.address);
+                header.u32(segment.physical_address);
+                header.u32(segment.file_size);
+                header.u32(segment.memory_size);
+                header.u32(segment.flags);
+                header.u32(segment.alignment);
+            }
+        }
+    }
     std::copy(header.data().begin(), header.data().end(), out.data().begin());
     return std::move(out.data());
 }

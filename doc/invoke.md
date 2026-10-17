@@ -1,17 +1,19 @@
-# Using cc, cpp, and as
+# Using cc, cpp, as, and ld
 
 ```text
 cc [options] input.x ...
 cpp [options] input.x ...
 as [options] input.s ...
+ld [options] file ...
 ```
 
 `cc` preprocesses and compiles Cross source (`.x`) to assembly or object
 files. `cpp` only preprocesses, writing Cross to standard output or to `-o`.
 `as` assembles hand-written GNU-syntax MIPS assembly into an object file
-([Assembling](#assembling)). `cc --help`, `cpp --help`, and `as --help` list
-every option. Options taking a value accept it joined or separate
-(`-oout.s`, `-o out.s`).
+([Assembling](#assembling)), and `ld` links MIPS objects into a static
+executable ([Linking](#linking)). `cc --help`, `cpp --help`, `as --help`, and
+`ld --help` list every option. Options of `cc`, `cpp`, and `as` taking a value
+accept it joined or separate (`-oout.s`, `-o out.s`).
 
 ## Output
 
@@ -43,8 +45,9 @@ whose sizes the bytes do not include.
 
 `cc` does not link: running it without `-S`, `-c`, or `-E` is an error, and
 linker options such as `-e`, `-L`, and `-l` are rejected. Link the objects with
-your own linker, startup code, and libraries. Nothing is added implicitly, and
-`main` has no special meaning: choose the entry symbol with the linker.
+`ld` or another linker, and with your own startup code and libraries. Nothing
+is added implicitly, and `main` has no special meaning: choose the entry
+symbol with the linker.
 
 All inputs of one command form a single compilation group with one output, named
 after the first input when `-o` is absent. Definitions without `static` or
@@ -222,6 +225,142 @@ or `.MIPS.options` (ELF64), and `.pdr` for each `.end`. Unlike GNU as:
   symbol`, and PIC code (`-mabicalls`, `.cpload`) are not available: write
   `div $zero, rs, rt` and `%hi`/`%lo` pairs.
 
+## Linking
+
+`ld` links ELF relocatable objects, archives, raw binary files, and the
+symbol addresses of other images into one static ELF executable, laid out by
+a GNU ld linker script. It links MIPS objects of either class and byte order
+(o32, n64, and EABI32, from `cc -c`, `as`, GNU as, GCC, and Clang); objects of
+other machines are rejected. It accepts GNU ld's spelling of the options
+below, and runs no other program.
+
+| Option | Selects |
+| --- | --- |
+| `-o FILE` | The executable (default `a.out`). |
+| `-T FILE`, `--script=FILE` | The linker script. |
+| `-e SYMBOL`, `--entry=SYMBOL` | The entry point, a symbol or an address. Without it, `ENTRY` in the script, then `_start`, then the start of `.text` (with a warning). |
+| `-L DIR`, `-l NAME` | `-l NAME` links `libNAME.a` (`-l:NAME` links `NAME`) from the `-L` directories and the script's `SEARCH_DIR`s. |
+| `-R FILE`, `--just-symbols=FILE` | The addresses of the global symbols that the ELF file FILE defines, without its contents. |
+| `-b binary`, `--format=binary` | Read the following inputs as raw data, each as a writable `.data` section with the symbols `_binary_NAME_start`, `_binary_NAME_end`, and `_binary_NAME_size`, where NAME is the path as written with each character other than a letter or digit replaced by `_`. `-b elf32-bigmips` (any ELF format) or `--format=default` ends raw input. |
+| `-u SYMBOL` | Require SYMBOL, linking an archive member that defines it. |
+| `--defsym SYMBOL=EXPRESSION` | Define SYMBOL with a script expression. |
+| `-Ttext=ADDRESS`, `-Tdata=ADDRESS`, `-Tbss=ADDRESS`, `--section-start=NAME=ADDRESS` | Place an output section at ADDRESS, read as hexadecimal. |
+| `-r`, `--relocatable` | Write a relocatable object instead of an executable. |
+| `--gc-sections`, `--print-gc-sections` | Remove the allocated sections that nothing reaches, and report each one removed. |
+| `-Map FILE`, `-M` | Write a link map to FILE, or to standard output. |
+| `-m EMULATION`, `--oformat=FORMAT`, `-EB`, `-EL` | The output class and byte order instead of the first object's: the emulations `elf32btsmip`, `elf32ltsmip`, `elf32ebmip`, `elf32elmip`, `elf64btsmip`, and `elf64ltsmip`, or the formats `elf32-bigmips`, `elf32-littlemips`, `elf32-tradbigmips`, `elf32-tradlittlemips`, and their `elf64-` counterparts. |
+| `-z max-page-size=SIZE` | The alignment of loadable segments in the file: by default 64 KiB for ELF64 and for the `ts` emulations and `trad` formats, otherwise 4 KiB. |
+| `-s`, `--strip-all` | Omit the symbol table. |
+| `--fatal-warnings` | Treat warnings as errors. |
+| `--start-group`, `--end-group` | Accepted; archives are searched in any order. |
+
+**Symbols.** A symbol has at most one strong definition. A strong definition
+replaces weak and common ones, a common symbol replaces a weak definition,
+and common symbols of one name merge to the largest size and alignment; they
+are allocated in an input section named `COMMON` (MIPS small commons in
+`.scommon`) of the file that defines them. An undefined weak symbol is zero.
+Of several COMDAT groups with one signature, the first is linked. An archive
+member is linked when it defines a symbol that a strong reference needs,
+wherever the archive and the reference appear on the command line; the first
+archive on the command line that defines the symbol provides it, and weak
+references link no member. A linker-script assignment defines its symbol
+even when an object also defines it.
+
+**Linker scripts.** The accepted commands are `SECTIONS`, `MEMORY`, `PHDRS`,
+`ENTRY`, `INCLUDE` (searched in the current directory, the `-L` and
+`SEARCH_DIR` directories, and the including script's directory),
+`SEARCH_DIR`, `EXTERN`, `ASSERT`, `OUTPUT_ARCH`, `OUTPUT_FORMAT` (both
+ignored), and assignments, also inside `PROVIDE`, `HIDDEN`, and
+`PROVIDE_HIDDEN`. An output section
+description may give an address, `(NOLOAD)`, `AT(...)`, `ALIGN(...)`,
+`>REGION`, `AT>REGION`, `:PHDR`, and `=FILL` (a 32-bit big-endian pattern);
+its contents are input section descriptions, `BYTE`, `SHORT`, `LONG`, `QUAD`,
+`SQUAD`, assignments to symbols and to `.`, and `ASSERT`. An input section
+description is `FILE(SECTION ...)` with the wildcards `*`, `?`, and `[...]`,
+optionally in `KEEP(...)`, with `EXCLUDE_FILE(...)`, `SORT`, `SORT_BY_NAME`,
+`SORT_BY_ALIGNMENT`, `SORT_NONE`, and `ARCHIVE:MEMBER` file patterns; a file
+pattern matches the path as written, and an archive member matches its
+archive's path. `COMMON` names the common symbols and `/DISCARD/` drops what
+it matches. Expressions have C's operators and the functions `ABSOLUTE`,
+`ADDR`, `ALIGN`, `ALIGNOF`, `BLOCK`, `CONSTANT`, `DEFINED`, `LENGTH`,
+`LOADADDR`, `LOG2CEIL`, `MAX`, `MIN`, `NEXT`, `ORIGIN`, `SEGMENT_START`,
+`SIZEOF`, and `SIZEOF_HEADERS`. Other commands, such as `OVERLAY`, `INSERT`,
+`INPUT`, `GROUP`, `STARTUP`, `NOCROSSREFS`, `REGION_ALIAS`, `SUBALIGN`,
+`ONLY_IF_RO`, `FILL`, output section types other than `NOLOAD`, and the
+`DATA_SEGMENT_*` functions, are diagnosed.
+
+**Layout.** Addresses, load addresses, empty sections, and the location
+counter follow GNU ld: an output section without contents is omitted (its
+address still counts when it defines symbols); a section without an address
+follows the location counter, or with `>REGION` that region, at its
+alignment; a plain number assigned to `.` inside an output section is an
+offset from the section's start. A section without `AT` or `AT>` keeps the
+difference between load and virtual address of the previous section in its
+region, and one without them that follows a section with `AT>` in the same
+region also loads in that section's load region. Sections without `>REGION`
+follow the location counter even when `MEMORY` defines regions. An input
+section that no rule matches keeps its name and follows the last output
+section of its kind (code, read-only data, data, or zero-filled data), or of
+an earlier kind; non-allocated ones come last, and `COMMON` goes to `.bss`.
+Without `-T` the layout is a subset of GNU ld's default for MIPS: the ABI
+sections and code at 0x400000 (0x120000000 for ELF64), the data on the next
+page at the same page offset, `_gp` 32 KiB past the start of the small data,
+and `_etext`, `_edata`, `__bss_start`, and `_end`.
+
+**Segments.** Without `PHDRS`, allocated sections share a loadable segment
+unless a section's load and virtual addresses differ by another amount, it
+overlaps the previous section or starts more than a page after its end, it
+holds data after a zero-filled section, or it is writable after read-only
+sections and on another page. With `PHDRS`, a section without `:PHDR` takes
+the program headers of the previous section unless it is `NOLOAD`. The file
+and program headers join the first loadable segment when there is room for
+them below its first section in that page, without `PHDRS` or when the
+segment's entry has `FILEHDR` or `PHDRS`. A `.MIPS.abiflags` or `.reginfo`
+output section also gets a `PT_MIPS_ABIFLAGS` or `PT_MIPS_REGINFO` header.
+
+**MIPS.** `ld` applies `R_MIPS_16`, `_32`, `_64`, `_26`, `_HI16`, `_LO16`,
+`_GPREL16`, `_GPREL32`, `_LITERAL`, `_PC16`, `_PC32`, `_HIGHER`, and
+`_HIGHEST`, the n64 combinations with `R_MIPS_64` and with `R_MIPS_SUB` and
+`_HI16` or `_LO16`, and ignores `R_MIPS_JALR` hints; PIC, TLS, MIPS16, and
+microMIPS relocations are diagnosed. A REL `R_MIPS_HI16` takes the low half
+of its addend from the next `R_MIPS_LO16` of the same symbol, so several may
+share one; one without such a `R_MIPS_LO16` gets a warning. `R_MIPS_26`
+requires the target in the 256 MiB region of the delay slot. In ELF32 output
+every address is a 32-bit value, so symbol addresses read with
+`--just-symbols` and script addresses compare as such. gp-relative
+relocations need a definition of `_gp`, and those against local symbols add
+the gp value an object's `.reginfo` or `.MIPS.options` records. `R_MIPS_16`
+fills the 16-bit field at its offset, where GNU ld fills the low half of the
+32-bit word there. The header flags of the objects must agree on the ABI, the
+NaN encoding, and FP64, and their ISAs must extend one another; the output
+takes the newest ISA. `.reginfo` and `.MIPS.options` merge into one register
+mask with the final `_gp`, and `.MIPS.abiflags` into the largest ISA and
+register sizes with the floating-point ABI that all objects accept (the
+objects' `.MIPS.abiflags`, where GNU ld takes it from `.gnu.attributes`;
+objects with incompatible floating-point ABIs get a warning, as in GNU ld).
+A `.pdr` record whose function a file does not contribute, such as a
+duplicate COMDAT copy, is dropped, and `.gnu.attributes` sections are not
+copied to the output.
+
+**Other rules.** Relocation-free `SHF_MERGE` sections of one output section
+are merged as GNU ld merges them: one copy of each string or constant, and
+strings that end other strings share their tails. `--gc-sections` keeps the
+entry, `-u`, `EXTERN`, and script symbols, `KEEP` sections, sections whose
+symbols those reach through relocations, COMDAT groups as wholes, note, init
+and fini array sections, `.ctors`, `.dtors`, OS- and processor-specific
+sections, and `.eh_frame` whole (relocations in it that refer to removed code
+resolve to zero, as they do in non-allocated sections). The symbol table
+keeps local symbols except assembler-local labels in mergeable sections,
+makes the symbols a script defines with `HIDDEN` or `PROVIDE_HIDDEN` local,
+keeps the binding and visibility objects give their symbols, and leaves out
+undefined weak symbols. The map lists discarded input sections, then each output section
+with its input sections, the files they come from, their symbols, and the
+script's assignments, in a format like GNU ld's. With `-r`, input sections
+of one name share an output section, except that the members of a section
+group keep their own and the group stays; relocations remain, against output
+section symbols with their addends adjusted, and common symbols stay common;
+`-r` takes `--defsym` but no linker script.
+
 ## Inspecting the compiler
 
 These options print what the selected target and models provide. Combine them
@@ -243,8 +382,11 @@ with `-target`, `-march`, or `-mprofile` to inspect another configuration.
 Diagnostics have the form `file:line:column: error: message`, followed by the
 source line and a caret. Errors in generated code also show the macro or
 syntax expansion chain; `as` reports an error inside a macro at the line that
-invokes it. Errors in a model file have the form
-`file:line: error: message`, the same under `cc`, `cpp`, and `as`, and errors
-that belong to no file, such as an unknown option, have the form
-`cc: error: message`, `cpp: error: message`, or `as: error: message`. The
-tools exit with status 1 after an error and 0 otherwise.
+invokes it, and `ld` an error in a linker script at its position. Errors in a
+model file have the form `file:line: error: message`, the same under `cc`,
+`cpp`, and `as`, and errors that belong to no file, such as an unknown option,
+have the form `cc: error: message`, `cpp: error: message`, `as: error:
+message`, or `ld: error: message`. `ld` names the object (`archive(member)`
+for an archive member), the section and offset, and the symbol of an error in
+the input, as in `ld: error: start.o:(.text+0x8): undefined reference to
+'main'`. The tools exit with status 1 after an error and 0 otherwise.

@@ -11,7 +11,7 @@ if(NOT DEFINED EXPECTED)
 endif()
 find_program(LLVM_MC NAMES llvm-mc)
 find_program(LLVM_OBJCOPY NAMES llvm-objcopy)
-find_program(LLD NAMES ld.lld)
+include("${CMAKE_CURRENT_LIST_DIR}/../../support/mips_linker.cmake")
 find_program(QEMU_B NAMES qemu-system-mips64)
 find_program(QEMU_L NAMES qemu-system-mips64el)
 if(NOT LLVM_MC OR NOT LLVM_OBJCOPY OR NOT LLD)
@@ -34,12 +34,17 @@ endif()
 # An optional C unit, compiled by GNU GCC with GCC_FLAGS, checks that its
 # objects and Cross objects link and run together. In the o32 symbol table
 # that GNU as writes for GCC output, sh_info counts the local FILE symbol as
-# global, which LLD rejects, so such a link uses GNU ld.
+# global, which LLD rejects, so unless LD names the Cross ld, such a link
+# uses GNU ld.
 set(gcc_unit OFF)
 if(DEFINED GCC_SOURCE AND NOT "${GCC_SOURCE}" STREQUAL "")
     set(gcc_unit ON)
     find_program(GNU_GCC NAMES mips64-elf-gcc)
-    find_program(GNU_LD NAMES mips64-elf-ld)
+    if(LD)
+        set(GNU_LD "${LD}")
+    else()
+        find_program(GNU_LD NAMES mips64-elf-ld)
+    endif()
     if(NOT GNU_GCC OR NOT GNU_LD)
         message(STATUS "skipping MIPS semantic test: mips64-elf-gcc and mips64-elf-ld are required")
         return()

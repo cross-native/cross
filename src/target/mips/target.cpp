@@ -5,8 +5,10 @@
 #include "common/options.hpp"
 #include "target/mips/assembler.hpp"
 #include "target/mips/bit_operations.hpp"
+#include "target/mips/elf.hpp"
 #include "target/mips/features.hpp"
 #include "target/mips/instructions.hpp"
+#include "target/mips/linker.hpp"
 #include "target/mips/select_operations.hpp"
 #include "target/subtarget.hpp"
 #include "target/target.hpp"
@@ -616,6 +618,8 @@ TargetInfo make_target(ByteOrder order,
     // %gp_rel offsets are relative to _gp, which $gp holds.
     result.data_base_registers = {"gp"};
     result.integrated_assembler = &mips::assemble;
+    result.elf_machine = mips::em_mips;
+    result.linker = &mips::make_linker_target;
     return result;
 }
 

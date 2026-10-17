@@ -14,7 +14,7 @@ endforeach()
 find_program(GDB NAMES gdb-multiarch)
 find_program(QEMU NAMES ${QEMU_NAME})
 find_program(LLVM_MC NAMES llvm-mc)
-find_program(LLD NAMES ld.lld)
+include("${CMAKE_CURRENT_LIST_DIR}/../../support/mips_linker.cmake")
 if(NOT GDB OR NOT QEMU OR NOT LLVM_MC OR NOT LLD)
     message(STATUS
         "skipping the gdb test: gdb-multiarch, ${QEMU_NAME}, llvm-mc, and ld.lld are required")

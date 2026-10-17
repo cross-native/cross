@@ -16,7 +16,7 @@ else()
     find_program(LLVM_MC NAMES llvm-mc)
 endif()
 find_program(LLVM_OBJCOPY NAMES llvm-objcopy)
-find_program(LLD NAMES ld.lld)
+include("${CMAKE_CURRENT_LIST_DIR}/../../support/mips_linker.cmake")
 find_program(QEMU NAMES qemu-system-mips64)
 if(NOT LLVM_MC OR NOT LLVM_OBJCOPY OR NOT LLD OR NOT QEMU)
     message(STATUS

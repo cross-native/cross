@@ -22,9 +22,9 @@ global void divide(u32 a, u32 b, out u32 quotient, out u32 remainder) {
 ```
 
 This repository contains the compiler `cc`, the preprocessor `cpp`, the MIPS
-assembler `as`, the compiler models, tests, and benchmarks. One `cc` build
-targets x86-64 (ELF, COFF, and Mach-O) and MIPS (MIPS I to MIPS64, including
-the VR4300 and Allegrex). Cross is a pre-1.0 draft: the compiler implements
+assembler `as` and linker `ld`, the compiler models, tests, and benchmarks.
+One `cc` build targets x86-64 (ELF, COFF, and Mach-O) and MIPS (MIPS I to
+MIPS64, including the VR4300 and Allegrex). Cross is a pre-1.0 draft: the compiler implements
 part of the current specification draft ([doc/spec.md](doc/spec.md), 0.9),
 `cc --version` reports the draft it conforms to, and drafts do not promise
 source or binary compatibility with one another.
@@ -42,13 +42,14 @@ build/bin/cc -S -O2 example.x -o example.s
 build/bin/cc -c -O2 -target x86_64-unknown-linux-gnu example.x -o example.o
 ```
 
-`cc` produces assembly or object files and does not link. Without `-target`,
-it compiles for the host it was built on.
+`cc` produces assembly or object files and does not link; `ld` links MIPS
+objects with a linker script. Without `-target`, `cc` compiles for the host it
+was built on.
 
 ## Documentation
 
 - [doc/install.md](doc/install.md): building, configuration, and tests.
-- [doc/invoke.md](doc/invoke.md): `cc`, `cpp`, and `as` options.
+- [doc/invoke.md](doc/invoke.md): `cc`, `cpp`, `as`, and `ld` options.
 - [doc/language.md](doc/language.md): the language, for C programmers.
 - [doc/spec.md](doc/spec.md): the language specification.
 - [doc/metaprogramming.md](doc/metaprogramming.md): macros, syntax

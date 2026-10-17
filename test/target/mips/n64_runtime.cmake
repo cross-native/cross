@@ -8,7 +8,7 @@ foreach(required CC SOURCE STARTUP LINKER OUTPUT)
 endforeach()
 
 find_program(LLVM_MC NAMES llvm-mc)
-find_program(LLD NAMES ld.lld)
+include("${CMAKE_CURRENT_LIST_DIR}/../../support/mips_linker.cmake")
 if(N64_ENDIAN STREQUAL "little")
     set(n64_arch mips64el)
     set(n64_link_emulation elf64ltsmip)

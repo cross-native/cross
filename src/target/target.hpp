@@ -9,6 +9,7 @@
 #include <optional>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -24,7 +25,11 @@ struct SourceFile;
 struct SubtargetTable;
 
 namespace assembler {
+struct ObjectInfo;
 struct Options;
+}
+namespace linker {
+class Target;
 }
 
 // Assembles GNU-syntax target assembly into a relocatable object.
@@ -32,6 +37,10 @@ using IntegratedAssembler = std::optional<std::vector<std::uint8_t>> (*)(
     const std::vector<const SourceFile*>& sources, const Subtarget& subtarget,
     const assembler::Options& options, SourceManager& manager,
     Diagnostics& diagnostics);
+
+// The linker's relocation and header-flag rules for an output of the
+// target's ELF machine.
+using LinkerTarget = std::unique_ptr<linker::Target> (*)(const assembler::ObjectInfo& output);
 
 struct AbiId {
     static constexpr std::uint32_t invalid_value =
@@ -726,6 +735,10 @@ struct TargetInfo {
     // Cross's own assembler; none while objects of the target still go
     // through llvm-mc.
     IntegratedAssembler integrated_assembler{};
+    // The ELF machine number of the target's objects, and the linker's
+    // rules for them; none while the linker does not support the target.
+    std::uint16_t elf_machine{};
+    LinkerTarget linker{};
 
     [[nodiscard]] bool matches(std::string_view triple) const;
     [[nodiscard]] std::string_view default_abi(std::string_view triple) const;

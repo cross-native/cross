@@ -10,7 +10,7 @@ endforeach()
 find_program(LLVM_MC NAMES llvm-mc)
 find_program(LLVM_OBJCOPY NAMES llvm-objcopy)
 find_program(LLVM_READOBJ NAMES llvm-readobj)
-find_program(LLD NAMES ld.lld)
+include("${CMAKE_CURRENT_LIST_DIR}/../../../support/mips_linker.cmake")
 if(NOT DEFINED PPSSPP OR "${PPSSPP}" STREQUAL "" OR
    NOT EXISTS "${PPSSPP}")
     find_program(PPSSPP_DISCOVERED NAMES PPSSPPHeadless PPSSPPHeadless.exe)
