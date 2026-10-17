@@ -169,18 +169,14 @@ entry needs only when it is selected, such as the `targets` of a preset with
 is checked only for the entry that `-O`, `-march`, `-mtune`, a profile, or a
 preset selects. Every other check applies to every entry.
 
-In this example, `board` combines an ISA level with an FPU. Its features are
-the union of its bases' features, and it has the `div.d` costs of
-`fpu-r4000`; if `isa-mips3` also described `div.d`, with other costs,
-`board` would have to describe it too:
+In this example, `board` combines the shipped ISA level `isa-mips3`, whose
+features are `mips3`, `llsc`, `branch-likely`, and `load-interlocks`, with
+an FPU. Its features are the union of its bases' features, and it has the
+`div.d` costs of `fpu-board`; if `isa-mips3` also described `div.d`, with
+other costs, `board` would have to describe it too:
 
 ```text
-cpu "isa-mips3" {
-    architecture = "mips";
-    features = ["mips3", "llsc", "branch-likely", "load-interlocks"];
-}
-
-cpu "fpu-r4000" {
+cpu "fpu-board" {
     architecture = "mips";
     features = ["hard-float", "fp32"];
     instruction "div.d" { latency = 58; issue = 58; }
@@ -188,7 +184,7 @@ cpu "fpu-r4000" {
 
 cpu "board" {
     architecture = "mips";
-    inherits = ["isa-mips3", "fpu-r4000"];
+    inherits = ["isa-mips3", "fpu-board"];
     instruction "mult" { latency = 5; issue = 5; }
 }
 ```

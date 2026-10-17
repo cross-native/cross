@@ -2331,6 +2331,23 @@ if(BUILD_TESTING)
     set_tests_properties(cross_mips_fp_branch_runtime_unfused PROPERTIES
         LABELS "check.runtime;arch.mips;backend.native;feature.floating;isa.vr4300;isa.r3000;endian.big;endian.little;opt.O2"
         SKIP_REGULAR_EXPRESSION "skipping MIPS")
+    # 32-bit rotates on CPUs with 64-bit GPRs; integer code, so FP32 objects
+    # link with the startup whatever FPU the CPU has.
+    foreach(rotate_level O0 O2)
+        add_test(NAME cross_mips_rotate_wide_gpr_runtime_${rotate_level}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/rotate_wide_gpr.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-rotate-wide-gpr-${rotate_level}
+                -DEXPECTED=P "-DCC_FLAGS=-${rotate_level};-fno-eval-calls;-mfp32"
+                "-DMIPS_CPUS=mips64r2;octeon;vr5400;sr71000;gs464;r10000"
+                -DQEMU_CPU=MIPS64R2-generic
+                -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(cross_mips_rotate_wide_gpr_runtime_${rotate_level} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;feature.intrinsics;isa.mips64r2;isa.octeon;isa.vr5400;isa.sr71000;isa.gs464;isa.r10000;endian.big;endian.little;opt.${rotate_level}"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS")
+    endforeach()
     # The floating kernels with FPR allocation before MIPS III, against the
     # x86-64 reference. MIPS I lacks the float-to-integer conversion they use.
     # Each entry: name|endian|QEMU CPU|flags.
@@ -2660,6 +2677,21 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/model/cpu_entries.cmake")
     set_tests_properties(cross_model_cpu_entries PROPERTIES
         LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;feature.model;feature.driver;feature.optimization")
+    add_test(NAME cross_model_cpu_catalog
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DAS=$<TARGET_FILE:cross_as>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/model-cpu-catalog
+                -P "${CMAKE_SOURCE_DIR}/test/model/cpu_catalog.cmake")
+    set_tests_properties(cross_model_cpu_catalog PROPERTIES
+        LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;feature.model;feature.driver;feature.assembler")
+    add_test(NAME cross_model_cpu_catalog_codegen
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/model-cpu-catalog-codegen
+                -P "${CMAKE_SOURCE_DIR}/test/model/cpu_catalog_codegen.cmake")
+    set_tests_properties(cross_model_cpu_catalog_codegen PROPERTIES
+        LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;backend.native;feature.model;feature.codegen;feature.intrinsics;feature.atomics;feature.vector;feature.floating")
     add_test(NAME cross_model_inheritance
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

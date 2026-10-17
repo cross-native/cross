@@ -1146,7 +1146,8 @@ abi "ms_abi" {
 }
 
 # CPUs. Their instructions keep the target's default costs, which
-# cc --print-costs shows.
+# cc --print-costs shows. A CPU that adds features to a CPU it inherits
+# takes them from its ext- entry; another name of a CPU only inherits it.
 cpu "generic" {
     architecture = "x86-64";
     features = ["base"];
@@ -1177,12 +1178,122 @@ cpu "x86-64-v4" {
                 "cx16", "xsave"];
 }
 
+# A tuning name; as -march it selects the x86-64 baseline.
+cpu "intel" {
+    architecture = "x86-64";
+    inherits = "generic";
+}
+
+# Intel Core and Xeon. TSX, SGX, CET, Key Locker, AMX, APX, AVX-VNNI,
+# the AVX-512 IFMA, BF16, FP16, and VP2INTERSECT subsets, and the other
+# extensions that cc --print-options=target does not list are not
+# modeled here or for the other Intel CPUs.
+cpu "ext-nocona" {
+    architecture = "x86-64";
+    features = ["sse3", "cx16"];
+}
+
+cpu "nocona" {
+    architecture = "x86-64";
+    inherits = ["x86-64", "ext-nocona"];
+}
+
+cpu "ext-core2" {
+    architecture = "x86-64";
+    features = ["ssse3"];
+}
+
+cpu "core2" {
+    architecture = "x86-64";
+    inherits = ["nocona", "ext-core2"];
+}
+
+cpu "ext-penryn" {
+    architecture = "x86-64";
+    features = ["sse4.1"];
+}
+
+cpu "penryn" {
+    architecture = "x86-64";
+    inherits = ["core2", "ext-penryn"];
+}
+
+cpu "ext-nehalem" {
+    architecture = "x86-64";
+    features = ["sse4.2", "popcnt"];
+}
+
+cpu "nehalem" {
+    architecture = "x86-64";
+    inherits = ["penryn", "ext-nehalem"];
+}
+
+cpu "corei7" {
+    architecture = "x86-64";
+    inherits = "nehalem";
+}
+
+cpu "ext-westmere" {
+    architecture = "x86-64";
+    features = ["pclmul"];
+}
+
+cpu "westmere" {
+    architecture = "x86-64";
+    inherits = ["nehalem", "ext-westmere"];
+}
+
+cpu "ext-sandybridge" {
+    architecture = "x86-64";
+    features = ["avx", "xsave", "xsaveopt"];
+}
+
+cpu "sandybridge" {
+    architecture = "x86-64";
+    inherits = ["westmere", "ext-sandybridge"];
+}
+
+cpu "corei7-avx" {
+    architecture = "x86-64";
+    inherits = "sandybridge";
+}
+
+cpu "ext-ivybridge" {
+    architecture = "x86-64";
+    features = ["f16c", "rdrnd", "fsgsbase"];
+}
+
+cpu "ivybridge" {
+    architecture = "x86-64";
+    inherits = ["sandybridge", "ext-ivybridge"];
+}
+
+cpu "core-avx-i" {
+    architecture = "x86-64";
+    inherits = "ivybridge";
+}
+
 cpu "haswell" {
     architecture = "x86-64";
     features = ["base", "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "aes",
                 "pclmul", "avx", "f16c", "fma", "avx2", "bmi", "bmi2",
                 "lzcnt", "movbe", "rdrnd", "cx16", "xsave", "xsaveopt",
                 "fsgsbase", "rdtscp", "invpcid"];
+}
+
+cpu "core-avx2" {
+    architecture = "x86-64";
+    inherits = "haswell";
+}
+
+cpu "ext-broadwell" {
+    architecture = "x86-64";
+    features = ["adx", "rdseed", "prefetchw"];
+}
+
+cpu "broadwell" {
+    architecture = "x86-64";
+    inherits = ["haswell", "ext-broadwell"];
 }
 
 cpu "skylake" {
@@ -1202,6 +1313,396 @@ cpu "skylake-avx512" {
                 "avx512dq", "avx512cd", "avx512bw", "avx512vl", "cx16",
                 "xsave", "xsaveopt", "xsavec", "xsaves", "fsgsbase", "rdtscp",
                 "pku", "clflushopt", "invpcid"];
+}
+
+cpu "skx" {
+    architecture = "x86-64";
+    inherits = "skylake-avx512";
+}
+
+cpu "ext-cascadelake" {
+    architecture = "x86-64";
+    features = ["clwb", "prefetchw", "avx512vnni"];
+}
+
+cpu "cascadelake" {
+    architecture = "x86-64";
+    inherits = ["skylake-avx512", "ext-cascadelake"];
+}
+
+cpu "cooperlake" {
+    architecture = "x86-64";
+    inherits = "cascadelake";
+}
+
+cpu "ext-cannonlake" {
+    architecture = "x86-64";
+    features = ["sha", "prefetchw", "avx512f", "avx512dq", "avx512cd",
+                "avx512bw", "avx512vl", "avx512vbmi"];
+}
+
+cpu "cannonlake" {
+    architecture = "x86-64";
+    inherits = ["skylake", "ext-cannonlake"];
+}
+
+cpu "ext-icelake-client" {
+    architecture = "x86-64";
+    features = ["gfni", "vpclmulqdq", "vaes", "rdpid", "avx512vnni",
+                "avx512vbmi2", "avx512bitalg", "avx512vpopcntdq"];
+}
+
+cpu "icelake-client" {
+    architecture = "x86-64";
+    inherits = ["cannonlake", "ext-icelake-client"];
+}
+
+cpu "rocketlake" {
+    architecture = "x86-64";
+    inherits = "icelake-client";
+}
+
+cpu "ext-icelake-server" {
+    architecture = "x86-64";
+    features = ["clwb", "wbnoinvd"];
+}
+
+cpu "icelake-server" {
+    architecture = "x86-64";
+    inherits = ["icelake-client", "ext-icelake-server"];
+}
+
+cpu "ext-tigerlake" {
+    architecture = "x86-64";
+    features = ["clwb", "movdiri", "movdir64b"];
+}
+
+cpu "tigerlake" {
+    architecture = "x86-64";
+    inherits = ["icelake-client", "ext-tigerlake"];
+}
+
+cpu "ext-sapphirerapids" {
+    architecture = "x86-64";
+    features = ["serialize", "waitpkg", "cldemote", "movdiri", "movdir64b",
+                "enqcmd"];
+}
+
+cpu "sapphirerapids" {
+    architecture = "x86-64";
+    inherits = ["icelake-server", "ext-sapphirerapids"];
+}
+
+cpu "emeraldrapids" {
+    architecture = "x86-64";
+    inherits = "sapphirerapids";
+}
+
+cpu "graniterapids" {
+    architecture = "x86-64";
+    inherits = "sapphirerapids";
+}
+
+cpu "graniterapids-d" {
+    architecture = "x86-64";
+    inherits = "graniterapids";
+}
+
+cpu "diamondrapids" {
+    architecture = "x86-64";
+    inherits = "graniterapids-d";
+}
+
+# Xeon Phi.
+cpu "ext-knl" {
+    architecture = "x86-64";
+    features = ["avx512f", "avx512cd"];
+}
+
+cpu "knl" {
+    architecture = "x86-64";
+    inherits = ["broadwell", "ext-knl"];
+}
+
+cpu "ext-knm" {
+    architecture = "x86-64";
+    features = ["avx512vpopcntdq"];
+}
+
+cpu "knm" {
+    architecture = "x86-64";
+    inherits = ["knl", "ext-knm"];
+}
+
+# Intel Atom and the hybrid CPUs.
+cpu "ext-bonnell" {
+    architecture = "x86-64";
+    features = ["movbe"];
+}
+
+cpu "bonnell" {
+    architecture = "x86-64";
+    inherits = ["core2", "ext-bonnell"];
+}
+
+cpu "atom" {
+    architecture = "x86-64";
+    inherits = "bonnell";
+}
+
+cpu "ext-silvermont" {
+    architecture = "x86-64";
+    features = ["movbe", "rdrnd", "prefetchw"];
+}
+
+cpu "silvermont" {
+    architecture = "x86-64";
+    inherits = ["westmere", "ext-silvermont"];
+}
+
+cpu "slm" {
+    architecture = "x86-64";
+    inherits = "silvermont";
+}
+
+cpu "ext-goldmont" {
+    architecture = "x86-64";
+    features = ["aes", "rdseed", "sha", "xsave", "xsaveopt", "xsavec",
+                "xsaves", "fsgsbase", "clflushopt"];
+}
+
+cpu "goldmont" {
+    architecture = "x86-64";
+    inherits = ["silvermont", "ext-goldmont"];
+}
+
+cpu "ext-goldmont-plus" {
+    architecture = "x86-64";
+    features = ["rdpid"];
+}
+
+cpu "goldmont-plus" {
+    architecture = "x86-64";
+    inherits = ["goldmont", "ext-goldmont-plus"];
+}
+
+cpu "ext-tremont" {
+    architecture = "x86-64";
+    features = ["gfni", "clwb", "waitpkg", "cldemote", "movdiri", "movdir64b"];
+}
+
+cpu "tremont" {
+    architecture = "x86-64";
+    inherits = ["goldmont-plus", "ext-tremont"];
+}
+
+cpu "ext-alderlake" {
+    architecture = "x86-64";
+    features = ["avx", "f16c", "fma", "avx2", "bmi", "bmi2", "lzcnt", "adx",
+                "gfni", "vpclmulqdq", "vaes", "serialize", "pku", "clwb",
+                "waitpkg", "invpcid", "movdiri", "movdir64b"];
+}
+
+cpu "alderlake" {
+    architecture = "x86-64";
+    inherits = ["goldmont-plus", "ext-alderlake"];
+}
+
+cpu "raptorlake" {
+    architecture = "x86-64";
+    inherits = "alderlake";
+}
+
+cpu "meteorlake" {
+    architecture = "x86-64";
+    inherits = "alderlake";
+}
+
+cpu "gracemont" {
+    architecture = "x86-64";
+    inherits = "alderlake";
+}
+
+cpu "arrowlake" {
+    architecture = "x86-64";
+    inherits = "alderlake";
+}
+
+cpu "arrowlake-s" {
+    architecture = "x86-64";
+    inherits = "arrowlake";
+}
+
+cpu "lunarlake" {
+    architecture = "x86-64";
+    inherits = "arrowlake-s";
+}
+
+cpu "pantherlake" {
+    architecture = "x86-64";
+    inherits = "arrowlake-s";
+}
+
+cpu "wildcatlake" {
+    architecture = "x86-64";
+    inherits = "pantherlake";
+}
+
+cpu "ext-novalake" {
+    architecture = "x86-64";
+    features = ["avx512f", "avx512dq", "avx512cd", "avx512bw", "avx512vl",
+                "avx512vnni", "avx512vbmi", "avx512vbmi2", "avx512bitalg",
+                "avx512vpopcntdq"];
+}
+
+cpu "novalake" {
+    architecture = "x86-64";
+    inherits = ["pantherlake", "ext-novalake"];
+}
+
+cpu "ext-sierraforest" {
+    architecture = "x86-64";
+    features = ["cldemote", "enqcmd"];
+}
+
+cpu "sierraforest" {
+    architecture = "x86-64";
+    inherits = ["alderlake", "ext-sierraforest"];
+}
+
+cpu "grandridge" {
+    architecture = "x86-64";
+    inherits = "sierraforest";
+}
+
+cpu "clearwaterforest" {
+    architecture = "x86-64";
+    inherits = "sierraforest";
+}
+
+# AMD. 3DNow!, SSE4a, FMA4, XOP, LWP, TBM, MONITORX, CLZERO, RDPRU, CET,
+# and the AVX-512 IFMA, BF16, FP16, and VP2INTERSECT subsets are not
+# modeled.
+cpu "ext-k8" {
+    architecture = "x86-64";
+    features = ["prefetchw"];
+}
+
+cpu "k8" {
+    architecture = "x86-64";
+    inherits = ["x86-64", "ext-k8"];
+}
+
+cpu "opteron" {
+    architecture = "x86-64";
+    inherits = "k8";
+}
+
+cpu "athlon64" {
+    architecture = "x86-64";
+    inherits = "k8";
+}
+
+cpu "athlon-fx" {
+    architecture = "x86-64";
+    inherits = "k8";
+}
+
+cpu "ext-k8-sse3" {
+    architecture = "x86-64";
+    features = ["sse3"];
+}
+
+cpu "k8-sse3" {
+    architecture = "x86-64";
+    inherits = ["k8", "ext-k8-sse3"];
+}
+
+cpu "opteron-sse3" {
+    architecture = "x86-64";
+    inherits = "k8-sse3";
+}
+
+cpu "athlon64-sse3" {
+    architecture = "x86-64";
+    inherits = "k8-sse3";
+}
+
+cpu "ext-amdfam10" {
+    architecture = "x86-64";
+    features = ["popcnt", "lzcnt", "cx16"];
+}
+
+cpu "amdfam10" {
+    architecture = "x86-64";
+    inherits = ["k8-sse3", "ext-amdfam10"];
+}
+
+cpu "barcelona" {
+    architecture = "x86-64";
+    inherits = "amdfam10";
+}
+
+cpu "ext-btver1" {
+    architecture = "x86-64";
+    features = ["sse3", "ssse3", "popcnt", "lzcnt", "cx16", "prefetchw"];
+}
+
+cpu "btver1" {
+    architecture = "x86-64";
+    inherits = ["x86-64", "ext-btver1"];
+}
+
+cpu "ext-btver2" {
+    architecture = "x86-64";
+    features = ["sse4.1", "sse4.2", "aes", "pclmul", "avx", "f16c", "bmi",
+                "movbe", "xsave", "xsaveopt"];
+}
+
+cpu "btver2" {
+    architecture = "x86-64";
+    inherits = ["btver1", "ext-btver2"];
+}
+
+cpu "ext-bdver1" {
+    architecture = "x86-64";
+    features = ["sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "aes", "pclmul",
+                "avx", "lzcnt", "cx16", "xsave", "prefetchw"];
+}
+
+cpu "bdver1" {
+    architecture = "x86-64";
+    inherits = ["x86-64", "ext-bdver1"];
+}
+
+cpu "ext-bdver2" {
+    architecture = "x86-64";
+    features = ["f16c", "fma", "bmi"];
+}
+
+cpu "bdver2" {
+    architecture = "x86-64";
+    inherits = ["bdver1", "ext-bdver2"];
+}
+
+cpu "ext-bdver3" {
+    architecture = "x86-64";
+    features = ["xsaveopt", "fsgsbase"];
+}
+
+cpu "bdver3" {
+    architecture = "x86-64";
+    inherits = ["bdver2", "ext-bdver3"];
+}
+
+cpu "ext-bdver4" {
+    architecture = "x86-64";
+    features = ["avx2", "bmi2", "movbe", "rdrnd"];
+}
+
+cpu "bdver4" {
+    architecture = "x86-64";
+    inherits = ["bdver3", "ext-bdver4"];
 }
 
 cpu "znver1" {
@@ -1230,6 +1731,152 @@ cpu "znver3" {
                 "vaes", "vpclmulqdq", "cx16", "xsave", "xsaveopt", "xsavec",
                 "xsaves", "fsgsbase", "rdtscp", "rdpid", "prefetchw",
                 "monitor", "clwb"];
+}
+
+cpu "ext-znver4" {
+    architecture = "x86-64";
+    features = ["pku", "clflushopt", "invpcid", "wbnoinvd", "avx512f",
+                "avx512dq", "avx512cd", "avx512bw", "avx512vl", "avx512vnni",
+                "avx512vbmi", "avx512vbmi2", "avx512bitalg",
+                "avx512vpopcntdq"];
+}
+
+cpu "znver4" {
+    architecture = "x86-64";
+    inherits = ["znver3", "ext-znver4"];
+}
+
+cpu "ext-znver5" {
+    architecture = "x86-64";
+    features = ["movdiri", "movdir64b"];
+}
+
+cpu "znver5" {
+    architecture = "x86-64";
+    inherits = ["znver4", "ext-znver5"];
+}
+
+cpu "znver6" {
+    architecture = "x86-64";
+    inherits = "znver5";
+}
+
+# Hygon, whose CPUs derive from Zen; the AMD extensions above are not
+# modeled for them either.
+cpu "ext-c86-4g-m4" {
+    architecture = "x86-64";
+    features = ["clflushopt"];
+}
+
+cpu "c86-4g-m4" {
+    architecture = "x86-64";
+    inherits = ["znver1", "ext-c86-4g-m4"];
+}
+
+cpu "c86-4g-m6" {
+    architecture = "x86-64";
+    inherits = "c86-4g-m4";
+}
+
+cpu "ext-c86-4g-m7" {
+    architecture = "x86-64";
+    features = ["gfni", "vpclmulqdq", "vaes", "clwb", "wbnoinvd", "avx512f",
+                "avx512dq", "avx512cd", "avx512bw", "avx512vl", "avx512vnni",
+                "avx512vbmi", "avx512vbmi2", "avx512bitalg",
+                "avx512vpopcntdq"];
+}
+
+cpu "c86-4g-m7" {
+    architecture = "x86-64";
+    inherits = ["c86-4g-m4", "ext-c86-4g-m7"];
+}
+
+cpu "c86-4g-m8" {
+    architecture = "x86-64";
+    inherits = "c86-4g-m7";
+}
+
+# VIA (Centaur) and Zhaoxin.
+cpu "ext-eden-x2" {
+    architecture = "x86-64";
+    features = ["sse3"];
+}
+
+cpu "eden-x2" {
+    architecture = "x86-64";
+    inherits = ["x86-64", "ext-eden-x2"];
+}
+
+cpu "ext-nano" {
+    architecture = "x86-64";
+    features = ["ssse3"];
+}
+
+cpu "nano" {
+    architecture = "x86-64";
+    inherits = ["eden-x2", "ext-nano"];
+}
+
+cpu "nano-1000" {
+    architecture = "x86-64";
+    inherits = "nano";
+}
+
+cpu "nano-2000" {
+    architecture = "x86-64";
+    inherits = "nano";
+}
+
+cpu "ext-nano-3000" {
+    architecture = "x86-64";
+    features = ["sse4.1"];
+}
+
+cpu "nano-3000" {
+    architecture = "x86-64";
+    inherits = ["nano", "ext-nano-3000"];
+}
+
+cpu "nano-x2" {
+    architecture = "x86-64";
+    inherits = "nano-3000";
+}
+
+cpu "eden-x4" {
+    architecture = "x86-64";
+    inherits = "nano-3000";
+}
+
+cpu "nano-x4" {
+    architecture = "x86-64";
+    inherits = "nano-3000";
+}
+
+cpu "ext-lujiazui" {
+    architecture = "x86-64";
+    features = ["sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "aes", "pclmul",
+                "bmi", "bmi2", "lzcnt", "movbe", "adx", "rdrnd", "rdseed",
+                "cx16", "xsave", "xsaveopt", "fsgsbase", "prefetchw"];
+}
+
+cpu "lujiazui" {
+    architecture = "x86-64";
+    inherits = ["x86-64", "ext-lujiazui"];
+}
+
+cpu "ext-yongfeng" {
+    architecture = "x86-64";
+    features = ["avx", "f16c", "fma", "avx2", "sha"];
+}
+
+cpu "yongfeng" {
+    architecture = "x86-64";
+    inherits = ["lujiazui", "ext-yongfeng"];
+}
+
+cpu "shijidadao" {
+    architecture = "x86-64";
+    inherits = "yongfeng";
 }
 
 profile "x86_64-windows" {

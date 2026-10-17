@@ -58,8 +58,8 @@ expect(allegrex-features "${stdout}"
 
 run(print-cpus -target mips-unknown-elf --print-cpus)
 expect(print-cpus "${stdout}"
-    "(^|\n)mips1  features: mips1,hard-float,fp32  issue_width: 1  source: shipped:mips[.]xm:[0-9]+\n"
-    "\nvr4300  inherits: mips3  features: mips3,hard-float,fp32,llsc,branch-likely,load-interlocks  issue_width: 1  source: shipped:mips[.]xm:[0-9]+\n")
+    "\nmips1  inherits: isa-mips1, fpu-fp32  features: mips1,hard-float,fp32  issue_width: 1  source: shipped:mips[.]xm:[0-9]+\n"
+    "\nvr4300  inherits: mips3  features: mips3,llsc,branch-likely,load-interlocks,hard-float,fp32  issue_width: 1  source: shipped:mips[.]xm:[0-9]+\n")
 reject(print-cpus "${stdout}" "haswell")
 
 # Costs: the -mtune entry's latency and issue, the -march entry's
@@ -458,10 +458,10 @@ cpu "vr4300" {
     architecture = "mips";
 }
 ]=])
-expect_rejected(cpu-parent 1 "cpu 'c' inherits unknown cpu 'r9000'" [=[
+expect_rejected(cpu-parent 1 "cpu 'c' inherits unknown cpu 'nonesuch'" [=[
 cpu "c" {
     architecture = "mips";
-    inherits = "r9000";
+    inherits = "nonesuch";
 }
 ]=])
 expect_rejected(cpu-parent-architecture 1
@@ -482,10 +482,10 @@ cpu "b" {
     inherits = "a";
 }
 ]=])
-expect_rejected(cpu-profile-arch 3 "unknown cpu 'r9000' for option 'm[.]arch'" [=[
+expect_rejected(cpu-profile-arch 3 "unknown cpu 'nonesuch' for option 'm[.]arch'" [=[
 profile "p" {
     target = "mips-unknown-elf";
-    m.arch = "r9000";
+    m.arch = "nonesuch";
 }
 ]=])
 expect_rejected(cpu-preset-tune 4 "unknown cpu 'vr4300' for option 'm[.]tune'" [=[

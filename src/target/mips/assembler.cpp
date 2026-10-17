@@ -187,7 +187,8 @@ struct Architecture {
 template <typename Has>
 Architecture architecture_from(Has has) {
     Architecture result;
-    result.isa = has(Feature::Mips64)     ? isa_mips64
+    result.isa = has(Feature::Mips64r2)   ? isa_mips64r2
+                 : has(Feature::Mips64)   ? isa_mips64
                  : has(Feature::Mips32r2) ? isa_mips32r2
                  : has(Feature::Mips32)   ? isa_mips32
                  : has(Feature::Mips5)    ? isa_mips5

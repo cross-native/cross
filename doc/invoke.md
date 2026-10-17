@@ -297,7 +297,11 @@ object. Unlike GNU as:
 - the `div` and `divu` macros, address macros such as `la` and `lw REG,
   symbol`, `.insn`, `-g` line tables for assembly source, and PIC code
   (`-mabicalls`, `.cpload`) are not available: write `div $zero, rs, rt` and
-  `%hi`/`%lo` pairs.
+  `%hi`/`%lo` pairs;
+- `-march` and `.set arch=` accept the CPUs that `cc --print-cpus` lists
+  ([targets.md](targets.md#mips)), with the instructions of their ISA level
+  and Allegrex's, but not the instructions that other CPUs add, such as the
+  Octeon and Loongson ones, and not the R5900 or Release 6 CPUs.
 
 `cc -c` assembles its own MIPS output with the same assembler and the object
 conventions of LLVM MC: `.text`, `.data`, and `.bss` aligned to 16 bytes, an

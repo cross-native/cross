@@ -449,6 +449,7 @@ const SubtargetTable subtargets{
         {"mips32", false, true, {"mips2"}, {"mips3", "mips4", "mips5"}},
         {"mips32r2", false, true, {"mips32"}, {}},
         {"mips64", false, true, {"mips3"}, {"mips32", "mips32r2"}},
+        {"mips64r2", false, true, {"mips64"}, {}},
         {"hard-float", false, true, {"mips1"}, {"soft-float"}},
         {"soft-float", false, true, {"mips1"}, {"hard-float"}},
         {"fp32", false, true, {"hard-float"}, {"fp64", "fpxx"}},
@@ -518,6 +519,7 @@ std::vector<OptionDefinition> target_options() {
     boolean("mips32", false, "enable the MIPS32 ISA");
     boolean("mips32r2", false, "enable the MIPS32 Release 2 ISA");
     boolean("mips64", false, "enable the MIPS64 ISA");
+    boolean("mips64r2", false, "enable the MIPS64 Release 2 ISA");
     boolean("hard-float", true, "use hardware floating-point ABI endpoints");
     boolean("soft-float", false, "use integer floating-point ABI endpoints");
     boolean("fp32", true, "use the paired 32-bit FPR convention");

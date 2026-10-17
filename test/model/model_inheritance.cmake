@@ -294,10 +294,10 @@ cpu "a" {
     architecture = "mips";
 }
 ]=])
-expect_rejected(unknown-base 1 "cpu 'c' inherits unknown cpu 'r9000'" [=[
+expect_rejected(unknown-base 1 "cpu 'c' inherits unknown cpu 'nonesuch'" [=[
 cpu "c" {
     architecture = "mips";
-    inherits = ["vr4300", "r9000"];
+    inherits = ["vr4300", "nonesuch"];
 }
 ]=])
 expect_rejected(unknown-preset 1 "optimization preset 'o' inherits unknown preset 'O9'" [=[

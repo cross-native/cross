@@ -104,12 +104,26 @@ Target options:
 
 | Option | Values |
 | --- | --- |
-| `-march=`, `-mtune=` | A `cpu` model entry ([models.md](models.md#cpu-entries)). `model/x86_64.xm` ships `generic`, `x86-64`, `x86-64-v2`, `x86-64-v3`, `x86-64-v4`, `haswell`, `skylake`, `skylake-avx512`, `znver1`, `znver2`, and `znver3`, which set features only, so their instructions have the target's default costs (`cc --print-costs`). |
+| `-march=`, `-mtune=` | A `cpu` model entry ([models.md](models.md#cpu-entries)), listed by `cc --print-cpus`. |
 | `-mFEATURE`, `-mno-FEATURE` | Instruction set extensions such as `sse4.2`, `popcnt`, `avx`, `avx2`, `fma`, `bmi2`, `avx512f`, `avx512vl` (see `--print-options=target`) |
 | `-mcmodel=` | `small` (default), `kernel`, `medium`, `large` |
 | `-mred-zone`, `-mno-red-zone` | Let leaf functions use the area below the stack pointer (not with COFF). |
 | `-mprefer-vector-width=` | `none`, `128`, `256`, `512`: widest vector the compiler chooses on its own. |
 | `-mrisc-cisc-balance=` | `0` to `100`, default `50`: weighs optimization cost estimates from load/store RISC (`0`) to CISC (`100`) behavior; it changes code choices, not the instruction set. The x86-64 profiles set `100`; MIPS also accepts the option, and its profiles set `0`. |
+
+`model/x86_64.xm` ships the `x86-64` levels and an entry for each CPU name
+that GCC and Clang accept for 64-bit code, such as `k8`, `core2`,
+`nehalem`, `haswell`, `alderlake`, `sapphirerapids`, `knl`, `znver5`,
+`c86-4g-m7`, and `nano-x4`, with their other names, such as `corei7` for
+`nehalem` and `skx` for `skylake-avx512`; the 32-bit CPUs, such as `i686`
+and `pentium4`, are not available, and neither is `native`. The entries set
+features only, so their instructions have the target's default costs
+(`cc --print-costs`). A CPU that adds features to the CPU it inherits takes
+them from an entry named `ext-` and the CPU's name; `intel`, a tuning name,
+selects the `x86-64` baseline. Extensions that `--print-options=target` does
+not list, such as TSX, SGX, CET, AMX, APX, AVX-VNNI, SSE4a, XOP, FMA4, and
+the AVX-512 IFMA, BF16, FP16, and VP2INTERSECT subsets, are not modeled, so
+no CPU enables them.
 
 Disabling a feature also disables the features that depend on it, so
 `-mno-avx` disables AVX2 and AVX-512 too. 128-bit integers, `f80`, vectors,
@@ -258,14 +272,34 @@ boundaries, per declaration with `[[abi("n64")]]` or for the whole
 compilation with `-mabi=n64`.
 
 `-march=` and `-mtune=` name `cpu` model entries
-([models.md](models.md#cpu-entries)). `model/mips.xm` ships `generic`,
-`mips1`, `r2000`, `r3000`, `mips2`, `r6000`, `allegrex`, `mips3`, `r4000`,
-`r4400`, `r4600`, `vr4300`, `mips4`, `mips5`, `mips32`, `mips32r2`, and
-`mips64`; `cc --print-cpus` lists the loaded entries. The `r2000`, `r3000`,
-`r6000`, `r4000`, `r4400`, `r4600`, and `vr4300` entries give those CPUs'
-multiply and divide cycle counts, all but `r4000` and `r4400` also their
-floating-point ones, and `r2000`, `r3000`, and `r4600` their load latency;
-the other entries carry no published timing. `cc --print-costs` shows the
+([models.md](models.md#cpu-entries)); `cc --print-cpus` lists the loaded
+entries. `model/mips.xm` ships `generic`, the ISA names `mips1` to `mips5`,
+`mips32`, `mips32r2`, `mips32r3`, `mips32r5`, `mips64`, `mips64r2`,
+`mips64r3`, and `mips64r5`, and the CPUs that GCC, Clang, and GNU as accept
+for these levels, from `r2000`, `r3900`, and `r4650` to `vr5500`, `24kf`,
+`m5100`, `sb1`, `loongson3a`, and `octeon3`, with the other spellings they
+accept, such as `r4300` for `vr4300` and `r10k` for `r10000`. Not shipped
+are the Release 6 CPUs (`mips32r6`, `mips64r6`, `i6400`, `i6500`, `p6600`),
+whose instruction encodings Cross does not implement, the R5900, whose
+short-loop erratum Cross does not work around, and the `r4k`, `4000`, and
+`4k` spellings of the R4000. Entries named `isa-` hold an ISA level's
+instructions and pipeline interlocks without an FPU, `fpu-` entries an FPU,
+and the ISA names and CPUs combine them. CPUs without an FPU, such as the
+VR4100 series, the R3900, the 4K, M4K, M14K, 24Kc, 34Kc, 74Kc, and 5Kc
+cores, the XLR, and the Octeon before Octeon III, use `-msoft-float`; the
+R4650 has a single-precision FPU, and the VR4100 series has no LL/SC.
+Extensions that `--print-options=target` does not list, such as DSP, MT,
+MIPS-3D, MSA, SmartMIPS, and the Octeon and Loongson instructions, are not
+modeled, and Release 3 and 5 CPUs produce Release 2 code and objects. Cross
+does not work around the R4400 and R10000 errata that GCC works around by
+default for those CPUs.
+
+The `r2000`, `r3000`, `r6000`, `r4000`, `r4400`, `r4600`, and `vr4300`
+entries give those CPUs' multiply and divide cycle counts, all but `r4000`
+and `r4400` also their floating-point ones, and `r2000`, `r3000`, and
+`r4600` their load latency; the `isa-` entries schedule loads of MIPS I,
+MIPS II, and MIPS32 CPUs as four-cycle operations, and the other CPUs take
+their costs from the entries they inherit. `cc --print-costs` shows the
 costs in effect. A CPU enables the features it implies, and `-m`/`-mno-`
 options adjust them:
 
@@ -273,7 +307,7 @@ options adjust them:
 | --- | --- |
 | `-mhard-float`, `-msoft-float`, `-msingle-float` | FPU availability. |
 | `-mfp32`, `-mfpxx`, `-mfp64` | FPU register model. |
-| `-modd-spreg` | The FPU has odd-numbered single-precision registers; the `mips32`, `mips32r2`, `mips64`, and `allegrex` entries enable it. A single-precision FPU then keeps `f32` values in all 32 registers; other FPUs keep them in even registers, which also hold `f64` values as even/odd pairs under `-mfp32`. |
+| `-modd-spreg` | The FPU has odd-numbered single-precision registers; the MIPS32 and MIPS64 CPUs with an FPU other than the GS464, and `allegrex`, enable it. A single-precision FPU then keeps `f32` values in all 32 registers; other FPUs keep them in even registers, which also hold `f64` values as even/odd pairs under `-mfp32`. |
 | `-mllsc` | 32-bit LL/SC atomics. |
 | `-mfix4300` | Separate consecutive floating-point multiplies affected by the VR4300 erratum. |
 | `-mnan2008` | Use the IEEE 754-2008 NaN encoding of MIPS32 Release 2 FPUs; the output declares it with `.nan 2008`. |

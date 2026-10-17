@@ -940,12 +940,16 @@ abi "eabi32" {
 }
 
 # CPUs. An instruction that no entry of a chain describes has the target's
-# default costs, which cc --print-costs shows. Without published timing,
-# loads of MIPS I, MIPS II, and MIPS32 CPUs are scheduled as four-cycle
-# operations.
-cpu "mips1" {
+# default costs, which cc --print-costs shows. The isa- entries hold an ISA
+# level's instructions and pipeline interlocks without an FPU, and the fpu-
+# entries an FPU; the ISA names and CPUs combine them. A CPU without costs
+# of its own names the entry it takes them from.
+
+# ISA levels. Without published timing, loads of MIPS I, MIPS II, and
+# MIPS32 CPUs are scheduled as four-cycle operations.
+cpu "isa-mips1" {
     architecture = "mips";
-    features = ["mips1", "hard-float", "fp32"];
+    features = ["mips1"];
     instruction "lb" { latency = 4; }
     instruction "lbu" { latency = 4; }
     instruction "lh" { latency = 4; }
@@ -958,12 +962,160 @@ cpu "mips1" {
     instruction "ll" { latency = 4; }
 }
 
+cpu "isa-mips2" {
+    architecture = "mips";
+    inherits = "isa-mips1";
+    features = ["mips2", "llsc", "branch-likely", "load-interlocks"];
+}
+
+cpu "isa-mips3" {
+    architecture = "mips";
+    features = ["mips3", "llsc", "branch-likely", "load-interlocks"];
+}
+
+cpu "isa-mips4" {
+    architecture = "mips";
+    features = ["mips4", "llsc", "branch-likely", "cond-move",
+                "load-interlocks", "fpu-transfer-interlocks",
+                "fpu-compare-interlocks"];
+}
+
+cpu "isa-mips5" {
+    architecture = "mips";
+    features = ["mips5", "llsc", "branch-likely", "cond-move",
+                "load-interlocks", "fpu-transfer-interlocks",
+                "fpu-compare-interlocks"];
+}
+
+cpu "isa-mips32" {
+    architecture = "mips";
+    inherits = "isa-mips2";
+    features = ["mips32", "llsc", "branch-likely", "cond-move",
+                "load-interlocks", "fpu-transfer-interlocks",
+                "fpu-compare-interlocks", "hilo-interlocks"];
+}
+
+cpu "isa-mips32r2" {
+    architecture = "mips";
+    inherits = "isa-mips32";
+    features = ["mips32r2", "llsc", "branch-likely", "cond-move", "rotate",
+                "load-interlocks", "fpu-transfer-interlocks",
+                "fpu-compare-interlocks", "hilo-interlocks"];
+}
+
+cpu "isa-mips64" {
+    architecture = "mips";
+    features = ["mips64", "llsc", "branch-likely", "cond-move",
+                "load-interlocks", "fpu-transfer-interlocks",
+                "fpu-compare-interlocks", "hilo-interlocks"];
+}
+
+cpu "isa-mips64r2" {
+    architecture = "mips";
+    features = ["mips64r2", "llsc", "branch-likely", "cond-move", "rotate",
+                "load-interlocks", "fpu-transfer-interlocks",
+                "fpu-compare-interlocks", "hilo-interlocks"];
+}
+
+# FPUs.
+cpu "fpu-none" {
+    architecture = "mips";
+    features = ["soft-float"];
+}
+
+cpu "fpu-fp32" {
+    architecture = "mips";
+    features = ["hard-float", "fp32"];
+}
+
+cpu "fpu-fp64" {
+    architecture = "mips";
+    features = ["hard-float", "fp64"];
+}
+
+cpu "fpu-single" {
+    architecture = "mips";
+    features = ["hard-float", "fp32", "single-float"];
+}
+
+cpu "fpu-odd-spreg" {
+    architecture = "mips";
+    features = ["odd-spreg"];
+}
+
+# ISA names. Releases 3 and 5 add microMIPS, EVA, XPA, virtualization, and
+# MSA, which are not modeled.
+cpu "mips1" {
+    architecture = "mips";
+    inherits = ["isa-mips1", "fpu-fp32"];
+}
+
 cpu "generic" {
     architecture = "mips";
     inherits = "mips1";
 }
 
-# The R3000 with the R3010 FPU.
+cpu "mips2" {
+    architecture = "mips";
+    inherits = ["isa-mips2", "fpu-fp32"];
+}
+
+cpu "mips3" {
+    architecture = "mips";
+    inherits = ["isa-mips3", "fpu-fp32"];
+}
+
+cpu "mips4" {
+    architecture = "mips";
+    inherits = ["isa-mips4", "fpu-fp64"];
+}
+
+cpu "mips5" {
+    architecture = "mips";
+    inherits = ["isa-mips5", "fpu-fp64"];
+}
+
+cpu "mips32" {
+    architecture = "mips";
+    inherits = ["isa-mips32", "fpu-fp32", "fpu-odd-spreg"];
+}
+
+cpu "mips32r2" {
+    architecture = "mips";
+    inherits = ["isa-mips32r2", "fpu-fp32", "fpu-odd-spreg"];
+}
+
+cpu "mips32r3" {
+    architecture = "mips";
+    inherits = "mips32r2";
+}
+
+cpu "mips32r5" {
+    architecture = "mips";
+    inherits = "mips32r2";
+}
+
+cpu "mips64" {
+    architecture = "mips";
+    inherits = ["isa-mips64", "fpu-fp64", "fpu-odd-spreg"];
+}
+
+cpu "mips64r2" {
+    architecture = "mips";
+    inherits = ["isa-mips64r2", "fpu-fp64", "fpu-odd-spreg"];
+}
+
+cpu "mips64r3" {
+    architecture = "mips";
+    inherits = "mips64r2";
+}
+
+cpu "mips64r5" {
+    architecture = "mips";
+    inherits = "mips64r2";
+}
+
+# MIPS I. The R3000 with the R3010 FPU.
 cpu "r3000" {
     architecture = "mips";
     inherits = "mips1";
@@ -1004,13 +1156,15 @@ cpu "r2000" {
     inherits = "r3000";
 }
 
-cpu "mips2" {
+# The Toshiba R3900 (TX39) interlocks loads and has no FPU; its three-operand
+# multiply and multiply-add are not modeled. Costs: those of isa-mips1.
+cpu "r3900" {
     architecture = "mips";
-    inherits = "mips1";
-    features = ["mips2", "hard-float", "fp32", "llsc", "branch-likely",
-                "load-interlocks"];
+    inherits = "isa-mips1";
+    features = ["mips1", "soft-float", "load-interlocks"];
 }
 
+# MIPS II.
 cpu "r6000" {
     architecture = "mips";
     inherits = "mips2";
@@ -1049,30 +1203,14 @@ cpu "allegrex" {
                 "hilo-interlocks"];
 }
 
-cpu "mips32" {
+# The LSI R4010; its own instructions are not modeled. Costs: those of
+# mips2.
+cpu "r4010" {
     architecture = "mips";
     inherits = "mips2";
-    features = ["mips32", "hard-float", "fp32", "odd-spreg", "llsc",
-                "branch-likely", "cond-move", "load-interlocks",
-                "fpu-transfer-interlocks", "fpu-compare-interlocks",
-                "hilo-interlocks"];
 }
 
-cpu "mips32r2" {
-    architecture = "mips";
-    inherits = "mips32";
-    features = ["mips32r2", "hard-float", "fp32", "odd-spreg", "llsc",
-                "branch-likely", "cond-move", "rotate", "load-interlocks",
-                "fpu-transfer-interlocks", "fpu-compare-interlocks",
-                "hilo-interlocks"];
-}
-
-cpu "mips3" {
-    architecture = "mips";
-    features = ["mips3", "hard-float", "fp32", "llsc", "branch-likely",
-                "load-interlocks"];
-}
-
+# MIPS III.
 cpu "r4000" {
     architecture = "mips";
     inherits = "mips3";
@@ -1113,6 +1251,53 @@ cpu "r4600" {
     instruction "sqrt.d" { latency = 60; }
 }
 
+# The Orion is the R4600.
+cpu "orion" {
+    architecture = "mips";
+    inherits = "r4600";
+}
+
+# The IDT R4650 has a single-precision FPU. Costs: those of isa-mips3.
+cpu "r4650" {
+    architecture = "mips";
+    inherits = ["isa-mips3", "fpu-single"];
+}
+
+# Costs: those of mips3.
+cpu "r4700" {
+    architecture = "mips";
+    inherits = "mips3";
+}
+
+# The NEC VR4100 series has neither an FPU nor LL/SC (the VR4133 has LL/SC,
+# which -mllsc enables); its multiply-accumulate instructions are not
+# modeled. Costs: those of mips3.
+cpu "vr4100" {
+    architecture = "mips";
+    inherits = "mips3";
+    features = ["mips3", "soft-float", "branch-likely", "load-interlocks"];
+}
+
+cpu "vr4111" {
+    architecture = "mips";
+    inherits = "vr4100";
+}
+
+cpu "vr4120" {
+    architecture = "mips";
+    inherits = "vr4100";
+}
+
+cpu "vr4130" {
+    architecture = "mips";
+    inherits = "vr4100";
+}
+
+cpu "vr4181" {
+    architecture = "mips";
+    inherits = "vr4100";
+}
+
 # The NEC VR4300 of the Nintendo 64. A multicycle operation stalls the
 # whole pipeline, so its issue cost equals its latency.
 cpu "vr4300" {
@@ -1150,30 +1335,573 @@ cpu "vr4300" {
     instruction "trunc.l.d" { latency = 5; issue = 5; }
 }
 
-cpu "mips4" {
+# The Loongson 2E and 2F add conditional moves and interlock FPU transfers,
+# FPU compares, and HI/LO; MMI is not modeled. Costs: those of mips3.
+cpu "loongson2e" {
     architecture = "mips";
     inherits = "mips3";
-    features = ["mips4", "hard-float", "fp64", "llsc", "branch-likely",
+    features = ["mips3", "hard-float", "fp32", "llsc", "branch-likely",
                 "cond-move", "load-interlocks", "fpu-transfer-interlocks",
-                "fpu-compare-interlocks"];
+                "fpu-compare-interlocks", "hilo-interlocks"];
 }
 
-cpu "mips5" {
+cpu "loongson2f" {
+    architecture = "mips";
+    inherits = "loongson2e";
+}
+
+# MIPS IV. Costs: those of mips4.
+cpu "r8000" {
     architecture = "mips";
     inherits = "mips4";
-    features = ["mips5", "hard-float", "fp64", "llsc", "branch-likely",
-                "cond-move", "load-interlocks", "fpu-transfer-interlocks",
-                "fpu-compare-interlocks"];
 }
 
-cpu "mips64" {
+cpu "r10000" {
     architecture = "mips";
-    inherits = "mips3";
+    inherits = "mips4";
+}
+
+cpu "r12000" {
+    architecture = "mips";
+    inherits = "mips4";
+}
+
+cpu "r14000" {
+    architecture = "mips";
+    inherits = "mips4";
+}
+
+cpu "r16000" {
+    architecture = "mips";
+    inherits = "mips4";
+}
+
+cpu "vr5000" {
+    architecture = "mips";
+    inherits = "mips4";
+}
+
+cpu "rm5200" {
+    architecture = "mips";
+    inherits = "mips4";
+}
+
+cpu "rm5230" {
+    architecture = "mips";
+    inherits = "mips4";
+}
+
+cpu "rm5231" {
+    architecture = "mips";
+    inherits = "mips4";
+}
+
+cpu "rm5261" {
+    architecture = "mips";
+    inherits = "mips4";
+}
+
+cpu "rm5721" {
+    architecture = "mips";
+    inherits = "mips4";
+}
+
+cpu "rm7000" {
+    architecture = "mips";
+    inherits = "mips4";
+}
+
+cpu "rm9000" {
+    architecture = "mips";
+    inherits = "mips4";
+}
+
+# The NEC VR5400 adds rotates.
+cpu "vr5400" {
+    architecture = "mips";
+    inherits = "mips4";
+    features = ["mips4", "hard-float", "fp64", "llsc", "branch-likely",
+                "cond-move", "rotate", "load-interlocks",
+                "fpu-transfer-interlocks", "fpu-compare-interlocks"];
+}
+
+# The NEC VR5500 adds rotates and HI/LO interlocks; its conditional moves
+# are not used.
+cpu "vr5500" {
+    architecture = "mips";
+    inherits = "mips4";
+    features = ["mips4", "hard-float", "fp64", "llsc", "branch-likely",
+                "rotate", "load-interlocks", "fpu-transfer-interlocks",
+                "fpu-compare-interlocks", "hilo-interlocks"];
+}
+
+# MIPS32 CPUs without an FPU; SmartMIPS is not modeled. Costs: those of
+# isa-mips32.
+cpu "4kc" {
+    architecture = "mips";
+    inherits = ["isa-mips32", "fpu-none"];
+}
+
+cpu "4km" {
+    architecture = "mips";
+    inherits = "4kc";
+}
+
+cpu "4ksc" {
+    architecture = "mips";
+    inherits = "4kc";
+}
+
+cpu "4kp" {
+    architecture = "mips";
+    inherits = ["isa-mips32", "fpu-none"];
+}
+
+# MIPS32 Release 2 CPUs without an FPU; DSP, MT, MCU, and SmartMIPS are not
+# modeled. Costs: those of isa-mips32r2.
+cpu "m4k" {
+    architecture = "mips";
+    inherits = ["isa-mips32r2", "fpu-none"];
+}
+
+cpu "m4kp" {
+    architecture = "mips";
+    inherits = "m4k";
+}
+
+cpu "m14k" {
+    architecture = "mips";
+    inherits = "m4k";
+}
+
+cpu "m14kc" {
+    architecture = "mips";
+    inherits = "m4k";
+}
+
+cpu "m14ke" {
+    architecture = "mips";
+    inherits = "m4k";
+}
+
+cpu "m14kec" {
+    architecture = "mips";
+    inherits = "m4k";
+}
+
+cpu "4kec" {
+    architecture = "mips";
+    inherits = ["isa-mips32r2", "fpu-none"];
+}
+
+cpu "4kem" {
+    architecture = "mips";
+    inherits = "4kec";
+}
+
+cpu "4ksd" {
+    architecture = "mips";
+    inherits = "4kec";
+}
+
+cpu "4kep" {
+    architecture = "mips";
+    inherits = ["isa-mips32r2", "fpu-none"];
+}
+
+cpu "24kc" {
+    architecture = "mips";
+    inherits = ["isa-mips32r2", "fpu-none"];
+}
+
+cpu "24kec" {
+    architecture = "mips";
+    inherits = "24kc";
+}
+
+cpu "34kc" {
+    architecture = "mips";
+    inherits = "24kc";
+}
+
+cpu "34kn" {
+    architecture = "mips";
+    inherits = "24kc";
+}
+
+cpu "1004kc" {
+    architecture = "mips";
+    inherits = "24kc";
+}
+
+cpu "74kc" {
+    architecture = "mips";
+    inherits = ["isa-mips32r2", "fpu-none"];
+}
+
+# MIPS32 Release 2 CPUs with an FPU; DSP and MT are not modeled. An entry
+# that inherits a CPU shares its pipeline. Costs: those of mips32r2.
+cpu "24kf2_1" {
+    architecture = "mips";
+    inherits = "mips32r2";
+}
+
+cpu "24kf" {
+    architecture = "mips";
+    inherits = "24kf2_1";
+}
+
+cpu "24kef2_1" {
+    architecture = "mips";
+    inherits = "24kf2_1";
+}
+
+cpu "24kef" {
+    architecture = "mips";
+    inherits = "24kf2_1";
+}
+
+cpu "34kf2_1" {
+    architecture = "mips";
+    inherits = "24kf2_1";
+}
+
+cpu "34kf" {
+    architecture = "mips";
+    inherits = "24kf2_1";
+}
+
+cpu "1004kf2_1" {
+    architecture = "mips";
+    inherits = "24kf2_1";
+}
+
+cpu "1004kf" {
+    architecture = "mips";
+    inherits = "24kf2_1";
+}
+
+cpu "interaptiv" {
+    architecture = "mips";
+    inherits = "24kf2_1";
+}
+
+cpu "interaptiv-mr2" {
+    architecture = "mips";
+    inherits = "interaptiv";
+}
+
+cpu "24kf1_1" {
+    architecture = "mips";
+    inherits = "mips32r2";
+}
+
+cpu "24kfx" {
+    architecture = "mips";
+    inherits = "24kf1_1";
+}
+
+cpu "24kx" {
+    architecture = "mips";
+    inherits = "24kf1_1";
+}
+
+cpu "24kef1_1" {
+    architecture = "mips";
+    inherits = "24kf1_1";
+}
+
+cpu "24kefx" {
+    architecture = "mips";
+    inherits = "24kf1_1";
+}
+
+cpu "24kex" {
+    architecture = "mips";
+    inherits = "24kf1_1";
+}
+
+cpu "34kf1_1" {
+    architecture = "mips";
+    inherits = "24kf1_1";
+}
+
+cpu "34kfx" {
+    architecture = "mips";
+    inherits = "24kf1_1";
+}
+
+cpu "34kx" {
+    architecture = "mips";
+    inherits = "24kf1_1";
+}
+
+cpu "1004kf1_1" {
+    architecture = "mips";
+    inherits = "24kf1_1";
+}
+
+cpu "74kf2_1" {
+    architecture = "mips";
+    inherits = "mips32r2";
+}
+
+cpu "74kf" {
+    architecture = "mips";
+    inherits = "74kf2_1";
+}
+
+cpu "74kf1_1" {
+    architecture = "mips";
+    inherits = "mips32r2";
+}
+
+cpu "74kfx" {
+    architecture = "mips";
+    inherits = "74kf1_1";
+}
+
+cpu "74kx" {
+    architecture = "mips";
+    inherits = "74kf1_1";
+}
+
+cpu "74kf3_2" {
+    architecture = "mips";
+    inherits = "mips32r2";
+}
+
+# MIPS32 Release 5 CPUs. The M5100's FPU uses the IEEE 754-2008 NaN
+# encoding, and the M5101 has no FPU. Costs: those of mips32r5.
+cpu "p5600" {
+    architecture = "mips";
+    inherits = "mips32r5";
+}
+
+cpu "m5100" {
+    architecture = "mips";
+    inherits = "mips32r5";
+    features = ["mips32r2", "hard-float", "fp32", "odd-spreg", "nan2008",
+                "llsc", "branch-likely", "cond-move", "rotate",
+                "load-interlocks", "fpu-transfer-interlocks",
+                "fpu-compare-interlocks", "hilo-interlocks"];
+}
+
+cpu "m5101" {
+    architecture = "mips";
+    inherits = ["isa-mips32r2", "fpu-none"];
+}
+
+# MIPS64 CPUs; MIPS-3D, MDMX, and paired single are not modeled. The 5Kc
+# and the XLR have no FPU, and the SR71000 adds rotates. Costs: those of
+# mips64.
+cpu "5kc" {
+    architecture = "mips";
+    inherits = ["isa-mips64", "fpu-none"];
+}
+
+cpu "5kf" {
+    architecture = "mips";
+    inherits = "mips64";
+}
+
+cpu "20kc" {
+    architecture = "mips";
+    inherits = "mips64";
+}
+
+cpu "25kf" {
+    architecture = "mips";
+    inherits = "mips64";
+}
+
+cpu "sb1" {
+    architecture = "mips";
+    inherits = "mips64";
+}
+
+cpu "sb1a" {
+    architecture = "mips";
+    inherits = "sb1";
+}
+
+cpu "xlr" {
+    architecture = "mips";
+    inherits = ["isa-mips64", "fpu-none"];
+}
+
+cpu "sr71000" {
+    architecture = "mips";
+    inherits = "mips64";
     features = ["mips64", "hard-float", "fp64", "odd-spreg", "llsc",
-                "branch-likely", "cond-move", "load-interlocks",
+                "branch-likely", "cond-move", "rotate", "load-interlocks",
                 "fpu-transfer-interlocks", "fpu-compare-interlocks",
                 "hilo-interlocks"];
 }
+
+# MIPS64 Release 2 CPUs; the Loongson, Octeon, and XLP extensions are not
+# modeled. The GS464 has no odd single-precision registers, and the Octeon,
+# Octeon+, and Octeon II have no FPU. Costs: those of mips64r2.
+cpu "gs464" {
+    architecture = "mips";
+    inherits = ["isa-mips64r2", "fpu-fp64"];
+}
+
+cpu "loongson3a" {
+    architecture = "mips";
+    inherits = "gs464";
+}
+
+cpu "gs464e" {
+    architecture = "mips";
+    inherits = "mips64r2";
+}
+
+cpu "gs264e" {
+    architecture = "mips";
+    inherits = "mips64r2";
+}
+
+cpu "octeon" {
+    architecture = "mips";
+    inherits = ["isa-mips64r2", "fpu-none"];
+}
+
+cpu "octeon+" {
+    architecture = "mips";
+    inherits = "octeon";
+}
+
+cpu "octeon2" {
+    architecture = "mips";
+    inherits = ["isa-mips64r2", "fpu-none"];
+}
+
+cpu "octeon3" {
+    architecture = "mips";
+    inherits = "mips64r2";
+}
+
+cpu "xlp" {
+    architecture = "mips";
+    inherits = "mips64r2";
+}
+
+# Other spellings that GCC and GNU as accept.
+cpu "r3k" { architecture = "mips"; inherits = "r3000"; }
+cpu "3000" { architecture = "mips"; inherits = "r3000"; }
+cpu "3k" { architecture = "mips"; inherits = "r3000"; }
+cpu "r2k" { architecture = "mips"; inherits = "r2000"; }
+cpu "2000" { architecture = "mips"; inherits = "r2000"; }
+cpu "2k" { architecture = "mips"; inherits = "r2000"; }
+cpu "3900" { architecture = "mips"; inherits = "r3900"; }
+cpu "r6k" { architecture = "mips"; inherits = "r6000"; }
+cpu "6000" { architecture = "mips"; inherits = "r6000"; }
+cpu "6k" { architecture = "mips"; inherits = "r6000"; }
+cpu "4100" { architecture = "mips"; inherits = "vr4100"; }
+cpu "r4100" { architecture = "mips"; inherits = "vr4100"; }
+cpu "4111" { architecture = "mips"; inherits = "vr4111"; }
+cpu "r4111" { architecture = "mips"; inherits = "vr4111"; }
+cpu "4120" { architecture = "mips"; inherits = "vr4120"; }
+cpu "r4120" { architecture = "mips"; inherits = "vr4120"; }
+cpu "4130" { architecture = "mips"; inherits = "vr4130"; }
+cpu "r4130" { architecture = "mips"; inherits = "vr4130"; }
+cpu "4300" { architecture = "mips"; inherits = "vr4300"; }
+cpu "r4300" { architecture = "mips"; inherits = "vr4300"; }
+cpu "4400" { architecture = "mips"; inherits = "r4400"; }
+cpu "4600" { architecture = "mips"; inherits = "r4600"; }
+cpu "4650" { architecture = "mips"; inherits = "r4650"; }
+cpu "4700" { architecture = "mips"; inherits = "r4700"; }
+cpu "r8k" { architecture = "mips"; inherits = "r8000"; }
+cpu "8000" { architecture = "mips"; inherits = "r8000"; }
+cpu "8k" { architecture = "mips"; inherits = "r8000"; }
+cpu "r10k" { architecture = "mips"; inherits = "r10000"; }
+cpu "10000" { architecture = "mips"; inherits = "r10000"; }
+cpu "10k" { architecture = "mips"; inherits = "r10000"; }
+cpu "r12k" { architecture = "mips"; inherits = "r12000"; }
+cpu "12000" { architecture = "mips"; inherits = "r12000"; }
+cpu "12k" { architecture = "mips"; inherits = "r12000"; }
+cpu "r14k" { architecture = "mips"; inherits = "r14000"; }
+cpu "14000" { architecture = "mips"; inherits = "r14000"; }
+cpu "14k" { architecture = "mips"; inherits = "r14000"; }
+cpu "r16k" { architecture = "mips"; inherits = "r16000"; }
+cpu "16000" { architecture = "mips"; inherits = "r16000"; }
+cpu "16k" { architecture = "mips"; inherits = "r16000"; }
+cpu "vr5k" { architecture = "mips"; inherits = "vr5000"; }
+cpu "5000" { architecture = "mips"; inherits = "vr5000"; }
+cpu "5k" { architecture = "mips"; inherits = "vr5000"; }
+cpu "r5000" { architecture = "mips"; inherits = "vr5000"; }
+cpu "r5k" { architecture = "mips"; inherits = "vr5000"; }
+cpu "5400" { architecture = "mips"; inherits = "vr5400"; }
+cpu "r5400" { architecture = "mips"; inherits = "vr5400"; }
+cpu "5500" { architecture = "mips"; inherits = "vr5500"; }
+cpu "r5500" { architecture = "mips"; inherits = "vr5500"; }
+cpu "rm7k" { architecture = "mips"; inherits = "rm7000"; }
+cpu "7000" { architecture = "mips"; inherits = "rm7000"; }
+cpu "7k" { architecture = "mips"; inherits = "rm7000"; }
+cpu "r7000" { architecture = "mips"; inherits = "rm7000"; }
+cpu "r7k" { architecture = "mips"; inherits = "rm7000"; }
+cpu "rm9k" { architecture = "mips"; inherits = "rm9000"; }
+cpu "9000" { architecture = "mips"; inherits = "rm9000"; }
+cpu "9k" { architecture = "mips"; inherits = "rm9000"; }
+cpu "r9000" { architecture = "mips"; inherits = "rm9000"; }
+cpu "r9k" { architecture = "mips"; inherits = "rm9000"; }
+cpu "r4kc" { architecture = "mips"; inherits = "4kc"; }
+cpu "r4km" { architecture = "mips"; inherits = "4km"; }
+cpu "r4kp" { architecture = "mips"; inherits = "4kp"; }
+cpu "r4ksc" { architecture = "mips"; inherits = "4ksc"; }
+cpu "r4kec" { architecture = "mips"; inherits = "4kec"; }
+cpu "r4kem" { architecture = "mips"; inherits = "4kem"; }
+cpu "r4kep" { architecture = "mips"; inherits = "4kep"; }
+cpu "r4ksd" { architecture = "mips"; inherits = "4ksd"; }
+cpu "r24kc" { architecture = "mips"; inherits = "24kc"; }
+cpu "r24kf2_1" { architecture = "mips"; inherits = "24kf2_1"; }
+cpu "r24kf" { architecture = "mips"; inherits = "24kf"; }
+cpu "r24kf1_1" { architecture = "mips"; inherits = "24kf1_1"; }
+cpu "r24kfx" { architecture = "mips"; inherits = "24kfx"; }
+cpu "r24kx" { architecture = "mips"; inherits = "24kx"; }
+cpu "r24kec" { architecture = "mips"; inherits = "24kec"; }
+cpu "r24kef2_1" { architecture = "mips"; inherits = "24kef2_1"; }
+cpu "r24kef" { architecture = "mips"; inherits = "24kef"; }
+cpu "r24kef1_1" { architecture = "mips"; inherits = "24kef1_1"; }
+cpu "r24kefx" { architecture = "mips"; inherits = "24kefx"; }
+cpu "r24kex" { architecture = "mips"; inherits = "24kex"; }
+cpu "r34kc" { architecture = "mips"; inherits = "34kc"; }
+cpu "r34kf2_1" { architecture = "mips"; inherits = "34kf2_1"; }
+cpu "r34kf" { architecture = "mips"; inherits = "34kf"; }
+cpu "r34kf1_1" { architecture = "mips"; inherits = "34kf1_1"; }
+cpu "r34kfx" { architecture = "mips"; inherits = "34kfx"; }
+cpu "r34kx" { architecture = "mips"; inherits = "34kx"; }
+cpu "r34kn" { architecture = "mips"; inherits = "34kn"; }
+cpu "r74kc" { architecture = "mips"; inherits = "74kc"; }
+cpu "r74kf2_1" { architecture = "mips"; inherits = "74kf2_1"; }
+cpu "r74kf" { architecture = "mips"; inherits = "74kf"; }
+cpu "r74kf1_1" { architecture = "mips"; inherits = "74kf1_1"; }
+cpu "r74kfx" { architecture = "mips"; inherits = "74kfx"; }
+cpu "r74kx" { architecture = "mips"; inherits = "74kx"; }
+cpu "r74kf3_2" { architecture = "mips"; inherits = "74kf3_2"; }
+cpu "r1004kc" { architecture = "mips"; inherits = "1004kc"; }
+cpu "r1004kf2_1" { architecture = "mips"; inherits = "1004kf2_1"; }
+cpu "r1004kf" { architecture = "mips"; inherits = "1004kf"; }
+cpu "r1004kf1_1" { architecture = "mips"; inherits = "1004kf1_1"; }
+cpu "r5kc" { architecture = "mips"; inherits = "5kc"; }
+cpu "r5kf" { architecture = "mips"; inherits = "5kf"; }
+cpu "r20kc" { architecture = "mips"; inherits = "20kc"; }
+cpu "sr71k" { architecture = "mips"; inherits = "sr71000"; }
+cpu "4010" { architecture = "mips"; inherits = "r4010"; }
+cpu "4181" { architecture = "mips"; inherits = "vr4181"; }
+cpu "r4181" { architecture = "mips"; inherits = "vr4181"; }
+cpu "5200" { architecture = "mips"; inherits = "rm5200"; }
+cpu "r5200" { architecture = "mips"; inherits = "rm5200"; }
+cpu "5230" { architecture = "mips"; inherits = "rm5230"; }
+cpu "r5230" { architecture = "mips"; inherits = "rm5230"; }
+cpu "5231" { architecture = "mips"; inherits = "rm5231"; }
+cpu "r5231" { architecture = "mips"; inherits = "rm5231"; }
+cpu "5261" { architecture = "mips"; inherits = "rm5261"; }
+cpu "r5261" { architecture = "mips"; inherits = "rm5261"; }
+cpu "5721" { architecture = "mips"; inherits = "rm5721"; }
+cpu "r5721" { architecture = "mips"; inherits = "rm5721"; }
+cpu "r25kf" { architecture = "mips"; inherits = "25kf"; }
 
 # Small data through $gp, like GCC's -G8 with constants kept out. No profile
 # selects it: the program must set $gp to _gp first.
