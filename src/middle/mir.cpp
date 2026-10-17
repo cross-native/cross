@@ -2016,8 +2016,9 @@ private:
                                 lane.memory->alignment);
         }
         const auto vector = load_slot(*lane.local, location);
-        const auto value = add_value(ValueKind::ExtractElement,
-                                     lane.element_type, location);
+        const auto value = add_value(
+            ValueKind::ExtractElement,
+            *hir_.type(current_.values[vector.value].type).element, location);
         current_.values[value.value].operands = {vector, lane.index};
         return value;
     }

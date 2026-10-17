@@ -66,6 +66,23 @@ typedef u32 u32x8 [[vector_size(32)]];
     return w[k];
 }
 
+// A const vector local reads its lanes as values of the element type.
+[[noinline]] global f64x2 pair(in f64 first, in f64 second) {
+    f64x2 v = first;
+    v[1] = second;
+    return v;
+}
+
+[[noinline]] global f64 const_doubles(in uptr k) {
+    const f64x2 v = pair(0.5, -3.0);
+    return v[0] + v[k];
+}
+
+[[noinline]] global i32 const_words(in uptr k) {
+    const i32x4 v = 5;
+    return v[k] + v[3];
+}
+
 global u32 test_entry() {
     for (uptr k = 0; k < 16; ++k) {
         const u32 lane = (u32)k;
@@ -93,6 +110,10 @@ global u32 test_entry() {
     if (doubles(0) != 2.5 || doubles(1) != -1.0e300) return 6u32;
     for (uptr k = 0; k < 8; ++k) {
         if (octets(k) != (u32)k + 16u32) return 7u32;
+    }
+    if (const_doubles(0) != 1.0 || const_doubles(1) != -2.5) return 8u32;
+    for (uptr k = 0; k < 4; ++k) {
+        if (const_words(k) != 10) return 9u32;
     }
     return 0u32;
 }
