@@ -5407,6 +5407,29 @@ if(BUILD_TESTING)
         set_tests_properties(cross_runtime_vector_constant_lanes_${constant_mode} PROPERTIES
             LABELS "check.runtime;arch.x86_64;backend.native;feature.vector;opt.${constant_level}")
     endforeach()
+    # Values in the result register across vector staging through XMM0-XMM2.
+    foreach(scratch_mode O0 O2 O3 O2-avx2 O3-avx2 O2-fma)
+        string(REGEX MATCH "^O[0-9s]" scratch_level "${scratch_mode}")
+        set(scratch_flags "-${scratch_level};-fno-eval-calls")
+        set(scratch_labels "")
+        if(scratch_mode MATCHES "-(avx2|fma)$")
+            list(APPEND scratch_flags "-march=x86-64-v3")
+            set(scratch_labels ";isa.avx")
+        endif()
+        if(scratch_mode MATCHES "-fma$")
+            list(APPEND scratch_flags "-ffp-contract=fast")
+        endif()
+        add_test(NAME cross_runtime_vector_scratch_endpoints_${scratch_mode}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/vector/scratch_endpoints.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-vector-scratch-endpoints-${scratch_mode}
+                -DENTRY=test_entry -DEXPECTED=0 "-DCC_FLAGS=${scratch_flags}"
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_vector_scratch_endpoints_${scratch_mode} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;feature.vector;feature.register_allocation${scratch_labels};opt.${scratch_level}")
+    endforeach()
     add_test(NAME cross_vector_constant_lanes_codegen
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

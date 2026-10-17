@@ -9045,6 +9045,92 @@ private:
                                    instruction.opcode == Opcode::Vstore;
                         });
                 });
+        // XMM0-XMM2 are the emitter's SIMD temporaries: it stages SIMD
+        // operands and results that live in their homes, variable lanes, and
+        // memory-class and aggregate copies through them. The audited leaf
+        // path keeps every SIMD value resident (an unassigned one withdraws
+        // XMM0/XMM1 below); elsewhere, and around a value that never is, a
+        // value live across such an instruction or read by it takes none of
+        // them, even through return-endpoint affinity. Scalar arithmetic
+        // reads its left operand in place unless it may fuse into an FMA.
+        {
+            std::vector<std::uint32_t> simd_scratches;
+            for (const auto name : {"xmm0", "xmm1", "xmm2"}) {
+                if (const auto* view = find_register_view(name)) {
+                    simd_scratches.push_back(view->storage_id);
+                }
+            }
+            const auto never_resident = [&](machine::Register reg) {
+                return is_simd_register(reg) && !eligible[reg.id];
+            };
+            const auto stages_simd =
+                [&](const machine::Instruction& instruction) {
+                    if (instruction.kind == machine::InstructionKind::Call ||
+                        instruction.kind == machine::InstructionKind::Return) {
+                        return false;
+                    }
+                    const auto touches = [&](const auto& predicate) {
+                        return std::any_of(instruction.uses.begin(),
+                                           instruction.uses.end(),
+                                           predicate) ||
+                               std::any_of(instruction.defs.begin(),
+                                           instruction.defs.end(),
+                                           predicate);
+                    };
+                    return has_property(instruction.opcode,
+                                        OpcodeProperty::Aggregate) ||
+                           has_property(instruction.opcode,
+                                        OpcodeProperty::Atomic) ||
+                           has_operand_of_class(
+                               instruction,
+                               machine::VirtualRegisterClass::Memory) ||
+                           touches(never_resident) ||
+                           (!extra_simd_colors_safe &&
+                            touches(is_simd_register));
+                };
+            for (const auto& block : current_.blocks) {
+                auto live = live_out[block.id.value];
+                for (auto item = block.instructions.rbegin();
+                     item != block.instructions.rend(); ++item) {
+                    for (const auto& definition : item->defs) {
+                        if (definition.kind ==
+                            machine::RegisterKind::Virtual) {
+                            live.erase(definition.id);
+                        }
+                    }
+                    if (stages_simd(*item)) {
+                        const auto forbid = [&](std::uint32_t id) {
+                            if (id < count) {
+                                forbidden[id].insert(simd_scratches.begin(),
+                                                     simd_scratches.end());
+                            }
+                        };
+                        for (const auto id : live) forbid(id);
+                        const auto base = binary_base_opcode(item->opcode);
+                        const bool left_in_place =
+                            !emitter_may_form_fma &&
+                            item->kind == machine::InstructionKind::Target &&
+                            (base == Opcode::Fadd || base == Opcode::Fsub ||
+                             base == Opcode::Fmul || base == Opcode::Fdiv) &&
+                            !item->uses.empty() &&
+                            item->uses.front().mode.bits <= 64;
+                        for (std::size_t index = left_in_place ? 1U : 0U;
+                             index < item->uses.size(); ++index) {
+                            if (item->uses[index].kind ==
+                                machine::RegisterKind::Virtual) {
+                                forbid(item->uses[index].id);
+                            }
+                        }
+                    }
+                    if (is_phi(*item)) continue;
+                    for (const auto& use : item->uses) {
+                        if (use.kind == machine::RegisterKind::Virtual) {
+                            live.insert(use.id);
+                        }
+                    }
+                }
+            }
+        }
         const auto collect_colors =
             [&](std::initializer_list<std::string_view> names,
                 bool clobbered) {
@@ -13399,6 +13485,44 @@ private:
         return 128;
     }
 
+    // Whether the operands of `first` keep their registers until `second`,
+    // a later instruction of the same block that then reads them in its
+    // place: no instruction between them is a call or writes one of those
+    // registers.
+    bool operands_intact(const machine::Function& function,
+                         const machine::Instruction& first,
+                         const machine::Instruction& second) const {
+        const auto writes = [&](const machine::Instruction& between,
+                                machine::PhysicalRegisterId held) {
+            const auto physical = [&](machine::Register reg) {
+                if (reg.kind == machine::RegisterKind::Physical) {
+                    return reg.id == held.value;
+                }
+                return reg.kind == machine::RegisterKind::Virtual &&
+                       reg.id < function.virtual_register_assignments.size() &&
+                       function.virtual_register_assignments[reg.id] == held;
+            };
+            return std::any_of(between.defs.begin(), between.defs.end(),
+                               physical) ||
+                   std::any_of(between.clobbers.begin(),
+                               between.clobbers.end(), physical);
+        };
+        for (const auto* between = &first + 1; between != &second;
+             ++between) {
+            if (between->kind == machine::InstructionKind::Call) return false;
+            for (const auto operand : first.uses) {
+                if (operand.kind != machine::RegisterKind::Virtual ||
+                    operand.id >= function.virtual_register_assignments.size()) {
+                    continue;
+                }
+                const auto held =
+                    function.virtual_register_assignments[operand.id];
+                if (held && writes(*between, *held)) return false;
+            }
+        }
+        return true;
+    }
+
     void plan_fused_multiply_adds(const machine::Function& function) {
         fused_adds_.clear();
         fused_multiplications_.clear();
@@ -13441,7 +13565,8 @@ private:
                             continue;
                         }
                         if (multiply->uses.size() != 2 ||
-                            multiply->defs.size() != 1) {
+                            multiply->defs.size() != 1 ||
+                            !operands_intact(function, *multiply, value)) {
                             continue;
                         }
                         fused_adds_.emplace(&value, multiply);
