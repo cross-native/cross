@@ -3490,13 +3490,17 @@ if(BUILD_TESTING)
             LABELS "check.runtime;arch.mips;backend.native;middle;feature.optimization;opt.${level}"
             SKIP_REGULAR_EXPRESSION "skipping MIPS")
     endforeach()
-    # Complete peeling of loops with a constant trip count.
-    foreach(peel_mode O0 O1-peel-loops O2 O3 Os O2-no-peel-loops O2-peel-limit)
+    # Complete peeling of loops with a constant trip count, or bounded by
+    # the extent of an array they search.
+    foreach(peel_mode O0 O1-peel-loops O2 O3 Os O2-no-peel-loops O2-peel-limit
+                      O2-no-loop-bounds)
         string(REGEX MATCH "^O[0-9s]" peel_level "${peel_mode}")
         if(peel_mode STREQUAL "O1-peel-loops")
             set(peel_flags "-O1;-fpeel-loops;-fpeel-limit=96")
         elseif(peel_mode STREQUAL "O2-no-peel-loops")
             set(peel_flags "-O2;-fno-peel-loops")
+        elseif(peel_mode STREQUAL "O2-no-loop-bounds")
+            set(peel_flags "-O2;-fno-loop-bounds-from-extents")
         elseif(peel_mode STREQUAL "O2-peel-limit")
             set(peel_flags "-O2;-fpeel-limit=4096")
         else()
@@ -3513,10 +3517,12 @@ if(BUILD_TESTING)
         set_tests_properties(cross_runtime_loop_peeling_${peel_mode} PROPERTIES
             LABELS "check.runtime;arch.x86_64;backend.native;middle;feature.optimization;opt.${peel_level}")
     endforeach()
-    foreach(peel_mode O2 O3 O2-no-peel-loops)
+    foreach(peel_mode O2 O3 O2-no-peel-loops O2-no-loop-bounds)
         string(REGEX MATCH "^O[0-9s]" peel_level "${peel_mode}")
         if(peel_mode STREQUAL "O2-no-peel-loops")
             set(peel_flags "-O2;-fno-peel-loops")
+        elseif(peel_mode STREQUAL "O2-no-loop-bounds")
+            set(peel_flags "-O2;-fno-loop-bounds-from-extents")
         else()
             set(peel_flags "-${peel_mode}")
         endif()
@@ -5014,6 +5020,41 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
     set_tests_properties(cross_runtime_native_loop_rotation PROPERTIES
         LABELS "check.runtime;arch.x86_64;backend.native;middle;feature.optimization;opt.O2")
+    # Inner loops whose first test folds rotate; references that do not.
+    foreach(rotation_mode O3 O2-no-rotate)
+        string(REGEX MATCH "^O[0-9s]" rotation_level "${rotation_mode}")
+        if(rotation_mode STREQUAL "O2-no-rotate")
+            set(rotation_flags "-O2;-fno-tree-loop-rotate")
+        else()
+            set(rotation_flags "-${rotation_mode}")
+        endif()
+        add_test(NAME cross_runtime_native_loop_rotation_${rotation_mode}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/loop_rotation.x
+                    -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-loop-rotation-${rotation_mode}
+                    -DENTRY=loop_rotation_entry
+                    -DEXPECTED=0
+                    "-DCC_FLAGS=${rotation_flags}"
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_native_loop_rotation_${rotation_mode}
+            PROPERTIES LABELS "check.runtime;arch.x86_64;backend.native;middle;feature.optimization;opt.${rotation_level}")
+    endforeach()
+    foreach(rotation_mode O2 O3)
+        add_test(NAME cross_runtime_loop_rotation_mips_${rotation_mode}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/loop_rotation.x
+                    -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-loop-rotation-mips-${rotation_mode}
+                    -DEXPECTED=P -DCC_FLAGS=-${rotation_mode}
+                    -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(cross_runtime_loop_rotation_mips_${rotation_mode} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;middle;feature.optimization;isa.vr4300;isa.r3000;endian.big;endian.little;opt.${rotation_mode}"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS")
+    endforeach()
     add_test(NAME cross_runtime_native_parallel_copy
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

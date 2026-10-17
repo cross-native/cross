@@ -23,6 +23,7 @@ optimization "O0" {
     f.move-loop-invariants = false;
     f.unroll-loops = false;
     f.peel-loops = false;
+    f.loop-bounds-from-extents = false;
     f.tree-reassoc = false;
     f.tree-slsr = false;
     f.div-by-constant = false;
@@ -80,6 +81,7 @@ optimization "O1" {
     f.tree-ccp = true;
     f.tree-bit-ccp = true;
     f.div-by-constant = true;
+    f.loop-bounds-from-extents = true;
     f.tree-copy-prop = true;
     f.tree-dce = true;
     f.tree-dse = true;

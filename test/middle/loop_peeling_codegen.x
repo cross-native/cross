@@ -15,3 +15,13 @@ global u32 weighted() {
     for (u32 i = 0u32; i < 4u32; ++i) total = (total ^ table[i]) * weights[i];
     return total;
 }
+
+// A search whose exit test reads the array it indexes makes at most as many
+// passes as the array has elements: with -floop-bounds-from-extents it
+// becomes straight-line code, one test per element, and the last pass
+// leaves without a test.
+global u32 searched(in u32 full) {
+    u32 i = 0u32;
+    while (table[i] == full) ++i;
+    return i;
+}

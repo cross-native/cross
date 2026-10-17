@@ -402,10 +402,15 @@ std::span<const OptionDefinition> common_option_definitions() {
         {"f.unroll-loops", {}, OptionValueKind::Boolean, false, {}, 0, 0,
          OptionCategory::Optimization, true, OptionImplementation::Partial,
          "unroll target-independent loops when legality and profitability are proven"},
+        {"f.loop-bounds-from-extents", {}, OptionValueKind::Boolean, false,
+         {}, 0, 0, OptionCategory::Optimization, true,
+         OptionImplementation::Implemented,
+         "bound a loop's trip count by an access in it to an object of known "
+         "extent, since an access past the extent is undefined"},
         {"f.peel-loops", {}, OptionValueKind::Boolean, false, {}, 0, 0,
          OptionCategory::Optimization, true, OptionImplementation::Partial,
-         "replace loops whose trip count is a known constant with copies of "
-         "their bodies"},
+         "replace loops whose trip count is a known constant, or bounded by "
+         "an object they access, with copies of their bodies"},
         {"f.tree-reassoc", {}, OptionValueKind::Boolean, false, {}, 0, 0,
          OptionCategory::Optimization, true, OptionImplementation::Partial,
          "rebalance legal associative SSA expressions and combine range tests "
@@ -866,6 +871,8 @@ bool resolve_registered_options(
         resolved_bool(options, "f.move-loop-invariants");
     options.unroll_loops = resolved_bool(options, "f.unroll-loops");
     options.peel_loops = resolved_bool(options, "f.peel-loops");
+    options.loop_bounds_from_extents =
+        resolved_bool(options, "f.loop-bounds-from-extents");
     options.tree_reassoc = resolved_bool(options, "f.tree-reassoc");
     options.tree_slsr = resolved_bool(options, "f.tree-slsr");
     options.div_by_constant = resolved_bool(options, "f.div-by-constant");

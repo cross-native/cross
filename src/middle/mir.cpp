@@ -9480,12 +9480,21 @@ void eliminate_dead_values(ManagedFunction& function,
             pending.push_back(value);
         }
     };
+    // A non-volatile load orders with memory effects but changes nothing,
+    // so one whose value nothing reads goes too.
+    const auto plain_load = [](const ManagedValue& value) {
+        return (value.kind == ValueKind::Load ||
+                value.kind == ValueKind::PointerLoad ||
+                value.kind == ValueKind::IndexedLoad ||
+                value.kind == ValueKind::GlobalLoad) &&
+               !value.is_volatile_access;
+    };
     for (const auto parameter : function.parameters) mark(parameter);
     for (const auto& block : function.blocks) {
         if (block.terminator.value) mark(*block.terminator.value);
         for (const auto value_id : block.values) {
             const auto& value = function.values[value_id.value];
-            if (is_effectful_value(value) ||
+            if ((is_effectful_value(value) && !plain_load(value)) ||
                 may_trap_floating(value, function, hir_module, environment)) {
                 mark(value_id);
             }
@@ -9525,6 +9534,13 @@ void eliminate_dead_values(ManagedFunction& function,
              value.kind == ValueKind::LifetimeEnd) &&
             value.slot && !referenced[value.slot->value]) {
             lifetimes.insert(value.id.value);
+        }
+    }
+    for (const auto& block : function.blocks) {
+        for (const auto id : block.values) {
+            if (!live[id.value] && plain_load(function.values[id.value])) {
+                lifetimes.insert(id.value);
+            }
         }
     }
     for (auto& block : function.blocks) {
@@ -11283,6 +11299,8 @@ void simplify_demanded_bits(ManagedFunction& function,
     }
 }
 
+} // namespace
+
 // An integer conversion of a `source_bits`-wide constant.
 std::optional<UInt128> fold_integer_cast(CastOperation cast, UInt128 value,
                                          unsigned source_bits,
@@ -11299,6 +11317,8 @@ std::optional<UInt128> fold_integer_cast(CastOperation cast, UInt128 value,
     }
     return mask_to(value, target_bits);
 }
+
+namespace {
 
 std::optional<UInt128> folded_integer_constant(
     const ManagedFunction& function, const hir::Module& hir_module,
@@ -11322,10 +11342,8 @@ std::optional<UInt128> folded_integer_constant(
         type_bits(hir_module, function.values[source_id.value].type), bits);
 }
 
-// The exact result of an integer operation on `bits`-wide constants (the
-// operand width for a comparison), or nothing when the operation is
-// undefined for them or not folded. Shift counts are reduced modulo the
-// width.
+} // namespace
+
 std::optional<UInt128> fold_integer_binary(BinaryOperation operation,
                                            UInt128 left, UInt128 right,
                                            unsigned bits) {
@@ -11412,6 +11430,8 @@ std::optional<UInt128> fold_integer_binary(BinaryOperation operation,
     default: return std::nullopt;
     }
 }
+
+namespace {
 
 // The unsigned type of an integer type's width, in which the shifts and
 // additions that replace a multiplication wrap exactly as it does. Narrow
@@ -14934,6 +14954,159 @@ bool reduce_affine_address_inductions(
         return false;
     };
 
+    // Under a size goal an index's groups take pointer recurrences when that
+    // costs no more instructions than their address arithmetic: one shift
+    // per scale and an add per group (one per offset where constant offsets
+    // are not split off), against a step and a copy of the start per group
+    // and the low part of a static object's address, which the accesses'
+    // displacements otherwise absorb. When the recurrences leave the index
+    // counting passes only, its step and start give way to the end address
+    // of the exit test, and when that bound is constant, a tie goes to the
+    // recurrences if they save work in each pass.
+    const auto index_recurrences_fit_size =
+        [&](ValueId index_phi_id, ValueId update_id, const CanonicalLoop& loop,
+            BlockId latch, const std::vector<Group>& groups,
+            const std::vector<bool>& selected) {
+            const bool shared =
+                options.tree_reassoc && options.risc_cisc_balance <= 50U;
+            std::unordered_set<std::uint64_t> scales;
+            std::size_t chosen = 0;
+            std::size_t adds = 0;
+            std::size_t lows = 0;
+            bool every_pass_unit = false;
+            std::unordered_set<std::uint32_t> bases;
+            for (std::size_t index = 0; index < groups.size(); ++index) {
+                if (!selected[index]) continue;
+                const auto& group = groups[index];
+                ++chosen;
+                if (group.element_size * group.scale > 1U) {
+                    scales.insert(group.element_size * group.scale);
+                }
+                std::unordered_set<std::uint64_t> offsets;
+                for (const auto& access : group.accesses) {
+                    offsets.insert(access.element_offset);
+                    every_pass_unit = every_pass_unit ||
+                        (group.scale == 1 &&
+                         dominators.dominates(access.block, latch));
+                }
+                adds += shared ? 1U : offsets.size();
+                auto base = group.base;
+                while (function.values[base.value].kind == ValueKind::Cast &&
+                       function.values[base.value].cast ==
+                           CastOperation::Reinterpret &&
+                       function.values[base.value].operands.size() == 1) {
+                    base = function.values[base.value].operands[0];
+                }
+                bases.insert(group.base.value);
+                if (function.values[base.value].kind ==
+                    ValueKind::GlobalAddress) {
+                    ++lows;
+                }
+            }
+            if (chosen == 0) return false;
+            // Whether the index then only counts passes: the header tests it
+            // for equality with an invariant bound, the loop has no other
+            // exit, and everything else that reads it is an address of a
+            // chosen group.
+            const auto& header = function.blocks[loop.header.value];
+            std::optional<ValueId> bound;
+            if (every_pass_unit && header.terminator.value) {
+                const auto& condition =
+                    function.values[header.terminator.value->value];
+                if (condition.kind == ValueKind::Binary &&
+                    (condition.binary == BinaryOperation::NotEqual ||
+                     condition.binary == BinaryOperation::Equal) &&
+                    condition.operands.size() == 2 &&
+                    (condition.operands[0] == index_phi_id ||
+                     condition.operands[1] == index_phi_id)) {
+                    bound = condition.operands[0] == index_phi_id
+                                ? condition.operands[1]
+                                : condition.operands[0];
+                    const auto definition = definition_blocks[bound->value];
+                    if (function.values[bound->value].kind !=
+                            ValueKind::ConstantInteger &&
+                        (!definition ||
+                         loop.blocks.contains(definition->value))) {
+                        bound.reset();
+                    }
+                }
+            }
+            const bool single_exit = std::all_of(
+                loop.blocks.begin(), loop.blocks.end(), [&](std::uint32_t id) {
+                    const auto& successors =
+                        function.blocks[id].terminator.successors;
+                    return id == loop.header.value ||
+                           std::all_of(successors.begin(), successors.end(),
+                                       [&](BlockId successor) {
+                                           return loop.blocks.contains(
+                                               successor.value);
+                                       });
+                });
+            bool counts = bound.has_value() && single_exit;
+            if (counts) {
+                const UseLists uses(function);
+                std::vector<ValueId> pending{index_phi_id};
+                std::unordered_set<std::uint32_t> seen{index_phi_id.value};
+                while (counts && !pending.empty()) {
+                    const auto current = pending.back();
+                    pending.pop_back();
+                    for (const auto& use : uses.uses(current)) {
+                        if (!use.user) {
+                            counts = use.kind == UseKind::Terminator &&
+                                     current == index_phi_id &&
+                                     use.block == loop.header;
+                            if (!counts) break;
+                            continue;
+                        }
+                        const auto user_id = *use.user;
+                        const auto& user = function.values[user_id.value];
+                        if (user_id == update_id) {
+                            counts = uses.uses(update_id).size() == 1;
+                        } else if (user_id == *header.terminator.value &&
+                                   current == index_phi_id) {
+                            counts = uses.uses(user_id).size() == 1;
+                        } else if (user.kind == ValueKind::IndexedAddress ||
+                                   user.kind == ValueKind::IndexedLoad) {
+                            counts = user.operands.size() == 2 &&
+                                     user.operands[1] == current &&
+                                     bases.contains(user.operands[0].value);
+                        } else if (user.kind == ValueKind::Phi ||
+                                   is_effectful_value(user) ||
+                                   !definition_blocks[user_id.value] ||
+                                   !loop.blocks.contains(
+                                       definition_blocks[user_id.value]
+                                           ->value)) {
+                            counts = false;
+                        } else if (seen.insert(user_id.value).second) {
+                            pending.push_back(user_id);
+                        }
+                        if (!counts) break;
+                    }
+                }
+            }
+            std::size_t before = scales.size() + adds;
+            std::size_t after = 2U * chosen + lows;
+            std::size_t before_pass = scales.size() + adds;
+            if (counts) {
+                before += 2U;
+                ++before_pass;
+                after += function.values[bound->value].kind ==
+                                 ValueKind::ConstantInteger
+                             ? 1U
+                             : 2U;
+            }
+            // A recurrence that does not take the index's place holds one
+            // more register across the loop, and so does the end address of
+            // a bound that is not constant, which usually stays live itself;
+            // a tie does not pay for that register.
+            const bool same_registers =
+                counts && function.values[bound->value].kind ==
+                              ValueKind::ConstantInteger;
+            return after < before ||
+                   (same_registers && after == before &&
+                    chosen < before_pass);
+        };
+
     for (const auto& loop : loops) {
         if (loop.header.value >= function.blocks.size() ||
             loop.preheader.value >= function.blocks.size()) {
@@ -15190,21 +15363,40 @@ bool reduce_affine_address_inductions(
                 }
             }
 
+            // A scaled index costs a shift and an add per address, a byte
+            // index an add, unless the target's addressing absorbs them.
+            const auto risc_weight =
+                100U - std::min(options.risc_cisc_balance, 100U);
+            std::vector<bool> selected(groups.size());
+            for (std::size_t index = 0; index < groups.size(); ++index) {
+                const auto& group = groups[index];
+                const auto address_cost = group.element_size == 1 ? 1U : 2U;
+                selected[index] = static_cast<std::uint64_t>(
+                                      group.accesses.size()) *
+                                      address_cost * risc_weight >
+                                  100U;
+            }
+            if (options.optimize_for == OptimizationGoal::Size ||
+                options.optimize_for == OptimizationGoal::MinimumSize) {
+                const auto all = selected;
+                if (!index_recurrences_fit_size(index_phi_id, update_id,
+                                                loop, latch, groups, all)) {
+                    // A group with several accesses still shares one
+                    // recurrence among them.
+                    for (std::size_t index = 0; index < groups.size();
+                         ++index) {
+                        selected[index] = all[index] &&
+                                          groups[index].accesses.size() >= 2;
+                    }
+                }
+            }
+
             // Pointer recurrences with an access in every pass.
             std::vector<std::pair<ValueId, const Group*>> every_pass;
-            for (auto& group : groups) {
-                if ((options.optimize_for == OptimizationGoal::Size ||
-                     options.optimize_for ==
-                         OptimizationGoal::MinimumSize) &&
-                    group.accesses.size() < 2) {
-                    continue;
-                }
-                const auto address_cost = group.element_size == 1 ? 1U : 2U;
-                const auto risc_weight =
-                    100U - std::min(options.risc_cisc_balance, 100U);
-                const auto benefit = static_cast<std::uint64_t>(
-                    group.accesses.size()) * address_cost * risc_weight;
-                if (benefit <= 100U) continue;
+            for (std::size_t group_index = 0; group_index < groups.size();
+                 ++group_index) {
+                if (!selected[group_index]) continue;
+                auto& group = groups[group_index];
 
                 ManagedValue pointer_phi;
                 pointer_phi.location = index_location;
@@ -16356,8 +16548,12 @@ struct CompletePeel {
     BlockId exit;
     // The loop's blocks in function order.
     std::vector<BlockId> blocks;
-    // How often the latch branches back to the header.
+    // How often the latch branches back to the header; for a bounded loop,
+    // how often it can.
     unsigned backedges{};
+    // The exit test reads what the recurrences do not decide: every pass
+    // keeps it, and the last pass leaves.
+    bool bounded{};
 };
 
 bool iteration_integer(const hir::Module& hir_module, hir::TypeId type) {
@@ -16475,15 +16671,163 @@ bool collect_iteration_phis(const ManagedFunction& function,
         });
 }
 
+// The header values whose recurrences decide `id`, with the values each
+// takes in the first pass; nothing when `id` reads anything else or a
+// first value is not constant.
+std::optional<std::pair<std::vector<ValueId>,
+                        std::unordered_map<std::uint32_t, UInt128>>>
+iteration_state(const ManagedFunction& function, const hir::Module& hir_module,
+                const std::vector<std::optional<BlockId>>& definitions,
+                const CanonicalLoop& loop, BlockId latch, ValueId id) {
+    std::vector<ValueId> phis;
+    std::unordered_set<std::uint32_t> visited;
+    if (!collect_iteration_phis(function, hir_module, loop.header, definitions,
+                                id, phis, visited)) {
+        return std::nullopt;
+    }
+    for (std::size_t index = 0; index < phis.size(); ++index) {
+        const auto next = phi_value_from(function.values[phis[index].value], latch);
+        if (!next || !collect_iteration_phis(function, hir_module, loop.header,
+                                             definitions, *next, phis,
+                                             visited)) {
+            return std::nullopt;
+        }
+    }
+    std::unordered_map<std::uint32_t, UInt128> state;
+    const std::unordered_map<std::uint32_t, UInt128> outside;
+    IterationEvaluator evaluate(function, hir_module, outside);
+    for (const auto phi : phis) {
+        const auto value = evaluate(
+            *phi_value_from(function.values[phi.value], loop.preheader));
+        if (!value) return std::nullopt;
+        state.emplace(phi.value, *value);
+    }
+    return std::pair{std::move(phis), std::move(state)};
+}
+
+// How many passes a loop can make when its header, before anything that
+// could end a pass or be observed, accesses an object of known extent at an
+// index that the header recurrences decide: no pass can access outside the
+// object, which would be undefined. Nothing when no such access exists or
+// more than `limit` passes stay inside.
+std::optional<unsigned> extent_bounded_passes(
+    const ManagedFunction& function, const hir::Module& hir_module,
+    const TargetInfo& target, const floating::Environment& environment,
+    const std::vector<std::optional<BlockId>>& definitions,
+    const CanonicalLoop& loop, BlockId latch, unsigned limit) {
+    for (const auto id : function.blocks[loop.header.value].values) {
+        const auto& value = function.values[id.value];
+        if (value.kind == ValueKind::Phi) continue;
+        std::optional<ValueId> address_base;
+        std::optional<ValueId> index;
+        std::optional<hir::TypeId> element;
+        if (!value.is_volatile_access && value.kind == ValueKind::IndexedLoad &&
+            value.operands.size() == 2) {
+            address_base = value.operands[0];
+            index = value.operands[1];
+            element = hir_module.type(function.values[value.operands[0].value].type)
+                          .pointee;
+        } else if (!value.is_volatile_access &&
+                   ((value.kind == ValueKind::PointerLoad &&
+                     value.operands.size() == 1) ||
+                    (value.kind == ValueKind::PointerStore &&
+                     value.operands.size() == 2))) {
+            const auto& address = function.values[value.operands[0].value];
+            if (address.kind == ValueKind::IndexedAddress &&
+                address.operands.size() == 2) {
+                address_base = address.operands[0];
+                index = address.operands[1];
+                element = hir_module.type(address.type).pointee;
+            }
+        }
+        if (address_base && element) {
+            while (function.values[address_base->value].kind ==
+                       ValueKind::Cast &&
+                   function.values[address_base->value].cast ==
+                       CastOperation::Reinterpret &&
+                   function.values[address_base->value].operands.size() == 1) {
+                address_base = function.values[address_base->value].operands[0];
+            }
+            const auto& base = function.values[address_base->value];
+            const auto object_type =
+                base.kind == ValueKind::GlobalAddress && base.object
+                    ? std::optional{hir_module.object(*base.object).type}
+                : base.kind == ValueKind::SlotAddress && base.slot
+                    ? std::optional{function.slots[base.slot->value].type}
+                    : std::nullopt;
+            const auto stride = storage_size(hir_module, *element, target);
+            const auto access = storage_size(
+                hir_module,
+                value.kind == ValueKind::PointerStore
+                    ? function.values[value.operands[1].value].type
+                    : value.type,
+                target);
+            const auto size = object_type
+                ? storage_size(hir_module, *object_type, target) : 0;
+            const auto bits =
+                type_bits(hir_module, function.values[index->value].type);
+            const auto state = size != 0 && stride != 0 && access != 0 &&
+                    bits == hir_module.address_bits && bits <= 64
+                ? iteration_state(function, hir_module, definitions, loop,
+                                  latch, *index)
+                : std::nullopt;
+            if (state) {
+                auto [phis, values] = *state;
+                const auto inside = [&](UInt128 raw) {
+                    auto element_index = static_cast<std::int64_t>(raw.low);
+                    if (bits < 64 && (raw.low >> (bits - 1U)) != 0) {
+                        element_index -= std::int64_t{1} << (bits - 1U);
+                        element_index -= std::int64_t{1} << (bits - 1U);
+                    }
+                    if (element_index < 0 ||
+                        static_cast<std::uint64_t>(element_index) >
+                            size / stride) {
+                        return false;
+                    }
+                    return static_cast<std::uint64_t>(element_index) * stride +
+                               access <= size;
+                };
+                for (unsigned passes = 0; passes <= limit; ++passes) {
+                    IterationEvaluator evaluate(function, hir_module, values);
+                    const auto offset = evaluate(*index);
+                    if (!offset) return std::nullopt;
+                    if (!inside(*offset)) {
+                        if (passes == 0) return std::nullopt;
+                        return passes;
+                    }
+                    std::unordered_map<std::uint32_t, UInt128> next;
+                    for (const auto phi : phis) {
+                        const auto updated = evaluate(
+                            *phi_value_from(function.values[phi.value], latch));
+                        if (!updated) return std::nullopt;
+                        next.emplace(phi.value, *updated);
+                    }
+                    values = std::move(next);
+                }
+                return std::nullopt;
+            }
+        }
+        // A pass may end, or be observed, before an access that follows.
+        if (value.effect_output || value.is_volatile_access ||
+            value.kind == ValueKind::Call ||
+            may_trap_floating(value, function, hir_module, environment)) {
+            return std::nullopt;
+        }
+    }
+    return std::nullopt;
+}
+
 // Plans the complete peeling of a canonical loop with one latch and one
 // exit edge, from a block that runs in every iteration, whose test the
 // header recurrences decide, when its copies have at most `limit`
-// operations.
+// operations. With `extent_bounds`, a loop whose test reads memory may
+// instead be bounded by an access to an object of known extent.
 std::optional<CompletePeel> plan_complete_peel(
     const ManagedFunction& function, const hir::Module& hir_module,
+    const TargetInfo& target, const floating::Environment& environment,
     const DominatorTree& dominators,
     const std::vector<std::optional<BlockId>>& definitions,
-    const CanonicalLoop& loop, unsigned limit) {
+    const CanonicalLoop& loop, unsigned limit, bool extent_bounds) {
     if (std::any_of(function.labels.begin(), function.labels.end(),
                     [&](const ManagedLabel& label) {
                         return loop.blocks.contains(label.block.value);
@@ -16535,31 +16879,24 @@ std::optional<CompletePeel> plan_complete_peel(
     }
     const bool exit_on_true = terminator.successors[0] == peel.exit;
 
-    std::vector<ValueId> phis;
-    std::unordered_set<std::uint32_t> visited;
-    if (!collect_iteration_phis(function, hir_module, loop.header, definitions,
-                                *terminator.value, phis, visited)) {
-        return std::nullopt;
-    }
-    for (std::size_t index = 0; index < phis.size(); ++index) {
-        const auto next = phi_value_from(function.values[phis[index].value], latch);
-        if (!next || !collect_iteration_phis(function, hir_module, loop.header,
-                                             definitions, *next, phis,
-                                             visited)) {
+    auto decided = iteration_state(function, hir_module, definitions, loop,
+                                   latch, *terminator.value);
+    if (!decided) {
+        // Every pass may leave, so the exit must belong to the loop alone.
+        const auto& exit = function.blocks[peel.exit.value];
+        if (!extent_bounds || size == 0 || exit.predecessors.size() != 1 ||
+            function.effects[exit.effect.value].kind != EffectKind::Phi) {
             return std::nullopt;
         }
+        const auto passes =
+            extent_bounded_passes(function, hir_module, target, environment,
+                                  definitions, loop, latch, limit / size);
+        if (!passes) return std::nullopt;
+        peel.backedges = *passes - 1U;
+        peel.bounded = true;
+        return peel;
     }
-    std::unordered_map<std::uint32_t, UInt128> state;
-    {
-        const std::unordered_map<std::uint32_t, UInt128> outside;
-        IterationEvaluator evaluate(function, hir_module, outside);
-        for (const auto phi : phis) {
-            const auto value = evaluate(
-                *phi_value_from(function.values[phi.value], loop.preheader));
-            if (!value) return std::nullopt;
-            state.emplace(phi.value, *value);
-        }
-    }
+    auto& [phis, state] = *decided;
     // A loop tested at its header runs only that test in its last pass.
     const std::size_t final_pass = peel.exiting == loop.header ? 0U : 1U;
     for (unsigned backedges = 0;; ++backedges) {
@@ -16583,11 +16920,163 @@ std::optional<CompletePeel> plan_complete_peel(
     }
 }
 
+// Every pass of a bounded peel may leave, so the exit, whose only
+// predecessor was the loop, merges what each pass leaves with: its phis
+// take one incoming value per pass, and code after the loop reads a phi of
+// each pass's value, or recomputes a pure integer or address computation
+// from the phis of its operands, which needs no copy on every exit edge.
+template <typename MapBlock, typename MapEffect, typename MapValue,
+          typename InLoop>
+void leave_bounded_peel(ManagedFunction& function,
+                        const hir::Module& hir_module, const CompletePeel& peel,
+                        std::uint32_t block_base, unsigned copies,
+                        MapBlock map_block, MapEffect map_effect,
+                        MapValue map_value, InLoop in_loop) {
+    const auto exiting_effect =
+        function.blocks[peel.exiting.value].terminator.effect;
+    std::vector<BlockId> exitings;
+    for (unsigned copy = 0; copy < copies; ++copy) {
+        exitings.push_back(map_block(peel.exiting, copy));
+    }
+    {
+        auto& exit = function.blocks[peel.exit.value];
+        exit.predecessors = exitings;
+        auto& effect = function.effects[exit.effect.value];
+        effect.incoming.clear();
+        for (unsigned copy = 0; copy < copies; ++copy) {
+            effect.incoming.push_back(
+                {exitings[copy], map_effect(exiting_effect, copy)});
+        }
+    }
+    std::vector<ValueId> phis;
+    std::vector<ValueId> computed;
+    std::unordered_map<std::uint32_t, ValueId> left;
+    const auto recomputable = [&](const ManagedValue& value) {
+        if (is_effectful_value(value) || value.is_volatile_access) return false;
+        switch (value.kind) {
+        case ValueKind::ConstantInteger:
+        case ValueKind::IndexedAddress:
+            return true;
+        case ValueKind::Cast:
+            return value.cast == CastOperation::SignExtend ||
+                   value.cast == CastOperation::ZeroExtend ||
+                   value.cast == CastOperation::Truncate ||
+                   value.cast == CastOperation::Reinterpret;
+        case ValueKind::Unary:
+        case ValueKind::Binary:
+            if (floating_type(hir_module, value.type)) {
+                return false;
+            }
+            return value.kind == ValueKind::Unary ||
+                   (value.binary != BinaryOperation::SignedDivide &&
+                    value.binary != BinaryOperation::UnsignedDivide &&
+                    value.binary != BinaryOperation::SignedRemainder &&
+                    value.binary != BinaryOperation::UnsignedRemainder);
+        default: return false;
+        }
+    };
+    const auto at_exit = [&](auto&& self, ValueId id) -> ValueId {
+        if (!in_loop(id)) return id;
+        if (const auto found = left.find(id.value); found != left.end()) {
+            return found->second;
+        }
+        auto value = function.values[id.value];
+        const bool phi = value.kind == ValueKind::Phi;
+        if (!phi && recomputable(value) &&
+            std::all_of(value.operands.begin(), value.operands.end(),
+                        [&](ValueId operand) {
+                            return !in_loop(operand) ||
+                                   function.values[operand.value].kind ==
+                                       ValueKind::Phi ||
+                                   recomputable(function.values[operand.value]);
+                        })) {
+            for (auto& operand : value.operands) operand = self(self, operand);
+            value.id = ValueId{static_cast<std::uint32_t>(function.values.size())};
+            computed.push_back(value.id);
+        } else {
+            ManagedValue merged;
+            merged.id = ValueId{static_cast<std::uint32_t>(function.values.size())};
+            merged.location = value.location;
+            merged.inline_site = value.inline_site;
+            merged.type = value.type;
+            merged.kind = ValueKind::Phi;
+            for (unsigned copy = 0; copy < copies; ++copy) {
+                merged.incoming.push_back({map_block(peel.exiting, copy),
+                                           map_value(id, copy)});
+            }
+            value = std::move(merged);
+            phis.push_back(value.id);
+        }
+        const auto result = value.id;
+        function.values.push_back(std::move(value));
+        left.emplace(id.value, result);
+        return result;
+    };
+    for (std::uint32_t index = 0; index < block_base; ++index) {
+        if (std::find(peel.blocks.begin(), peel.blocks.end(),
+                      BlockId{index}) != peel.blocks.end()) {
+            continue;
+        }
+        auto& block = function.blocks[index];
+        const auto values = block.values;
+        for (const auto id : values) {
+            if (function.values[id.value].kind == ValueKind::Phi &&
+                block.id == peel.exit) {
+                std::vector<PhiIncoming> incoming;
+                for (const auto& edge : function.values[id.value].incoming) {
+                    for (unsigned copy = 0; copy < copies; ++copy) {
+                        incoming.push_back(
+                            {exitings[copy], map_value(edge.value, copy)});
+                    }
+                }
+                function.values[id.value].incoming = std::move(incoming);
+                continue;
+            }
+            for (std::size_t operand = 0;
+                 operand < function.values[id.value].operands.size();
+                 ++operand) {
+                const auto mapped =
+                    at_exit(at_exit, function.values[id.value].operands[operand]);
+                function.values[id.value].operands[operand] = mapped;
+            }
+            for (std::size_t argument = 0;
+                 argument < function.values[id.value].call_arguments.size();
+                 ++argument) {
+                if (const auto source =
+                        function.values[id.value].call_arguments[argument].value) {
+                    const auto mapped = at_exit(at_exit, *source);
+                    function.values[id.value].call_arguments[argument].value =
+                        mapped;
+                }
+            }
+            for (std::size_t edge = 0;
+                 edge < function.values[id.value].incoming.size(); ++edge) {
+                const auto mapped =
+                    at_exit(at_exit, function.values[id.value].incoming[edge].value);
+                function.values[id.value].incoming[edge].value = mapped;
+            }
+        }
+        if (block.terminator.value) {
+            block.terminator.value = at_exit(at_exit, *block.terminator.value);
+        }
+    }
+    auto& exit_values = function.blocks[peel.exit.value].values;
+    const auto first_non_phi = std::find_if(
+        exit_values.begin(), exit_values.end(), [&](ValueId id) {
+            return function.values[id.value].kind != ValueKind::Phi;
+        });
+    auto position = exit_values.insert(first_non_phi, phis.begin(), phis.end());
+    position += static_cast<std::ptrdiff_t>(phis.size());
+    exit_values.insert(position, computed.begin(), computed.end());
+}
+
 // Replaces the loop with one copy per pass through its header, in order.
 // Each copy starts with the values its header phis take in that pass; the
 // exit test leaves only in the last copy, whose values the code after the
-// loop reads.
-void peel_completely(ManagedFunction& function, const CompletePeel& peel) {
+// loop reads. A bounded loop's copies keep their exit tests, and its last
+// copy leaves without one.
+void peel_completely(ManagedFunction& function, const hir::Module& hir_module,
+                     const CompletePeel& peel) {
     const unsigned copies = peel.backedges + 1U;
     const unsigned last = peel.backedges;
     const auto block_base = static_cast<std::uint32_t>(function.blocks.size());
@@ -16750,7 +17239,11 @@ void peel_completely(ManagedFunction& function, const CompletePeel& peel) {
                 return id == peel.header ? map_block(id, copy + 1U)
                                          : map_block(id, copy);
             };
-            if (source_id == peel.exiting) {
+            if (source_id == peel.exiting && peel.bounded && copy != last) {
+                for (auto& target : terminator.successors) {
+                    if (target != peel.exit) target = successor(target);
+                }
+            } else if (source_id == peel.exiting) {
                 const auto inside = source.terminator.successors[0] == peel.exit
                                         ? source.terminator.successors[1]
                                         : source.terminator.successors[0];
@@ -16791,6 +17284,15 @@ void peel_completely(ManagedFunction& function, const CompletePeel& peel) {
     }
     const auto last_exiting = map_block(peel.exiting, last);
     auto& exit = function.blocks[peel.exit.value];
+    if (peel.bounded) {
+        leave_bounded_peel(
+            function, hir_module, peel, block_base, copies, map_block,
+            map_effect, map_value, [&](ValueId id) {
+                return id.value < value_base &&
+                       (phi_index[id.value] != none ||
+                        member_index[id.value] != none);
+            });
+    }
     std::replace(exit.predecessors.begin(), exit.predecessors.end(),
                  peel.exiting, last_exiting);
     for (auto& incoming : function.effects[exit.effect.value].incoming) {
@@ -16799,7 +17301,8 @@ void peel_completely(ManagedFunction& function, const CompletePeel& peel) {
         incoming.effect = map_effect(exiting_effect, last);
     }
     // Code after the loop reads the values of the last pass.
-    for (std::uint32_t index = 0; index < block_base; ++index) {
+    for (std::uint32_t index = 0; index < block_base && !peel.bounded;
+         ++index) {
         if (block_index[index] != none) continue;
         auto& block = function.blocks[index];
         for (const auto id : block.values) {
@@ -16840,7 +17343,9 @@ void peel_completely(ManagedFunction& function, const CompletePeel& peel) {
 // Completely peels loops, innermost first, while one qualifies. Peeling
 // replaces a loop's blocks, so every peel starts from a fresh loop forest.
 bool peel_loops_completely(ManagedFunction& function,
-                           const hir::Module& hir_module, unsigned limit) {
+                           const hir::Module& hir_module,
+                           const TargetInfo& target,
+                           const CompilerOptions& options) {
     bool changed = false;
     while (true) {
         const DominatorTree dominators(function);
@@ -16848,12 +17353,14 @@ bool peel_loops_completely(ManagedFunction& function,
         const auto definitions = value_definition_blocks(function);
         std::optional<CompletePeel> peel;
         for (const auto& loop : forest.canonical_loops()) {
-            peel = plan_complete_peel(function, hir_module, dominators,
-                                      definitions, loop, limit);
+            peel = plan_complete_peel(
+                function, hir_module, target, options.floating_environment,
+                dominators, definitions, loop, options.peel_limit,
+                options.loop_bounds_from_extents);
             if (peel) break;
         }
         if (!peel) return changed;
-        peel_completely(function, *peel);
+        peel_completely(function, hir_module, *peel);
         changed = true;
     }
 }
@@ -21492,7 +21999,7 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
             PassId::CompleteLoopPeeling,
             [&](ManagedFunction& function, FunctionAnalysisManager&) {
                 if (!peel_loops_completely(function, hir_module,
-                                           options.peel_limit)) {
+                                           subtarget.target(), options)) {
                     return PassResult::unchanged();
                 }
                 if (options.tree_ccp) {
@@ -21767,7 +22274,8 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
         pipeline.add(
             PassId::LoopRotation,
             [&](ManagedFunction& function, FunctionAnalysisManager&) {
-                const bool changed = rotate_guarded_loops(function);
+                const bool changed =
+                    rotate_guarded_loops(function, hir_module);
                 if (changed) {
                     // Rotation clones the continuation predicate after the
                     // ordinary scalar simplification rounds. Re-canonicalize

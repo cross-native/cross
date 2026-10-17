@@ -194,6 +194,7 @@ struct CompilerOptions {
     bool move_loop_invariants{};
     bool unroll_loops{};
     bool peel_loops{};
+    bool loop_bounds_from_extents{};
     bool tree_reassoc{};
     bool tree_slsr{};
     bool div_by_constant{};

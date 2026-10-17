@@ -3,7 +3,9 @@
 
 # A loop with a constant trip count is completely peeled under -fpeel-loops
 # within -fpeel-limit, and its reads of values stored before it become those
-# values, on x86-64 and MIPS.
+# values, on x86-64 and MIPS. A search bounded by the extent of the array it
+# reads is peeled too under -floop-bounds-from-extents, and stays a loop
+# without it.
 
 foreach(required CC SOURCE OUTPUT)
     if(NOT DEFINED ${required} OR "${${required}}" STREQUAL "")
@@ -11,6 +13,8 @@ foreach(required CC SOURCE OUTPUT)
     endif()
 endforeach()
 file(MAKE_DIRECTORY "${OUTPUT}")
+
+set(function weighted)
 
 function(compile label)
     execute_process(COMMAND "${CC}" -S ${ARGN} "${SOURCE}"
@@ -21,13 +25,13 @@ function(compile label)
     endif()
     file(READ "${OUTPUT}/${label}.s" assembly)
     string(REPLACE ";" "," assembly "${assembly}")
-    string(FIND "${assembly}" "\nweighted:\n" start)
-    string(FIND "${assembly}" "\n.size weighted," end)
+    string(FIND "${assembly}" "\n${function}:\n" start)
+    string(FIND "${assembly}" "\n.size ${function}," end)
     if(end EQUAL -1)
-        string(FIND "${assembly}" "\n.end weighted" end)
+        string(FIND "${assembly}" "\n.end ${function}" end)
     endif()
     if(start EQUAL -1 OR end EQUAL -1)
-        message(FATAL_ERROR "${label}: no function weighted in\n${assembly}")
+        message(FATAL_ERROR "${label}: no function ${function} in\n${assembly}")
     endif()
     math(EXPR length "${end} - ${start}")
     string(SUBSTRING "${assembly}" ${start} ${length} text)
@@ -36,9 +40,9 @@ endfunction()
 
 function(expect label pattern present)
     if(present AND NOT text MATCHES "${pattern}")
-        message(FATAL_ERROR "${label}: weighted lacks '${pattern}'\n${text}")
+        message(FATAL_ERROR "${label}: ${function} lacks '${pattern}'\n${text}")
     elseif(NOT present AND text MATCHES "${pattern}")
-        message(FATAL_ERROR "${label}: weighted has '${pattern}'\n${text}")
+        message(FATAL_ERROR "${label}: ${function} has '${pattern}'\n${text}")
     endif()
 endfunction()
 
@@ -49,7 +53,7 @@ function(expect_count label pattern count)
     list(LENGTH matches found)
     if(NOT found EQUAL count)
         message(FATAL_ERROR
-            "${label}: weighted has ${found} '${pattern}', not ${count}\n${text}")
+            "${label}: ${function} has ${found} '${pattern}', not ${count}\n${text}")
     endif()
 endfunction()
 
@@ -80,3 +84,24 @@ foreach(mode "O2" "O3")
 endforeach()
 compile(mips-no-peel -O2 -fno-peel-loops ${mips})
 expect(mips-no-peel "${mips_branch}" TRUE)
+
+# The search over table[8] makes at most eight passes: seven reads and
+# tests, since the last pass leaves without testing, and no backward branch.
+# Without the bound it stays a loop.
+set(function searched)
+set(mips_read "\tlw\t")
+foreach(mode O2 O3)
+    compile(x86-search-${mode} -${mode} ${x86})
+    expect_count(x86-search-${mode} "${x86_read}" 7)
+    expect_count(x86-search-${mode} "\tjne\t" 7)
+    expect(x86-search-${mode} "\tje\t" FALSE)
+    compile(mips-search-${mode} -${mode} ${mips})
+    expect_count(mips-search-${mode} "${mips_read}" 7)
+    expect_count(mips-search-${mode} "\tbne\t" 7)
+    expect(mips-search-${mode} "\tbeql?\t" FALSE)
+endforeach()
+foreach(target x86 mips)
+    compile(${target}-search-no-bound -O2 -fno-loop-bounds-from-extents
+            ${${target}})
+    expect_count(${target}-search-no-bound "${${target}_read}" 1)
+endforeach()

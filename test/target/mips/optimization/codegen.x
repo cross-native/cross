@@ -668,6 +668,24 @@ global u32 mips_inner_exit_test(in const u32 *cells, in u32 rounds) {
     return hits;
 }
 
+// The same inner loop to a bound that is not constant: its first test does
+// not specialize, so MIR keeps the test at its top and the backend moves it
+// to the latch after allocation.
+[[abi("o32"), noinline]]
+global u32 mips_inner_exit_count(in const u32 *cells, in u32 rounds,
+                                 in u32 count) {
+    u32 hits = 0u32;
+    for (u32 n = 0u32; n < rounds; ++n) {
+        u32 k = n & 15u32;
+        for (u32 j = 0u32; j < count; ++j) {
+            if (j != k && cells[j] > cells[k]) {
+                hits = hits + 1u32;
+            }
+        }
+    }
+    return hits;
+}
+
 // The test of a slot draw has nothing of its own for its delay slot, and
 // its other edge starts with a branch: the search's first operation, whose
 // result that edge does not read, fills it.
@@ -743,4 +761,185 @@ global u32 mips_truncated_store(in u32 index, in u32 value) {
     u32 slot = value * 32u32 + index;
     mips_stored_halves[index & 7u32] = (u16)slot;
     return slot * 3u32;
+}
+
+global u32 mips_slot_bits[8];
+
+// A search over a static array is peeled to its extent: each pass tests a
+// word and sets the index in the branch's delay slot, the draw's test loads
+// the first word in its slot, since a load inside a defined static object
+// cannot fault, and the bit scan, rotated because its first test needs no
+// shift, runs its own first operation in its branch-likely slot.
+[[abi("o32"), noinline]]
+global u32 mips_static_search(in u32 seed, in u32 count) {
+    u32 live = 0u32;
+    u32 sum = 0u32;
+    for (u32 n = 0u32; n < count; ++n) {
+        seed = seed * 1664525u32 + 1013904223u32;
+        if ((seed & 196608u32) != 0u32) {
+            u32 w = 0u32;
+            while (mips_slot_bits[w] == 4294967295u32) {
+                ++w;
+            }
+            const u32 word = mips_slot_bits[w];
+            u32 bit = 0u32;
+            while (((word >> bit) & 1u32) != 0u32) {
+                ++bit;
+            }
+            mips_slot_bits[w] = word | (1u32 << bit);
+            sum = sum + w * 32u32 + bit;
+            live = live + 1u32;
+        } else if (live != 0u32) {
+            live = live - 1u32;
+        }
+    }
+    return sum ^ live;
+}
+
+// The same draw through a pointer: the first load may fault, so it stays
+// out of the draw's delay slot.
+[[abi("o32"), noinline]]
+global u32 mips_pointer_search(in const u32 *bits, in u32 seed,
+                               in u32 count) {
+    u32 live = 0u32;
+    u32 sum = 0u32;
+    for (u32 n = 0u32; n < count; ++n) {
+        seed = seed * 1664525u32 + 1013904223u32;
+        if ((seed & 196608u32) != 0u32) {
+            sum = sum + bits[0];
+            live = live + 1u32;
+        } else if (live != 0u32) {
+            live = live - 1u32;
+        }
+    }
+    return sum ^ live;
+}
+
+global f32 mips_rows_matrix[16];
+
+// Under a size goal, row loops take pointer recurrences when they cost no
+// more instructions than the scaled indices they replace: the row index,
+// which then only counts passes to a constant bound, gives way to the end
+// address.
+[[abi("o32"), noinline]]
+global void mips_size_rows(in f32 *vertex) {
+    const f32 x = vertex[0];
+    const f32 y = vertex[1];
+    for (u32 row = 0u32; row < 3u32; ++row) {
+        vertex[row] = mips_rows_matrix[row * 4u32] * x +
+                      mips_rows_matrix[row * 4u32 + 1u32] * y;
+    }
+}
+
+// Fourteen values stay live across the loop: under o32, which carries no
+// values in t2 and t3, the allocator colors them before preserved
+// registers; a rotation's expansion writes them as scratches, so values
+// live across rotations stay out of them.
+[[abi("o32"), noinline]]
+global u32 mips_scratch_pressure(in u32 a, in u32 b, in u32 c) {
+    u32 v0 = a;
+    u32 v1 = b;
+    u32 v2 = c;
+    u32 v3 = a ^ b;
+    u32 v4 = b ^ c;
+    u32 v5 = a + c;
+    u32 v6 = a - b;
+    u32 v7 = b - c;
+    u32 v8 = c - a;
+    u32 v9 = a * 3u32;
+    u32 v10 = b * 5u32;
+    u32 v11 = c * 7u32;
+    u32 v12 = a | c;
+    u32 v13 = b & c;
+    for (u32 n = 0u32; n < c; ++n) {
+        v0 = v0 + v13;
+        v1 = v1 ^ (v0 >> 3);
+        v2 = v2 + v1;
+        v3 = v3 ^ (v2 << 5);
+        v4 = v4 + v3;
+        v5 = v5 ^ v4;
+        v6 = v6 + (v5 >> 7);
+        v7 = v7 ^ v6;
+        v8 = v8 + v7;
+        v9 = v9 ^ (v8 << 11);
+        v10 = v10 + v9;
+        v11 = v11 ^ v10;
+        v12 = v12 + v11;
+        v13 = v13 ^ (v12 >> 13) ^ n;
+    }
+    return v0 ^ v1 ^ v2 ^ v3 ^ v4 ^ v5 ^ v6 ^ v7 ^ v8 ^ v9 ^ v10 ^ v11 ^
+           v12 ^ v13;
+}
+
+[[abi("o32"), noinline]]
+global u32 mips_scratch_rotations(in u32 a, in u32 b, in u32 c) {
+    u32 v0 = a;
+    u32 v1 = b;
+    u32 v2 = c;
+    u32 v3 = a ^ b;
+    u32 v4 = b ^ c;
+    u32 v5 = a + c;
+    u32 v6 = a - b;
+    u32 v7 = b - c;
+    u32 v8 = c - a;
+    u32 v9 = a * 3u32;
+    u32 v10 = b * 5u32;
+    u32 v11 = c * 7u32;
+    u32 v12 = a | c;
+    u32 v13 = b & c;
+    for (u32 n = 0u32; n < c; ++n) {
+        v0 = v0 + v13;
+        v1 = v1 ^ $::rotl(v0, v12 & 31u32);
+        v2 = v2 + v1;
+        v3 = v3 ^ $::rotr(v2, n);
+        v4 = v4 + v3;
+        v5 = v5 ^ v4;
+        v6 = v6 + $::rotl(v5, 7u32);
+        v7 = v7 ^ v6;
+        v8 = v8 + v7;
+        v9 = v9 ^ $::rotr(v8, v1 & 31u32);
+        v10 = v10 + v9;
+        v11 = v11 ^ v10;
+        v12 = v12 + v11;
+        v13 = v13 ^ $::rotl(v12, 13u32);
+    }
+    return v0 ^ v1 ^ v2 ^ v3 ^ v4 ^ v5 ^ v6 ^ v7 ^ v8 ^ v9 ^ v10 ^ v11 ^
+           v12 ^ v13;
+}
+
+// The Cross ABI passes arguments in t2 and t3, so they stay free.
+[[abi("cross32"), noinline]]
+global u32 mips_scratch_cross(in u32 a, in u32 b, in u32 c) {
+    u32 v0 = a;
+    u32 v1 = b;
+    u32 v2 = c;
+    u32 v3 = a ^ b;
+    u32 v4 = b ^ c;
+    u32 v5 = a + c;
+    u32 v6 = a - b;
+    u32 v7 = b - c;
+    u32 v8 = c - a;
+    u32 v9 = a * 3u32;
+    u32 v10 = b * 5u32;
+    u32 v11 = c * 7u32;
+    u32 v12 = a | c;
+    u32 v13 = b & c;
+    for (u32 n = 0u32; n < c; ++n) {
+        v0 = v0 + v13;
+        v1 = v1 ^ (v0 >> 3);
+        v2 = v2 + v1;
+        v3 = v3 ^ (v2 << 5);
+        v4 = v4 + v3;
+        v5 = v5 ^ v4;
+        v6 = v6 + (v5 >> 7);
+        v7 = v7 ^ v6;
+        v8 = v8 + v7;
+        v9 = v9 ^ (v8 << 11);
+        v10 = v10 + v9;
+        v11 = v11 ^ v10;
+        v12 = v12 + v11;
+        v13 = v13 ^ (v12 >> 13) ^ n;
+    }
+    return v0 ^ v1 ^ v2 ^ v3 ^ v4 ^ v5 ^ v6 ^ v7 ^ v8 ^ v9 ^ v10 ^ v11 ^
+           v12 ^ v13;
 }

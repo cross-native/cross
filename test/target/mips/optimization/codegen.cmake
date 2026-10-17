@@ -99,6 +99,7 @@ compile_variant(no_memory_if_conversion -fif-conversion-memory-limit=0)
 compile_variant(force_memory_if_conversion -fif-conversion-memory-limit=12)
 compile_variant(force_ordinary_if_conversion -fif-conversion-limit=12)
 compile_variant(no_reorder -fno-reorder-blocks)
+compile_variant(no_extent_bounds -fno-loop-bounds-from-extents)
 compile_size_variant(size)
 compile_size_variant(size_no_machine_combine -fno-machine-combine)
 compile_size_variant(size_no_licm -fno-move-loop-invariants)
@@ -1062,18 +1063,36 @@ if(NOT wide_masks MATCHES
     message(FATAL_ERROR
         "MIPS doubleword constants took longer sequences\n${wide_masks}")
 endif()
-# An inner loop whose test heads it tests at its latch, where a pointer
-# increment fills the slot, under -freorder-blocks.
+# An inner loop whose first test is constant (0 < 16) rotates in MIR: it
+# tests at its latch, where a pointer increment fills the slot, and keeps
+# no guard; -fno-tree-loop-rotate keeps the test at its top.
 function_body("${OUTPUT}.enabled.s" mips_inner_exit_test inner_exit)
-function_body("${OUTPUT}.no_reorder.s" mips_inner_exit_test inner_exit_unrotated)
+function_body("${OUTPUT}.no_rotation.s" mips_inner_exit_test
+              inner_exit_top)
 if(NOT inner_exit MATCHES
+       "[\t ]bne[\t ][^\n]*\n[\t ]+addiu[\t ]+[$][a-z0-9]+,[$][a-z0-9]+,4\n" OR
+   inner_exit MATCHES "[\t ]sltiu[\t ]" OR
+   inner_exit_top MATCHES
+       "[\t ]bne[\t ][^\n]*\n[\t ]+addiu[\t ]+[$][a-z0-9]+,[$][a-z0-9]+,4\n")
+    message(FATAL_ERROR
+        "an inner loop with a constant first test did not rotate in MIR, "
+        "or -fno-tree-loop-rotate was ignored\n"
+        "enabled:\n${inner_exit}\nwithout:\n${inner_exit_top}")
+endif()
+# An inner loop whose test heads it and does not specialize tests at its
+# latch after allocation, where a pointer increment fills the slot, under
+# -freorder-blocks.
+function_body("${OUTPUT}.enabled.s" mips_inner_exit_count inner_count)
+function_body("${OUTPUT}.no_reorder.s" mips_inner_exit_count
+              inner_count_unrotated)
+if(NOT inner_count MATCHES
        "[\t ]beq[\t ][^\n]*\n[\t ]+addiu[\t ]+[$][a-z0-9]+,[$][a-z0-9]+,4\n" OR
-   inner_exit_unrotated MATCHES
+   inner_count_unrotated MATCHES
        "[\t ]beq[\t ][^\n]*\n[\t ]+addiu[\t ]+[$][a-z0-9]+,[$][a-z0-9]+,4\n")
     message(FATAL_ERROR
         "an inner loop did not test at its latch, or -fno-reorder-blocks "
         "was ignored\n"
-        "enabled:\n${inner_exit}\nwithout:\n${inner_exit_unrotated}")
+        "enabled:\n${inner_count}\nwithout:\n${inner_count_unrotated}")
 endif()
 # A branch's delay slot runs the first operation of the block it falls
 # through to when the taken edge does not read its result.
@@ -1088,6 +1107,78 @@ if(NOT fallthrough_delay MATCHES
         "a branch did not run its fallthrough's first operation in its "
         "delay slot, or -fno-schedule-insns2 was ignored\n"
         "enabled:\n${fallthrough_delay}\nwithout:\n${fallthrough_delay_empty}")
+endif()
+# A search bounded by its static array's extent is peeled: seven tests with
+# the index in their slots. The draw's test loads the first word in its
+# slot, from a static object only, and on load-interlocked CPUs only; the
+# rotated bit scan tests bit zero with ANDI and fills its own branch-likely
+# slot with its first operation.
+function_body("${OUTPUT}.enabled.s" mips_static_search static_search)
+function_body("${OUTPUT}.no_delay.s" mips_static_search static_search_empty)
+function_body("${OUTPUT}.no_extent_bounds.s" mips_static_search
+              static_search_loop)
+function_body("${OUTPUT}.r3000.s" mips_static_search static_search_r3000)
+function_body("${OUTPUT}.enabled.s" mips_pointer_search pointer_search)
+string(REGEX MATCHALL "[\t ]bne[\t ][^\n]*\n[\t ]+li[\t ]+[$][a-z0-9]+,[0-6]\n"
+       peeled_tests "${static_search}")
+list(LENGTH peeled_tests peeled_test_count)
+string(REGEX MATCHALL "[\t ]bne[\t ][^\n]*\n[\t ]+li[\t ]+[$][a-z0-9]+,[0-6]\n"
+       looped_tests "${static_search_loop}")
+list(LENGTH looped_tests looped_test_count)
+if(NOT peeled_test_count EQUAL 7 OR NOT looped_test_count EQUAL 0 OR
+   NOT static_search MATCHES
+       "[\t ]and[\t ][^\n]*\n[\t ]+beq[\t ][^\n]*\n[\t ]+lw[\t ][^\n]*,0[(]" OR
+   static_search_empty MATCHES
+       "[\t ]beq[\t ][^\n]*\n[\t ]+lw[\t ]" OR
+   static_search_r3000 MATCHES
+       "[\t ]beq[\t ][^\n]*\n[\t ]+lw[\t ]" OR
+   pointer_search MATCHES
+       "[\t ]beq[\t ][^\n]*\n[\t ]+lw[\t ]" OR
+   NOT static_search MATCHES
+       "[\t ]andi[\t ]+[$][a-z0-9]+,[$][a-z0-9]+,1\n[\t ]+beq[\t ]" OR
+   NOT static_search MATCHES
+       "[\t ]srlv[\t ][^\n]*\n[\t ]+andi[\t ][^\n]*\n[\t ]+bnel[\t ][^\n]*\n[\t ]+addiu[\t ]")
+    message(FATAL_ERROR
+        "a static search was not peeled with its index in the tests' slots, "
+        "its first load did not fill the draw's slot from the static object "
+        "only, or its bit scan did not rotate into a filled self-loop\n"
+        "enabled:\n${static_search}\nwithout delay slots:\n"
+        "${static_search_empty}\nwithout extent bounds:\n"
+        "${static_search_loop}\nR3000:\n${static_search_r3000}\n"
+        "pointer:\n${pointer_search}")
+endif()
+# Under -Oz the row loop steps pointers to the matrix and the vertex and
+# tests the vertex pointer against its end; the speed preset does too.
+function_body("${OUTPUT}.size.s" mips_size_rows size_rows)
+if(size_rows MATCHES "[\t ]sll[\t ]" OR
+   NOT size_rows MATCHES "[\t ]addiu[\t ]+[$][a-z0-9]+,[$][a-z0-9]+,16\n" OR
+   NOT size_rows MATCHES "[\t ]addiu[\t ]+[$][a-z0-9]+,[$][a-z0-9]+,4\n")
+    message(FATAL_ERROR
+        "an -Oz row loop did not take pointer recurrences that cost no more "
+        "than its scaled indices\n${size_rows}")
+endif()
+# Under o32 the allocator colors t2 and t3 before preserved registers, and
+# keeps every value live across a rotation, whose expansion writes them, out
+# of them; the Cross ABI, which passes arguments in them, keeps them free.
+function_body("${OUTPUT}.enabled.s" mips_scratch_pressure scratch_pressure)
+function_body("${OUTPUT}.enabled.s" mips_scratch_rotations scratch_rotations)
+function_body("${OUTPUT}.enabled.s" mips_scratch_cross
+              scratch_pressure_cross)
+string(REGEX MATCHALL "[\t ]sd[\t ]+[$]s[0-7]," pressure_saves
+       "${scratch_pressure}")
+string(REGEX MATCHALL "[\t ]sd[\t ]+[$]s[0-7]," rotation_saves
+       "${scratch_rotations}")
+list(LENGTH pressure_saves pressure_save_count)
+list(LENGTH rotation_saves rotation_save_count)
+if(NOT scratch_pressure MATCHES "[$]t2[,\n]" OR
+   NOT scratch_pressure MATCHES "[$]t3[,\n]" OR
+   NOT pressure_save_count LESS rotation_save_count OR
+   scratch_pressure_cross MATCHES "[$]t[23][,\n]")
+    message(FATAL_ERROR
+        "o32 allocation did not color t2 and t3 before preserved registers, "
+        "or a rotation or the Cross ABI did not keep them free\n"
+        "o32:\n${scratch_pressure}\nrotations:\n${scratch_rotations}\n"
+        "Cross ABI:\n${scratch_pressure_cross}")
 endif()
 # Loop constants live at the loop's pressure peak leave it at -Oz without
 # another saved register, and a loop with calls keeps a constant in a

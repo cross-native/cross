@@ -87,6 +87,7 @@ enum class LoweringPass : std::uint16_t {
     FuseCompareSelects,
     FuseCompareBranches,
     EliminateDeadValues,
+    RematerializePhiConstants,
     HoistLoopConstants,
     ScheduleBlockLayout,
     ScheduleInstructions,
@@ -2414,6 +2415,10 @@ private:
                 integer_colors.push_back({12});
                 integer_colors.push_back({13});
             }
+            if (scratch_colors_) {
+                integer_colors.push_back({10});
+                integer_colors.push_back({11});
+            }
         }
         for (std::uint32_t id = 16; id <= 23; ++id) {
             integer_colors.push_back({id});
@@ -2440,6 +2445,118 @@ private:
         add_colors(1, 5, 2);
         add_colors(20, 31, 1);
         return floating_colors;
+    }
+
+    // Whether the expansion of `value` may write t2 or t3 when every value
+    // it reads or writes has a color: rotations without rotate
+    // instructions, atomics, dynamic stack operations, and, conservatively,
+    // aggregate and unaligned accesses and the entry and return boundaries.
+    static bool uses_scratch_colors(const machine::Instruction& value) {
+        if (value.kind == machine::InstructionKind::Return) return true;
+        if (value.kind != machine::InstructionKind::Target) return false;
+        switch (decode_opcode(value.opcode)) {
+        case Opcode::AggregateIndexedLoad:
+        case Opcode::AggregateLoad:
+        case Opcode::AggregateStore:
+        case Opcode::UnalignedLoadSigned:
+        case Opcode::UnalignedLoadUnsigned:
+        case Opcode::UnalignedStore:
+        case Opcode::Rotl:
+        case Opcode::Rotr:
+        case Opcode::StackSave:
+        case Opcode::StackAllocate:
+        case Opcode::StackRestore:
+        case Opcode::VariadicState:
+        case Opcode::Parameter:
+        case Opcode::Fparameter:
+            return true;
+        default: {
+            const auto opcode = decode_opcode(value.opcode);
+            return opcode >= Opcode::AtomicLoad &&
+                   opcode <= Opcode::AtomicSignalFence;
+        }
+        }
+    }
+
+    // A function may color t2 and t3 when no ABI it uses carries values in
+    // them, and neither a registry instruction nor a hard-bound object
+    // names registers of its own: then only the expansions above write
+    // them, and those clobber them. Any value left without a color would be
+    // reloaded through them, so such an allocation is redone without them.
+    bool allocate_with_scratch_colors(machine::Function& function) {
+        const auto carries = [](const AbiEntry* abi) {
+            if (!abi) return true;
+            for (const auto& bank : abi->banks) {
+                for (const auto* registers : {&bank.arguments, &bank.results}) {
+                    for (const auto& name : *registers) {
+                        if (name == "t2" || name == "t3") return true;
+                    }
+                }
+            }
+            return false;
+        };
+        bool eligible = options_.register_allocation && !naked_ &&
+            hard_slots_.empty() &&
+            !carries(managed_abi_model(hir_, hir_.function(function.source),
+                                       subtarget_, options_));
+        for (const auto& block : function.blocks) {
+            for (const auto& value : block.instructions) {
+                if (!eligible) break;
+                if (decode_opcode(value.opcode) == Opcode::Machine) {
+                    eligible = false;
+                } else if (value.kind == machine::InstructionKind::Call) {
+                    const auto signature = hir::call_signature(
+                        hir_, value.direct_callee, value.call_signature);
+                    const auto* abi = value.direct_callee
+                        ? managed_abi_model(
+                              hir_, hir_.function(*value.direct_callee),
+                              subtarget_, options_)
+                        : signature ? abi_model(signature->abi) : nullptr;
+                    eligible = !carries(abi);
+                }
+            }
+        }
+        if (!eligible) return allocate_registers(function);
+        auto unchanged = function;
+        for (auto& block : function.blocks) {
+            for (auto& value : block.instructions) {
+                if (!uses_scratch_colors(value)) continue;
+                for (const auto id : {10U, 11U}) {
+                    const auto scratch = machine::Register::physical_register(
+                        {id}, subtarget_.has_feature(Feature::Mips3)
+                                  ? machine::i64 : machine::i32);
+                    if (std::find(value.clobbers.begin(), value.clobbers.end(),
+                                  scratch) == value.clobbers.end()) {
+                        value.clobbers.push_back(scratch);
+                    }
+                }
+            }
+        }
+        scratch_colors_ = true;
+        auto changed = allocate_registers(function);
+        scratch_colors_ = false;
+        const auto colorable = [&](std::uint32_t id) {
+            const auto kind = function.virtual_register_classes[id];
+            const auto bits = function.virtual_registers[id].bits;
+            return (kind == machine::VirtualRegisterClass::Integer &&
+                    (bits <= 32 || subtarget_.has_feature(Feature::Mips3))) ||
+                   (kind == machine::VirtualRegisterClass::Floating &&
+                    colorable_floating(subtarget_, bits));
+        };
+        for (const auto& block : function.blocks) {
+            for (const auto& value : block.instructions) {
+                for (const auto& use : value.uses) {
+                    if (use.kind == machine::RegisterKind::Virtual &&
+                        use.id < function.virtual_register_assignments.size() &&
+                        colorable(use.id) &&
+                        !function.virtual_register_assignments[use.id]) {
+                        function = std::move(unchanged);
+                        return allocate_registers(function);
+                    }
+                }
+            }
+        }
+        return changed;
     }
 
     bool allocate_registers(machine::Function& function) {
@@ -2950,6 +3067,28 @@ private:
             auto live = live_out[block.id.value];
             for (auto item = block.instructions.rbegin();
                  item != block.instructions.rend(); ++item) {
+                // Another instruction's clobbers are its expansion's
+                // scratches, written before its operands are read: no value
+                // live across it and none of its operands may hold them.
+                if (item->kind != machine::InstructionKind::Call &&
+                    !item->clobbers.empty()) {
+                    auto touched = live;
+                    for (const auto* registers : {&item->uses, &item->defs}) {
+                        for (const auto& value : *registers) {
+                            if (const auto id = virtual_id(value)) {
+                                touched.insert(*id);
+                            }
+                        }
+                    }
+                    for (const auto id : touched) {
+                        for (const auto& clobber : item->clobbers) {
+                            if (clobber.kind ==
+                                machine::RegisterKind::Physical) {
+                                hard_forbidden_colors[id].insert(clobber.id);
+                            }
+                        }
+                    }
+                }
                 for (const auto& definition : item->defs) {
                     if (const auto id = virtual_id(definition)) {
                         live.erase(*id);
@@ -6516,6 +6655,28 @@ private:
                     });
             });
         passes.add(
+            {{LoweringPass::RematerializePhiConstants},
+             Stage::InstructionCombining, "rematerialize-phi-constants"},
+            [this](machine::Function& function) {
+                if (!options_.rematerialize || !options_.register_allocation ||
+                    naked_) {
+                    return false;
+                }
+                native::PhiConstantPolicy policy;
+                // A 16-bit or `lui` constant is one instruction anywhere.
+                policy.is_constant = [](const machine::Instruction& value) {
+                    return decode_opcode(value.opcode) == Opcode::Constant &&
+                        value.defs.front().mode.bits <= 32;
+                };
+                policy.is_phi = phi_instruction;
+                policy.clone_register = [this](machine::Function& target,
+                                               const machine::Register& like) {
+                    return create_integer_temporary(target, like.mode, {},
+                                                    "phi.constant");
+                };
+                return native::rematerialize_phi_constants(function, policy);
+            });
+        passes.add(
             {{LoweringPass::HoistLoopConstants}, Stage::InstructionCombining,
              "hoist-loop-constants"},
             [this](machine::Function& function) {
@@ -6618,7 +6779,7 @@ private:
             {{LoweringPass::AllocateRegisters}, Stage::RegisterAllocation,
               "allocate-registers"},
             [this](machine::Function& function) {
-                return allocate_registers(function);
+                return allocate_with_scratch_colors(function);
             });
         passes.add(
             {{LoweringPass::DuplicateBranchBlocks},
@@ -6887,6 +7048,9 @@ private:
     // The function is naked: frameless, spill-free allocation over its
     // declared registers, and hard-bound objects live in their registers.
     bool naked_{};
+    // The allocation may color t2 and t3, which the instructions whose
+    // expansions use them as scratches clobber.
+    bool scratch_colors_{};
     std::unordered_map<std::uint32_t, machine::PhysicalRegisterId>
         hard_slots_;
 };
@@ -8362,8 +8526,16 @@ private:
                                            reg_name(index));
             return;
         }
+        // A temporary holds the scaled index when the destination would
+        // overwrite an operand first, and a scale that is no power of two:
+        // $at, or in a naked function, whose temporaries come from its
+        // clobbers, t2 and t3.
+        const bool naked = naked_writable_.has_value();
+        const auto temporary =
+            naked ? std::string_view{"t3"} : std::string_view{"at"};
         const auto scaled = destination != base && base != index
-            ? destination : std::string_view{"t2"};
+            ? destination
+            : naked ? std::string_view{"t2"} : std::string_view{"at"};
         if (scale == 0) {
             instruction("move", reg_name(destination) + "," +
                                     reg_name(base));
@@ -8374,8 +8546,10 @@ private:
                         reg_name(scaled) + "," + reg_name(index) + "," +
                             std::to_string(std::countr_zero(scale)));
         } else {
-            instruction("li", "$t3," + std::to_string(scale));
-            instruction(address_multiply(), reg_name(index) + ",$t3");
+            instruction("li", reg_name(temporary) + "," +
+                                  std::to_string(scale));
+            instruction(address_multiply(),
+                        reg_name(index) + "," + reg_name(temporary));
             instruction("mflo", reg_name(scaled));
         }
         instruction(address_add(), reg_name(destination) + "," +
@@ -12245,6 +12419,23 @@ private:
     // with its parameter captures) get no solution.
     void compute_physical_liveness(const machine::Function& function) {
         live_in_.clear();
+        static_addresses_.clear();
+        for (const auto& block : function.blocks) {
+            for (const auto& value : block.instructions) {
+                const auto* symbol =
+                    decode_opcode(value.opcode) == Opcode::GlobalAddress &&
+                            value.defs.size() == 1 &&
+                            value.defs.front().kind ==
+                                machine::RegisterKind::Virtual &&
+                            value.operands.size() == 1
+                        ? std::get_if<machine::SymbolOperand>(
+                              &value.operands.front())
+                        : nullptr;
+                if (symbol && symbol->object && !symbol->is_function) {
+                    static_addresses_.emplace(value.defs.front().id, *symbol);
+                }
+            }
+        }
         const auto count = function.blocks.size();
         if (naked_writable_ || !hazard_forms_.empty()) return;
         for (const auto& block : function.blocks) {
@@ -12299,18 +12490,85 @@ private:
         live_in_ = std::move(live_in);
     }
 
+    // A load that cannot fault wherever it runs: a naturally aligned load
+    // inside a defined, ordinary static object, whose storage the program
+    // may read for its whole run. Weak, aliased, and fixed-address objects
+    // may lack that storage.
+    bool nonfaulting_load(const machine::Instruction& load) const {
+        const auto opcode = decode_opcode(load.opcode);
+        if (load.has_side_effects || load.may_store || load.defs.size() != 1 ||
+            load.operands.empty()) {
+            return false;
+        }
+        std::optional<machine::SymbolOperand> address;
+        if (opcode == Opcode::GlobalLoadSigned ||
+            opcode == Opcode::GlobalLoadUnsigned ||
+            opcode == Opcode::FglobalLoad) {
+            if (const auto* symbol = std::get_if<machine::SymbolOperand>(
+                    &load.operands.front())) {
+                address = *symbol;
+            }
+        } else if ((opcode == Opcode::PointerLoadSigned ||
+                    opcode == Opcode::PointerLoadUnsigned ||
+                    opcode == Opcode::FpointerLoad) &&
+                   !load.uses.empty()) {
+            if (const auto* low = std::get_if<machine::SymbolOperand>(
+                    &load.operands.back())) {
+                // The base is the `%hi` part of the same symbol and addend.
+                address = *low;
+            } else if (const auto found =
+                           load.uses.front().kind ==
+                                   machine::RegisterKind::Virtual
+                               ? static_addresses_.find(load.uses.front().id)
+                               : static_addresses_.end();
+                       found != static_addresses_.end()) {
+                address = found->second;
+                if (const auto* displacement =
+                        std::get_if<machine::ImmediateOperand>(
+                            &load.operands.back());
+                    displacement && load.operands.size() == 2) {
+                    address->addend +=
+                        static_cast<std::int64_t>(displacement->value);
+                }
+            }
+        }
+        if (!address || !address->object || address->is_function) {
+            return false;
+        }
+        const auto& object = hir_.object(*address->object);
+        if (!object.definition || object.weak || object.alias_target ||
+            object.weakref_target || object.fixed_address ||
+            object.is_thread_local) {
+            return false;
+        }
+        const auto size =
+            storage_size(hir_, object.type, subtarget_.target());
+        const auto alignment = std::max<std::uint64_t>(
+            object.minimum_alignment,
+            hir::layout_alignment(hir_, object.type, subtarget_.target())
+                .value_or(1));
+        const auto access = std::max<std::uint64_t>(
+            1U, (load.defs.front().mode.bits + 7U) / 8U);
+        return address->addend >= 0 &&
+            static_cast<std::uint64_t>(address->addend) % access == 0 &&
+            alignment % access == 0 &&
+            static_cast<std::uint64_t>(address->addend) + access <= size;
+    }
+
     // An operation that a branch's delay slot may run on both edges
     // although only one of them would: one instruction that neither
-    // touches memory nor raises an exception, defining one register. A
-    // floating copy moves bits without arithmetic.
+    // touches memory, other than a load that cannot fault, nor raises an
+    // exception, defining one register. A floating copy moves bits without
+    // arithmetic.
     bool speculative_delay_instruction(
         const machine::Function& function,
         const machine::Instruction& candidate) const {
         if (!single_delay_slot_instruction(function, candidate) ||
-            candidate.has_side_effects || candidate.may_load ||
-            candidate.may_store || candidate.defs.size() != 1) {
+            candidate.has_side_effects || candidate.may_store ||
+            candidate.defs.size() != 1) {
             return false;
         }
+        if (candidate.may_load) return nonfaulting_load(candidate);
         if (candidate.kind == machine::InstructionKind::Copy) return true;
         switch (decode_opcode(candidate.opcode)) {
         case Opcode::Constant:
@@ -12744,16 +13002,16 @@ private:
                                    std::optional<machine::BlockId>
                                        speculative_against = {}) {
             // A successor's first operation cannot run before its prologue.
-            if (target == source.id ||
-                function.frame.prologue_block == target ||
+            // A loop of one block may run its own first operation in its
+            // branch's slot and resume after it.
+            if (function.frame.prologue_block == target ||
                 layout_successor(function, source.id) == target ||
                 edge_has_phi_copies(function, source.id, target)) {
                 return;
             }
             const auto edge_target = target;
             target = threaded_target(function, target);
-            if (target == source.id ||
-                function.frame.prologue_block == target) {
+            if (function.frame.prologue_block == target) {
                 return;
             }
             const auto successor = std::find_if(
@@ -13103,6 +13361,9 @@ private:
     // Physical registers live into each block after its PHIs, by block id;
     // empty when the function's registers are not all modeled.
     std::vector<PhysicalSet> live_in_;
+    // The static object address each GlobalAddress register holds.
+    std::unordered_map<std::uint32_t, machine::SymbolOperand>
+        static_addresses_;
     // Delay-slot operations taken from the block a conditional branch falls
     // through to, by branch block, and the operation each such block lends.
     struct FallthroughDelay {
@@ -15358,8 +15619,11 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
             } else {
                 std::string_view work = result;
                 if (result == condition) {
+                    // A naked function's temporaries come from its clobbers.
+                    work = "at";
                     for (const std::string_view scratch : {"t2", "t1", "t0"}) {
-                        if (scratch != yes && scratch != no) {
+                        if (naked_writable_ && scratch != yes &&
+                            scratch != no) {
                             work = scratch;
                             break;
                         }

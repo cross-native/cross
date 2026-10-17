@@ -922,7 +922,7 @@ int main() {
     if (!labeled_diagnostics_text.str().empty()) std::cerr << labeled_diagnostics_text.str();
 
     auto guarded = guarded_loop_function();
-    ok &= expect(rotate_guarded_loops(guarded),
+    ok &= expect(rotate_guarded_loops(guarded, hir),
                  "guarded loop should rotate to a bottom test");
     ok &= expect(
         guarded.blocks.size() == 5 &&
@@ -970,7 +970,7 @@ int main() {
     cross::Diagnostics rotated_diagnostics(rotated_diagnostics_text);
     ok &= expect(verify(rotated_module, hir, rotated_diagnostics),
                  "rotated loop should preserve MIR value/effect SSA");
-    ok &= expect(!rotate_guarded_loops(guarded),
+    ok &= expect(!rotate_guarded_loops(guarded, hir),
                  "already rotated loop should remain stable");
     if (!rotated_diagnostics_text.str().empty()) {
         std::cerr << rotated_diagnostics_text.str();
@@ -979,7 +979,7 @@ int main() {
     auto header_invariant = guarded_loop_function();
     header_invariant.blocks[0].values = {{0}, {2}};
     header_invariant.blocks[1].values = {{3}, {1}, {4}};
-    ok &= expect(rotate_guarded_loops(header_invariant),
+    ok &= expect(rotate_guarded_loops(header_invariant, hir),
                  "header-local guard invariants should remain reusable");
     if (header_invariant.blocks.size() == 5) {
         const auto& test = header_invariant.blocks[3];
@@ -1007,7 +1007,7 @@ int main() {
     auto body_invariant = guarded_loop_function();
     body_invariant.blocks[0].values = {{0}, {1}};
     body_invariant.blocks[1].values = {{3}, {2}, {4}};
-    ok &= expect(rotate_guarded_loops(body_invariant),
+    ok &= expect(rotate_guarded_loops(body_invariant, hir),
                  "header-local body invariants should remain reusable");
     ManagedModule body_invariant_module;
     body_invariant_module.functions.push_back(body_invariant);
@@ -1023,7 +1023,7 @@ int main() {
     }
 
     auto cross_recurrence = cross_recurrence_loop_function();
-    ok &= expect(rotate_guarded_loops(cross_recurrence),
+    ok &= expect(rotate_guarded_loops(cross_recurrence, hir),
                  "cross-state recurrence should rotate");
     if (cross_recurrence.blocks.size() == 5 &&
         cross_recurrence.blocks[2].values.size() >= 2) {

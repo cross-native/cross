@@ -119,6 +119,25 @@ struct LoopConstantPolicy {
 [[nodiscard]] bool hoist_loop_constants(machine::Function& function,
                                         const LoopConstantPolicy& policy);
 
+// What a target tells PHI constant rematerialization: which instructions
+// materialize a constant and which are PHIs, and how to make a virtual
+// register like a given one, with its fallback home.
+struct PhiConstantPolicy {
+    MachineInstructionPredicate is_constant;
+    MachineInstructionPredicate is_phi;
+    std::function<machine::Register(machine::Function&,
+                                    const machine::Register&)>
+        clone_register;
+};
+
+// A constant that a PHI reads on the edge from a block other than the
+// constant's own costs a copy on that edge anyway. A copy of its
+// materialization at the end of the edge's predecessor costs the same
+// instruction and keeps no register live from the definition to the edge;
+// a definition left without uses is removed.
+[[nodiscard]] bool rematerialize_phi_constants(
+    machine::Function& function, const PhiConstantPolicy& policy);
+
 // A quotient and a remainder of the same SSA operands in one block become one
 // combined instruction at the first position, defining {quotient, remainder}.
 struct DivisionKind {

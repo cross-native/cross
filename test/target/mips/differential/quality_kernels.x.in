@@ -730,3 +730,115 @@ global u32 k_q_call_constants(in u32 a, in u32 b, in u32 c) {
     }
     return r ^ j;
 }
+
+// A search over a static array is peeled to the array's extent: each pass
+// tests one word and leaves with its index, and the draw's test loads the
+// first word in its delay slot. The bit scan rotates, testing bit zero
+// without a shift. The words keep a clear bit below the eighth allocation,
+// so no search runs past the array.
+global u32 q_slots[8];
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_static_search(in u32 a, in u32 b, in u32 c) {
+    for (u32 k = 0u32; k < 8u32; ++k) {
+        q_slots[k] = k < (c & 7u32) ? 4294967295u32
+                                    : (b >> 7) & ~(1u32 << k);
+    }
+    u32 sum = 0u32;
+    u32 seed = a;
+    for (u32 n = 0u32; n < 6u32; ++n) {
+        seed = seed * 1664525u32 + 1013904223u32;
+        if ((seed & 196608u32) != 0u32) {
+            u32 w = 0u32;
+            while (q_slots[w] == 4294967295u32) {
+                ++w;
+            }
+            const u32 word = q_slots[w];
+            u32 bit = 0u32;
+            while (((word >> bit) & 1u32) != 0u32) {
+                ++bit;
+            }
+            q_slots[w] = word | (1u32 << bit);
+            sum = sum * 31u32 + w * 32u32 + bit;
+        } else {
+            sum = sum ^ seed;
+        }
+    }
+    return sum;
+}
+
+// Fourteen values stay live across the loop, so the allocator colors t2
+// and t3, which a rotation's expansion writes as scratches: no value live
+// across the rotation, and none of its operands, may hold them.
+[[abi("@ABI@"), noinline]]
+global u32 k_q_scratch_colors(in u32 a, in u32 b, in u32 c) {
+    u32 v0 = a;
+    u32 v1 = b;
+    u32 v2 = c;
+    u32 v3 = a ^ b;
+    u32 v4 = b ^ c;
+    u32 v5 = a + c;
+    u32 v6 = a - b;
+    u32 v7 = b - c;
+    u32 v8 = c - a;
+    u32 v9 = a * 3u32;
+    u32 v10 = b * 5u32;
+    u32 v11 = c * 7u32;
+    u32 v12 = a | c;
+    u32 v13 = b & c;
+    for (u32 n = 0u32; n < (c & 15u32) + 3u32; ++n) {
+        v0 = v0 + v13;
+        v1 = v1 ^ $::rotl(v0, v12 & 31u32);
+        v2 = v2 + v1;
+        v3 = v3 ^ $::rotr(v2, n);
+        v4 = v4 + v3;
+        v5 = v5 ^ v4;
+        v6 = v6 + $::rotl(v5, 7u32);
+        v7 = v7 ^ v6;
+        v8 = v8 + v7;
+        v9 = v9 ^ $::rotr(v8, v1 & 31u32);
+        v10 = v10 + v9;
+        v11 = v11 ^ v10;
+        v12 = v12 + v11;
+        v13 = v13 ^ $::rotl(v12, 13u32);
+    }
+    return v0 ^ v1 ^ v2 ^ v3 ^ v4 ^ v5 ^ v6 ^ v7 ^ v8 ^ v9 ^ v10 ^ v11 ^
+           v12 ^ v13;
+}
+
+// The same pressure without rotations: t2 and t3 hold loop values.
+[[abi("@ABI@"), noinline]]
+global u32 k_q_scratch_pressure(in u32 a, in u32 b, in u32 c) {
+    u32 v0 = a;
+    u32 v1 = b;
+    u32 v2 = c;
+    u32 v3 = a ^ b;
+    u32 v4 = b ^ c;
+    u32 v5 = a + c;
+    u32 v6 = a - b;
+    u32 v7 = b - c;
+    u32 v8 = c - a;
+    u32 v9 = a * 3u32;
+    u32 v10 = b * 5u32;
+    u32 v11 = c * 7u32;
+    u32 v12 = a | c;
+    u32 v13 = b & c;
+    for (u32 n = 0u32; n < (c & 15u32) + 3u32; ++n) {
+        v0 = v0 + v13;
+        v1 = v1 ^ (v0 >> 3);
+        v2 = v2 + v1;
+        v3 = v3 ^ (v2 << 5);
+        v4 = v4 + v3;
+        v5 = v5 ^ v4;
+        v6 = v6 + (v5 >> 7);
+        v7 = v7 ^ v6;
+        v8 = v8 + v7;
+        v9 = v9 ^ (v8 << 11);
+        v10 = v10 + v9;
+        v11 = v11 ^ v10;
+        v12 = v12 + v11;
+        v13 = v13 ^ (v12 >> 13) ^ n;
+    }
+    return v0 ^ v1 ^ v2 ^ v3 ^ v4 ^ v5 ^ v6 ^ v7 ^ v8 ^ v9 ^ v10 ^ v11 ^
+           v12 ^ v13;
+}

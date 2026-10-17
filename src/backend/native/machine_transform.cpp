@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <iterator>
+#include <map>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
@@ -590,6 +591,105 @@ bool control_transfer(const machine::Instruction& instruction) {
 }
 
 } // namespace
+
+bool rematerialize_phi_constants(machine::Function& function,
+                                 const PhiConstantPolicy& policy) {
+    const auto count = function.blocks.size();
+    for (std::uint32_t block = 0; block < count; ++block) {
+        if (function.blocks[block].id.value != block) return false;
+    }
+    // Each constant's block and materialization, by virtual register.
+    std::unordered_map<std::uint32_t,
+                       std::pair<std::uint32_t, machine::Instruction>>
+        constants;
+    for (const auto& block : function.blocks) {
+        for (const auto& instruction : block.instructions) {
+            if (structurally_pure_single_definition(instruction) &&
+                instruction.uses.empty() && policy.is_constant(instruction)) {
+                constants.emplace(instruction.defs.front().id,
+                                  std::pair{block.id.value, instruction});
+            }
+        }
+    }
+    if (constants.empty()) return false;
+    // Copies by predecessor and original register.
+    std::map<std::pair<std::uint32_t, std::uint32_t>, machine::Register> copies;
+    std::vector<std::vector<machine::Instruction>> inserted(count);
+    for (auto& block : function.blocks) {
+        for (auto& phi : block.instructions) {
+            if (!policy.is_phi(phi)) continue;
+            for (std::size_t index = 0; index < phi.uses.size(); ++index) {
+                const auto source = phi.uses[index];
+                const auto* predecessor =
+                    2 * index < phi.operands.size()
+                        ? std::get_if<machine::BlockOperand>(
+                              &phi.operands[2 * index])
+                        : nullptr;
+                const auto found = source.kind == machine::RegisterKind::Virtual
+                    ? constants.find(source.id) : constants.end();
+                if (!predecessor || found == constants.end() ||
+                    found->second.first == predecessor->target.value ||
+                    predecessor->target.value >= count) {
+                    continue;
+                }
+                const auto key =
+                    std::pair{predecessor->target.value, source.id};
+                auto copy = copies.find(key);
+                if (copy == copies.end()) {
+                    auto materialization = found->second.second;
+                    const auto target =
+                        policy.clone_register(function, source);
+                    materialization.defs.front() = target;
+                    inserted[predecessor->target.value].push_back(
+                        std::move(materialization));
+                    copy = copies.emplace(key, target).first;
+                }
+                phi.uses[index] = copy->second;
+                phi.operands[2 * index + 1] =
+                    machine::RegisterOperand{copy->second};
+            }
+        }
+    }
+    if (copies.empty()) return false;
+    for (std::uint32_t block = 0; block < count; ++block) {
+        if (inserted[block].empty()) continue;
+        auto& instructions = function.blocks[block].instructions;
+        auto position = instructions.end();
+        if (!instructions.empty() && control_transfer(instructions.back())) {
+            position = std::prev(instructions.end());
+        }
+        instructions.insert(position, inserted[block].begin(),
+                            inserted[block].end());
+    }
+    std::unordered_set<std::uint32_t> read;
+    for (const auto& block : function.blocks) {
+        for (const auto& instruction : block.instructions) {
+            for (const auto& use : instruction.uses) {
+                if (use.kind == machine::RegisterKind::Virtual) {
+                    read.insert(use.id);
+                }
+            }
+            for (const auto& value : instruction.live_across_call) {
+                if (value.kind == machine::RegisterKind::Virtual) {
+                    read.insert(value.id);
+                }
+            }
+        }
+    }
+    for (const auto& [key, copy] : copies) {
+        (void)copy;
+        const auto original = key.second;
+        if (read.contains(original)) continue;
+        auto& instructions =
+            function.blocks[constants.at(original).first].instructions;
+        std::erase_if(instructions, [&](const machine::Instruction& value) {
+            return value.defs.size() == 1 &&
+                   value.defs.front().kind == machine::RegisterKind::Virtual &&
+                   value.defs.front().id == original;
+        });
+    }
+    return true;
+}
 
 bool hoist_loop_constants(machine::Function& function,
                           const LoopConstantPolicy& policy) {

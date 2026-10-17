@@ -1092,7 +1092,77 @@ bool cloneable_rotated_guard_value(const ManagedValue& value) {
     }
 }
 
+// Whether the guard operations, in evaluation order, fold an operation to a
+// constant or to one of its operands when the header phis take the constant
+// values in `known`.
+bool static_first_test(const ManagedFunction& function,
+                       const hir::Module& hir_module,
+                       std::span<const ValueId> guard,
+                       std::unordered_map<std::uint32_t, UInt128> known) {
+    const auto constant = [&](ValueId id) -> std::optional<UInt128> {
+        if (const auto found = known.find(id.value); found != known.end()) {
+            return found->second;
+        }
+        const auto& value = function.values[id.value];
+        const auto bits = scalar_integer_bits(hir_module, value.type);
+        if (value.kind != ValueKind::ConstantInteger || bits == 0) {
+            return std::nullopt;
+        }
+        return mask_to(UInt128{value.integer, value.integer_high}, bits);
+    };
+    bool folds = false;
+    for (const auto id : guard) {
+        const auto& value = function.values[id.value];
+        const auto bits = scalar_integer_bits(hir_module, value.type);
+        if (bits == 0 || value.operands.empty()) continue;
+        const auto source_bits = scalar_integer_bits(
+            hir_module, function.values[value.operands[0].value].type);
+        std::optional<UInt128> result;
+        if (value.kind == ValueKind::Cast && value.operands.size() == 1) {
+            if (const auto source = constant(value.operands[0])) {
+                result = fold_integer_cast(value.cast, *source, source_bits, bits);
+            }
+        } else if (value.kind == ValueKind::Binary &&
+                   value.operands.size() == 2) {
+            const auto left = constant(value.operands[0]);
+            const auto right = constant(value.operands[1]);
+            const bool comparison =
+                value.binary >= BinaryOperation::Equal &&
+                value.binary <= BinaryOperation::UnsignedGreaterEqual;
+            if (left && right) {
+                result = fold_integer_binary(value.binary, *left, *right,
+                                             comparison ? source_bits : bits);
+            } else if (right && *right == UInt128{}) {
+                // x + 0, x - 0, x | 0, x ^ 0, and shifts by zero.
+                switch (value.binary) {
+                case BinaryOperation::Add:
+                case BinaryOperation::Subtract:
+                case BinaryOperation::BitOr:
+                case BinaryOperation::BitXor:
+                case BinaryOperation::ShiftLeft:
+                case BinaryOperation::ShiftRightArithmetic:
+                case BinaryOperation::ShiftRightLogical:
+                case BinaryOperation::RotateLeft:
+                case BinaryOperation::RotateRight: folds = true; break;
+                default: break;
+                }
+            } else if (left && *left == UInt128{} &&
+                       (value.binary == BinaryOperation::Add ||
+                        value.binary == BinaryOperation::BitOr ||
+                        value.binary == BinaryOperation::BitXor)) {
+                folds = true;
+            }
+        }
+        if (result) {
+            known[id.value] = *result;
+            folds = true;
+        }
+    }
+    return folds;
+}
+
 bool rotate_one_guarded_loop(ManagedFunction& function,
+                             const hir::Module& hir_module,
                              const NaturalLoop& loop,
                              const UseLists& uses) {
     if (!loop.preheader || loop.latches.size() != 1 ||
@@ -1134,7 +1204,6 @@ bool rotate_one_guarded_loop(ManagedFunction& function,
         else exit_id = successor;
     }
     if (!body_id || !exit_id || *body_id == header_id ||
-        *body_id == latch_id ||
         *exit_id == preheader_id ||
         body_id->value >= function.blocks.size() ||
         exit_id->value >= function.blocks.size()) {
@@ -1303,6 +1372,26 @@ bool rotate_one_guarded_loop(ManagedFunction& function,
         return true;
     };
     if (!collect_guard(collect_guard, condition_id)) return false;
+    // A top test of an inner loop, or of a loop whose body is its latch,
+    // costs no more than a bottom test once the target lays the loop out;
+    // copying it pays only when the first test specializes.
+    if (loop.parent || *body_id == latch_id) {
+        std::unordered_map<std::uint32_t, UInt128> entry;
+        for (const auto& state : states) {
+            const auto& initial = function.values[state.initial.value];
+            const auto bits = scalar_integer_bits(hir_module, initial.type);
+            if (initial.kind == ValueKind::ConstantInteger && bits != 0) {
+                entry.emplace(state.header.value,
+                              mask_to(UInt128{initial.integer,
+                                              initial.integer_high},
+                                      bits));
+            }
+        }
+        if (!static_first_test(function, hir_module, guard_clone_order,
+                               std::move(entry))) {
+            return false;
+        }
+    }
 
     // Validate the immutable use-list coordinates before allocating any new
     // values. Appending PHIs cannot invalidate these coordinates, so all
@@ -1866,7 +1955,8 @@ bool factor_common_phi_tails(ManagedFunction& function,
     return true;
 }
 
-bool rotate_guarded_loops(ManagedFunction& function) {
+bool rotate_guarded_loops(ManagedFunction& function,
+                          const hir::Module& hir_module) {
     bool changed = false;
     // Each rotation rewires the latch and invalidates every CFG-derived
     // analysis. Rebuild before considering another loop; the original block
@@ -1878,12 +1968,9 @@ bool rotate_guarded_loops(ManagedFunction& function) {
         const UseLists uses(function);
         bool rotated = false;
         for (const auto& loop : loops.loops()) {
-            // Keep inner compact loops in their canonical form. Duplicating
-            // their guards increases code size and regresses mixed workloads;
-            // target block placement can still make their hot bodies and
-            // backedges contiguous without changing MIR.
-            if (loop.parent) continue;
-            if (!rotate_one_guarded_loop(function, loop, uses)) continue;
+            if (!rotate_one_guarded_loop(function, hir_module, loop, uses)) {
+                continue;
+            }
             changed = true;
             rotated = true;
             break;

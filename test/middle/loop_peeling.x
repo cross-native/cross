@@ -6,9 +6,12 @@
 // wrapping and descending counters, recurrences other than counters, values
 // read after the loop, branches, calls, and volatile accesses in the body,
 // nested and triangular loops, and loops left in place because they have a
-// second exit or too many iterations. test_entry returns zero when every
-// result matches; its reference loops run to bounds that are not constant.
-// It runs with -fno-eval-calls, so that the calls run.
+// second exit or too many iterations. Searches whose exit test reads memory
+// are peeled to the extent of the array they index, with each pass keeping
+// its test, and keep their results when the inputs stop them at any pass,
+// the last one included. test_entry returns zero when every result matches;
+// its reference loops run to bounds that are not constant. It runs with
+// -fno-eval-calls, so that the calls run.
 
 global u32 table[8];
 global f32 matrix[16];
@@ -188,6 +191,61 @@ static u32 bits_of(in f32 value) {
     return sum;
 }
 
+global u32 slots[8];
+global u16 halves[5];
+global i32 odd[8];
+
+// Searches whose exit test reads the array they index make at most as many
+// passes as keep the access inside it: completely peeled, each pass keeps
+// its test. The word, its index, and its address leave the loop.
+[[noinline]] global u32 first_free(in u32 full) {
+    u32 w = 0u32;
+    while (slots[w] == full) ++w;
+    const u32 word = slots[w];
+    slots[w] = word | 1u32;
+    return w * 1000u32 + word;
+}
+
+// Tested after the access, at the bottom: the last pass leaves after it.
+[[noinline]] global u32 summed_to_zero() {
+    u32 i = 0u32;
+    u32 total = 0u32;
+    u16 value;
+    do {
+        value = halves[i];
+        total = total * 3u32 + (u32)value;
+        ++i;
+    } while (value != 0u16);
+    return total * 16u32 + i;
+}
+
+// A descending index leaves the array below its first element.
+[[noinline]] global u32 last_used() {
+    u32 i = 7u32;
+    while (slots[i] == 0u32) --i;
+    return i;
+}
+
+// A signed index stepping by two, into an automatic array.
+[[noinline]] global i32 odd_match(in i32 key) {
+    i32 local[8];
+    for (i32 k = 0; k < 8; ++k) local[k] = odd[k];
+    i32 i = 1;
+    while (local[i] != key) i += 2;
+    return i;
+}
+
+// A call before the access may end the pass, so the access bounds nothing.
+[[noinline]] global u32 noted_search(in u32 full) {
+    u32 w = 0u32;
+    for (;;) {
+        note(w);
+        if (slots[w] != full) break;
+        ++w;
+    }
+    return w;
+}
+
 global u32 test_entry() {
     for (u32 i = 0u32; i < 8u32; ++i) table[i] = i * i + 1u32;
     u32 expected = 3u32;
@@ -261,5 +319,38 @@ global u32 test_entry() {
         }
     }
     if ($::runtime(transform(6u32)) != expected) return 14u32;
+    // The first word other than `full` stops the search at every position.
+    for (u32 stop = 0u32; stop < opaque(8u32); ++stop) {
+        for (u32 k = 0u32; k < opaque(8u32); ++k) {
+            slots[k] = k < stop ? 4294967295u32 : k * 6u32;
+        }
+        if ($::runtime(first_free(4294967295u32)) != stop * 1000u32 + stop * 6u32 ||
+            slots[stop] != (stop * 6u32 | 1u32)) {
+            return 15u32;
+        }
+        if ($::runtime(noted_search(4294967295u32)) != stop) return 16u32;
+    }
+    // Sums 9, 8, then 0 at index 2; and 1, 2, 3, 4, 0 to the last element.
+    halves[0] = 9u16;
+    halves[1] = 8u16;
+    halves[2] = 0u16;
+    if ($::runtime(summed_to_zero()) != ((9u32 * 3u32 + 8u32) * 3u32) * 16u32 + 3u32)
+        return 17u32;
+    for (u32 k = 0u32; k < opaque(4u32); ++k) halves[k] = (u16)(k + 1u32);
+    halves[4] = 0u16;
+    expected = 0u32;
+    for (u32 k = 0u32; k < opaque(5u32); ++k) {
+        expected = expected * 3u32 + (u32)halves[k];
+    }
+    if ($::runtime(summed_to_zero()) != expected * 16u32 + 5u32) return 18u32;
+    for (u32 last = 0u32; last < opaque(8u32); ++last) {
+        for (u32 k = 0u32; k < opaque(8u32); ++k) slots[k] = k == last ? 3u32 : 0u32;
+        if ($::runtime(last_used()) != last) return 19u32;
+    }
+    for (i32 k = 0; k < (i32)opaque(8u32); ++k) odd[k] = k * 10;
+    if ($::runtime(odd_match(10)) != 1 || $::runtime(odd_match(70)) != 7 ||
+        $::runtime(odd_match(50)) != 5) {
+        return 20u32;
+    }
     return 0u32;
 }

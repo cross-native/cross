@@ -35,11 +35,28 @@ canonicalize_bitwise_operations(ManagedFunction& function,
 [[nodiscard]] bool reassociate_unit_recurrence_adds(
     ManagedFunction& function, const hir::Module& hir_module,
     std::span<const CanonicalLoop> loops, const UseLists& use_lists);
-// Convert a legal outermost top-tested natural loop into an initial zero-trip
-// guard and a bottom-tested loop. The transform repairs value SSA and effect
-// SSA and deliberately rejects secondary exits, multiple latches, compact
-// self-latches, and addressable blocks rather than weakening those invariants.
-[[nodiscard]] bool rotate_guarded_loops(ManagedFunction& function);
+// An integer conversion of a `source_bits`-wide constant.
+[[nodiscard]] std::optional<UInt128> fold_integer_cast(CastOperation cast,
+                                                       UInt128 value,
+                                                       unsigned source_bits,
+                                                       unsigned target_bits);
+// The exact result of an integer operation on `bits`-wide constants (the
+// operand width for a comparison), or nothing when the operation is
+// undefined for them or not folded. Shift counts are reduced modulo the
+// width.
+[[nodiscard]] std::optional<UInt128> fold_integer_binary(
+    BinaryOperation operation, UInt128 left, UInt128 right, unsigned bits);
+
+// Convert a legal top-tested natural loop into an initial zero-trip guard
+// and a bottom-tested loop. The transform repairs value SSA and effect SSA
+// and deliberately rejects secondary exits, multiple latches, and
+// addressable blocks rather than weakening those invariants. An inner loop,
+// or one whose body is its latch, rotates only when its first test, given
+// the constant values its header phis enter with, folds an operation:
+// duplicating a test that does not specialize costs code without saving
+// work.
+[[nodiscard]] bool rotate_guarded_loops(ManagedFunction& function,
+                                        const hir::Module& hir_module);
 
 // Lowers each bit intrinsic and rotation to the target's instructions or to
 // an inline sequence, whichever the subtarget's costs favor; afterwards the
