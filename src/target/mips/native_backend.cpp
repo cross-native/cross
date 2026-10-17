@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <bitset>
 #include <cctype>
 #include <charconv>
 #include <cstdint>
@@ -91,6 +92,7 @@ enum class LoweringPass : std::uint16_t {
     ScheduleInstructions,
     SplitEntryParameters,
     AllocateRegisters,
+    DuplicateBranchBlocks,
     ElideUnusedSpillSlots,
 };
 
@@ -3031,11 +3033,27 @@ private:
                         }
                     }
                 }
+                // An integer reinterpretation leaves its register's bits
+                // as they are, so its result and source hold the same bits
+                // wherever both live and may share a color.
+                const auto same_bits =
+                    item->kind == machine::InstructionKind::Target &&
+                        item->opcode == Opcode::Reinterpret &&
+                        item->uses.size() == 1 && item->defs.size() == 1
+                    ? virtual_id(item->uses.front())
+                    : std::nullopt;
                 for (const auto& definition : item->defs) {
                     const auto id = virtual_id(definition);
                     if (!id) continue;
                     for (const auto other : live) {
-                        if (other == *id) continue;
+                        if (other == *id ||
+                            (same_bits && other == *same_bits &&
+                             function.virtual_register_classes[other] ==
+                                 machine::VirtualRegisterClass::Integer &&
+                             function.virtual_register_classes[*id] ==
+                                 machine::VirtualRegisterClass::Integer)) {
+                            continue;
+                        }
                         interference[*id].insert(other);
                         interference[other].insert(*id);
                     }
@@ -5477,7 +5495,9 @@ private:
             options_.optimize_for == OptimizationGoal::MinimumSize;
         const bool speed =
             options_.optimize_for == OptimizationGoal::Speed;
-        const auto pressure_weight = [&](std::uint32_t id) {
+        // Size modes score by pressure first; a latency-scored schedule is
+        // also tried there and kept only if it does not raise the peak.
+        const auto pressure_weight = [&](std::uint32_t id, bool latency) {
             if (id < current_.virtual_register_classes.size()) {
                 const auto register_class =
                     current_.virtual_register_classes[id];
@@ -5488,7 +5508,7 @@ private:
                         machine::VirtualRegisterClass::Memory) {
                     return 0;
                 }
-                if (compact || !speed) return compact ? 40 : 24;
+                if (!latency) return compact ? 40 : 24;
                 if (register_class ==
                         machine::VirtualRegisterClass::Floating) {
                     // A latency-bearing floating operation commonly has
@@ -5510,69 +5530,10 @@ private:
             // otherwise-ready nodes.
             return compact ? 40 : 24;
         };
-        std::vector<bool> emitted(count);
-        std::vector<std::size_t> order;
-        order.reserve(count);
-        std::vector<bool> scheduled_live(remaining_uses.size());
-        std::array<unsigned, 4> scheduled_live_counts{};
-        for (std::size_t id = 0; id < scheduled_live.size(); ++id) {
-            scheduled_live[id] = region_use[id] &&
-                !definition.contains(static_cast<std::uint32_t>(id));
-            if (!scheduled_live[id] ||
-                id >= current_.virtual_register_classes.size()) {
-                continue;
-            }
-            const auto bank = static_cast<std::size_t>(
-                current_.virtual_register_classes[id]);
-            if (bank < scheduled_live_counts.size()) {
-                ++scheduled_live_counts[bank];
-            }
-        }
         // Leave two colors for loop-PHI interference and emitter staging that
         // are not visible in a single straight-line scheduling region.
         constexpr unsigned schedulable_gpr_peak = 17U;
         constexpr unsigned schedulable_fpr_peak = 11U;
-        const auto projected_pressure = [&](std::size_t index) {
-            auto projected = scheduled_live_counts;
-            std::unordered_map<std::uint32_t, unsigned> uses;
-            for (const auto use : instructions[begin + index].uses) {
-                if (use.kind == machine::RegisterKind::Virtual &&
-                    use.id < remaining_uses.size()) {
-                    ++uses[use.id];
-                }
-            }
-            for (const auto [id, consumed] : uses) {
-                if (!scheduled_live[id] ||
-                    remaining_uses[id] > consumed ||
-                    id >= current_.virtual_register_classes.size()) {
-                    continue;
-                }
-                const auto bank = static_cast<std::size_t>(
-                    current_.virtual_register_classes[id]);
-                if (bank < projected.size() && projected[bank] != 0) {
-                    --projected[bank];
-                }
-            }
-            for (const auto definition_value :
-                 instructions[begin + index].defs) {
-                if (definition_value.kind !=
-                        machine::RegisterKind::Virtual ||
-                    definition_value.id >= remaining_uses.size() ||
-                    remaining_uses[definition_value.id] == 0 ||
-                    scheduled_live[definition_value.id] ||
-                    definition_value.id >=
-                        current_.virtual_register_classes.size()) {
-                    continue;
-                }
-                const auto bank = static_cast<std::size_t>(
-                    current_.virtual_register_classes[
-                        definition_value.id]);
-                if (bank < projected.size()) ++projected[bank];
-            }
-            return projected;
-        };
-        unsigned hilo_write_gap{};
-        unsigned hilo_result_gap{};
         const auto opcode_at = [&](std::size_t index) {
             return decode_opcode(instructions[begin + index].opcode);
         };
@@ -5590,225 +5551,325 @@ private:
             return opcode != Opcode::MulStart &&
                 atomic_hilo_operation(instructions[begin + index]);
         };
-        // Without FPU transfer interlocks, the register a transfer writes is
-        // usable one instruction late: prefer ready work that does not read
-        // it, so the emitter need not separate the two with a NOP.
-        std::optional<std::uint32_t> delayed_result;
-        const auto reads_delayed_result = [&](std::size_t index) {
-            const auto& uses = instructions[begin + index].uses;
-            return delayed_result &&
-                std::any_of(uses.begin(), uses.end(),
-                            [&](machine::Register use) {
-                                return use.kind ==
-                                           machine::RegisterKind::Virtual &&
-                                       use.id == *delayed_result;
-                            });
-        };
-        while (order.size() != count) {
-            std::optional<std::size_t> best;
-            int best_score = std::numeric_limits<int>::min();
-            const bool ready_independent_of_transfer = [&] {
-                for (std::size_t index = 0; index < count; ++index) {
-                    if (!emitted[index] && indegree[index] == 0 &&
-                        !reads_delayed_result(index)) {
-                        return true;
-                    }
-                }
-                return false;
-            }();
-            const bool ready_non_hilo_writer = [&] {
-                for (std::size_t index = 0; index < count; ++index) {
-                    if (!emitted[index] && indegree[index] == 0 &&
-                        !starts_hilo_operation(index)) {
-                        return true;
-                    }
-                }
-                return false;
-            }();
-            const bool ready_non_hilo_read = [&] {
-                for (std::size_t index = 0; index < count; ++index) {
-                    if (!emitted[index] && indegree[index] == 0 &&
-                        !reads_split_hilo(index)) {
-                        return true;
-                    }
-                }
-                return false;
-            }();
-            const auto floating_bank = static_cast<std::size_t>(
-                machine::VirtualRegisterClass::Floating);
-            const auto integer_bank = static_cast<std::size_t>(
-                machine::VirtualRegisterClass::Integer);
-            const auto integer_limit = std::max(
-                schedulable_gpr_peak,
-                scheduled_live_counts[integer_bank]);
-            const auto floating_limit = std::max(
-                schedulable_fpr_peak,
-                scheduled_live_counts[floating_bank]);
-            const bool ready_within_pressure_budget = [&] {
-                for (std::size_t index = 0; index < count; ++index) {
-                    if (emitted[index] || indegree[index] != 0) continue;
-                    const auto projected = projected_pressure(index);
-                    if (projected[integer_bank] <= integer_limit &&
-                        projected[floating_bank] <= floating_limit) {
-                        return true;
-                    }
-                }
-                return false;
-            }();
-            for (std::size_t index = 0; index < count; ++index) {
-                if (emitted[index] || indegree[index] != 0) continue;
-                const auto& candidate = instructions[begin + index];
-                int pressure_delta{};
-                for (const auto definition_value : candidate.defs) {
-                    if (definition_value.kind ==
-                            machine::RegisterKind::Virtual &&
-                        definition_value.id < remaining_uses.size() &&
-                        remaining_uses[definition_value.id] != 0) {
-                        pressure_delta -= pressure_weight(definition_value.id);
-                    }
-                }
-                std::unordered_map<std::uint32_t, unsigned> consumed_uses;
-                for (const auto& use : candidate.uses) {
-                    if (use.kind == machine::RegisterKind::Virtual &&
-                        use.id < remaining_uses.size()) {
-                        ++consumed_uses[use.id];
-                    }
-                }
-                for (const auto [id, consumed] : consumed_uses) {
-                    if (remaining_uses[id] <= consumed) {
-                        pressure_delta += pressure_weight(id);
-                    }
-                }
-                // VR4300 has a small allocatable bank and spilling costs more
-                // instructions than a modest latency win can repay.  Prefer a
-                // ready node that closes live ranges; use critical height to
-                // choose among schedules with comparable pressure.
-                int score = static_cast<int>(critical_height[index]) *
-                                (compact ? 1 : 2) + pressure_delta;
-                if (prefer_early[index]) score += compact ? 1 : 4;
-                // MFHI/MFLO on pre-interlocked MIPS forbids a following
-                // HI/LO writer for two architectural instructions. Prefer
-                // ready scalar work during that window so the emitter does
-                // not have to repair the schedule with NOPs.
-                if (hilo_write_gap != 0 && ready_non_hilo_writer &&
-                    starts_hilo_operation(index)) {
-                    score -= 10000;
-                }
-                // A split MFLO is data-ready only after the multiply latency.
-                // Prefer independent ready work during that interval.  The
-                // dependency token still forces the read after its writer and
-                // serializes every other use of the architectural HI/LO pair.
-                if (hilo_result_gap != 0 && ready_non_hilo_read &&
-                    reads_split_hilo(index)) {
-                    score -= 10000;
-                }
-                if (ready_independent_of_transfer &&
-                    reads_delayed_result(index)) {
-                    score -= 10000;
-                }
-                const auto projected = projected_pressure(index);
-                if (ready_within_pressure_budget &&
-                    (projected[integer_bank] > integer_limit ||
-                     projected[floating_bank] > floating_limit)) {
-                    score -= 10000;
-                }
-                const auto opcode = decode_opcode(candidate.opcode);
-                if (opcode == Opcode::Constant ||
-                    opcode == Opcode::Fconstant ||
-                    opcode == Opcode::StackAddress ||
-                    opcode == Opcode::GlobalAddress ||
-                    opcode == Opcode::GlobalHigh ||
-                    opcode == Opcode::LabelAddress) {
-                    score -= 2;
-                }
-                if (!best || score > best_score ||
-                    (score == best_score && index < *best)) {
-                    best = index;
-                    best_score = score;
-                }
-            }
-            // A missing ready node means a malformed dependence graph; keep
-            // the original order and let the verifier diagnose the function.
-            if (!best) return false;
-            emitted[*best] = true;
-            order.push_back(*best);
-            delayed_result.reset();
-            if (!subtarget_.has_feature(Feature::FpuTransferInterlocks) &&
-                (opcode_at(*best) == Opcode::Freinterpret ||
-                 opcode_at(*best) == Opcode::Fconstant) &&
-                instructions[begin + *best].defs.size() == 1 &&
-                instructions[begin + *best].defs.front().kind ==
-                    machine::RegisterKind::Virtual) {
-                delayed_result = instructions[begin + *best].defs.front().id;
-            }
-            if (opcode_at(*best) == Opcode::MulStart) {
-                // A remaining post-MFLO exclusion is paid as hardware/emitter
-                // stalls when no independent node can fill it.  It no longer
-                // applies after this writer has issued.
-                hilo_write_gap = 0;
-                hilo_result_gap = estimated_latency(
-                    instructions[begin + *best]);
-            } else if (reads_split_hilo(*best)) {
-                hilo_result_gap = 0;
-                hilo_write_gap =
-                    subtarget_.has_feature(Feature::HiloInterlocks) ? 0U : 2U;
-            } else {
-                if (hilo_result_gap != 0) --hilo_result_gap;
-                if (completes_atomic_hilo(*best)) {
-                    hilo_write_gap =
-                        subtarget_.has_feature(Feature::HiloInterlocks)
-                        ? 0U : 2U;
-                } else if (hilo_write_gap != 0) {
-                    --hilo_write_gap;
-                }
-            }
-            for (const auto& use : instructions[begin + *best].uses) {
-                if (use.kind == machine::RegisterKind::Virtual &&
-                    use.id < remaining_uses.size() &&
-                    remaining_uses[use.id] != 0) {
-                    --remaining_uses[use.id];
-                    if (remaining_uses[use.id] == 0 &&
-                        scheduled_live[use.id] &&
-                        use.id < current_.virtual_register_classes.size()) {
-                        scheduled_live[use.id] = false;
-                        const auto bank = static_cast<std::size_t>(
-                            current_.virtual_register_classes[use.id]);
-                        if (bank < scheduled_live_counts.size() &&
-                            scheduled_live_counts[bank] != 0) {
-                            --scheduled_live_counts[bank];
-                        }
-                    }
-                }
-            }
-            for (const auto definition_value :
-                 instructions[begin + *best].defs) {
-                if (definition_value.kind !=
-                        machine::RegisterKind::Virtual ||
-                    definition_value.id >= remaining_uses.size() ||
-                    remaining_uses[definition_value.id] == 0 ||
-                    scheduled_live[definition_value.id] ||
-                    definition_value.id >=
-                        current_.virtual_register_classes.size()) {
+        const auto ready_indegree = indegree;
+        const auto ready_uses = remaining_uses;
+        const auto greedy = [&](bool latency, bool avoid_waits)
+            -> std::optional<std::vector<std::size_t>> {
+            auto indegree = ready_indegree;
+            auto remaining_uses = ready_uses;
+            std::vector<bool> emitted(count);
+            std::vector<std::size_t> order;
+            order.reserve(count);
+            std::vector<bool> scheduled_live(remaining_uses.size());
+            std::array<unsigned, 4> scheduled_live_counts{};
+            for (std::size_t id = 0; id < scheduled_live.size(); ++id) {
+                scheduled_live[id] = region_use[id] &&
+                    !definition.contains(static_cast<std::uint32_t>(id));
+                if (!scheduled_live[id] ||
+                    id >= current_.virtual_register_classes.size()) {
                     continue;
                 }
-                scheduled_live[definition_value.id] = true;
                 const auto bank = static_cast<std::size_t>(
-                    current_.virtual_register_classes[
-                        definition_value.id]);
+                    current_.virtual_register_classes[id]);
                 if (bank < scheduled_live_counts.size()) {
                     ++scheduled_live_counts[bank];
                 }
             }
-            for (const auto successor : successors[*best]) {
-                if (indegree[successor] != 0) --indegree[successor];
+            const auto projected_pressure = [&](std::size_t index) {
+                auto projected = scheduled_live_counts;
+                std::unordered_map<std::uint32_t, unsigned> uses;
+                for (const auto use : instructions[begin + index].uses) {
+                    if (use.kind == machine::RegisterKind::Virtual &&
+                        use.id < remaining_uses.size()) {
+                        ++uses[use.id];
+                    }
+                }
+                for (const auto [id, consumed] : uses) {
+                    if (!scheduled_live[id] ||
+                        remaining_uses[id] > consumed ||
+                        id >= current_.virtual_register_classes.size()) {
+                        continue;
+                    }
+                    const auto bank = static_cast<std::size_t>(
+                        current_.virtual_register_classes[id]);
+                    if (bank < projected.size() && projected[bank] != 0) {
+                        --projected[bank];
+                    }
+                }
+                for (const auto definition_value :
+                     instructions[begin + index].defs) {
+                    if (definition_value.kind !=
+                            machine::RegisterKind::Virtual ||
+                        definition_value.id >= remaining_uses.size() ||
+                        remaining_uses[definition_value.id] == 0 ||
+                        scheduled_live[definition_value.id] ||
+                        definition_value.id >=
+                            current_.virtual_register_classes.size()) {
+                        continue;
+                    }
+                    const auto bank = static_cast<std::size_t>(
+                        current_.virtual_register_classes[
+                            definition_value.id]);
+                    if (bank < projected.size()) ++projected[bank];
+                }
+                return projected;
+            };
+            unsigned hilo_write_gap{};
+            unsigned hilo_result_gap{};
+            // Without FPU transfer interlocks, the register a transfer writes is
+            // usable one instruction late: prefer ready work that does not read
+            // it, so the emitter need not separate the two with a NOP.
+            std::optional<std::uint32_t> delayed_result;
+            const auto reads_delayed_result = [&](std::size_t index) {
+                const auto& uses = instructions[begin + index].uses;
+                return delayed_result &&
+                    std::any_of(uses.begin(), uses.end(),
+                                [&](machine::Register use) {
+                                    return use.kind ==
+                                               machine::RegisterKind::Virtual &&
+                                           use.id == *delayed_result;
+                                });
+            };
+            // A latency-scored schedule tracks when each loaded value is
+            // ready and prefers ready work that does not wait for one.
+            std::vector<unsigned> ready_at(count);
+            unsigned cycle{};
+            const auto wait = [&](std::size_t index) {
+                unsigned start = cycle;
+                for (const auto use : instructions[begin + index].uses) {
+                    if (use.kind != machine::RegisterKind::Virtual) continue;
+                    const auto producer = definition.find(use.id);
+                    if (producer != definition.end() &&
+                        producer->second != index &&
+                        emitted[producer->second] &&
+                        instructions[begin + producer->second].may_load) {
+                        start = std::max(start, ready_at[producer->second]);
+                    }
+                }
+                return start - cycle;
+            };
+            while (order.size() != count) {
+                std::optional<std::size_t> best;
+                int best_score = std::numeric_limits<int>::min();
+                const bool ready_without_wait = avoid_waits && [&] {
+                    for (std::size_t index = 0; index < count; ++index) {
+                        if (!emitted[index] && indegree[index] == 0 &&
+                            wait(index) == 0) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }();
+                const bool ready_independent_of_transfer = [&] {
+                    for (std::size_t index = 0; index < count; ++index) {
+                        if (!emitted[index] && indegree[index] == 0 &&
+                            !reads_delayed_result(index)) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }();
+                const bool ready_non_hilo_writer = [&] {
+                    for (std::size_t index = 0; index < count; ++index) {
+                        if (!emitted[index] && indegree[index] == 0 &&
+                            !starts_hilo_operation(index)) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }();
+                const bool ready_non_hilo_read = [&] {
+                    for (std::size_t index = 0; index < count; ++index) {
+                        if (!emitted[index] && indegree[index] == 0 &&
+                            !reads_split_hilo(index)) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }();
+                const auto floating_bank = static_cast<std::size_t>(
+                    machine::VirtualRegisterClass::Floating);
+                const auto integer_bank = static_cast<std::size_t>(
+                    machine::VirtualRegisterClass::Integer);
+                const auto integer_limit = std::max(
+                    schedulable_gpr_peak,
+                    scheduled_live_counts[integer_bank]);
+                const auto floating_limit = std::max(
+                    schedulable_fpr_peak,
+                    scheduled_live_counts[floating_bank]);
+                const bool ready_within_pressure_budget = [&] {
+                    for (std::size_t index = 0; index < count; ++index) {
+                        if (emitted[index] || indegree[index] != 0) continue;
+                        const auto projected = projected_pressure(index);
+                        if (projected[integer_bank] <= integer_limit &&
+                            projected[floating_bank] <= floating_limit) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }();
+                for (std::size_t index = 0; index < count; ++index) {
+                    if (emitted[index] || indegree[index] != 0) continue;
+                    const auto& candidate = instructions[begin + index];
+                    int pressure_delta{};
+                    for (const auto definition_value : candidate.defs) {
+                        if (definition_value.kind ==
+                                machine::RegisterKind::Virtual &&
+                            definition_value.id < remaining_uses.size() &&
+                            remaining_uses[definition_value.id] != 0) {
+                            pressure_delta -=
+                                pressure_weight(definition_value.id, latency);
+                        }
+                    }
+                    std::unordered_map<std::uint32_t, unsigned> consumed_uses;
+                    for (const auto& use : candidate.uses) {
+                        if (use.kind == machine::RegisterKind::Virtual &&
+                            use.id < remaining_uses.size()) {
+                            ++consumed_uses[use.id];
+                        }
+                    }
+                    for (const auto [id, consumed] : consumed_uses) {
+                        if (remaining_uses[id] <= consumed) {
+                            pressure_delta += pressure_weight(id, latency);
+                        }
+                    }
+                    // VR4300 has a small allocatable bank and spilling costs more
+                    // instructions than a modest latency win can repay.  Prefer a
+                    // ready node that closes live ranges; use critical height to
+                    // choose among schedules with comparable pressure.
+                    const bool by_pressure = compact && !latency;
+                    int score = static_cast<int>(critical_height[index]) *
+                                    (by_pressure ? 1 : 2) + pressure_delta;
+                    if (prefer_early[index]) score += by_pressure ? 1 : 4;
+                    // MFHI/MFLO on pre-interlocked MIPS forbids a following
+                    // HI/LO writer for two architectural instructions. Prefer
+                    // ready scalar work during that window so the emitter does
+                    // not have to repair the schedule with NOPs.
+                    if (hilo_write_gap != 0 && ready_non_hilo_writer &&
+                        starts_hilo_operation(index)) {
+                        score -= 10000;
+                    }
+                    // A split MFLO is data-ready only after the multiply latency.
+                    // Prefer independent ready work during that interval.  The
+                    // dependency token still forces the read after its writer and
+                    // serializes every other use of the architectural HI/LO pair.
+                    if (hilo_result_gap != 0 && ready_non_hilo_read &&
+                        reads_split_hilo(index)) {
+                        score -= 10000;
+                    }
+                    if (ready_independent_of_transfer &&
+                        reads_delayed_result(index)) {
+                        score -= 10000;
+                    }
+                    if (ready_without_wait) {
+                        score -= 1000 * static_cast<int>(wait(index));
+                    }
+                    const auto projected = projected_pressure(index);
+                    if (ready_within_pressure_budget &&
+                        (projected[integer_bank] > integer_limit ||
+                         projected[floating_bank] > floating_limit)) {
+                        score -= 10000;
+                    }
+                    const auto opcode = decode_opcode(candidate.opcode);
+                    if (opcode == Opcode::Constant ||
+                        opcode == Opcode::Fconstant ||
+                        opcode == Opcode::StackAddress ||
+                        opcode == Opcode::GlobalAddress ||
+                        opcode == Opcode::GlobalHigh ||
+                        opcode == Opcode::LabelAddress) {
+                        score -= 2;
+                    }
+                    if (!best || score > best_score ||
+                        (score == best_score && index < *best)) {
+                        best = index;
+                        best_score = score;
+                    }
+                }
+                // A missing ready node means a malformed dependence graph; keep
+                // the original order and let the verifier diagnose the function.
+                if (!best) return std::nullopt;
+                const auto start = cycle + wait(*best);
+                ready_at[*best] =
+                    start + estimated_latency(instructions[begin + *best]);
+                cycle = start + 1;
+                emitted[*best] = true;
+                order.push_back(*best);
+                delayed_result.reset();
+                if (!subtarget_.has_feature(Feature::FpuTransferInterlocks) &&
+                    (opcode_at(*best) == Opcode::Freinterpret ||
+                     opcode_at(*best) == Opcode::Fconstant) &&
+                    instructions[begin + *best].defs.size() == 1 &&
+                    instructions[begin + *best].defs.front().kind ==
+                        machine::RegisterKind::Virtual) {
+                    delayed_result = instructions[begin + *best].defs.front().id;
+                }
+                if (opcode_at(*best) == Opcode::MulStart) {
+                    // A remaining post-MFLO exclusion is paid as hardware/emitter
+                    // stalls when no independent node can fill it.  It no longer
+                    // applies after this writer has issued.
+                    hilo_write_gap = 0;
+                    hilo_result_gap = estimated_latency(
+                        instructions[begin + *best]);
+                } else if (reads_split_hilo(*best)) {
+                    hilo_result_gap = 0;
+                    hilo_write_gap =
+                        subtarget_.has_feature(Feature::HiloInterlocks) ? 0U : 2U;
+                } else {
+                    if (hilo_result_gap != 0) --hilo_result_gap;
+                    if (completes_atomic_hilo(*best)) {
+                        hilo_write_gap =
+                            subtarget_.has_feature(Feature::HiloInterlocks)
+                            ? 0U : 2U;
+                    } else if (hilo_write_gap != 0) {
+                        --hilo_write_gap;
+                    }
+                }
+                for (const auto& use : instructions[begin + *best].uses) {
+                    if (use.kind == machine::RegisterKind::Virtual &&
+                        use.id < remaining_uses.size() &&
+                        remaining_uses[use.id] != 0) {
+                        --remaining_uses[use.id];
+                        if (remaining_uses[use.id] == 0 &&
+                            scheduled_live[use.id] &&
+                            use.id < current_.virtual_register_classes.size()) {
+                            scheduled_live[use.id] = false;
+                            const auto bank = static_cast<std::size_t>(
+                                current_.virtual_register_classes[use.id]);
+                            if (bank < scheduled_live_counts.size() &&
+                                scheduled_live_counts[bank] != 0) {
+                                --scheduled_live_counts[bank];
+                            }
+                        }
+                    }
+                }
+                for (const auto definition_value :
+                     instructions[begin + *best].defs) {
+                    if (definition_value.kind !=
+                            machine::RegisterKind::Virtual ||
+                        definition_value.id >= remaining_uses.size() ||
+                        remaining_uses[definition_value.id] == 0 ||
+                        scheduled_live[definition_value.id] ||
+                        definition_value.id >=
+                            current_.virtual_register_classes.size()) {
+                        continue;
+                    }
+                    scheduled_live[definition_value.id] = true;
+                    const auto bank = static_cast<std::size_t>(
+                        current_.virtual_register_classes[
+                            definition_value.id]);
+                    if (bank < scheduled_live_counts.size()) {
+                        ++scheduled_live_counts[bank];
+                    }
+                }
+                for (const auto successor : successors[*best]) {
+                    if (indegree[successor] != 0) --indegree[successor];
+                }
             }
-        }
-
-        bool changed = false;
-        for (std::size_t index = 0; index < count; ++index) {
-            changed = changed || order[index] != index;
-        }
-        if (!changed) return false;
+            return order;
+        };
+        const auto greedy_order = greedy(!compact && speed, false);
+        if (!greedy_order) return false;
+        auto order = *greedy_order;
 
         struct Pressure {
             std::array<unsigned, 4> peak{};
@@ -5867,13 +5928,21 @@ private:
             original[index] = index;
         }
         const auto original_pressure = measure_pressure(original);
-        const auto scheduled_pressure = measure_pressure(order);
+        // Under -mfix4300 the emitter separates consecutive floating
+        // multiplies with a NOP.
         const auto estimated_cycles = [&](const std::vector<std::size_t>& plan) {
             std::vector<unsigned> ready(count);
             unsigned next_issue{};
             unsigned completion{};
+            bool after_multiply = false;
             for (const auto index : plan) {
                 unsigned issue = next_issue;
+                const bool multiply = opcode_at(index) == Opcode::Fmul;
+                if (multiply && after_multiply &&
+                    subtarget_.has_feature(Feature::Fix4300)) {
+                    ++issue;
+                }
+                after_multiply = multiply;
                 for (const auto use : instructions[begin + index].uses) {
                     if (use.kind != machine::RegisterKind::Virtual) continue;
                     const auto producer = definition.find(use.id);
@@ -5889,8 +5958,6 @@ private:
             }
             return completion;
         };
-        const auto original_cycles = estimated_cycles(original);
-        const auto scheduled_cycles = estimated_cycles(order);
         const auto hilo_stalls = [&](const std::vector<std::size_t>& plan) {
             unsigned write_gap{};
             unsigned result_gap{};
@@ -5923,6 +5990,51 @@ private:
             }
             return stalls;
         };
+        // Without an interlock, a transferred register read by the next
+        // operation costs the emitter a NOP.
+        const auto transfer_nops = [&](const std::vector<std::size_t>& plan) {
+            if (subtarget_.has_feature(Feature::FpuTransferInterlocks)) {
+                return 0U;
+            }
+            unsigned nops{};
+            for (std::size_t at = 1; at < plan.size(); ++at) {
+                const auto& previous = instructions[begin + plan[at - 1]];
+                const auto opcode = decode_opcode(previous.opcode);
+                if ((opcode != Opcode::Freinterpret &&
+                     opcode != Opcode::Fconstant) ||
+                    previous.defs.size() != 1) {
+                    continue;
+                }
+                const auto& uses = instructions[begin + plan[at]].uses;
+                nops += std::find(uses.begin(), uses.end(),
+                                  previous.defs.front()) != uses.end();
+            }
+            return nops;
+        };
+        // A size goal's pressure-first schedule ignores latency; a
+        // latency-scored one that also keeps loaded values from being used
+        // before they are ready replaces it when it raises no bank's peak
+        // above the original order's, needs no more separating NOPs, and
+        // finishes sooner.
+        if (compact) {
+            if (const auto alternative = greedy(true, true)) {
+                const auto peak = measure_pressure(*alternative).peak;
+                bool fits = true;
+                for (std::size_t bank = 0; bank < peak.size(); ++bank) {
+                    fits = fits && peak[bank] <= original_pressure.peak[bank];
+                }
+                if (fits &&
+                    transfer_nops(*alternative) <= transfer_nops(order) &&
+                    hilo_stalls(*alternative) <= hilo_stalls(order) &&
+                    estimated_cycles(*alternative) < estimated_cycles(order)) {
+                    order = *alternative;
+                }
+            }
+        }
+        if (order == original) return false;
+        const auto scheduled_pressure = measure_pressure(order);
+        const auto original_cycles = estimated_cycles(original);
+        const auto scheduled_cycles = estimated_cycles(order);
         const bool removes_hilo_stalls =
             speed &&
             hilo_stalls(order) < hilo_stalls(original);
@@ -6443,7 +6555,8 @@ private:
                 // Like the scheduler's peaks, leave colors for loop-PHI
                 // interference and emitter staging. For size, a hoisted
                 // constant must not need a register the function would
-                // then save and restore.
+                // then save and restore: one beyond the volatile colors
+                // and the function's peak pressure.
                 const bool size =
                     options_.optimize_for == OptimizationGoal::Size ||
                     options_.optimize_for == OptimizationGoal::MinimumSize;
@@ -6468,6 +6581,9 @@ private:
                 const auto fprs = colors(allocatable_fprs());
                 policy.capacity = {gprs > 3U ? gprs - 3U : 0U,
                                    fprs > 2U ? fprs - 2U : 0U};
+                policy.colors = {
+                    static_cast<unsigned>(allocatable_gprs(function).size()),
+                    static_cast<unsigned>(allocatable_fprs().size())};
                 return native::hoist_loop_constants(function, policy);
             });
         passes.add(
@@ -6503,6 +6619,70 @@ private:
               "allocate-registers"},
             [this](machine::Function& function) {
                 return allocate_registers(function);
+            });
+        passes.add(
+            {{LoweringPass::DuplicateBranchBlocks},
+             Stage::RegisterAllocation, "duplicate-branch-blocks"},
+            [this](machine::Function& function) {
+                if (!options_.reorder_blocks ||
+                    !options_.register_allocation || naked_ ||
+                    options_.optimize_for != OptimizationGoal::Speed) {
+                    return false;
+                }
+                native::BranchDuplicationPolicy policy;
+                policy.is_phi = phi_instruction;
+                policy.emits_nothing = [](const machine::Instruction& value) {
+                    const auto opcode = decode_opcode(value.opcode);
+                    return value.kind == machine::InstructionKind::Target &&
+                        (opcode == Opcode::LifetimeStart ||
+                         opcode == Opcode::LifetimeEnd ||
+                         opcode == Opcode::IntrinsicNoop);
+                };
+                // Every PHI result shares its incoming value's color.
+                policy.copy_free = [&](machine::BlockId from,
+                                       machine::BlockId to) {
+                    for (const auto& phi :
+                         function.blocks[to.value].instructions) {
+                        if (!phi_instruction(phi) || phi.defs.size() != 1) {
+                            continue;
+                        }
+                        const auto color = [&](machine::Register value)
+                            -> std::optional<machine::PhysicalRegisterId> {
+                            if (value.kind != machine::RegisterKind::Virtual ||
+                                value.id >= function
+                                    .virtual_register_assignments.size()) {
+                                return std::nullopt;
+                            }
+                            return function.virtual_register_assignments[
+                                value.id];
+                        };
+                        for (std::size_t index = 0;
+                             index + 1 < phi.operands.size(); index += 2) {
+                            const auto* edge =
+                                std::get_if<machine::BlockOperand>(
+                                    &phi.operands[index]);
+                            const auto* value =
+                                std::get_if<machine::RegisterOperand>(
+                                    &phi.operands[index + 1]);
+                            if (!edge || edge->target != from) continue;
+                            const auto source = value
+                                ? color(value->value) : std::nullopt;
+                            if (!source ||
+                                source != color(phi.defs.front())) {
+                                return false;
+                            }
+                        }
+                    }
+                    return true;
+                };
+                policy.is_addressable = [&](machine::BlockId block) {
+                    return std::any_of(
+                        function.labels.begin(), function.labels.end(),
+                        [&](const machine::Function::LocalLabel& label) {
+                            return label.block == block;
+                        });
+                };
+                return native::duplicate_branch_blocks(function, policy);
             });
         passes.add(
             {{LoweringPass::ElideUnusedSpillSlots},
@@ -6851,6 +7031,9 @@ private:
         bool elide_original{};
         std::optional<machine::BlockId> forward;
         machine::BlockId edge_target;
+        // An ordinary branch's slot runs the operation on its other edge
+        // too, where its result is dead.
+        bool speculative{};
     };
     // Edge plans are keyed by source and CFG target: a conditional branch
     // with both destinations out of line plans each of its edges.
@@ -11467,7 +11650,7 @@ private:
                 std::all_of(candidate.uses.begin(), candidate.uses.end(),
                             allocated) &&
                 (floating ? candidate.defs.front().mode.bits <= 32 ||
-                                subtarget_.has_feature(Feature::Mips2)
+                                single_doubleword_fpr_access(true)
                           : !legalizes_to_pair(candidate.defs.front()));
         }
         if (candidate.may_load || candidate.may_store ||
@@ -11585,11 +11768,63 @@ private:
         }
     }
 
+    // A store that is one instruction: a pointer store, or a global store
+    // off a data base's register, of an assigned register that needs no
+    // word pair. A delay slot may run it where nothing it would pass reads
+    // or writes memory. A store's pending data-cache write is not carried
+    // across a branch, so functions with registry forms keep stores in place.
+    bool slot_store(const machine::Function& function,
+                    const machine::Instruction& candidate) const {
+        if (!options_.schedule_insns2 ||
+            candidate.kind != machine::InstructionKind::Target ||
+            candidate.patch || !candidate.defs.empty() ||
+            !hazard_forms_.empty()) {
+            return false;
+        }
+        const auto opcode = decode_opcode(candidate.opcode);
+        const bool pointer = opcode == Opcode::PointerStore ||
+            opcode == Opcode::FpointerStore;
+        const auto* symbol = candidate.operands.empty()
+            ? nullptr
+            : std::get_if<machine::SymbolOperand>(&candidate.operands.front());
+        const bool global = (opcode == Opcode::GlobalStore ||
+                             opcode == Opcode::FglobalStore) &&
+            symbol && object_data_base(hir_, options_, *symbol);
+        if ((!pointer && !global) ||
+            candidate.uses.size() != (pointer ? 2U : 1U)) {
+            return false;
+        }
+        const auto source = candidate.uses.back();
+        const bool floating = opcode == Opcode::FpointerStore ||
+            opcode == Opcode::FglobalStore;
+        if (floating ? !assigned_fpr(function, source) ||
+                           (source.mode.bits > 32 &&
+                            !single_doubleword_fpr_access(false))
+                     : !assigned_gpr(function, source) ||
+                           legalizes_to_pair(source)) {
+            return false;
+        }
+        return !pointer || assigned_gpr(function, candidate.uses.front());
+    }
+
+    // Whether LDC1 or SDC1 is one instruction rather than two word
+    // accesses (`split_doubleword_coprocessor_access`).
+    bool single_doubleword_fpr_access(bool load) const {
+        return subtarget_.has_feature(Feature::Mips2) &&
+            (subtarget_.has_instruction(load ? Instruction::Ldc1
+                                             : Instruction::Sdc1) ||
+             !subtarget_.has_feature(Feature::Fp32));
+    }
+
     bool can_fill_delay_slot(const machine::Function& function,
                              const machine::Instruction& candidate,
                              const machine::Instruction& terminator,
                              machine::BlockId predecessor) const {
-        if (!single_delay_slot_instruction(function, candidate)) return false;
+        if (!single_delay_slot_instruction(function, candidate) &&
+            (!slot_store(function, candidate) ||
+             trapping_branch(terminator))) {
+            return false;
+        }
         // A return's result is already in place; `jr $ra` and a branch to
         // the epilogue read no allocatable register.
         if (terminator.kind == machine::InstructionKind::Return) return true;
@@ -11782,11 +12017,14 @@ private:
                                        (storage && physical(value) == storage);
                                });
         };
-        const auto pointer_load = [](const machine::Instruction& value) {
+        // A load or store through a base register and a displacement.
+        const auto pointer_access = [](const machine::Instruction& value) {
             switch (decode_opcode(value.opcode)) {
             case Opcode::PointerLoadSigned:
             case Opcode::PointerLoadUnsigned:
             case Opcode::FpointerLoad:
+            case Opcode::PointerStore:
+            case Opcode::FpointerStore:
                 return value.kind == machine::InstructionKind::Target &&
                     !std::holds_alternative<machine::SymbolOperand>(
                         value.operands.back());
@@ -11815,15 +12053,16 @@ private:
             const auto& candidate = *sequence[candidate_index];
             // An operation that may trap is still the last one before the
             // slot unless the branch's own comparison may trap; nothing
-            // earlier passes it.
+            // earlier passes it. A store passes no memory access.
             const bool trapping = trap_only(candidate);
-            if ((barrier(candidate) && !trapping) ||
+            const bool store = slot_store(function, candidate);
+            if ((barrier(candidate) && !trapping && !store) ||
                 (trapping && trapping_branch(terminator))) {
                 break;
             }
             if (!can_fill_delay_slot(function, candidate, terminator,
                                      block)) {
-                if (trapping) break;
+                if (trapping || store) break;
                 continue;
             }
             bool legal = true;
@@ -11831,21 +12070,24 @@ private:
             for (std::size_t between = candidate_index + 1;
                  between < sequence.size() && legal; ++between) {
                 const auto& crossed = *sequence[between];
-                // A load follows an increment of its base by subtracting
-                // the increment from its displacement.
-                if (pointer_load(candidate)) {
+                // A load or store follows an increment of its base by
+                // subtracting the increment from its displacement; a store
+                // of the base itself would store the incremented value.
+                if (pointer_access(candidate)) {
                     const auto base = candidate.uses.front();
                     if (const auto amount = base_increment(crossed, base)) {
                         legal = std::none_of(
                             candidate.defs.begin(), candidate.defs.end(),
                             [&](machine::Register definition) {
                                 return conflicts(definition, crossed.uses);
-                            });
+                            }) &&
+                            (!store ||
+                             !conflicts(candidate.uses.back(), {base}));
                         displacement -= *amount;
                         continue;
                     }
                 }
-                legal = !barrier(crossed) &&
+                legal = !barrier(crossed) && !(store && crossed.may_load) &&
                     std::none_of(candidate.defs.begin(), candidate.defs.end(),
                                  [&](machine::Register definition) {
                                      return conflicts(definition,
@@ -11871,7 +12113,7 @@ private:
                     moved <= std::numeric_limits<std::int16_t>::max();
             }
             if (legal) return std::pair{candidate_index, displacement};
-            if (trapping) break;
+            if (trapping || store) break;
         }
         return std::nullopt;
     }
@@ -11928,6 +12170,266 @@ private:
                     CrossBlockDelay{predecessor->id, found->first,
                                     found->second});
             }
+        }
+    }
+
+    // Physical registers by number, the FPRs after the GPRs.
+    using PhysicalSet = std::bitset<64>;
+
+    // The physical registers an operand occupies: an assigned virtual
+    // register's color, both registers of an FR=0 double, or a physical
+    // register. An unassigned value lives in memory.
+    PhysicalSet physical_registers(const machine::Function& function,
+                                   machine::Register value) const {
+        PhysicalSet result;
+        std::optional<std::uint32_t> id;
+        if (value.kind == machine::RegisterKind::Physical) {
+            id = value.id;
+        } else if (value.id < function.virtual_register_assignments.size() &&
+                   function.virtual_register_assignments[value.id]) {
+            id = function.virtual_register_assignments[value.id]->value;
+        }
+        if (!id || *id >= result.size()) return result;
+        result.set(*id);
+        if (*id >= fpr_physical_base && *id + 1 < result.size() &&
+            occupies_fpr_pair(subtarget_, value.mode.bits)) {
+            result.set(*id + 1);
+        }
+        return result;
+    }
+
+    // The registers a block's PHIs take from `predecessor` and those they
+    // define, as the edge's parallel copies read and write them.
+    std::pair<PhysicalSet, PhysicalSet> phi_edge_registers(
+        const machine::Function& function, const machine::Block& block,
+        machine::BlockId predecessor) const {
+        PhysicalSet read;
+        PhysicalSet written;
+        for (const auto& phi : block.instructions) {
+            if (!phi_instruction(phi) || phi.defs.size() != 1) continue;
+            written |= physical_registers(function, phi.defs.front());
+            for (std::size_t index = 0; index + 1 < phi.operands.size();
+                 index += 2) {
+                const auto* from =
+                    std::get_if<machine::BlockOperand>(&phi.operands[index]);
+                const auto* value = std::get_if<machine::RegisterOperand>(
+                    &phi.operands[index + 1]);
+                if (from && value && from->target == predecessor) {
+                    read |= physical_registers(function, value->value);
+                }
+            }
+        }
+        return {read, written};
+    }
+
+    // The physical registers live on the edge from `predecessor` into
+    // `successor`, before that edge's PHI copies.
+    PhysicalSet live_on_edge(const machine::Function& function,
+                             machine::BlockId predecessor,
+                             machine::BlockId successor) const {
+        const auto* block = find_block(function, successor);
+        if (!block || successor.value >= live_in_.size()) {
+            return PhysicalSet{}.set();
+        }
+        const auto [read, written] =
+            phi_edge_registers(function, *block, predecessor);
+        return (live_in_[successor.value] & ~written) | read;
+    }
+
+    // A backward solution of the physical registers live into each block.
+    // An instruction reads the registers of its uses and, for a call, those
+    // of the values split around it; it writes those of its definitions
+    // and clobbers. A block's PHIs read their incoming registers on each
+    // edge. Functions whose registers have effects outside Machine IR
+    // operands (naked bodies, registry forms, a branch back to the entry
+    // with its parameter captures) get no solution.
+    void compute_physical_liveness(const machine::Function& function) {
+        live_in_.clear();
+        const auto count = function.blocks.size();
+        if (naked_writable_ || !hazard_forms_.empty()) return;
+        for (const auto& block : function.blocks) {
+            if (block.id.value >= count) return;
+            if (std::find(block.successors.begin(), block.successors.end(),
+                          function.entry) != block.successors.end()) {
+                return;
+            }
+        }
+        const auto transfer = [&](const machine::Block& block,
+                                  PhysicalSet live) {
+            for (auto item = block.instructions.rbegin();
+                 item != block.instructions.rend(); ++item) {
+                if (phi_instruction(*item)) continue;
+                for (const auto& definition : item->defs) {
+                    live &= ~physical_registers(function, definition);
+                }
+                for (const auto& clobber : item->clobbers) {
+                    live &= ~physical_registers(function, clobber);
+                }
+                for (const auto& use : item->uses) {
+                    live |= physical_registers(function, use);
+                }
+                for (const auto& split : item->live_across_call) {
+                    live |= physical_registers(function, split);
+                }
+            }
+            return live;
+        };
+        std::vector<PhysicalSet> live_in(count);
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (auto item = function.layout.rbegin();
+                 item != function.layout.rend(); ++item) {
+                const auto* block = find_block(function, *item);
+                if (!block) continue;
+                PhysicalSet out;
+                for (const auto successor : block->successors) {
+                    const auto* next = find_block(function, successor);
+                    if (!next) continue;
+                    const auto [read, written] =
+                        phi_edge_registers(function, *next, block->id);
+                    out |= (live_in[successor.value] & ~written) | read;
+                }
+                const auto in = transfer(*block, out);
+                if (in != live_in[block->id.value]) {
+                    live_in[block->id.value] = in;
+                    changed = true;
+                }
+            }
+        }
+        live_in_ = std::move(live_in);
+    }
+
+    // An operation that a branch's delay slot may run on both edges
+    // although only one of them would: one instruction that neither
+    // touches memory nor raises an exception, defining one register. A
+    // floating copy moves bits without arithmetic.
+    bool speculative_delay_instruction(
+        const machine::Function& function,
+        const machine::Instruction& candidate) const {
+        if (!single_delay_slot_instruction(function, candidate) ||
+            candidate.has_side_effects || candidate.may_load ||
+            candidate.may_store || candidate.defs.size() != 1) {
+            return false;
+        }
+        if (candidate.kind == machine::InstructionKind::Copy) return true;
+        switch (decode_opcode(candidate.opcode)) {
+        case Opcode::Constant:
+        case Opcode::GlobalHigh:
+        case Opcode::StackAddress:
+        case Opcode::GlobalAddress:
+        case Opcode::PointerOffset:
+        case Opcode::Neg:
+        case Opcode::Not:
+        case Opcode::Iszero:
+        case Opcode::Add:
+        case Opcode::Sub:
+        case Opcode::And:
+        case Opcode::Or:
+        case Opcode::Xor:
+        case Opcode::Shl:
+        case Opcode::ShrS:
+        case Opcode::ShrU: return true;
+        default: {
+            const auto opcode = decode_opcode(candidate.opcode);
+            return opcode >= Opcode::CmpEq && opcode <= Opcode::CmpUge;
+        }
+        }
+    }
+
+    // A conditional branch whose delay slot nothing else fills runs the
+    // first operation of the block it falls through to, when that block
+    // has no other predecessor and the operation's result is dead on the
+    // taken edge. A branch-likely slot planned for the taken edge yields
+    // only when that edge leaves the branch's loop and the fallthrough
+    // stays in it.
+    void plan_fallthrough_delays(const machine::Function& function) {
+        fallthrough_delays_.clear();
+        if (!options_.schedule_insns2 || live_in_.empty()) return;
+        const auto depths = native::loop_depths(function);
+        for (const auto& block : function.blocks) {
+            if (block.instructions.empty() ||
+                skipped_layout_.contains(block.id.value) ||
+                delay_slot_plan(function, block) ||
+                cross_block_delays_.contains(block.id.value)) {
+                continue;
+            }
+            const auto& branch = block.instructions.back();
+            if (branch.kind != machine::InstructionKind::ConditionalBranch ||
+                branch.operands.size() < 3) {
+                continue;
+            }
+            const auto* yes =
+                std::get_if<machine::BlockOperand>(&branch.operands[1]);
+            const auto* no =
+                std::get_if<machine::BlockOperand>(&branch.operands[2]);
+            const auto next = layout_successor(function, block.id);
+            if (!yes || !no || yes->target == no->target || !next ||
+                (*next != yes->target && *next != no->target)) {
+                continue;
+            }
+            const auto taken = *next == yes->target ? no->target
+                                                    : yes->target;
+            const auto* fallthrough = find_block(function, *next);
+            if (!fallthrough || fallthrough->predecessors.size() != 1 ||
+                fallthrough->id == function.entry ||
+                function.frame.prologue_block == fallthrough->id ||
+                labeled_block(function, fallthrough->id) ||
+                framed_[block.id.value] != framed_[fallthrough->id.value] ||
+                edge_has_phi_copies(function, block.id, *next) ||
+                edge_has_phi_copies(function, block.id, taken)) {
+                continue;
+            }
+            const bool exits = depths[taken.value] < depths[block.id.value] &&
+                depths[next->value] >= depths[block.id.value];
+            if (edge_delay_entries_.contains(edge_key(block.id, taken)) &&
+                !exits) {
+                continue;
+            }
+            std::size_t index = 0;
+            while (index < fallthrough->instructions.size() &&
+                   no_output_prefix(fallthrough->instructions[index])) {
+                ++index;
+            }
+            if (index + 1 >= fallthrough->instructions.size()) continue;
+            const auto& candidate = fallthrough->instructions[index];
+            if (!speculative_delay_instruction(function, candidate) ||
+                (physical_registers(function, candidate.defs.front()) &
+                 live_on_edge(function, block.id, taken)).any()) {
+                continue;
+            }
+            // The operation may already fill the fallthrough block's own
+            // slot or one of its successor's.
+            if (const auto own = delay_slot_plan(function, *fallthrough);
+                (own && own->candidate == index) ||
+                given_delay_instruction(fallthrough->id) == index) {
+                continue;
+            }
+            fallthrough_delays_.emplace(block.id.value,
+                                        FallthroughDelay{*next, index});
+        }
+    }
+
+    // Keeps the fallthrough delays whose block the emitted layout places
+    // right after the branch, and records what each such block lends.
+    void settle_fallthrough_delays(const machine::Function& function) {
+        lent_delays_.clear();
+        std::vector<machine::BlockId> emitted;
+        for (const auto block : function.layout) {
+            if (!elided_returns_.contains(block.value) &&
+                !forwarded_blocks_.contains(block.value) &&
+                !skipped_layout_.contains(block.value)) {
+                emitted.push_back(block);
+            }
+        }
+        std::erase_if(fallthrough_delays_, [&](const auto& entry) {
+            const auto at = std::find(emitted.begin(), emitted.end(),
+                                      machine::BlockId{entry.first});
+            return at == emitted.end() || at + 1 == emitted.end() ||
+                *(at + 1) != entry.second.block;
+        });
+        for (const auto& [branch, delay] : fallthrough_delays_) {
+            (void)branch;
+            lent_delays_.emplace(delay.block.value, delay.instruction);
         }
     }
 
@@ -12104,8 +12606,9 @@ private:
                 machine::InstructionKind::Target ||
             decode_opcode(block->instructions[index].opcode) ==
                 Opcode::MulStart ||
-            !single_delay_slot_instruction(function,
-                                           block->instructions[index])) {
+            (!single_delay_slot_instruction(function,
+                                            block->instructions[index]) &&
+             !slot_store(function, block->instructions[index]))) {
             return std::nullopt;
         }
         const auto target = branch_after(function, *block, index + 1);
@@ -12237,7 +12740,9 @@ private:
         const auto plan_edge = [&](const machine::Block& source,
                                    machine::BlockId target,
                                    bool allow_fused_compare,
-                                   bool prior_branch_clears_hilo = false) {
+                                   bool prior_branch_clears_hilo = false,
+                                   std::optional<machine::BlockId>
+                                       speculative_against = {}) {
             // A successor's first operation cannot run before its prologue.
             if (target == source.id ||
                 function.frame.prologue_block == target ||
@@ -12264,9 +12769,25 @@ private:
                  index < successor->instructions.size(); ++index) {
                 const auto& candidate = successor->instructions[index];
                 if (no_output_prefix(candidate)) continue;
-                // The resume label follows a target operation.
+                // The resume label follows a target operation. A slot that
+                // runs only on this edge runs a store where it would run; one
+                // that runs on both, an operation whose result the other
+                // edge does not read.
+                if (speculative_against) {
+                    if (candidate.kind == machine::InstructionKind::Target &&
+                        speculative_delay_instruction(function, candidate) &&
+                        !(physical_registers(function,
+                                             candidate.defs.front()) &
+                          live_on_edge(function, source.id,
+                                       *speculative_against))
+                             .any()) {
+                        candidate_index = index;
+                    }
+                    break;
+                }
                 if (candidate.kind == machine::InstructionKind::Target &&
-                    single_delay_slot_instruction(function, candidate)) {
+                    (single_delay_slot_instruction(function, candidate) ||
+                     slot_store(function, candidate))) {
                     if (decode_opcode(candidate.opcode) == Opcode::MulStart &&
                         !prior_branch_clears_hilo &&
                         !hilo_delay_safe(source.id)) {
@@ -12315,6 +12836,7 @@ private:
             }
             auto edge = entry->second;
             edge.edge_target = edge_target;
+            edge.speculative = speculative_against.has_value();
             edge_delay_entries_.emplace(edge_key(source.id, edge_target),
                                         std::move(edge));
         };
@@ -12342,7 +12864,8 @@ private:
             const auto* no = std::get_if<machine::BlockOperand>(
                 &branch.operands[2]);
             if (!yes || !no || delay_slot_plan(function, source) ||
-                cross_block_delays_.contains(source.id.value)) {
+                cross_block_delays_.contains(source.id.value) ||
+                fallthrough_delays_.contains(source.id.value)) {
                 continue;
             }
             const bool yes_copies =
@@ -12379,6 +12902,13 @@ private:
                 } else if (next == no->target && !yes_copies) {
                     plan_edge(source, yes->target, false);
                 }
+            } else if (!yes_copies && !no_copies && !live_in_.empty()) {
+                // Without branch-likely forms, an ordinary branch runs the
+                // taken edge's first operation when the fallthrough edge
+                // does not read its result.
+                const auto taken = next == yes->target ? no->target
+                                                       : yes->target;
+                plan_edge(source, taken, false, false, *next);
             }
         }
 
@@ -12570,6 +13100,17 @@ private:
         std::int64_t displacement{};
     };
     std::unordered_map<std::uint32_t, CrossBlockDelay> cross_block_delays_;
+    // Physical registers live into each block after its PHIs, by block id;
+    // empty when the function's registers are not all modeled.
+    std::vector<PhysicalSet> live_in_;
+    // Delay-slot operations taken from the block a conditional branch falls
+    // through to, by branch block, and the operation each such block lends.
+    struct FallthroughDelay {
+        machine::BlockId block;
+        std::size_t instruction{};
+    };
+    std::unordered_map<std::uint32_t, FallthroughDelay> fallthrough_delays_;
+    std::unordered_map<std::uint32_t, std::size_t> lent_delays_;
 };
 
 void AssemblyEmitter::emit_integer_pair_binary(
@@ -15177,6 +15718,7 @@ void AssemblyEmitter::emit_terminator(
                     planned->second.instruction];
             }
         }
+        const bool likely_slot = !taken_delay || !taken_delay->speculative;
         if (!value.condition_predicate.empty()) {
             const auto predicate = decode_opcode(value.condition_predicate);
             const auto emit_fused_branch = [&, this](
@@ -15223,7 +15765,9 @@ void AssemblyEmitter::emit_terminator(
                             predicate != Opcode::CmpNe;
                         auto branch = branch_on_truth == truth_on_equal
                             ? std::string{"beq"} : std::string{"bne"};
-                        if (copy || use_taken_delay) branch += 'l';
+                        if (copy || (use_taken_delay && likely_slot)) {
+                            branch += 'l';
+                        }
                         instruction(branch,
                                     reg_name(left) + "," + reg_name(right) +
                                         "," + destination);
@@ -15235,7 +15779,9 @@ void AssemblyEmitter::emit_terminator(
                             function, value.uses[0], "t0", value.location);
                         auto branch = std::string{
                             branch_on_truth ? zero->first : zero->second};
-                        if (copy || use_taken_delay) branch += 'l';
+                        if (copy || (use_taken_delay && likely_slot)) {
+                            branch += 'l';
+                        }
                         instruction(branch,
                                     reg_name(tested) + "," + destination);
                         selected_delay();
@@ -15249,7 +15795,9 @@ void AssemblyEmitter::emit_terminator(
                     }
                     auto branch = branch_on_truth == *truth_on_nonzero
                         ? std::string{"bne"} : std::string{"beq"};
-                    if (copy || use_taken_delay) branch += 'l';
+                    if (copy || (use_taken_delay && likely_slot)) {
+                        branch += 'l';
+                    }
                     instruction(branch,
                                 "$at,$zero," +
                                     destination);
@@ -15312,7 +15860,9 @@ void AssemblyEmitter::emit_terminator(
                                 reg_name(left) + "," + reg_name(right));
                     auto branch = branch_on_truth == truth_on_condition
                         ? std::string{"bc1t"} : std::string{"bc1f"};
-                    if (copy || use_taken_delay) branch += 'l';
+                    if (copy || (use_taken_delay && likely_slot)) {
+                        branch += 'l';
+                    }
                     instruction(branch, destination);
                     selected_delay();
                     return true;
@@ -15440,9 +15990,11 @@ void AssemblyEmitter::emit_terminator(
             taken_candidate) {
             const auto condition_gpr = input_gpr(
                 function, condition, "t0", value.location);
-            instruction(taken_delay->edge_target == yes ? "bnezl" : "beqzl",
-                        reg_name(condition_gpr) + "," +
-                            taken_delay->resume_label);
+            std::string branch =
+                taken_delay->edge_target == yes ? "bnez" : "beqz";
+            if (likely_slot) branch += 'l';
+            instruction(branch, reg_name(condition_gpr) + "," +
+                                    taken_delay->resume_label);
             emit_target(function, *taken_candidate);
             if (neither_next) {
                 emit_successor_delay_branch(function, predecessor, no);
@@ -15827,10 +16379,14 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
     // their neighbors' plans; replan until the skipped blocks are exactly
     // the forwarded ones, or else keep every block in the layout.
     skipped_layout_.clear();
+    compute_physical_liveness(function);
     for (unsigned round = 0;; ++round) {
         plan_cross_block_delays(function);
         if (round < 3) forward_fallthrough_arms(function);
+        fallthrough_delays_.clear();
         plan_successor_delay_slots(function);
+        plan_fallthrough_delays(function);
+        if (!fallthrough_delays_.empty()) plan_successor_delay_slots(function);
         if (forwarded_blocks_ == skipped_layout_ ||
             (round >= 3 && skipped_layout_.empty())) {
             break;
@@ -15839,6 +16395,7 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
         else skipped_layout_ = forwarded_blocks_;
     }
     plan_elided_returns(function);
+    settle_fallthrough_delays(function);
 
     for (const auto block_id : function.layout) {
         const auto found = std::find_if(
@@ -15878,11 +16435,18 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
         const auto delay_plan = delay_slot_plan(function, *found);
         const auto given = given_delay_instruction(found->id);
         const auto taken = cross_block_delays_.find(found->id.value);
+        const auto fallthrough_delay =
+            fallthrough_delays_.find(found->id.value);
+        // The operation the branch laid out before this block runs.
+        const auto lent_delay = lent_delays_.find(found->id.value);
+        const auto lent = lent_delay != lent_delays_.end()
+            ? std::optional<std::size_t>{lent_delay->second}
+            : std::nullopt;
         machine::Instruction moved_delay;
         for (std::size_t index = 0;
              index < found->instructions.size(); ++index) {
             if ((delay_plan && index == delay_plan->candidate) ||
-                (given && index == *given)) {
+                (given && index == *given) || (lent && index == *lent)) {
                 continue;
             }
             const auto& value = found->instructions[index];
@@ -15974,6 +16538,11 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
                         source->instructions[taken->second.instruction],
                         taken->second.displacement);
                     delay = &moved_delay;
+                } else if (fallthrough_delay != fallthrough_delays_.end() &&
+                           index + 1 == found->instructions.size()) {
+                    const auto& lender = fallthrough_delay->second;
+                    delay = &find_block(function, lender.block)
+                                 ->instructions[lender.instruction];
                 }
                 std::string_view resume_after_compare;
                 const auto successor_delay =

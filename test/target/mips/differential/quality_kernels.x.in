@@ -549,3 +549,184 @@ global u32 k_q_scaled_rows(in u32 a, in u32 b, in u32 c) {
     }
     return r;
 }
+
+// Stores in delay slots: a loop's store moves past its pointer increment,
+// a store of the pointer itself stays before it, arms of one store run in
+// branch-likely or jump slots, and no store passes a later load, here of a
+// cell that one argument triple makes the stored one.
+global u32 q_cells[16];
+global u16 q_shorts[8];
+global f32 q_floats[8];
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_slot_stores(in u32 a, in u32 b, in u32 c) {
+    u32 *p = &q_cells[0];
+    u32 *end = &q_cells[8];
+    u32 v = a;
+    while (p != end) {
+        *p = v;
+        v = v * 3u32 + b;
+        p = p + 1;
+    }
+    u32 *q = &q_cells[8];
+    u32 *last = &q_cells[15];
+    while (q != last) {
+        *q = (u32)(uptr)q;
+        q = q + 1;
+    }
+    u32 *s = &q_cells[a & 7u32];
+    u32 *t = &q_cells[b & 7u32];
+    u32 r = c;
+    for (u32 i = 0u32; i < 4u32; ++i) {
+        *s = i + c;
+        if (*t == i + c) {
+            r = r + 1u32;
+        }
+    }
+    for (u32 i = 0u32; i < 8u32; ++i) {
+        if (((a >> i) & 1u32) != 0u32) {
+            q_shorts[i] = (u16)(b + i);
+        } else {
+            q_shorts[i] = (u16)(c ^ i);
+        }
+        if ((b & (1u32 << i)) != 0u32) {
+            q_floats[i] = (f32)i * 0.5f32;
+        }
+        q_cells[i] = q_cells[i] + 1u32;
+        r = r + q_cells[i];
+    }
+    for (u32 i = 8u32; i < 15u32; ++i) {
+        r = r + (q_cells[i] - (u32)(uptr)&q_cells[i]);
+    }
+    for (u32 i = 0u32; i < 8u32; ++i) {
+        r = r * 31u32 + q_shorts[i];
+        if (q_floats[i] > 1.0f32) {
+            r = r + 1u32;
+        }
+    }
+    return r;
+}
+
+// Delay slots that run the first operation of the block a branch falls
+// through to, which the taken edge must not need: a search entered from a
+// test whose other edge starts with a branch, and arms whose other edge
+// returns a value in the register such an operation would write.
+global u32 q_words[8] = {
+    0xffffffffu32, 0xffffffffu32, 0xfffffff7u32, 0xffffffffu32,
+    0u32, 0xffffffffu32, 0xffffffffu32, 0x0000ffffu32,
+};
+
+[[abi("@ABI@"), noinline]]
+static u32 q_pick(in u32 seed, in u32 other) {
+    u32 found = 7u32;
+    if ((seed & 196608u32) != 0u32) {
+        u32 w = seed & 3u32;
+        while (q_words[w] == 4294967295u32) {
+            ++w;
+        }
+        found = w;
+    } else if (other != 0u32) {
+        found = other * 5u32;
+    }
+    return found;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_fallthrough_slots(in u32 a, in u32 b, in u32 c) {
+    u32 live = c & 3u32;
+    u32 sum = 0u32;
+    u32 seed = a;
+    for (u32 n = 0u32; n < 12u32; ++n) {
+        seed = seed * 1664525u32 + 1013904223u32;
+        if ((seed & 196608u32) != 0u32) {
+            u32 w = (seed >> 9) & 3u32;
+            while (q_words[w] == 4294967295u32) {
+                ++w;
+            }
+            sum = sum + w;
+            live = live + 1u32;
+        } else if (live != 0u32) {
+            live = live - 1u32;
+        }
+        sum = sum + q_pick(seed ^ b, live & (n + b));
+    }
+    return sum ^ (live << 16);
+}
+
+// An inner loop whose exit test heads it and whose latch reaches it without
+// copies tests at its latch, where an increment fills the slot; the outer
+// loop enters it through its original test.
+global f32 q_points[16];
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_inner_exit(in u32 a, in u32 b, in u32 c) {
+    for (u32 i = 0u32; i < 16u32; ++i) {
+        q_points[i] = (f32)((a >> (i & 7u32)) & 31u32);
+    }
+    u32 contacts = c & 255u32;
+    u32 rounds = (b & 7u32) + 2u32;
+    for (u32 n = 0u32; n < rounds; ++n) {
+        u32 k = (n + b) & 15u32;
+        f32 x = q_points[k] + 0.5f32;
+        for (u32 j = 0u32; j < 16u32; ++j) {
+            if (j != k) {
+                f32 d = q_points[j] > x ? q_points[j] - x : x - q_points[j];
+                if (d < 3.0f32) {
+                    contacts = contacts + j;
+                }
+            }
+        }
+        q_points[k] = x;
+    }
+    return contacts;
+}
+
+// An inner loop whose back edge swaps values keeps its test in its header:
+// the swap's copies run on the way there.
+[[abi("@ABI@"), noinline]]
+global u32 k_q_inner_swap(in u32 a, in u32 b, in u32 c) {
+    u32 contacts = 0u32;
+    u32 rounds = (b & 3u32) + 2u32;
+    for (u32 r = 0u32; r < rounds; ++r) {
+        u32 x = a + r;
+        u32 y = b ^ r;
+        u32 k = (r + c) & 7u32;
+        u32 limit = (c & 7u32) + r + 1u32;
+        for (u32 j = 0u32; j < limit; ++j) {
+            if (j != k) {
+                contacts = contacts + (x ^ j);
+            }
+            u32 t = x;
+            x = y + j;
+            y = t;
+        }
+        contacts = contacts + x - y;
+    }
+    return contacts;
+}
+
+// After a loop that keeps more values across its calls, a loop's register
+// constant lives in a call-preserved register the function saves anyway.
+[[abi("@ABI@"), noinline]]
+static u32 q_step(in u32 x) {
+    return x * 3u32 + 1u32;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_call_constants(in u32 a, in u32 b, in u32 c) {
+    u32 x = a;
+    u32 y = b ^ 1u32;
+    u32 z = c + 7u32;
+    u32 count = (c & 7u32) + 1u32;
+    for (u32 i = 0u32; i < count; ++i) {
+        x = q_step(x + y);
+        y = y + z;
+    }
+    u32 r = x ^ y ^ z;
+    u32 j = 0u32;
+    while (q_step(r) != 24u32 && j < count) {
+        r = r + 3u32;
+        j = j + 1u32;
+    }
+    return r ^ j;
+}

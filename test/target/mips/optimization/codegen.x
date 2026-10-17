@@ -61,8 +61,7 @@ global u32 mips_successor_delay(in volatile u32 *cell,
     return (value ^ 255u32) + 3u32;
 }
 
-// One arm jumps to the join, whose fused signed comparison can fill that
-// jump's delay slot.
+// An arm of one store runs in a branch-likely delay slot.
 [[abi("o32"), noinline]]
 global i32 mips_successor_compare(in volatile i32 *cell, in i32 a,
                                   in i32 b) {
@@ -73,6 +72,48 @@ global i32 mips_successor_compare(in volatile i32 *cell, in i32 a,
     }
     if (a < b) {
         *cell = 7;
+    }
+    return 3;
+}
+
+[[abi("o32"), noinline]]
+global void mips_successor_sink(in u32 value) {
+    *(volatile u32 *)4096 = value;
+}
+
+[[abi("o32"), noinline]]
+global void mips_successor_other_sink(in u32 value) {
+    *(volatile u32 *)4100 = value;
+}
+
+[[abi("o32"), noinline]]
+global u32 mips_successor_other_sink_value(in u32 value) {
+    *(volatile u32 *)4100 = value;
+    return value * 3u32 + 1u32;
+}
+
+// After a call, an arm has no operation of its own for its jump's delay
+// slot: the join's first operation, or its fused signed comparison, runs
+// there.
+[[abi("o32"), noinline]]
+global u32 mips_successor_call_delay(in u32 condition, in u32 value) {
+    if (condition != 0) {
+        mips_successor_sink(value);
+    } else {
+        mips_successor_other_sink(value + 1u32);
+    }
+    return (value ^ 255u32) + 3u32;
+}
+
+[[abi("o32"), noinline]]
+global i32 mips_successor_call_compare(in i32 a, in i32 b) {
+    if (a != 0) {
+        mips_successor_sink((u32)b);
+    } else {
+        mips_successor_other_sink((u32)a);
+    }
+    if (a < b) {
+        mips_successor_sink(7u32);
     }
     return 3;
 }
@@ -608,4 +649,98 @@ global void mips_matrix_rows(in const i32 *matrix, in i32 *sums,
 [[abi("o32"), noinline]]
 global u64 mips_wide_masks(in u64 x) {
     return (x & 0x00000000ffffffffu64) ^ (x + 0x0fffffffff000000u64);
+}
+
+// The inner loop's exit test, which heads it, moves to its latch, where a
+// pointer increment fills the test's delay slot; the outer loop enters the
+// inner one through the original test.
+[[abi("o32"), noinline]]
+global u32 mips_inner_exit_test(in const u32 *cells, in u32 rounds) {
+    u32 hits = 0u32;
+    for (u32 n = 0u32; n < rounds; ++n) {
+        u32 k = n & 15u32;
+        for (u32 j = 0u32; j < 16u32; ++j) {
+            if (j != k && cells[j] > cells[k]) {
+                hits = hits + 1u32;
+            }
+        }
+    }
+    return hits;
+}
+
+// The test of a slot draw has nothing of its own for its delay slot, and
+// its other edge starts with a branch: the search's first operation, whose
+// result that edge does not read, fills it.
+[[abi("o32"), noinline]]
+global u32 mips_fallthrough_delay(in const u32 *cells, in u32 seed,
+                                  in u32 count) {
+    u32 live = 0u32;
+    u32 sum = 0u32;
+    for (u32 n = 0u32; n < count; ++n) {
+        seed = seed * 1664525u32 + 1013904223u32;
+        if ((seed & 196608u32) != 0u32) {
+            u32 w = 0u32;
+            while (cells[w] == 4294967295u32) {
+                ++w;
+            }
+            sum = sum + w;
+            live = live + 1u32;
+        } else if (live != 0u32) {
+            live = live - 1u32;
+        }
+    }
+    return sum ^ live;
+}
+
+global i32 mips_range_px[32];
+global i32 mips_range_vx[32];
+
+// The upper bound of the range test is live where the loop's pressure
+// peaks, so it leaves the loop at -Oz without a further saved register.
+[[abi("o32"), noinline]]
+global u32 mips_range_loop(in u32 count, in i32 limit) {
+    u32 hits = 0u32;
+    for (u32 n = 0u32; n < count; ++n) {
+        u32 k = n & 31u32;
+        i32 vx = mips_range_vx[k] * 3i32 + limit;
+        i32 px = mips_range_px[k] + vx;
+        if (px < -1048576i32 || px > 1048576i32) {
+            vx = 0i32 - vx;
+            px = mips_range_px[k];
+            hits = hits + 1u32;
+        }
+        mips_range_px[k] = px;
+        mips_range_vx[k] = vx;
+    }
+    return hits;
+}
+
+// The second loop's calls keep fewer values than the first loop's, so its
+// comparison constant lives in a call-preserved register saved anyway.
+[[abi("o32"), noinline]]
+global u32 mips_call_constant_loop(in u32 count, in u32 seed) {
+    u32 a = seed;
+    u32 b = seed ^ 1u32;
+    u32 c = seed + 7u32;
+    for (u32 i = 0u32; i < count; ++i) {
+        a = mips_successor_other_sink_value(a + b);
+        b = b + c;
+    }
+    u32 r = a ^ b ^ c;
+    u32 j = 0u32;
+    while (mips_successor_other_sink_value(r) != 24u32 && j < count) {
+        r = r + 3u32;
+        j = j + 1u32;
+    }
+    return r ^ j;
+}
+
+global u16 mips_stored_halves[8];
+
+// A halfword store of a value that stays live stores that value's register.
+[[abi("o32"), noinline]]
+global u32 mips_truncated_store(in u32 index, in u32 value) {
+    u32 slot = value * 32u32 + index;
+    mips_stored_halves[index & 7u32] = (u16)slot;
+    return slot * 3u32;
 }

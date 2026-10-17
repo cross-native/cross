@@ -1460,6 +1460,246 @@ _start:
 	move $4,$2
 	jal print_hex
 	nop
+	li $4,1
+	li $5,3
+	li $6,5
+	jal k_q_slot_stores
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,7
+	li $5,2
+	li $6,0
+	jal k_q_slot_stores
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,-1
+	li $5,-2147483648
+	li $6,2147483647
+	jal k_q_slot_stores
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,305419896
+	li $5,-1698898192
+	li $6,43
+	jal k_q_slot_stores
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,-2147483648
+	li $5,-1
+	li $6,16
+	jal k_q_slot_stores
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,15
+	li $5,16
+	li $6,33
+	jal k_q_slot_stores
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,1
+	li $5,3
+	li $6,5
+	jal k_q_fallthrough_slots
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,7
+	li $5,2
+	li $6,0
+	jal k_q_fallthrough_slots
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,-1
+	li $5,-2147483648
+	li $6,2147483647
+	jal k_q_fallthrough_slots
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,305419896
+	li $5,-1698898192
+	li $6,43
+	jal k_q_fallthrough_slots
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,-2147483648
+	li $5,-1
+	li $6,16
+	jal k_q_fallthrough_slots
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,15
+	li $5,16
+	li $6,33
+	jal k_q_fallthrough_slots
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,1
+	li $5,3
+	li $6,5
+	jal k_q_inner_exit
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,7
+	li $5,2
+	li $6,0
+	jal k_q_inner_exit
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,-1
+	li $5,-2147483648
+	li $6,2147483647
+	jal k_q_inner_exit
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,305419896
+	li $5,-1698898192
+	li $6,43
+	jal k_q_inner_exit
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,-2147483648
+	li $5,-1
+	li $6,16
+	jal k_q_inner_exit
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,15
+	li $5,16
+	li $6,33
+	jal k_q_inner_exit
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,1
+	li $5,3
+	li $6,5
+	jal k_q_inner_swap
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,7
+	li $5,2
+	li $6,0
+	jal k_q_inner_swap
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,-1
+	li $5,-2147483648
+	li $6,2147483647
+	jal k_q_inner_swap
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,305419896
+	li $5,-1698898192
+	li $6,43
+	jal k_q_inner_swap
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,-2147483648
+	li $5,-1
+	li $6,16
+	jal k_q_inner_swap
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,15
+	li $5,16
+	li $6,33
+	jal k_q_inner_swap
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,1
+	li $5,3
+	li $6,5
+	jal k_q_call_constants
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,7
+	li $5,2
+	li $6,0
+	jal k_q_call_constants
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,-1
+	li $5,-2147483648
+	li $6,2147483647
+	jal k_q_call_constants
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,305419896
+	li $5,-1698898192
+	li $6,43
+	jal k_q_call_constants
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,-2147483648
+	li $5,-1
+	li $6,16
+	jal k_q_call_constants
+	nop
+	move $4,$2
+	jal print_hex
+	nop
+	li $4,15
+	li $5,16
+	li $6,33
+	jal k_q_call_constants
+	nop
+	move $4,$2
+	jal print_hex
+	nop
 	move $4,$0
 	daddiu $2,$0,1
 	daddiu $25,$0,1

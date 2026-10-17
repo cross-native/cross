@@ -178,7 +178,243 @@ std::vector<NaturalLoop> natural_loops(const machine::Function& function,
     return loops;
 }
 
+// The block targets of a branch, in operand order.
+std::vector<machine::BlockId> branch_targets(
+    const machine::Instruction& instruction) {
+    std::vector<machine::BlockId> targets;
+    for (const auto& operand : instruction.operands) {
+        if (const auto* block = std::get_if<machine::BlockOperand>(&operand)) {
+            targets.push_back(block->target);
+        }
+    }
+    return targets;
+}
+
 } // namespace
+
+bool duplicate_branch_blocks(machine::Function& function,
+                             const BranchDuplicationPolicy& policy) {
+    const auto count = function.blocks.size();
+    if (count < 2 || function.layout.size() != count) return false;
+    for (std::uint32_t block = 0; block < count; ++block) {
+        if (function.blocks[block].id.value != block) return false;
+    }
+    const auto addressable = [&](std::uint32_t block) {
+        return policy.is_addressable && policy.is_addressable({block});
+    };
+    // The block laid out after `block`, if any.
+    const auto next = [&](std::uint32_t block) -> std::optional<std::uint32_t> {
+        const auto at = std::find(function.layout.begin(),
+                                  function.layout.end(),
+                                  machine::BlockId{block});
+        if (at == function.layout.end() || at + 1 == function.layout.end()) {
+            return std::nullopt;
+        }
+        return (at + 1)->value;
+    };
+    const auto jump_target = [&](std::uint32_t block)
+        -> std::optional<std::uint32_t> {
+        const auto& instructions = function.blocks[block].instructions;
+        if (instructions.empty() ||
+            instructions.back().kind != machine::InstructionKind::Branch) {
+            return std::nullopt;
+        }
+        const auto targets = branch_targets(instructions.back());
+        if (targets.size() != 1) return std::nullopt;
+        return targets.front().value;
+    };
+    // A block of PHIs and code-free instructions ending in a conditional
+    // branch to two other blocks.
+    const auto tests_only = [&](std::uint32_t block) {
+        const auto& value = function.blocks[block];
+        if (block == function.entry.value || addressable(block) ||
+            function.frame.prologue_block == value.id ||
+            value.instructions.empty() ||
+            value.instructions.back().kind !=
+                machine::InstructionKind::ConditionalBranch) {
+            return false;
+        }
+        for (std::size_t index = 0; index + 1 < value.instructions.size();
+             ++index) {
+            const auto& instruction = value.instructions[index];
+            if (!policy.is_phi(instruction) &&
+                !policy.emits_nothing(instruction)) {
+                return false;
+            }
+        }
+        const auto targets = branch_targets(value.instructions.back());
+        return targets.size() == 2 && targets[0] != targets[1] &&
+            targets[0].value != block && targets[1].value != block &&
+            targets[0].value < count && targets[1].value < count;
+    };
+
+    // Whether `source` reaches `header` by a back edge and `inside`, a
+    // successor of the header, lies in that loop while its other successor
+    // leaves it.
+    const auto looping = [&](std::uint32_t header, std::uint32_t source,
+                             std::uint32_t inside) {
+        const auto dominance = block_dominance(function);
+        if (!dominance.dominates(header, source)) return false;
+        for (const auto& loop : natural_loops(function, dominance)) {
+            if (loop.header != header) continue;
+            const auto targets = function.blocks[header].successors;
+            return std::all_of(targets.begin(), targets.end(),
+                               [&](machine::BlockId block) {
+                                   return loop.members[block.value] ==
+                                       (block.value == inside);
+                               });
+        }
+        return false;
+    };
+
+    bool changed = false;
+    for (std::size_t round = 0; round < count; ++round) {
+        bool duplicated = false;
+        for (std::uint32_t tested = 0; tested < count && !duplicated;
+             ++tested) {
+            if (!tests_only(tested)) continue;
+            const auto& branch = function.blocks[tested].instructions.back();
+            const auto targets = branch_targets(branch);
+            const auto target = [&](std::optional<std::uint32_t> block) {
+                return block && (*block == targets[0].value ||
+                                 *block == targets[1].value);
+            };
+            // Another predecessor keeps the tested block reachable.
+            const auto predecessors = function.blocks[tested].predecessors;
+            if (predecessors.size() < 2) continue;
+            for (const auto source_id : predecessors) {
+                const auto source = source_id.value;
+                if (source >= count || source == tested ||
+                    jump_target(source) != tested ||
+                    !policy.copy_free(source_id, {tested})) {
+                    continue;
+                }
+                // Only a loop test that falls through into its loop and
+                // branches out of it wastes its delay slot on the loop's
+                // path; one laid out after its loop already branches back
+                // with a useful slot.
+                const auto after_tested = next(tested);
+                if (next(source) != tested || !target(after_tested) ||
+                    !looping(tested, source, *after_tested)) {
+                    continue;
+                }
+                // The tested block moves after another block that jumps to
+                // it and is laid out before one of its targets, so that
+                // block no longer jumps and the tested one still falls
+                // through.
+                std::optional<std::uint32_t> host;
+                for (const auto other : predecessors) {
+                    if (other.value != source && other.value < count &&
+                        jump_target(other.value) == tested &&
+                        next(other.value) != tested &&
+                        target(next(other.value))) {
+                        host = other.value;
+                        break;
+                    }
+                }
+                if (!host) continue;
+
+                // The source passes its own incoming value where the tested
+                // block's PHI result would flow.
+                std::unordered_map<std::uint32_t, machine::Register> incoming;
+                for (const auto& instruction :
+                     function.blocks[tested].instructions) {
+                    if (!policy.is_phi(instruction) ||
+                        instruction.defs.size() != 1) {
+                        continue;
+                    }
+                    for (std::size_t index = 0;
+                         index + 1 < instruction.operands.size();
+                         index += 2) {
+                        const auto* from = std::get_if<machine::BlockOperand>(
+                            &instruction.operands[index]);
+                        const auto* value =
+                            std::get_if<machine::RegisterOperand>(
+                                &instruction.operands[index + 1]);
+                        if (from && value && from->target.value == source) {
+                            incoming.emplace(instruction.defs.front().id,
+                                             value->value);
+                        }
+                    }
+                }
+                const auto rename = [&](machine::Register value) {
+                    if (value.kind != machine::RegisterKind::Virtual) {
+                        return value;
+                    }
+                    const auto found = incoming.find(value.id);
+                    return found == incoming.end() ? value : found->second;
+                };
+                auto copy = branch;
+                for (auto& use : copy.uses) use = rename(use);
+                for (auto& operand : copy.operands) {
+                    if (auto* value =
+                            std::get_if<machine::RegisterOperand>(&operand)) {
+                        value->value = rename(value->value);
+                    }
+                }
+                auto& source_block = function.blocks[source];
+                source_block.instructions.back() = std::move(copy);
+                source_block.successors = targets;
+                for (const auto successor : targets) {
+                    auto& block = function.blocks[successor.value];
+                    block.predecessors.push_back(source_id);
+                    for (auto& instruction : block.instructions) {
+                        if (!policy.is_phi(instruction)) continue;
+                        for (std::size_t index = 0;
+                             index + 1 < instruction.operands.size();
+                             index += 2) {
+                            const auto* from =
+                                std::get_if<machine::BlockOperand>(
+                                    &instruction.operands[index]);
+                            const auto* value =
+                                std::get_if<machine::RegisterOperand>(
+                                    &instruction.operands[index + 1]);
+                            if (!from || !value ||
+                                from->target.value != tested) {
+                                continue;
+                            }
+                            const machine::Operand edge =
+                                machine::BlockOperand{source_id};
+                            const machine::Operand passed =
+                                machine::RegisterOperand{
+                                    rename(value->value)};
+                            instruction.operands.push_back(edge);
+                            instruction.operands.push_back(passed);
+                            break;
+                        }
+                    }
+                }
+                auto& tested_block = function.blocks[tested];
+                std::erase(tested_block.predecessors, source_id);
+                for (auto& instruction : tested_block.instructions) {
+                    if (!policy.is_phi(instruction)) continue;
+                    for (std::size_t index = 0;
+                         index + 1 < instruction.operands.size();
+                         index += 2) {
+                        const auto* from = std::get_if<machine::BlockOperand>(
+                            &instruction.operands[index]);
+                        if (from && from->target.value == source) {
+                            const auto at = instruction.operands.begin() +
+                                static_cast<std::ptrdiff_t>(index);
+                            instruction.operands.erase(at, at + 2);
+                            break;
+                        }
+                    }
+                }
+                std::erase(function.layout, machine::BlockId{tested});
+                const auto at = std::find(function.layout.begin(),
+                                          function.layout.end(),
+                                          machine::BlockId{*host});
+                function.layout.insert(at + 1, machine::BlockId{tested});
+                duplicated = true;
+                changed = true;
+                break;
+            }
+        }
+        if (!duplicated) break;
+    }
+    return changed;
+}
 
 std::vector<unsigned> loop_depths(const machine::Function& function) {
     std::vector<unsigned> depths(function.blocks.size());
@@ -193,11 +429,26 @@ std::vector<unsigned> loop_depths(const machine::Function& function) {
 
 namespace {
 
-// The largest number of simultaneously live virtual registers of each bank
-// at any point of each block, from a backward liveness solution in which a
-// PHI's uses are live out of the predecessor they arrive from.
-std::vector<std::vector<unsigned>> block_pressure(
-    const machine::Function& function, const LoopConstantPolicy& policy) {
+// The live virtual registers of each bank at every point of a function,
+// from a backward liveness solution in which a PHI's uses are live out of
+// the predecessor they arrive from. A block's points are its end, each
+// instruction (whose definitions occupy colors even when dead), and the
+// point before each instruction. For each register of `tracked`, the
+// points where it is live or being defined.
+struct PressurePoints {
+    std::vector<std::vector<unsigned>> counts;
+    std::vector<std::uint32_t> block;
+    // Each block's first point, its end; its terminator's two follow.
+    std::vector<std::size_t> first;
+    std::unordered_map<std::uint32_t, std::vector<bool>> live;
+    // Each call's block and the values of each bank live across it.
+    std::vector<std::pair<std::uint32_t, std::vector<unsigned>>> calls;
+};
+
+PressurePoints pressure_points(const machine::Function& function,
+                               const LoopConstantPolicy& policy,
+                               const std::unordered_set<std::uint32_t>&
+                                   tracked_ids) {
     const auto count = function.blocks.size();
     const auto banks = policy.capacity.size();
     std::vector<std::optional<unsigned>> bank_of(
@@ -268,14 +519,32 @@ std::vector<std::vector<unsigned>> block_pressure(
             }
         }
     }
-    std::vector<std::vector<unsigned>> pressure(
-        count, std::vector<unsigned>(banks));
+    PressurePoints points;
+    for (const auto id : tracked_ids) points.live[id];
+    const auto record = [&](std::uint32_t block,
+                            const std::vector<unsigned>& counts,
+                            const LiveSet& live,
+                            const machine::Instruction* defining) {
+        points.counts.push_back(counts);
+        points.block.push_back(block);
+        for (auto& [id, at] : points.live) {
+            bool present = live.contains(id);
+            if (defining) {
+                for (const auto& definition : defining->defs) {
+                    present = present || (definition.kind ==
+                                              machine::RegisterKind::Virtual &&
+                                          definition.id == id);
+                }
+            }
+            at.push_back(present);
+        }
+    };
     for (std::uint32_t block = 0; block < count; ++block) {
         auto live = live_out[block];
         std::vector<unsigned> current(banks);
         for (const auto id : live) ++current[*bank_of[id]];
-        auto& peak = pressure[block];
-        peak = current;
+        points.first.push_back(points.counts.size());
+        record(block, current, live, nullptr);
         const auto& instructions = function.blocks[block].instructions;
         for (auto instruction = instructions.rbegin();
              instruction != instructions.rend(); ++instruction) {
@@ -286,10 +555,14 @@ std::vector<std::vector<unsigned>> block_pressure(
                     ++at[*bank_of[definition.id]];
                 }
             }
+            record(block, at, live, &*instruction);
             for (const auto& definition : instruction->defs) {
                 if (tracked(definition) && live.erase(definition.id)) {
                     --current[*bank_of[definition.id]];
                 }
+            }
+            if (instruction->kind == machine::InstructionKind::Call) {
+                points.calls.emplace_back(block, current);
             }
             if (!policy.is_phi(*instruction)) {
                 for (const auto& use : instruction->uses) {
@@ -298,12 +571,10 @@ std::vector<std::vector<unsigned>> block_pressure(
                     }
                 }
             }
-            for (std::size_t bank = 0; bank < banks; ++bank) {
-                peak[bank] = std::max({peak[bank], at[bank], current[bank]});
-            }
+            record(block, current, live, nullptr);
         }
     }
-    return pressure;
+    return points;
 }
 
 bool control_transfer(const machine::Instruction& instruction) {
@@ -333,8 +604,10 @@ bool hoist_loop_constants(machine::Function& function,
                      [](const NaturalLoop& left, const NaturalLoop& right) {
                          return left.size < right.size;
                      });
-    // A constant that only PHIs read still costs a copy on every edge.
+    // A constant that only PHIs read still costs a copy on every edge, and
+    // one that only calls read a copy into its argument register.
     std::vector<bool> operand_use(function.virtual_registers.size());
+    std::vector<bool> operation_use(function.virtual_registers.size());
     for (const auto& block : function.blocks) {
         for (const auto& instruction : block.instructions) {
             if (policy.is_phi(instruction)) continue;
@@ -342,6 +615,8 @@ bool hoist_loop_constants(machine::Function& function,
                 if (use.kind == machine::RegisterKind::Virtual &&
                     use.id < operand_use.size()) {
                     operand_use[use.id] = true;
+                    operation_use[use.id] = operation_use[use.id] ||
+                        instruction.kind != machine::InstructionKind::Call;
                 }
             }
         }
@@ -353,9 +628,29 @@ bool hoist_loop_constants(machine::Function& function,
                operand_use[instruction.defs.front().id] &&
                policy.bank(instruction.defs.front()).has_value();
     };
-    // Pressure only grows as constants leave inner loops; a hoisted
-    // constant counts as live in every block of the loop it left.
-    auto pressure = block_pressure(function, policy);
+    std::unordered_set<std::uint32_t> constant_ids;
+    for (const auto& block : function.blocks) {
+        for (const auto& instruction : block.instructions) {
+            if (constant(instruction)) {
+                constant_ids.insert(instruction.defs.front().id);
+            }
+        }
+    }
+    // A hoisted constant is live at every point of the loop it leaves and
+    // at the end of the loop's preheader, so it adds a register at each of
+    // them where it was not already live. Constants are hoisted while
+    // every such point stays within the bank's limit: its capacity, or the
+    // function's peak when that is higher but still within the bank's
+    // colors, since a point that stays below the peak needs no new color.
+    auto points = pressure_points(function, policy, constant_ids);
+    std::vector<unsigned> limit = policy.capacity;
+    for (std::size_t bank = 0; bank < limit.size(); ++bank) {
+        unsigned peak = 0;
+        for (const auto& at : points.counts) peak = std::max(peak, at[bank]);
+        if (bank < policy.colors.size() && peak <= policy.colors[bank]) {
+            limit[bank] = std::max(limit[bank], peak);
+        }
+    }
     bool changed = false;
     for (const auto& loop : loops) {
         std::optional<std::uint32_t> preheader;
@@ -384,15 +679,41 @@ bool hoist_loop_constants(machine::Function& function,
                 candidates = candidates || constant(instruction);
             }
         }
-        if (calls || !candidates) continue;
-
-        std::vector<unsigned> peak(policy.capacity.size());
-        for (std::uint32_t block = 0; block < count; ++block) {
-            if (!loop.members[block]) continue;
-            for (std::size_t bank = 0; bank < peak.size(); ++bank) {
-                peak[bank] = std::max(peak[bank], pressure[block][bank]);
+        if (!candidates) continue;
+        // A constant hoisted out of a loop with calls lives across them in
+        // a call-preserved color. The function already preserves as many
+        // as the values live across its busiest call; those that the
+        // loop's calls leave free cost nothing more.
+        std::vector<unsigned> preserved_free(limit.size());
+        if (calls) {
+            std::vector<unsigned> busiest(limit.size());
+            std::vector<unsigned> busiest_in_loop(limit.size());
+            for (const auto& [block, across] : points.calls) {
+                for (std::size_t bank = 0; bank < across.size(); ++bank) {
+                    busiest[bank] = std::max(busiest[bank], across[bank]);
+                    if (loop.members[block]) {
+                        busiest_in_loop[bank] =
+                            std::max(busiest_in_loop[bank], across[bank]);
+                    }
+                }
+            }
+            for (std::size_t bank = 0; bank < limit.size(); ++bank) {
+                preserved_free[bank] = busiest[bank] - busiest_in_loop[bank];
             }
         }
+
+        // The loop's points, and the preheader's end and terminator, before
+        // which the constants go.
+        std::vector<std::size_t> region;
+        for (std::size_t point = 0; point < points.block.size(); ++point) {
+            if (loop.members[points.block[point]]) region.push_back(point);
+        }
+        for (std::size_t point = points.first[*preheader];
+             point < points.first[*preheader] + 3; ++point) {
+            region.push_back(point);
+        }
+        std::vector<std::vector<unsigned>> added(
+            region.size(), std::vector<unsigned>(limit.size()));
         auto& target = function.blocks[*preheader].instructions;
         ReplacementMap replacements;
         std::vector<machine::Instruction> hoisted;
@@ -419,31 +740,37 @@ bool hoist_loop_constants(machine::Function& function,
                     continue;
                 }
                 const auto bank = *policy.bank(instruction->defs.front());
-                if (peak[bank] + 1 > policy.capacity[bank]) {
+                const auto& live =
+                    points.live.at(instruction->defs.front().id);
+                bool fits = !calls ||
+                    (preserved_free[bank] != 0 &&
+                     operation_use[instruction->defs.front().id]);
+                for (std::size_t index = 0; index < region.size() && fits;
+                     ++index) {
+                    const auto point = region[index];
+                    fits = points.counts[point][bank] + added[index][bank] +
+                            (live[point] ? 0U : 1U) <= limit[bank];
+                }
+                if (!fits) {
                     ++instruction;
                     continue;
                 }
-                ++peak[bank];
+                for (std::size_t index = 0; index < region.size(); ++index) {
+                    if (!live[region[index]]) ++added[index][bank];
+                }
+                if (calls) --preserved_free[bank];
                 hoisted.push_back(std::move(*instruction));
                 instruction = instructions.erase(instruction);
             }
         }
         if (hoisted.empty() && replacements.empty()) continue;
-        std::vector<unsigned> added(policy.capacity.size());
-        for (const auto& instruction : hoisted) {
-            ++added[*policy.bank(instruction.defs.front())];
-        }
-        for (std::uint32_t block = 0; block < count; ++block) {
-            if (!loop.members[block] && block != *preheader) continue;
-            for (std::size_t bank = 0; bank < added.size(); ++bank) {
-                pressure[block][bank] += added[bank];
-            }
-        }
         target.insert(target.end() - 1,
                       std::make_move_iterator(hoisted.begin()),
                       std::make_move_iterator(hoisted.end()));
         if (!replacements.empty()) apply_replacements(function, replacements);
         changed = true;
+        // Outer loops see the constants in this loop's preheader.
+        points = pressure_points(function, policy, constant_ids);
     }
     return changed;
 }

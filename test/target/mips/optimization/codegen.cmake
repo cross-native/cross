@@ -98,8 +98,10 @@ compile_variant(no_ivopts -fno-ivopts)
 compile_variant(no_memory_if_conversion -fif-conversion-memory-limit=0)
 compile_variant(force_memory_if_conversion -fif-conversion-memory-limit=12)
 compile_variant(force_ordinary_if_conversion -fif-conversion-limit=12)
+compile_variant(no_reorder -fno-reorder-blocks)
 compile_size_variant(size)
 compile_size_variant(size_no_machine_combine -fno-machine-combine)
+compile_size_variant(size_no_licm -fno-move-loop-invariants)
 compile_reassociation_variant(reassoc_risc 0)
 compile_reassociation_variant(reassoc_risc_off 0 -fno-tree-reassoc)
 compile_reassociation_variant(reassoc_cisc 100 -fno-unroll-loops)
@@ -214,14 +216,34 @@ if(NOT empty_delay MATCHES "[	 ]b(eq|ne)[^\n]*\n[	 ]+nop")
         "-fno-schedule-insns2 did not leave the delay slot empty\n${empty_delay}")
 endif()
 
+# A store fills its own arm's jump slot, and an arm of one store runs in
+# the branch's branch-likely slot.
 function_body("${OUTPUT}.enabled.s"
-              mips_successor_delay scheduled_successor)
+              mips_successor_delay scheduled_store_arm)
+function_body("${OUTPUT}.enabled.s"
+              mips_successor_compare forwarded_store_arm)
 function_body("${OUTPUT}.no_delay.s"
-              mips_successor_delay empty_successor)
+              mips_successor_compare empty_store_arm)
+if(NOT scheduled_store_arm MATCHES
+       "[\t ]b[\t ]+\\.Lcross[.]mips[.][0-9_]+[.]bb[.][0-9]+\n[\t ]+sw[\t ]" OR
+   NOT forwarded_store_arm MATCHES
+       "[\t ]b(eq|ne)z?l[\t ][^\n]*\n[\t ]+sw[\t ]" OR
+   empty_store_arm MATCHES "[\t ]b[a-z]*[\t ][^\n]*\n[\t ]+sw[\t ]")
+    message(FATAL_ERROR
+        "a store did not fill its arm's delay slot or -fno-schedule-insns2 "
+        "was ignored\n"
+        "scheduled:\n${scheduled_store_arm}\nforwarded:\n${forwarded_store_arm}\n"
+        "disabled:\n${empty_store_arm}")
+endif()
+
+function_body("${OUTPUT}.enabled.s"
+              mips_successor_call_delay scheduled_successor)
+function_body("${OUTPUT}.no_delay.s"
+              mips_successor_call_delay empty_successor)
 if(NOT scheduled_successor MATCHES
        "[\t ]b[\t ]+\\.Lcross[.]mips[.][0-9_]+[.]tmp[.][0-9]+\n[\t ]+xori[\t ]" OR
    NOT scheduled_successor MATCHES
-       "[\t ]xori[^\n]*\n\\.Lcross[.]mips[.][0-9_]+[.]tmp[.][0-9]+:\n([\t ]+jr[\t ]+\\$ra\n)?[\t ]+addiu[\t ]" OR
+       "[\t ]xori[^\n]*\n\\.Lcross[.]mips[.][0-9_]+[.]tmp[.][0-9]+:\n[\t ]+(jr|b)[\t ][^\n]*\n[\t ]+addiu[\t ]" OR
    NOT empty_successor MATCHES
        "[\t ]b[\t ]+\\.Lcross[.]mips[.][0-9_]+[.]bb[.][0-9]+\n[\t ]+nop")
     message(FATAL_ERROR
@@ -231,9 +253,9 @@ if(NOT scheduled_successor MATCHES
 endif()
 
 function_body("${OUTPUT}.enabled.s"
-              mips_successor_compare scheduled_successor_compare)
+              mips_successor_call_compare scheduled_successor_compare)
 function_body("${OUTPUT}.no_delay.s"
-              mips_successor_compare empty_successor_compare)
+              mips_successor_call_compare empty_successor_compare)
 if(NOT scheduled_successor_compare MATCHES
        "[\t ]b[\t ]+\\.Lcross[.]mips[.][0-9_]+[.]tmp[.][0-9]+\n[\t ]+sltu?[\t ]" OR
    NOT scheduled_successor_compare MATCHES
@@ -1039,4 +1061,84 @@ if(NOT wide_masks MATCHES
    wide_masks MATCHES "[\t ]li[\t ][^\n]*,0\n")
     message(FATAL_ERROR
         "MIPS doubleword constants took longer sequences\n${wide_masks}")
+endif()
+# An inner loop whose test heads it tests at its latch, where a pointer
+# increment fills the slot, under -freorder-blocks.
+function_body("${OUTPUT}.enabled.s" mips_inner_exit_test inner_exit)
+function_body("${OUTPUT}.no_reorder.s" mips_inner_exit_test inner_exit_unrotated)
+if(NOT inner_exit MATCHES
+       "[\t ]beq[\t ][^\n]*\n[\t ]+addiu[\t ]+[$][a-z0-9]+,[$][a-z0-9]+,4\n" OR
+   inner_exit_unrotated MATCHES
+       "[\t ]beq[\t ][^\n]*\n[\t ]+addiu[\t ]+[$][a-z0-9]+,[$][a-z0-9]+,4\n")
+    message(FATAL_ERROR
+        "an inner loop did not test at its latch, or -fno-reorder-blocks "
+        "was ignored\n"
+        "enabled:\n${inner_exit}\nwithout:\n${inner_exit_unrotated}")
+endif()
+# A branch's delay slot runs the first operation of the block it falls
+# through to when the taken edge does not read its result.
+function_body("${OUTPUT}.enabled.s" mips_fallthrough_delay fallthrough_delay)
+function_body("${OUTPUT}.no_delay.s" mips_fallthrough_delay
+              fallthrough_delay_empty)
+if(NOT fallthrough_delay MATCHES
+       "[\t ]and[\t ][^\n]*\n[\t ]+beq[\t ][^\n]*\n[\t ]+li[\t ][^\n]*,0\n" OR
+   NOT fallthrough_delay_empty MATCHES
+       "[\t ]and[\t ][^\n]*\n[\t ]+beq[\t ][^\n]*\n[\t ]+nop\n")
+    message(FATAL_ERROR
+        "a branch did not run its fallthrough's first operation in its "
+        "delay slot, or -fno-schedule-insns2 was ignored\n"
+        "enabled:\n${fallthrough_delay}\nwithout:\n${fallthrough_delay_empty}")
+endif()
+# Loop constants live at the loop's pressure peak leave it at -Oz without
+# another saved register, and a loop with calls keeps a constant in a
+# call-preserved register the function saves anyway.
+function_body("${OUTPUT}.size.s" mips_range_loop range_loop)
+function_body("${OUTPUT}.size_no_licm.s" mips_range_loop range_loop_inside)
+function_body("${OUTPUT}.enabled.s" mips_call_constant_loop call_constants)
+function_body("${OUTPUT}.no_licm.s" mips_call_constant_loop
+              call_constants_inside)
+string(REGEX MATCHALL "[\t ]sd[\t ]+[$]s[0-7]," range_saves "${range_loop}")
+string(REGEX MATCHALL "[\t ]sd[\t ]+[$]s[0-7]," call_saves "${call_constants}")
+string(REGEX MATCHALL "[\t ]sd[\t ]+[$]s[0-7]," call_saves_inside
+       "${call_constants_inside}")
+list(LENGTH range_saves range_save_count)
+list(LENGTH call_saves call_save_count)
+list(LENGTH call_saves_inside call_save_count_inside)
+# The hoisted constant comes before the loop's first array access in the
+# layout; in the loop it comes after it.
+string(FIND "${range_loop}" ",2097152\n" range_constant)
+string(FIND "${range_loop}" "%lo(mips_range_px)" range_access)
+string(FIND "${range_loop_inside}" ",2097152\n" range_constant_inside)
+string(FIND "${range_loop_inside}" "%lo(mips_range_px)" range_access_inside)
+if(range_constant EQUAL -1 OR NOT range_constant LESS range_access OR
+   range_constant_inside LESS range_access_inside OR
+   range_save_count GREATER 1 OR
+   call_constants MATCHES "[\t ]li[\t ][^\n]*,24\n[\t ]+beql" OR
+   NOT call_constants_inside MATCHES "[\t ]li[\t ][^\n]*,24\n[\t ]+beql" OR
+   NOT call_save_count EQUAL call_save_count_inside)
+    message(FATAL_ERROR
+        "MIPS loop constants at a pressure peak or in a loop with calls "
+        "stayed in the loop or added a saved register, or "
+        "-fno-move-loop-invariants was ignored\n"
+        "size:\n${range_loop}\nwithout:\n${range_loop_inside}\n"
+        "calls:\n${call_constants}\nwithout:\n${call_constants_inside}")
+endif()
+# A truncation that only stores read shares its source's register.
+function_body("${OUTPUT}.enabled.s" mips_truncated_store truncated_store)
+if(NOT truncated_store MATCHES "[\t ]sh[\t ]" OR
+   truncated_store MATCHES "[\t ]move[^\n]*\n[\t ]+sh[\t ]")
+    message(FATAL_ERROR
+        "a halfword store copied its live source first\n${truncated_store}")
+endif()
+# Without branch-likely forms (R3000), an ordinary branch runs a one-operation
+# arm in its delay slot when its other edge does not read the result.
+function_body("${OUTPUT}.r3000.s" mips_ring_step ring_step_r3000)
+function_body("${OUTPUT}.no_delay.s" mips_ring_step ring_step_unfilled)
+if(NOT ring_step_r3000 MATCHES "[\t ]bne[\t ][^\n]*\n[\t ]+addiu[\t ][^\n]*,-1\n" OR
+   ring_step_r3000 MATCHES "[\t ]b[a-z]+l[\t ]" OR
+   ring_step_unfilled MATCHES "[\t ]bne[\t ][^\n]*\n[\t ]+addiu[\t ][^\n]*,-1\n")
+    message(FATAL_ERROR
+        "an R3000 branch did not run its taken arm in its delay slot, or "
+        "-fno-schedule-insns2 was ignored\n"
+        "r3000:\n${ring_step_r3000}\nwithout:\n${ring_step_unfilled}")
 endif()
