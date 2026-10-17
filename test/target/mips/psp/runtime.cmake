@@ -1,11 +1,15 @@
 # Copyright (C) 2026 Cross contributors
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-foreach(required CC SOURCE PAIR_SOURCE RUNTIME MODULE_INFO LINKER OUTPUT)
+foreach(required CC SOURCE PAIR_SOURCE BIT_SOURCE RUNTIME MODULE_INFO LINKER OUTPUT)
     if(NOT DEFINED ${required} OR "${${required}}" STREQUAL "")
         message(FATAL_ERROR "${required} must name a path")
     endif()
 endforeach()
+
+# PPSSPP serves the image's directory as host0:, so each run has its own.
+get_filename_component(test_root "${OUTPUT}" DIRECTORY)
+file(MAKE_DIRECTORY "${test_root}")
 
 find_program(LLVM_MC NAMES llvm-mc)
 find_program(LLVM_OBJCOPY NAMES llvm-objcopy)
@@ -50,6 +54,7 @@ endfunction()
 
 set(functions "${OUTPUT}.functions.o")
 set(pairs "${OUTPUT}.pairs.o")
+set(bits "${OUTPUT}.bits.o")
 set(runtime "${OUTPUT}.runtime.o")
 set(metadata_object "${OUTPUT}.metadata.o")
 set(metadata_binary "${OUTPUT}.metadata.bin")
@@ -59,6 +64,8 @@ run_checked(cross-functions "${CC}" -c -O2 -mprofile=psp-allegrex
             "${SOURCE}" -o "${functions}")
 run_checked(cross-pairs "${CC}" -c -O2 -mprofile=psp-allegrex
             "${PAIR_SOURCE}" -o "${pairs}")
+run_checked(cross-bits "${CC}" -c -O2 -mprofile=psp-allegrex
+            "${BIT_SOURCE}" -o "${bits}")
 run_checked(cross-runtime "${CC}" -c -O2 -mprofile=psp-allegrex
             "${RUNTIME}" -o "${runtime}")
 run_checked(module-metadata "${LLVM_MC}" --filetype=obj
@@ -68,7 +75,7 @@ run_checked(flatten-module-metadata "${LLVM_OBJCOPY}"
             "--dump-section=.rodata.sceModuleInfo=${metadata_binary}"
             "${metadata_object}")
 run_checked(link "${LLD}" -m elf32ltsmip -T "${LINKER}"
-            "${runtime}" "${functions}" "${pairs}"
+            "${runtime}" "${functions}" "${pairs}" "${bits}"
             --format=binary "${metadata_binary}"
             -o "${executable}")
 
@@ -89,7 +96,6 @@ foreach(expect "Format: elf32-mips" "DataEncoding: LittleEndian"
     endif()
 endforeach()
 
-get_filename_component(test_root "${OUTPUT}" DIRECTORY)
 execute_process(
     COMMAND "${PPSSPP}" --graphics=software --timeout=5 -i -l
             --root "${test_root}" "${executable}"
@@ -102,9 +108,11 @@ if(NOT ppsspp_status EQUAL 0)
     fatal_with_log(
         "Allegrex execution failed (status ${ppsspp_status})" ppsspp_log)
 endif()
+# The exit call logs as "sceKernel: sceKernelExitGame" or, in newer
+# builds, "[sceKernel]: <source>:<line> sceKernelExitGame".
 foreach(expect "Loadable Segment Copied to 08804000"
                "Importing Module LoadExecForUser"
-               "sceKernel: sceKernelExitGame")
+               "sceKernel\\]?: ([^ \n]+ )?sceKernelExitGame")
     if(NOT ppsspp_log MATCHES "${expect}")
         fatal_with_log("PPSSPP did not report '${expect}'" ppsspp_log)
     endif()

@@ -1777,19 +1777,33 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/target/mips/allegrex.cmake")
     set_tests_properties(cross_mips_allegrex PROPERTIES
         LABELS "check.compile;arch.mips;backend.native;feature.codegen")
-    add_test(NAME cross_mips_allegrex_runtime
-        COMMAND "${CMAKE_COMMAND}"
-                -DCC=$<TARGET_FILE:cross_cc>
-                -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/allegrex.x
-                -DPAIR_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/i64_pair.x
-                -DRUNTIME=${CMAKE_SOURCE_DIR}/test/target/mips/psp/runtime.x
-                -DMODULE_INFO=${CMAKE_SOURCE_DIR}/test/target/mips/psp/module_info.s
-                -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/psp/link.ld
-                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-allegrex-runtime
-                -DPPSSPP=${CROSS_PPSSPP_HEADLESS}
-                -P "${CMAKE_SOURCE_DIR}/test/target/mips/psp/runtime.cmake")
-    set_tests_properties(cross_mips_allegrex_runtime PROPERTIES
-        LABELS "check.runtime;arch.mips;backend.native;feature.codegen")
+    # Allegrex code run in PPSSPP, linked by LLD and by the Cross ld.
+    foreach(psp_linker lld ld)
+        if(psp_linker STREQUAL ld)
+            set(psp_test cross_mips_allegrex_runtime_ld)
+            set(psp_ld "-DLD=$<TARGET_FILE:cross_ld>")
+            set(psp_labels ";feature.linker")
+        else()
+            set(psp_test cross_mips_allegrex_runtime)
+            set(psp_ld "")
+            set(psp_labels "")
+        endif()
+        add_test(NAME ${psp_test}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc> ${psp_ld}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/allegrex.x
+                    -DPAIR_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/i64_pair.x
+                    -DBIT_SOURCE=${CMAKE_SOURCE_DIR}/test/language/semantics/bit_intrinsics.x
+                    -DRUNTIME=${CMAKE_SOURCE_DIR}/test/target/mips/psp/runtime.x
+                    -DMODULE_INFO=${CMAKE_SOURCE_DIR}/test/target/mips/psp/module_info.s
+                    -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/psp/link.ld
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-allegrex-runtime-${psp_linker}/image
+                    -DPPSSPP=${CROSS_PPSSPP_HEADLESS}
+                    -P "${CMAKE_SOURCE_DIR}/test/target/mips/psp/runtime.cmake")
+        set_tests_properties(${psp_test} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;feature.codegen;feature.intrinsics${psp_labels};isa.allegrex;endian.little;opt.O2"
+            SKIP_REGULAR_EXPRESSION "skipping PSP runtime test")
+    endforeach()
     add_test(NAME cross_mips_vr4300_runtime
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
