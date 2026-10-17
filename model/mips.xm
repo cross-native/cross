@@ -1349,9 +1349,6 @@ data_base "mips-gp" {
     kinds = ["writable"];
 }
 
-# MIPS profiles keep the larger budget for recognized high-entropy memory
-# predicates, where speculation can beat a branch even on a CPU without
-# conditional moves, whose diamonds otherwise stay branches.
 profile "mips-elf" {
     default_for = ["mips", "mips-*"];
     target = "mips-unknown-elf";
@@ -1359,7 +1356,6 @@ profile "mips-elf" {
     mangling = "cross";
     m.arch = "generic";
     m.risc-cisc-balance = 0;
-    f.if-conversion-memory-limit = 12;
 }
 
 profile "mipsel-elf" {
@@ -1369,7 +1365,6 @@ profile "mipsel-elf" {
     mangling = "cross";
     m.arch = "generic";
     m.risc-cisc-balance = 0;
-    f.if-conversion-memory-limit = 12;
 }
 
 # MIPS64 ELF targets default to the n64 data model with the Cross ABI; C
@@ -1384,7 +1379,6 @@ profile "mips64-n64" {
     mangling = "cross";
     m.arch = "mips64";
     m.risc-cisc-balance = 0;
-    f.if-conversion-memory-limit = 12;
 }
 
 profile "mips64el-n64" {
@@ -1394,7 +1388,6 @@ profile "mips64el-n64" {
     mangling = "cross";
     m.arch = "mips64";
     m.risc-cisc-balance = 0;
-    f.if-conversion-memory-limit = 12;
 }
 
 profile "vr4300-cross64" {
@@ -1404,7 +1397,6 @@ profile "vr4300-cross64" {
     m.arch = "vr4300";
     m.tune = "vr4300";
     m.risc-cisc-balance = 0;
-    f.if-conversion-memory-limit = 12;
 }
 
 profile "vr4300-o32" {
@@ -1413,7 +1405,6 @@ profile "vr4300-o32" {
     mangling = "cross";
     m.arch = "vr4300";
     m.risc-cisc-balance = 0;
-    f.if-conversion-memory-limit = 12;
 }
 
 # Threads of the N64 operating system run with FCSR.FS and the
@@ -1426,7 +1417,6 @@ profile "n64" {
     m.tune = "vr4300";
     m.fix4300 = true;
     m.risc-cisc-balance = 0;
-    f.if-conversion-memory-limit = 12;
     fp_traps = ["invalid"];
     fp_denormal_operand = "trap";
     fp_denormal_result = "flush";
@@ -1458,7 +1448,6 @@ profile "r3000-o32" {
     m.arch = "r3000";
     m.tune = "r3000";
     m.risc-cisc-balance = 0;
-    f.if-conversion-memory-limit = 12;
 }
 
 profile "r6000-eabi" {
@@ -1468,5 +1457,4 @@ profile "r6000-eabi" {
     m.arch = "r6000";
     m.tune = "r6000";
     m.risc-cisc-balance = 0;
-    f.if-conversion-memory-limit = 12;
 }

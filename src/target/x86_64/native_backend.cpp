@@ -86,17 +86,20 @@ enum class LoweringPass : std::uint16_t {
     FuseScalarDivisionResults,
     PropagateCopiesLate,
     FuseCompareSelects,
+    FuseBorrowSelects,
     FuseCompareFloatSelects,
     FoldFloatSelectConstants,
     FuseVectorSignSelects,
     FuseCompareBranches,
     HoistVectorComparisonSignMasks,
     FormDenseJumpTables,
+    FoldMaskedZeroTests,
     FoldIndexedAddresses,
     EliminateRedundantLoadsLate,
     FoldScalarMemoryOperands,
     FoldFloatMemoryOperands,
     FoldVectorMemoryOperands,
+    FoldVectorLaneMemory,
     EliminateDeadValues,
     ScheduleBlockLayout,
     ScheduleAcrossBlocks,
@@ -123,8 +126,10 @@ bool prefer_direct_dense_dispatch(const CompilerOptions& options,
 
 bool same_fused_select_condition(const machine::Instruction& left,
                                  const machine::Instruction& right) {
+    // A borrow select's subtraction is also its result.
     if (left.opcode != Opcode::Select || right.opcode != Opcode::Select ||
         left.condition_predicate.empty() ||
+        left.condition_predicate == Opcode::SubBorrowImm ||
         left.condition_predicate != right.condition_predicate ||
         left.uses.size() < 3 || right.uses.size() < 3 ||
         left.operands.size() < 2 || right.operands.size() < 2) {
@@ -874,6 +879,112 @@ private:
         return immediate_operand(
             type_bits(hir_, element), flags, machine::i128,
             is_signed_integer(hir_, element));
+    }
+
+    // The lanes of a vector each lane of which is a constant: a splat or a
+    // lane insertion of constants, or lane-wise integer arithmetic of such
+    // vectors, as vectorized loops form their lane offsets.
+    std::optional<std::vector<machine::ImmediateOperand>>
+    constant_vector_lanes(mir::ValueId id, unsigned depth = 0) const {
+        using mir::ValueKind;
+        if (depth > 256 || id.value >= source_->values.size()) {
+            return std::nullopt;
+        }
+        const auto& value = source_->values[id.value];
+        const auto& type = hir_.type(value.type);
+        if (type.kind != hir::Type::Kind::Vector || type.scalable ||
+            !type.element || type.lanes == 0) {
+            return std::nullopt;
+        }
+        const auto bits = type_bits(hir_, *type.element);
+        if (bits != 8 && bits != 16 && bits != 32 && bits != 64) {
+            return std::nullopt;
+        }
+        const auto mask = bits == 64 ? ~std::uint64_t{0}
+                                     : (std::uint64_t{1} << bits) - 1U;
+        const auto mode =
+            machine::IntegerMode{static_cast<std::uint16_t>(bits)};
+        const auto lane = [&](mir::ValueId operand)
+            -> std::optional<machine::ImmediateOperand> {
+            const auto& scalar = source_->values[operand.value];
+            if (scalar.kind != ValueKind::ConstantInteger &&
+                scalar.kind != ValueKind::ConstantFloating) {
+                return std::nullopt;
+            }
+            return machine::ImmediateOperand{scalar.integer & mask, 0, mode};
+        };
+        if (value.kind == ValueKind::Splat && value.operands.size() == 1) {
+            const auto element = lane(value.operands.front());
+            if (!element) return std::nullopt;
+            return std::vector(type.lanes, *element);
+        }
+        if (value.kind == ValueKind::InsertElement &&
+            value.operands.size() == 3) {
+            auto lanes = constant_vector_lanes(value.operands[0], depth + 1U);
+            const auto& index = source_->values[value.operands[1].value];
+            const auto element = lane(value.operands[2]);
+            if (!lanes || !element ||
+                index.kind != ValueKind::ConstantInteger ||
+                index.integer_high != 0 || index.integer >= lanes->size()) {
+                return std::nullopt;
+            }
+            (*lanes)[index.integer] = *element;
+            return lanes;
+        }
+        if (value.kind == ValueKind::Cast && value.operands.size() == 1 &&
+            !vector_is_floating(hir_, value.type) &&
+            !vector_is_floating(
+                hir_, source_->values[value.operands.front().value].type) &&
+            (value.cast == mir::CastOperation::ZeroExtend ||
+             value.cast == mir::CastOperation::SignExtend ||
+             value.cast == mir::CastOperation::Truncate ||
+             value.cast == mir::CastOperation::Reinterpret)) {
+            auto lanes = constant_vector_lanes(value.operands.front(),
+                                               depth + 1U);
+            if (!lanes || lanes->size() != type.lanes) return std::nullopt;
+            for (auto& element : *lanes) {
+                const auto from = element.mode.bits;
+                if (value.cast == mir::CastOperation::SignExtend && from < 64 &&
+                    ((element.value >> (from - 1U)) & 1U) != 0) {
+                    element.value |= ~std::uint64_t{0} << from;
+                }
+                element.value &= mask;
+                element.mode = mode;
+            }
+            return lanes;
+        }
+        if (value.kind != ValueKind::Binary || value.operands.size() != 2 ||
+            vector_is_floating(hir_, value.type)) {
+            return std::nullopt;
+        }
+        using mir::BinaryOperation;
+        const auto operation = value.binary;
+        if (operation != BinaryOperation::Add &&
+            operation != BinaryOperation::Subtract &&
+            operation != BinaryOperation::BitAnd &&
+            operation != BinaryOperation::BitOr &&
+            operation != BinaryOperation::BitXor) {
+            return std::nullopt;
+        }
+        auto left = constant_vector_lanes(value.operands[0], depth + 1U);
+        const auto right =
+            constant_vector_lanes(value.operands[1], depth + 1U);
+        if (!left || !right || left->size() != right->size()) {
+            return std::nullopt;
+        }
+        for (std::size_t index = 0; index < left->size(); ++index) {
+            auto& result = (*left)[index].value;
+            const auto other = (*right)[index].value;
+            switch (operation) {
+            case BinaryOperation::Add: result += other; break;
+            case BinaryOperation::Subtract: result -= other; break;
+            case BinaryOperation::BitAnd: result &= other; break;
+            case BinaryOperation::BitOr: result |= other; break;
+            default: result ^= other; break;
+            }
+            result &= mask;
+        }
+        return left;
     }
 
     bool has_result(const mir::ManagedValue& value) const {
@@ -2226,10 +2337,7 @@ private:
             const bool literal =
                 scalar.kind == ValueKind::ConstantInteger ||
                 scalar.kind == ValueKind::ConstantFloating;
-            const bool immediate = literal &&
-                value.operands.front().value < source_splat_use_counts_.size() &&
-                source_splat_use_counts_[value.operands.front().value] == 1 &&
-                source_non_splat_use_counts_[value.operands.front().value] == 0;
+            const bool immediate = literal;
             auto instruction = target_instruction(
                 immediate ? Opcode::VsplatConstant : Opcode::Vsplat,
                 value.location);
@@ -2267,6 +2375,25 @@ private:
                 source_->values[value.operands.front().value].type));
             instruction.defs.push_back(reg(value.id));
             return instruction;
+        }
+        // A vector of constant lanes loads from a literal pool, which the
+        // medium and large data models cannot reach RIP-relatively.
+        if ((value.kind == ValueKind::InsertElement ||
+             ((value.kind == ValueKind::Binary ||
+               value.kind == ValueKind::Cast) &&
+              is_vector(hir_, value.type))) &&
+            options_.code_model != CodeModel::Medium &&
+            options_.code_model != CodeModel::Large) {
+            if (auto lanes = constant_vector_lanes(value.id)) {
+                auto instruction =
+                    target_instruction(Opcode::Vconstant, value.location);
+                for (const auto& lane : *lanes) {
+                    instruction.operands.push_back(lane);
+                }
+                instruction.operands.push_back(vector_metadata(value.type));
+                instruction.defs.push_back(reg(value.id));
+                return instruction;
+            }
         }
         if (value.kind == ValueKind::InsertElement) {
             auto instruction = target_instruction(Opcode::Vinsert, value.location);
@@ -2615,9 +2742,10 @@ private:
                     instruction.operands.size() < 2) {
                     continue;
                 }
+                // A literal with other uses stays for them; the splat still
+                // takes the immediate, which later combines can fold.
                 const auto source = instruction.uses.front();
-                if (source.id >= constants.size() || !constants[source.id] ||
-                    uses[source.id] != 1) {
+                if (source.id >= constants.size() || !constants[source.id]) {
                     continue;
                 }
                 instruction.opcode = Opcode::VsplatConstant;
@@ -5276,8 +5404,70 @@ private:
         }
     }
 
+    // An element stride LEA cannot encode that is a power of two scales the
+    // index with a shift of its own, so the address is base plus the
+    // shifted index, which accesses at a displacement from it can read.
+    void split_indexed_address_scales() {
+        for (auto& block : current_.blocks) {
+            for (std::size_t index = 0; index < block.instructions.size();
+                 ++index) {
+                auto& address = block.instructions[index];
+                const auto* scale = address.opcode == Opcode::IndexedAddress &&
+                                            address.uses.size() == 2 &&
+                                            address.operands.size() == 3 &&
+                                            !address.patch
+                    ? std::get_if<machine::ImmediateOperand>(
+                          &address.operands[2])
+                    : nullptr;
+                if (!scale || scale->high != 0 || scale->value <= 8 ||
+                    !std::has_single_bit(scale->value) ||
+                    scale->value > (std::uint64_t{1} << 30U) ||
+                    address.uses[1].kind != machine::RegisterKind::Virtual ||
+                    address.uses[1].mode.bits != 64) {
+                    continue;
+                }
+                const auto mode = address.uses[1].mode;
+                const machine::VirtualRegisterId id{static_cast<std::uint32_t>(
+                    current_.virtual_registers.size())};
+                current_.virtual_registers.push_back(mode);
+                current_.virtual_register_assignments.push_back(std::nullopt);
+                current_.rematerialized_immediates.push_back(std::nullopt);
+                current_.virtual_register_classes.push_back(
+                    machine::VirtualRegisterClass::Integer);
+                machine::StackSlot spill;
+                spill.id = {static_cast<std::uint32_t>(
+                    current_.stack_slots.size())};
+                spill.kind = machine::StackSlotKind::Spill;
+                spill.size = mode_bytes(mode);
+                spill.alignment = mode_alignment(mode);
+                spill.location = address.location;
+                spill.name = "$v" + std::to_string(id.value);
+                spill.spill_for = id;
+                current_.stack_slots.push_back(std::move(spill));
+                const auto shifted = machine::Register::virtual_register(id, mode);
+                auto shift = target_instruction(Opcode::ShlImm, address.location);
+                shift.uses = {address.uses[1]};
+                shift.operands = {machine::RegisterOperand{address.uses[1]},
+                                  immediate_operand(static_cast<std::uint64_t>(
+                                      std::countr_zero(scale->value)), 0,
+                                      machine::i64)};
+                shift.defs = {shifted};
+                declare_home_staging(shift);
+                address.uses[1] = shifted;
+                address.operands[1] = machine::RegisterOperand{shifted};
+                address.operands[2] = immediate_operand(1, 0, machine::i64);
+                block.instructions.insert(
+                    block.instructions.begin() +
+                        static_cast<std::ptrdiff_t>(index),
+                    std::move(shift));
+                ++index;
+            }
+        }
+    }
+
     void fold_indexed_memory_addresses() {
         if (!options_.combine_addresses) return;
+        split_indexed_address_scales();
         fold_constant_index_addresses();
         std::vector<unsigned> uses(current_.virtual_registers.size());
         for (const auto& block : current_.blocks) {
@@ -5353,8 +5543,16 @@ private:
                     consumer.opcode == Opcode::PointerStore ||
                     consumer.opcode == Opcode::FpointerStore ||
                     consumer.opcode == Opcode::VpointerStore;
+                // An access at a displacement from the address keeps it.
+                const bool displaced =
+                    consumer.operands.size() == (store ? 3U : 2U);
+                const auto* displacement = displaced
+                    ? std::get_if<machine::ImmediateOperand>(
+                          &consumer.operands.back())
+                    : nullptr;
                 if (opcode.empty() || consumer.uses.empty() ||
-                    consumer.operands.size() != (store ? 2U : 1U) ||
+                    (consumer.operands.size() != (store ? 2U : 1U) &&
+                     !displacement) ||
                     (!store && consumer.defs.size() != 1) ||
                     (store && (!consumer.defs.empty() ||
                                consumer.uses.size() != 2)) ||
@@ -5379,10 +5577,22 @@ private:
                     : consumer.defs.front().mode;
                 const bool vector_store =
                     consumer.opcode == Opcode::VpointerStore;
-                if (!scale || (!vector_store && scale->value !=
-                    mode_bytes(transported_mode))) {
+                const bool element_scale = scale &&
+                    (vector_store ||
+                     scale->value == mode_bytes(transported_mode));
+                const bool encodable = scale && scale->high == 0 &&
+                    (scale->value == 1 || scale->value == 2 ||
+                     scale->value == 4 || scale->value == 8);
+                if (!scale || (!element_scale && !encodable) ||
+                    (displacement && !encodable)) {
                     continue;
                 }
+                // Other scales and displacements are explicit operands.
+                const bool explicit_form = displacement || !element_scale;
+                const machine::Operand offset = displacement
+                    ? machine::Operand{*displacement}
+                    : machine::Operand{machine::ImmediateOperand{
+                          0, 0, machine::i64, true}};
                 consumer.opcode = opcode;
                 // The fused memory operation still materializes spilled
                 // address components through the address emitter's scratch.
@@ -5404,10 +5614,15 @@ private:
                         address.operands[0], address.operands[1],
                         machine::RegisterOperand{source},
                         address.operands[2]};
+                    if (explicit_form) consumer.operands.push_back(offset);
                 } else {
                     consumer.uses = address.uses;
                     consumer.operands.assign(address.operands.begin(),
                                              address.operands.begin() + 2);
+                    if (explicit_form) {
+                        consumer.operands.push_back(address.operands[2]);
+                        consumer.operands.push_back(offset);
+                    }
                 }
                 if (uses[address_id] == 1 && found->second.block == block.id) {
                     removed.insert(found->second.index);
@@ -5516,6 +5731,345 @@ private:
                 }
                 block.instructions = std::move(compact);
             }
+        }
+    }
+
+    // `x == 0 ? c : x - 1` and its inverse select by the borrow of the
+    // decrement, which computes the other arm: SUB $1 and CMOVB/CMOVAE
+    // instead of LEA, CMP, and CMOV.
+    void fuse_borrow_selects() {
+        if (!options_.compare_select_fusion) return;
+        std::vector<unsigned> uses(current_.virtual_registers.size());
+        for (const auto& block : current_.blocks) {
+            for (const auto& instruction : block.instructions) {
+                for (const auto& use : instruction.uses) {
+                    if (use.kind == machine::RegisterKind::Virtual &&
+                        use.id < uses.size()) {
+                        ++uses[use.id];
+                    }
+                }
+            }
+        }
+        for (auto& block : current_.blocks) {
+            std::unordered_map<std::uint32_t, std::size_t> definitions;
+            std::unordered_set<std::size_t> removed;
+            for (std::size_t index = 0; index < block.instructions.size();
+                 ++index) {
+                auto& select = block.instructions[index];
+                const bool equal = select.condition_predicate == Opcode::CmpEqImm;
+                const auto* zero = select.operands.size() == 4
+                    ? std::get_if<machine::ImmediateOperand>(&select.operands[1])
+                    : nullptr;
+                if (select.opcode == Opcode::Select &&
+                    (equal || select.condition_predicate == Opcode::CmpNeImm) &&
+                    select.defs.size() == 1 && select.uses.size() == 3 &&
+                    zero && zero->value == 0 && zero->high == 0 &&
+                    (select.defs.front().mode.bits == 32 ||
+                     select.defs.front().mode.bits == 64)) {
+                    const auto tested = select.uses[0];
+                    const auto bits = select.defs.front().mode.bits;
+                    const auto all_ones =
+                        bits == 64 ? ~std::uint64_t{0} : 0xffffffffULL;
+                    for (const unsigned arm : {1U, 2U}) {
+                        const auto value = select.uses[arm];
+                        if (value.kind != machine::RegisterKind::Virtual ||
+                            value.id >= uses.size() || uses[value.id] != 1 ||
+                            tested.mode != value.mode) {
+                            continue;
+                        }
+                        const auto found = definitions.find(value.id);
+                        if (found == definitions.end() ||
+                            removed.contains(found->second)) {
+                            continue;
+                        }
+                        const auto& decrement = block.instructions[found->second];
+                        const auto* amount =
+                            decrement.operands.size() >= 2
+                                ? std::get_if<machine::ImmediateOperand>(
+                                      &decrement.operands[1])
+                                : nullptr;
+                        if (!amount || decrement.uses.size() != 1 ||
+                            decrement.uses.front() != tested ||
+                            decrement.patch || decrement.has_side_effects ||
+                            !((decrement.opcode == Opcode::AddImm &&
+                               (amount->value & all_ones) == all_ones) ||
+                              (decrement.opcode == Opcode::SubImm &&
+                               amount->value == 1))) {
+                            continue;
+                        }
+                        // The decrement borrows exactly when x is zero; the
+                        // other arm replaces it when the condition picks it.
+                        const bool keep_on_borrow = equal == (arm == 1U);
+                        const auto other = select.uses[3U - arm];
+                        const auto other_operand = select.operands[4U - arm];
+                        select.condition_predicate = Opcode::SubBorrowImm;
+                        select.uses = {tested, other};
+                        select.operands = {
+                            select.operands[0],
+                            machine::ImmediateOperand{keep_on_borrow ? 1U : 0U,
+                                                      0, machine::i64, false},
+                            other_operand};
+                        removed.insert(found->second);
+                        break;
+                    }
+                }
+                for (const auto& definition : select.defs) {
+                    if (definition.kind == machine::RegisterKind::Virtual) {
+                        definitions[definition.id] = index;
+                    }
+                }
+            }
+            if (removed.empty()) continue;
+            std::vector<machine::Instruction> kept;
+            kept.reserve(block.instructions.size() - removed.size());
+            for (std::size_t index = 0; index < block.instructions.size();
+                 ++index) {
+                if (!removed.contains(index)) {
+                    kept.push_back(std::move(block.instructions[index]));
+                }
+            }
+            block.instructions = std::move(kept);
+        }
+    }
+
+    // A materialized `(x & C) == 0` or `!= 0` tests the bits in place:
+    // TEST and SETcc instead of AND, CMP, and SETcc. Branches and selects
+    // fuse the same form themselves; this takes the comparisons they leave.
+    void fold_masked_zero_tests() {
+        if (!options_.machine_combine) return;
+        std::vector<unsigned> uses(current_.virtual_registers.size());
+        for (const auto& block : current_.blocks) {
+            for (const auto& instruction : block.instructions) {
+                for (const auto& use : instruction.uses) {
+                    if (use.kind == machine::RegisterKind::Virtual &&
+                        use.id < uses.size()) {
+                        ++uses[use.id];
+                    }
+                }
+            }
+        }
+        for (auto& block : current_.blocks) {
+            std::unordered_map<std::uint32_t, std::size_t> definitions;
+            std::unordered_set<std::size_t> removed;
+            for (std::size_t index = 0; index < block.instructions.size();
+                 ++index) {
+                auto& compare = block.instructions[index];
+                const bool equal = compare.opcode == Opcode::CmpEqImm;
+                if ((equal || compare.opcode == Opcode::CmpNeImm) &&
+                    compare.defs.size() == 1 && compare.uses.size() == 1 &&
+                    compare.operands.size() == 2 && !compare.patch &&
+                    !compare.has_side_effects) {
+                    const auto* zero = std::get_if<machine::ImmediateOperand>(
+                        &compare.operands[1]);
+                    const auto masked = compare.uses.front();
+                    const auto found = masked.kind ==
+                                               machine::RegisterKind::Virtual &&
+                                           masked.id < uses.size() &&
+                                           uses[masked.id] == 1
+                        ? definitions.find(masked.id)
+                        : definitions.end();
+                    if (zero && zero->value == 0 && zero->high == 0 &&
+                        found != definitions.end() &&
+                        !removed.contains(found->second)) {
+                        const auto& mask = block.instructions[found->second];
+                        if (mask.opcode == Opcode::AndImm &&
+                            mask.uses.size() == 1 &&
+                            mask.operands.size() >= 2 && !mask.patch &&
+                            !mask.has_side_effects &&
+                            mask.defs.front().mode == masked.mode) {
+                            compare.opcode = equal ? Opcode::TestEqImm
+                                                   : Opcode::TestNeImm;
+                            compare.uses = mask.uses;
+                            compare.operands = {mask.operands.front(),
+                                                mask.operands.back()};
+                            removed.insert(found->second);
+                        }
+                    }
+                }
+                for (const auto& definition : compare.defs) {
+                    if (definition.kind == machine::RegisterKind::Virtual) {
+                        definitions[definition.id] = index;
+                    }
+                }
+            }
+            if (removed.empty()) continue;
+            std::vector<machine::Instruction> kept;
+            kept.reserve(block.instructions.size() - removed.size());
+            for (std::size_t index = 0; index < block.instructions.size();
+                 ++index) {
+                if (!removed.contains(index)) {
+                    kept.push_back(std::move(block.instructions[index]));
+                }
+            }
+            block.instructions = std::move(kept);
+        }
+    }
+
+    // A splat of a scalar floating load broadcasts from memory, and a store
+    // of a floating lane stores it from its vector: VBROADCASTSS, VMOVDDUP,
+    // or VBROADCASTSD; VMOVSS, VMOVSD, VEXTRACTPS, or VMOVHPS. The load or
+    // store keeps its place, so no memory access moves.
+    void fold_vector_lane_memory() {
+        if (!options_.fold_memory_operands ||
+            !subtarget_.has_feature(Feature::Avx)) {
+            return;
+        }
+        std::vector<unsigned> uses(current_.virtual_registers.size());
+        for (const auto& block : current_.blocks) {
+            for (const auto& instruction : block.instructions) {
+                for (const auto& use : instruction.uses) {
+                    if (use.kind == machine::RegisterKind::Virtual &&
+                        use.id < uses.size()) {
+                        ++uses[use.id];
+                    }
+                }
+            }
+        }
+        const auto single_use = [&](const machine::Register& value) {
+            return value.kind == machine::RegisterKind::Virtual &&
+                   value.id < uses.size() && uses[value.id] == 1;
+        };
+        struct Shape {
+            unsigned element_bits{};
+            bool floating{};
+        };
+        // The vector metadata is an instruction's last immediate.
+        const auto vector_shape = [](const machine::Instruction& value) {
+            for (auto operand = value.operands.rbegin();
+                 operand != value.operands.rend(); ++operand) {
+                if (const auto* metadata =
+                        std::get_if<machine::ImmediateOperand>(&*operand)) {
+                    return Shape{static_cast<unsigned>(metadata->value),
+                                 (metadata->high & (1ULL << 32U)) != 0};
+                }
+            }
+            return Shape{};
+        };
+        for (auto& block : current_.blocks) {
+            std::unordered_map<std::uint32_t, std::size_t> definitions;
+            std::unordered_set<std::size_t> removed;
+            for (std::size_t index = 0; index < block.instructions.size();
+                 ++index) {
+                auto& instruction = block.instructions[index];
+                const auto defining = [&](const machine::Register& value)
+                    -> machine::Instruction* {
+                    if (!single_use(value)) return nullptr;
+                    const auto found = definitions.find(value.id);
+                    if (found == definitions.end() ||
+                        removed.contains(found->second)) {
+                        return nullptr;
+                    }
+                    return &block.instructions[found->second];
+                };
+                if (instruction.opcode == Opcode::Vsplat &&
+                    instruction.defs.size() == 1 &&
+                    instruction.uses.size() == 1) {
+                    const auto shape = vector_shape(instruction);
+                    const auto bits = instruction.defs.front().mode.bits;
+                    auto* load = defining(instruction.uses.front());
+                    const bool pointer =
+                        load && load->opcode == Opcode::FpointerLoad;
+                    const bool indexed =
+                        load && load->opcode == Opcode::FindexedLoad;
+                    if ((pointer || indexed) && shape.floating &&
+                        (shape.element_bits == 32 ||
+                         shape.element_bits == 64) &&
+                        (bits == 128 || bits == 256) &&
+                        load->defs.size() == 1 &&
+                        load->defs.front().mode.bits == shape.element_bits &&
+                        !load->has_side_effects && !load->patch) {
+                        // The scale and displacement are explicit, the
+                        // shape follows them.
+                        if (indexed && load->operands.size() < 3U) {
+                            load->operands.push_back(machine::ImmediateOperand{
+                                mode_bytes(load->defs.front().mode), 0,
+                                machine::i64, false});
+                        }
+                        if (load->operands.size() < (pointer ? 2U : 4U)) {
+                            load->operands.push_back(machine::ImmediateOperand{
+                                0, 0, machine::i64, true});
+                        }
+                        load->operands.push_back(instruction.operands.back());
+                        load->opcode = pointer ? Opcode::VbroadcastPointer
+                                               : Opcode::VbroadcastIndexed;
+                        load->defs = instruction.defs;
+                        definitions.erase(instruction.uses.front().id);
+                        definitions[instruction.defs.front().id] =
+                            static_cast<std::size_t>(load - block.instructions.data());
+                        removed.insert(index);
+                        continue;
+                    }
+                }
+                const bool pointer_store =
+                    instruction.opcode == Opcode::FpointerStore &&
+                    instruction.uses.size() == 2;
+                const bool indexed_store =
+                    instruction.opcode == Opcode::FindexedStore &&
+                    instruction.uses.size() == 3 &&
+                    instruction.operands.size() >= 4;
+                if (pointer_store || indexed_store) {
+                    const auto source = instruction.uses.back();
+                    auto* extract = defining(source);
+                    const auto* lane = extract && extract->opcode ==
+                                                      Opcode::Vextract &&
+                                               extract->operands.size() >= 2
+                        ? std::get_if<machine::ImmediateOperand>(
+                              &extract->operands[1])
+                        : nullptr;
+                    if (lane && extract->uses.size() == 1) {
+                        const auto shape = vector_shape(*extract);
+                        const auto vector = extract->uses.front();
+                        // The store keeps its place and width, so even a
+                        // volatile one may store the lane directly.
+                        if (shape.floating &&
+                            (shape.element_bits == 32 ||
+                             shape.element_bits == 64) &&
+                            source.mode.bits == shape.element_bits &&
+                            lane->high == 0 &&
+                            lane->value * shape.element_bits < 128 &&
+                            (vector.mode.bits == 128 ||
+                             vector.mode.bits == 256) &&
+                            (shape.element_bits == 64 || lane->value == 0 ||
+                             subtarget_.has_feature(Feature::Sse41))) {
+                            const auto fixed = pointer_store ? 2U : 4U;
+                            while (instruction.operands.size() < fixed + 1U) {
+                                instruction.operands.push_back(
+                                    machine::ImmediateOperand{0, 0,
+                                                              machine::i64,
+                                                              true});
+                            }
+                            instruction.uses.back() = vector;
+                            instruction.operands[pointer_store ? 1U : 2U] =
+                                machine::RegisterOperand{vector};
+                            instruction.operands.push_back(*lane);
+                            instruction.operands.push_back(
+                                extract->operands.back());
+                            instruction.opcode =
+                                pointer_store ? Opcode::VlaneStorePointer
+                                              : Opcode::VlaneStoreIndexed;
+                            append_fixed_clobber(instruction, "xmm0",
+                                                 machine::i128);
+                            removed.insert(static_cast<std::size_t>(
+                                extract - block.instructions.data()));
+                        }
+                    }
+                }
+                for (const auto& definition : instruction.defs) {
+                    if (definition.kind == machine::RegisterKind::Virtual) {
+                        definitions[definition.id] = index;
+                    }
+                }
+            }
+            if (removed.empty()) continue;
+            std::vector<machine::Instruction> kept;
+            kept.reserve(block.instructions.size() - removed.size());
+            for (std::size_t index = 0; index < block.instructions.size();
+                 ++index) {
+                if (!removed.contains(index)) {
+                    kept.push_back(std::move(block.instructions[index]));
+                }
+            }
+            block.instructions = std::move(kept);
         }
     }
 
@@ -6599,6 +7153,11 @@ private:
                     instruction.opcode == Opcode::Vphi ||
                     instruction.opcode == Opcode::Vsplat ||
                     instruction.opcode == Opcode::VsplatConstant ||
+                    instruction.opcode == Opcode::Vconstant ||
+                    instruction.opcode == Opcode::VbroadcastIndexed ||
+                    instruction.opcode == Opcode::VbroadcastPointer ||
+                    instruction.opcode == Opcode::VlaneStoreIndexed ||
+                    instruction.opcode == Opcode::VlaneStorePointer ||
                     instruction.opcode == Opcode::VindexedLoad ||
                     instruction.opcode == Opcode::VindexedStore ||
                     instruction.opcode == Opcode::Vload ||
@@ -7131,11 +7690,16 @@ private:
                     opcode == Opcode::VsignMask ||
                     opcode == Opcode::Vsplat ||
                     opcode == Opcode::VsplatConstant ||
+                    opcode == Opcode::Vconstant ||
                     opcode == Opcode::Vxor ||
                     opcode == Opcode::VindexedLoad ||
                     opcode == Opcode::VindexedStore ||
                     opcode == Opcode::VpointerLoad ||
                     opcode == Opcode::VpointerStore ||
+                    opcode == Opcode::VbroadcastIndexed ||
+                    opcode == Opcode::VbroadcastPointer ||
+                    opcode == Opcode::VlaneStoreIndexed ||
+                    opcode == Opcode::VlaneStorePointer ||
                     opcode == Opcode::Vload || opcode == Opcode::Vstore ||
                     has_property(opcode, OpcodeProperty::Reduction) ||
                     opcode == Opcode::Vextract) {
@@ -7584,13 +8148,17 @@ private:
                     instruction.opcode == Opcode::Udivrem ||
                     instruction.opcode == Opcode::Mulhs ||
                     instruction.opcode == Opcode::Mulhu ||
-                    (has_property(base, OpcodeProperty::Comparison) &&
+                    ((has_property(base, OpcodeProperty::Comparison) ||
+                      has_property(base, OpcodeProperty::Test)) &&
                      !has_property(base, OpcodeProperty::Vector)) ||
                     instruction.opcode == Opcode::Vphi ||
                     instruction.opcode == Opcode::VsignMask ||
                     instruction.opcode == Opcode::Vsplat ||
+                    instruction.opcode == Opcode::Vconstant ||
                     instruction.opcode == Opcode::VindexedLoad ||
                     instruction.opcode == Opcode::VindexedStore ||
+                    instruction.opcode == Opcode::VbroadcastIndexed ||
+                    instruction.opcode == Opcode::VlaneStoreIndexed ||
                     instruction.opcode == Opcode::Vload ||
                     instruction.opcode == Opcode::Vstore ||
                     has_property(instruction.opcode,
@@ -7675,6 +8243,8 @@ private:
                        instruction.opcode == Opcode::PointerStore ||
                        instruction.opcode == Opcode::FpointerLoad ||
                        instruction.opcode == Opcode::FpointerStore ||
+                       instruction.opcode == Opcode::VbroadcastPointer ||
+                       instruction.opcode == Opcode::VlaneStorePointer ||
                        instruction.opcode == Opcode::GlobalLoad ||
                        instruction.opcode == Opcode::GlobalStore ||
                        instruction.opcode == Opcode::FglobalLoad ||
@@ -8454,6 +9024,7 @@ private:
                                    instruction.opcode == Opcode::Vsplat ||
                                    instruction.opcode ==
                                        Opcode::VsplatConstant ||
+                                   instruction.opcode == Opcode::Vconstant ||
                                    instruction.opcode == Opcode::Vadd ||
                                    instruction.opcode == Opcode::Vsub ||
                                    instruction.opcode == Opcode::Vand ||
@@ -8638,7 +9209,8 @@ private:
         const bool reserve_frame_pointer =
             has_dynamic_stack(current_) || has_over_aligned_slot(current_) ||
             !options_.omit_frame_pointer ||
-            subtarget_.object_format() == ObjectFormat::Coff;
+            subtarget_.object_format() == ObjectFormat::Coff ||
+            outgoing_area_realigned();
         if (reserve_frame_pointer) {
             if (const auto* rbp = find_register_view("rbp")) {
                 std::erase_if(
@@ -9465,6 +10037,100 @@ private:
         }
     }
 
+    struct CallArea {
+        std::size_t size{};
+        std::size_t alignment{};
+    };
+
+    // The outgoing argument area of CALL by its manual or dynamic ABI plan
+    // or by its ABI model, whose layout LAYOUT then receives; no value when
+    // the call has no such classification, which DIAGNOSE reports.
+    std::optional<CallArea> call_outgoing_area(
+        const machine::Instruction& call,
+        std::optional<SignatureLayout>* layout, bool diagnose) {
+        const auto callee = hir::call_signature(hir_, call.direct_callee,
+                                                call.call_signature);
+        if (!callee) return std::nullopt;
+        if (const auto* manual =
+                manual_plans_.find(call.direct_callee, call.call_signature)) {
+            if (!manual->valid) {
+                if (diagnose) {
+                    diagnostics_.error(
+                        call.location,
+                        "invalid manual ABI plan reached frame lowering");
+                }
+                return std::nullopt;
+            }
+            return CallArea{
+                static_cast<std::size_t>(manual->stack.outgoing_area_size),
+                static_cast<std::size_t>(
+                    manual->stack.outgoing_area_alignment)};
+        }
+        if (const auto* dynamic = call.direct_callee
+                ? dynamic_plans_.find(*call.direct_callee)
+                : nullptr) {
+            return CallArea{dynamic->call.outgoing_area_size,
+                            dynamic->call.outgoing_area_alignment};
+        }
+        const auto* abi = abi_model(callee->abi);
+        if (!abi) {
+            if (diagnose) {
+                diagnostics_.error(
+                    call.location,
+                    "x86-64 could not find a managed call ABI model");
+            }
+            return std::nullopt;
+        }
+        std::vector<AbiValue> arguments;
+        arguments.reserve(call.call_argument_types.size());
+        for (std::size_t index = 0; index < call.call_argument_types.size();
+             ++index) {
+            const bool fixed = index < callee->parameters.size();
+            const bool direct = !fixed ||
+                callee->parameters[index].mode == ParameterMode::In;
+            arguments.push_back(abi_value_for(
+                hir_, call.call_argument_types[index], *abi,
+                direct ? ValueTransport::Direct
+                       : ValueTransport::ByReference));
+        }
+        std::vector<AbiValue> results;
+        if (!is_void(hir_, callee->result_type)) {
+            results.push_back(abi_value_for(hir_, callee->result_type, *abi));
+        }
+        auto classified = callee->variadic
+            ? classify_variadic_signature(*abi, arguments, results,
+                                          callee->parameters.size(),
+                                          subtarget_.enabled_features())
+            : classify_signature(*abi, arguments, results,
+                                 subtarget_.enabled_features());
+        if (!classified) {
+            if (diagnose) {
+                diagnostics_.error(
+                    call.location,
+                    "x86-64 could not classify a managed call interface");
+            }
+            return std::nullopt;
+        }
+        const CallArea area{classified.layout.call.outgoing_area_size,
+                            classified.layout.call.outgoing_area_alignment};
+        if (layout) *layout = std::move(classified.layout);
+        return area;
+    }
+
+    // Whether a call's arguments need more than 16-byte stack alignment,
+    // which realigns the frame through RBP.
+    bool outgoing_area_realigned() {
+        for (const auto& block : current_.blocks) {
+            for (const auto& instruction : block.instructions) {
+                if (instruction.kind != machine::InstructionKind::Call) continue;
+                const auto area =
+                    call_outgoing_area(instruction, nullptr, false);
+                if (area && area->alignment > 16) return true;
+            }
+        }
+        return false;
+    }
+
     void finalize_frame() {
         std::unordered_set<std::uint32_t> split_homes;
         std::size_t largest_outgoing = 0;
@@ -9485,85 +10151,15 @@ private:
                         target->value.id >= current_.virtual_register_assignments.size() ||
                         !current_.virtual_register_assignments[target->value.id];
                 }
-                const auto callee =
-                    hir::call_signature(hir_, instruction.direct_callee,
-                                        instruction.call_signature);
-                if (!callee) continue;
-                if (const auto* manual = manual_plans_.find(
-                        instruction.direct_callee, instruction.call_signature)) {
-                    if (!manual->valid) {
-                        diagnostics_.error(
-                            instruction.location,
-                            "invalid manual ABI plan reached frame lowering");
-                        continue;
-                    }
-                    largest_outgoing =
-                        std::max(largest_outgoing,
-                                 static_cast<std::size_t>(
-                                     manual->stack.outgoing_area_size));
-                    largest_outgoing_alignment =
-                        std::max(largest_outgoing_alignment,
-                                 static_cast<std::size_t>(
-                                     manual->stack.outgoing_area_alignment));
-                    continue;
-                }
-                if (const auto* dynamic =
-                        instruction.direct_callee
-                            ? dynamic_plans_.find(*instruction.direct_callee)
-                            : nullptr) {
-                    largest_outgoing = std::max(
-                        largest_outgoing, dynamic->call.outgoing_area_size);
-                    largest_outgoing_alignment =
-                        std::max(largest_outgoing_alignment,
-                                 dynamic->call.outgoing_area_alignment);
-                    continue;
-                }
-                std::vector<AbiValue> arguments;
-                arguments.reserve(instruction.call_argument_types.size());
-                const auto* abi = abi_model(callee->abi);
-                if (!abi) {
-                    diagnostics_.error(
-                        instruction.location,
-                        "x86-64 could not find a managed call ABI model");
-                    continue;
-                }
-                for (std::size_t index = 0;
-                     index < instruction.call_argument_types.size(); ++index) {
-                    const bool fixed = index < callee->parameters.size();
-                    const bool direct = !fixed ||
-                        callee->parameters[index].mode == ParameterMode::In;
-                    const auto type = instruction.call_argument_types[index];
-                    arguments.push_back(abi_value_for(
-                        hir_, type, *abi,
-                        direct ? ValueTransport::Direct
-                               : ValueTransport::ByReference));
-                }
-                std::vector<AbiValue> results;
-                if (!is_void(hir_, callee->result_type)) {
-                    results.push_back(abi_value_for(
-                        hir_, callee->result_type, *abi));
-                }
-                const auto layout = callee->variadic
-                    ? classify_variadic_signature(
-                          *abi, arguments, results,
-                          callee->parameters.size(),
-                          subtarget_.enabled_features())
-                    : classify_signature(
-                          *abi, arguments, results,
-                          subtarget_.enabled_features());
-                if (!layout) {
-                    diagnostics_.error(
-                        instruction.location,
-                        "x86-64 could not classify a managed call interface");
-                    continue;
-                }
-                largest_outgoing =
-                    std::max(largest_outgoing,
-                             layout.layout.call.outgoing_area_size);
-                largest_outgoing_alignment = std::max(
-                    largest_outgoing_alignment,
-                    layout.layout.call.outgoing_area_alignment);
-                const auto& placed = layout.layout.call.arguments;
+                std::optional<SignatureLayout> layout;
+                const auto area =
+                    call_outgoing_area(instruction, &layout, true);
+                if (!area) continue;
+                largest_outgoing = std::max(largest_outgoing, area->size);
+                largest_outgoing_alignment =
+                    std::max(largest_outgoing_alignment, area->alignment);
+                if (!layout) continue;
+                const auto& placed = layout->call.arguments;
                 for (std::size_t index = 0; index < placed.size() &&
                          index + 1U < instruction.operands.size();
                      ++index) {
@@ -9575,10 +10171,9 @@ private:
                         split_homes.insert(operand->value.id);
                     }
                 }
-                if (!instruction.defs.empty() &&
-                    !layout.layout.results.empty() &&
-                    !layout.layout.results.front().indirect &&
-                    layout.layout.results.front().pieces.size() > 1) {
+                if (!instruction.defs.empty() && !layout->results.empty() &&
+                    !layout->results.front().indirect &&
+                    layout->results.front().pieces.size() > 1) {
                     split_homes.insert(instruction.defs.front().id);
                 }
             }
@@ -9968,30 +10563,6 @@ private:
         current_.abi = entity.abi;
         current_.entry = {source.entry.value};
         current_.frame.elide_incoming_saves = elide_noreturn_saves(entity);
-        source_splat_use_counts_.assign(source.values.size(), 0);
-        source_non_splat_use_counts_.assign(source.values.size(), 0);
-        for (const auto& value : source.values) {
-            for (const auto operand : value.operands) {
-                if (value.kind == mir::ValueKind::Splat) {
-                    ++source_splat_use_counts_[operand.value];
-                } else {
-                    ++source_non_splat_use_counts_[operand.value];
-                }
-            }
-            for (const auto& argument : value.call_arguments) {
-                if (argument.value) {
-                    ++source_non_splat_use_counts_[argument.value->value];
-                }
-            }
-            for (const auto& incoming : value.incoming) {
-                ++source_non_splat_use_counts_[incoming.value.value];
-            }
-        }
-        for (const auto& block : source.blocks) {
-            if (block.terminator.value) {
-                ++source_non_splat_use_counts_[block.terminator.value->value];
-            }
-        }
         create_registers(source);
         create_stack_slots(source);
         lower_blocks(source);
@@ -10057,6 +10628,8 @@ private:
             &MachineLowerer::propagate_machine_copies);
         add(LoweringPass::FuseCompareSelects, Stage::InstructionCombining,
             "fuse-compare-selects", &MachineLowerer::fuse_compare_selects);
+        add(LoweringPass::FuseBorrowSelects, Stage::InstructionCombining,
+            "fuse-borrow-selects", &MachineLowerer::fuse_borrow_selects);
         add(LoweringPass::FuseCompareFloatSelects,
             Stage::InstructionCombining, "fuse-compare-float-selects",
             &MachineLowerer::fuse_compare_float_selects);
@@ -10075,6 +10648,8 @@ private:
             &MachineLowerer::hoist_vector_comparison_sign_masks);
         add(LoweringPass::FormDenseJumpTables, Stage::ControlFlow,
             "form-dense-jump-tables", &MachineLowerer::form_dense_jump_tables);
+        add(LoweringPass::FoldMaskedZeroTests, Stage::InstructionCombining,
+            "fold-masked-zero-tests", &MachineLowerer::fold_masked_zero_tests);
         add(LoweringPass::FoldIndexedAddresses, Stage::InstructionCombining,
             "fold-indexed-addresses",
             &MachineLowerer::fold_indexed_memory_addresses);
@@ -10091,6 +10666,9 @@ private:
         add(LoweringPass::FoldVectorMemoryOperands,
             Stage::InstructionCombining, "fold-vector-memory-operands",
             &MachineLowerer::fold_vector_memory_operands);
+        add(LoweringPass::FoldVectorLaneMemory,
+            Stage::InstructionCombining, "fold-vector-lane-memory",
+            &MachineLowerer::fold_vector_lane_memory);
         // Remove dead setup before liveness so it cannot create spills or
         // callee-saved obligations.
         add(LoweringPass::EliminateDeadValues, Stage::Canonicalization,
@@ -10138,8 +10716,6 @@ private:
     machine::Function current_;
     const mir::ManagedFunction* source_{};
     std::vector<std::optional<machine::VirtualRegisterId>> value_registers_;
-    std::vector<unsigned> source_splat_use_counts_;
-    std::vector<unsigned> source_non_splat_use_counts_;
 };
 
 bool safe_assembly_text(std::string_view text) {
@@ -10885,6 +11461,11 @@ private:
         std::string label;
     };
 
+    struct VectorLiteral {
+        std::vector<std::uint8_t> bytes;
+        std::string label;
+    };
+
     struct JumpTable {
         std::string label;
         std::vector<std::string> targets;
@@ -11001,11 +11582,45 @@ private:
         }
     }
 
+    // The little-endian bytes of a vector constant's lanes.
+    static std::vector<std::uint8_t> vector_literal_bytes(
+        const machine::Instruction& value) {
+        std::vector<std::uint8_t> bytes;
+        for (std::size_t index = 0; index + 1U < value.operands.size();
+             ++index) {
+            const auto* lane =
+                std::get_if<machine::ImmediateOperand>(&value.operands[index]);
+            if (!lane) continue;
+            for (unsigned byte = 0; byte < lane->mode.bits / 8U; ++byte) {
+                bytes.push_back(
+                    static_cast<std::uint8_t>(lane->value >> (byte * 8U)));
+            }
+        }
+        return bytes;
+    }
+
+    const VectorLiteral* find_vector_literal(
+        const machine::Instruction& value) const {
+        const auto bytes = vector_literal_bytes(value);
+        const auto found = std::find_if(
+            vector_literals_.begin(), vector_literals_.end(),
+            [&](const VectorLiteral& literal) { return literal.bytes == bytes; });
+        return found == vector_literals_.end() ? nullptr : &*found;
+    }
+
     void collect_vector_literals(const machine::Function& function) {
         byte_swap_literal_bytes_ = 0;
         swap16_label_ = label_prefix(function) + ".swap16";
+        vector_literals_.clear();
         for (const auto& block : function.blocks) {
             for (const auto& instruction : block.instructions) {
+                if (instruction.opcode == Opcode::Vconstant &&
+                    !find_vector_literal(instruction)) {
+                    vector_literals_.push_back(
+                        {vector_literal_bytes(instruction),
+                         label_prefix(function) + ".vector." +
+                             std::to_string(vector_literals_.size())});
+                }
                 if (instruction.opcode != Opcode::Vbswap16 ||
                     instruction.defs.empty()) {
                     continue;
@@ -11051,7 +11666,7 @@ private:
     // most aligned first.
     void emit_read_only_data(const machine::Function& function) {
         if (byte_swap_literal_bytes_ == 0 && float_literals_.empty() &&
-            jump_tables_.empty()) {
+            vector_literals_.empty() && jump_tables_.empty()) {
             return;
         }
         const auto& entity = hir_.function(function.source);
@@ -11073,6 +11688,27 @@ private:
             for (unsigned offset = 0; offset < byte_swap_literal_bytes_;
                  offset += 16) {
                 output_ << "\t.byte 1,0,3,2,5,4,7,6,9,8,11,10,13,12,15,14\n";
+            }
+        }
+        // Wider first, aligned to their size, so that none needs padding.
+        auto vector_literals = vector_literals_;
+        std::stable_sort(vector_literals.begin(), vector_literals.end(),
+                         [](const VectorLiteral& left,
+                            const VectorLiteral& right) {
+                             return left.bytes.size() > right.bytes.size();
+                         });
+        for (const auto& literal : vector_literals) {
+            const auto size = literal.bytes.size();
+            output_ << ".p2align " << (size >= 64 ? 6 : size >= 32 ? 5 : 4)
+                    << '\n' << literal.label << ":\n";
+            for (std::size_t offset = 0; offset < size; offset += 8) {
+                std::uint64_t quad{};
+                for (std::size_t byte = 0; byte < 8 && offset + byte < size;
+                     ++byte) {
+                    quad |= static_cast<std::uint64_t>(literal.bytes[offset + byte])
+                            << (byte * 8U);
+                }
+                output_ << "\t.quad " << quad << '\n';
             }
         }
         for (const auto& literal : float_literals_) {
@@ -12221,7 +12857,7 @@ private:
         // While a function's 256- or 512-bit registers are live, a legacy SSE
         // instruction merges with their upper halves (and on some cores
         // stalls), so such a function spells its SSE instructions with VEX.
-        if (uses_wide_vectors_ && subtarget_.has_feature(Feature::Avx)) {
+        if (uses_wide_vectors_) {
             if (const auto vex = vex_spelling(opcode, operands)) {
                 output_ << '\t' << vex->first << '\t' << vex->second << '\n';
                 return;
@@ -12362,6 +12998,14 @@ private:
         instruction("fstpt", memory(offset));
     }
 
+    // A floating copy between registers moves the whole register: MOVAPS
+    // is renamed away, while MOVSS or MOVSD would merge into, and so wait
+    // for, the destination's previous value.
+    void copy_float_register(std::string_view from, std::string_view to) {
+        instruction("movaps",
+                    "%" + std::string(from) + ", %" + std::string(to));
+    }
+
     // An f80 or binary128 value moves as its whole 16-byte home.
     void load_float(const machine::Function& function, machine::Register source,
                     std::string_view xmm) {
@@ -12373,9 +13017,7 @@ private:
         if (const auto* assigned =
                 assigned_simd_register(function, source)) {
             if (assigned->name == xmm) return;
-            instruction("mov" + float_suffix(source),
-                        "%" + std::string(assigned->name) + ", %" +
-                            std::string(xmm));
+            copy_float_register(assigned->name, xmm);
             return;
         }
         if (const auto* immediate =
@@ -12418,9 +13060,7 @@ private:
         if (const auto* assigned =
                 assigned_simd_register(function, target)) {
             if (assigned->name == xmm) return;
-            instruction("mov" + float_suffix(target),
-                        "%" + std::string(xmm) + ", %" +
-                            std::string(assigned->name));
+            copy_float_register(xmm, assigned->name);
             return;
         }
         instruction("mov" + float_suffix(target),
@@ -12589,6 +13229,12 @@ private:
                      machine::Register source,
                      machine::Register target) {
         const auto width = memory_vector_width(source);
+        // A rematerialized zero forms in its destination register.
+        if (is_rematerialized_zero_vector(function, source) &&
+            vector_is_assigned(function, target, width)) {
+            zero_vector_register(vector_register(target, 0, width), width);
+            return;
+        }
         for (unsigned chunk = 0; chunk < vector_chunks(source, width); ++chunk) {
             load_vector(function, source, 0, chunk, width);
             store_vector_from(function, target,
@@ -13446,6 +14092,32 @@ private:
         }
     }
 
+    // A vector of constant lanes loads from its literal, chunk by chunk
+    // where the value lives in its home.
+    void emit_vector_constant(const machine::Function& function,
+                              const machine::Instruction& value) {
+        const auto target = value.defs.front();
+        const auto* literal = find_vector_literal(value);
+        if (!literal) {
+            diagnostics_.error(value.location,
+                               "vector constant has no literal-pool entry");
+            return;
+        }
+        const auto total = static_cast<unsigned>(target.mode.bits);
+        const auto width = vector_is_assigned(function, target, total)
+            ? total : std::min(total, memory_vector_width(target));
+        for (unsigned chunk = 0; chunk < vector_chunks(target, width);
+             ++chunk) {
+            const auto offset = chunk * (width / 8U);
+            instruction(vector_move_opcode(width),
+                        literal->label +
+                            (offset == 0 ? std::string{}
+                                         : "+" + std::to_string(offset)) +
+                            "(%rip), %" + vector_register(target, 0, width));
+            store_vector(function, target, 0, chunk, width);
+        }
+    }
+
     void emit_vector_splat(const machine::Function& function,
                            const machine::Instruction& value) {
         const auto shape = vector_shape(value);
@@ -13698,7 +14370,13 @@ private:
                 const auto destination = assigned
                     ? std::string(assigned->name)
                     : std::string("xmm0");
-                if (subtarget_.has_feature(Feature::Avx)) {
+                if (subtarget_.has_feature(Feature::Avx) &&
+                    lane_in_quarter == 0) {
+                    // The low lane is the scalar value already.
+                    if (destination != quarter_register) {
+                        copy_float_register(quarter_register, destination);
+                    }
+                } else if (subtarget_.has_feature(Feature::Avx)) {
                     if (shape.element_bits == 32) {
                         instruction("vpermilps",
                                     "$" + std::to_string(
@@ -14079,7 +14757,16 @@ private:
                 element_register = "xmm1";
                 load_float(function, element, element_register);
             }
-            copy_vector(function, source, target);
+            if (vector_is_assigned(function, target, 128)) {
+                copy_vector(function, source, target);
+            } else {
+                // A home-resident result is formed in the XMM0 scratch.
+                load_vector(function, source, 0);
+                const auto from = vector_register(source, 0);
+                if (from != destination) {
+                    instruction("movaps", "%" + from + ", %" + destination);
+                }
+            }
             if (shape.element_bits == 64) {
                 if (lane == 0) {
                     if (element_register != destination) {
@@ -16531,9 +17218,7 @@ private:
                                 ", %" + destination);
             } else {
                 if (lhs_register != destination) {
-                    instruction("mov" + suffix,
-                                "%" + lhs_register + ", %" +
-                                    destination);
+                    copy_float_register(lhs_register, destination);
                 }
                 instruction(std::string(opcode) + suffix,
                             memory_operand + ", %" + destination);
@@ -16691,8 +17376,7 @@ private:
                                 ", %" + destination);
             } else {
                 if (left_register != destination) {
-                    instruction("mov" + suffix,
-                                "%" + left_register + ", %" + destination);
+                    copy_float_register(left_register, destination);
                 }
                 instruction(opcode + suffix,
                             right_operand + ", %" + destination);
@@ -16805,8 +17489,7 @@ private:
                                                 ", %" + destination);
                 } else {
                     if (source_register != destination) {
-                        instruction("movss", "%" + source_register +
-                                                   ", %" + destination);
+                        copy_float_register(source_register, destination);
                     }
                     instruction("xorps", "%xmm1, %" + destination);
                 }
@@ -16818,8 +17501,7 @@ private:
                                                 ", %" + destination);
                 } else {
                     if (source_register != destination) {
-                        instruction("movsd", "%" + source_register +
-                                                   ", %" + destination);
+                        copy_float_register(source_register, destination);
                     }
                     instruction("xorpd", "%xmm1, %" + destination);
                 }
@@ -19848,6 +20530,28 @@ private:
         const auto immediate_text = bits == 64
             ? std::to_string(signed_value)
             : std::to_string(immediate.value);
+        if (base == Opcode::TestEq || base == Opcode::TestNe) {
+            const auto* assigned_source =
+                assigned_integer_register(function, source);
+            const auto source_register = assigned_source
+                ? std::string(assigned_source->storage_name)
+                : std::string("rax");
+            if (!assigned_source) load(function, source, source_register);
+            const auto test_bits = masked_test_bits(bits, immediate);
+            instruction("test" + std::string(1, suffix(test_bits)),
+                        "$" + (test_bits == 64 ? immediate_text
+                                               : std::to_string(immediate.value)) +
+                            ", " + register_name(source_register, test_bits));
+            const auto* assigned_target =
+                assigned_integer_register(function, target);
+            const auto destination = assigned_target
+                ? std::string(assigned_target->storage_name)
+                : std::string("rax");
+            instruction(base == Opcode::TestEq ? "sete" : "setne",
+                        register_name(destination, 8));
+            store(function, target, destination);
+            return;
+        }
         if (const auto code = condition_code(base); !code.empty()) {
             const auto* assigned_source =
                 assigned_integer_register(function, source);
@@ -19946,8 +20650,14 @@ private:
             (base == Opcode::Add || base == Opcode::Sub)) {
             const auto* assigned_source =
                 assigned_integer_register(function, source);
+            // A 32-bit operation's immediate wraps at 32 bits, as LEA's
+            // 32-bit result does.
+            const auto wrapped = bits == 32
+                ? static_cast<std::int64_t>(static_cast<std::int32_t>(
+                      static_cast<std::uint32_t>(immediate.value)))
+                : signed_value;
             const auto displacement = base == Opcode::Add
-                ? signed_value : -signed_value;
+                ? wrapped : -wrapped;
             if (assigned_source && assigned_target &&
                 assigned_source->storage_id !=
                     assigned_target->storage_id &&
@@ -20347,8 +21057,47 @@ private:
         store_float(function, target, "xmm0");
     }
 
+    void emit_borrow_select(const machine::Function& function,
+                            const machine::Instruction& value) {
+        const auto tested = value.uses[0];
+        const auto other = value.uses[1];
+        const auto target = value.defs.front();
+        const auto bits = target.mode.bits;
+        const auto* keep = std::get_if<machine::ImmediateOperand>(
+            &value.operands[1]);
+        const auto* assigned_target =
+            assigned_integer_register(function, target);
+        const auto destination = assigned_target
+            ? std::string(assigned_target->storage_name)
+            : std::string("rax");
+        const auto scratch = destination == "rax" ? std::string("rcx")
+                                                  : std::string("rax");
+        // The other arm must survive the decrement of the destination.
+        std::string other_register = scratch;
+        const auto* assigned_other = assigned_integer_register(function, other);
+        if (assigned_other && assigned_other->storage_name != destination) {
+            other_register = assigned_other->storage_name;
+        } else {
+            load(function, other, scratch);
+        }
+        load(function, tested, destination);
+        instruction("sub" + std::string(1, suffix(bits)),
+                    "$1, " + register_name(destination, bits));
+        instruction(std::string(keep && keep->value != 0 ? "cmovae" : "cmovb") +
+                        std::string(1, suffix(bits)),
+                    register_name(other_register, bits) + ", " +
+                        register_name(destination, bits));
+        store(function, target, destination);
+    }
+
     void emit_select(const machine::Function& function,
                      const machine::Instruction& value) {
+        if (value.condition_predicate == Opcode::SubBorrowImm &&
+            value.uses.size() == 2 && value.defs.size() == 1 &&
+            value.operands.size() == 3) {
+            emit_borrow_select(function, value);
+            return;
+        }
         if (value.uses.size() < 3 || value.defs.size() != 1) {
             diagnostics_.error(value.location,
                                "malformed x86 select instruction");
@@ -21176,6 +21925,97 @@ private:
                             ? "movdqu"
                             : source.mode.bits == 32 ? "movss" : "movsd",
                         "%" + source_register + ", " + memory);
+        }
+    }
+
+    // The memory operand of a pointer access whose displacement is operand
+    // DISPLACEMENT, or of an indexed access whose scale is operand SCALE and
+    // whose displacement follows it. A home-resident base or address stages
+    // through RAX, an index through RCX.
+    std::string float_access_memory(const machine::Function& function,
+                                    const machine::Instruction& value,
+                                    bool indexed, std::size_t operand) {
+        const auto address_register = [&](machine::Register source,
+                                           std::string_view scratch) {
+            if (const auto* assigned =
+                    assigned_integer_register(function, source)) {
+                return std::string(assigned->storage_name);
+            }
+            load(function, source, scratch);
+            return std::string(scratch);
+        };
+        const auto base_register = address_register(value.uses[0], "rax");
+        if (!indexed) {
+            return std::to_string(pointer_displacement(value, operand)) +
+                   "(%" + base_register + ")";
+        }
+        auto index_register = address_register(value.uses[1], "rcx");
+        auto scale =
+            std::get<machine::ImmediateOperand>(value.operands[operand]).value;
+        const auto displacement = static_cast<std::int64_t>(
+            std::get<machine::ImmediateOperand>(value.operands[operand + 1U])
+                .value);
+        if (scale != 1 && scale != 2 && scale != 4 && scale != 8) {
+            load(function, value.uses[1], "rcx");
+            index_register = "rcx";
+            if (std::has_single_bit(scale)) {
+                instruction("shlq", "$" + std::to_string(
+                    std::countr_zero(scale)) + ", %rcx");
+            } else {
+                instruction("imulq", "$" + std::to_string(scale) +
+                                         ", %rcx, %rcx");
+            }
+            scale = 1;
+        }
+        return (displacement == 0 ? std::string{}
+                                  : std::to_string(displacement)) +
+               "(%" + base_register + ",%" + index_register +
+               (scale == 1 ? ")" : "," + std::to_string(scale) + ")");
+    }
+
+    void emit_vector_broadcast_load(const machine::Function& function,
+                                    const machine::Instruction& value) {
+        const bool indexed = value.opcode == Opcode::VbroadcastIndexed;
+        const auto memory =
+            float_access_memory(function, value, indexed, indexed ? 2U : 1U);
+        const auto target = value.defs.front();
+        const auto shape = vector_shape(value);
+        const auto width = static_cast<unsigned>(target.mode.bits);
+        instruction(shape.element_bits == 32 ? "vbroadcastss"
+                    : width == 256           ? "vbroadcastsd"
+                                             : "vmovddup",
+                    memory + ", %" + vector_register(target, 0, width));
+        store_vector(function, target, 0, 0, width);
+    }
+
+    void emit_vector_lane_store(const machine::Function& function,
+                                const machine::Instruction& value) {
+        const bool indexed = value.opcode == Opcode::VlaneStoreIndexed;
+        const auto vector = value.uses.back();
+        const auto shape = vector_shape(value);
+        const auto lane = std::get<machine::ImmediateOperand>(
+            value.operands[value.operands.size() - 2U]).value;
+        // The stored lane is in the low 128 bits: an assigned vector's own
+        // XMM view, else its home's first 16 bytes in XMM0.
+        std::string source = "xmm0";
+        if (const auto* assigned = assigned_simd_register(function, vector)) {
+            const auto name = std::string_view(assigned->name);
+            source = "xmm" +
+                     std::string(name.substr(name.find_first_of("0123456789")));
+        } else {
+            instruction("vmovdqu", memory(vreg_offset(function, vector)) +
+                                       ", %xmm0");
+        }
+        const auto address =
+            float_access_memory(function, value, indexed, indexed ? 3U : 2U);
+        if (lane == 0) {
+            instruction(shape.element_bits == 32 ? "vmovss" : "vmovsd",
+                        "%" + source + ", " + address);
+        } else if (shape.element_bits == 32) {
+            instruction("vextractps", "$" + std::to_string(lane) + ", %" +
+                                          source + ", " + address);
+        } else {
+            instruction("vmovhps", "%" + source + ", " + address);
         }
     }
 
@@ -23569,9 +24409,7 @@ private:
                 const auto* from = assigned_simd_register(function, source);
                 const auto* to = assigned_simd_register(function, target);
                 if (from && to) {
-                    instruction("mov" + float_suffix(target),
-                                "%" + std::string(from->name) + ", %" +
-                                    std::string(to->name));
+                    copy_float_register(from->name, to->name);
                 } else if (from) {
                     store_float(function, target, from->name);
                 } else {
@@ -23785,10 +24623,7 @@ private:
                         return;
                     }
                     if (source && target) {
-                        instruction(
-                            "mov" + float_suffix(copy.target),
-                            "%" + std::string(source->name) + ", %" +
-                                std::string(target->name));
+                        copy_float_register(source->name, target->name);
                         return;
                     }
                     load_float(function, copy.source, "xmm0");
@@ -25031,6 +25866,12 @@ private:
         } else if (value.opcode == Opcode::FpointerLoad ||
                    value.opcode == Opcode::FpointerStore) {
             emit_float_pointer_access(function, value);
+        } else if (value.opcode == Opcode::VbroadcastPointer ||
+                   value.opcode == Opcode::VbroadcastIndexed) {
+            emit_vector_broadcast_load(function, value);
+        } else if (value.opcode == Opcode::VlaneStorePointer ||
+                   value.opcode == Opcode::VlaneStoreIndexed) {
+            emit_vector_lane_store(function, value);
         } else if (value.opcode == Opcode::VpointerLoad ||
                    value.opcode == Opcode::VpointerStore) {
             emit_vector_pointer_access(function, value);
@@ -25139,6 +25980,8 @@ private:
         } else if (value.opcode == Opcode::Vsplat ||
                    value.opcode == Opcode::VsplatConstant) {
             emit_vector_splat(function, value);
+        } else if (value.opcode == Opcode::Vconstant) {
+            emit_vector_constant(function, value);
         } else if (value.opcode == Opcode::Vextract) {
             emit_vector_extract(function, value);
         } else if (has_property(value.opcode, OpcodeProperty::Reduction)) {
@@ -25363,8 +26206,11 @@ private:
                 spill_homes_[owner->value] = index;
         }
         const auto& entity = hir_.function(function.source);
+        // Without AVX, wide vectors live in XMM halves and leave no upper
+        // register state to clear.
         uses_wide_vectors_ = false;
         for (std::size_t id = 0;
+             subtarget_.has_feature(Feature::Avx) &&
              id < function.virtual_registers.size() &&
              id < function.virtual_register_classes.size(); ++id) {
             if (function.virtual_register_classes[id] ==
@@ -25954,6 +26800,7 @@ private:
     std::unordered_map<std::uint32_t, std::vector<FloatLiteral>> unit_literals_;
     std::vector<FloatLiteral>* shared_literals_{};
     std::string swap16_label_;
+    std::vector<VectorLiteral> vector_literals_;
     std::vector<JumpTable> jump_tables_;
     std::vector<DeferredEdgeStub> deferred_edge_stubs_;
     std::uint32_t next_label_{};

@@ -140,6 +140,7 @@ struct CompilerOptions {
     // the target performs with a branch; a preset's budget covers only
     // branchless ones.
     bool if_conversion_limit_explicit{};
+    bool if_conversion_memory_limit_explicit{};
     unsigned if_conversion_memory_limit{12};
     unsigned unroll_factor{2};
     unsigned peel_limit{};

@@ -3335,7 +3335,7 @@ if(BUILD_TESTING)
     set_tests_properties(cross_store_motion_codegen PROPERTIES
         LABELS "check.compile;arch.x86_64;arch.mips;middle;backend.native;feature.optimization;feature.object;feature.floating;feature.model;isa.vr4300;opt.O2;opt.O3;opt.Os")
     # Conditional reductions over floating and narrowed index comparisons.
-    foreach(reduction_mode O0 O2 O3 O3-avx2)
+    foreach(reduction_mode O0 O2 O2-avx2 O3 O3-avx2)
         string(REGEX MATCH "^O[0-9s]" reduction_level "${reduction_mode}")
         set(reduction_flags "-${reduction_level}")
         if(reduction_mode MATCHES "-avx2$")
@@ -3604,6 +3604,102 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/middle/branch_combining.cmake")
     set_tests_properties(cross_branch_combining_codegen PROPERTIES
         LABELS "check.compile;arch.x86_64;middle;backend.native;feature.optimization;opt.O3")
+    # Tests of one integer joined by && or || that fold into one comparison.
+    foreach(range_level O0 O1 O2 O3 Os)
+        add_test(NAME cross_runtime_range_tests_${range_level}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/range_tests.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-range-tests-${range_level}
+                -DENTRY=test_entry -DEXPECTED=0 "-DCC_FLAGS=-${range_level};-fno-eval-calls"
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_range_tests_${range_level} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;middle;feature.optimization;opt.${range_level}")
+    endforeach()
+    add_test(NAME cross_runtime_range_tests_mips_O2
+        COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/range_tests.x
+            -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-range-tests-mips-O2
+            -DEXPECTED=P "-DCC_FLAGS=-O2;-fno-eval-calls"
+            -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+    set_tests_properties(cross_runtime_range_tests_mips_O2 PROPERTIES
+        LABELS "check.runtime;arch.mips;backend.native;middle;feature.optimization;isa.vr4300;isa.r3000;endian.big;endian.little;opt.O2"
+        SKIP_REGULAR_EXPRESSION "skipping MIPS")
+    # Bounded index additions that join address displacements.
+    foreach(bounded_level O0 O2 O3 Os)
+        add_test(NAME cross_runtime_bounded_indices_${bounded_level}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/bounded_indices.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-bounded-indices-${bounded_level}
+                -DENTRY=test_entry -DEXPECTED=0 "-DCC_FLAGS=-${bounded_level};-fno-eval-calls"
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_bounded_indices_${bounded_level} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;middle;feature.optimization;opt.${bounded_level}")
+    endforeach()
+    add_test(NAME cross_runtime_bounded_indices_mips_O2
+        COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/bounded_indices.x
+            -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-bounded-indices-mips-O2
+            -DEXPECTED=P "-DCC_FLAGS=-O2;-fno-eval-calls"
+            -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+    set_tests_properties(cross_runtime_bounded_indices_mips_O2 PROPERTIES
+        LABELS "check.runtime;arch.mips;backend.native;middle;feature.optimization;isa.vr4300;isa.r3000;endian.big;endian.little;opt.O2"
+        SKIP_REGULAR_EXPRESSION "skipping MIPS")
+    add_test(NAME cross_bounded_indices_codegen
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/bounded_indices.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/bounded-indices-codegen
+                -P "${CMAKE_SOURCE_DIR}/test/middle/bounded_indices.cmake")
+    set_tests_properties(cross_bounded_indices_codegen PROPERTIES
+        LABELS "check.compile;arch.x86_64;middle;backend.native;feature.optimization;opt.O2")
+    # Masks, sets, and offsets whose bits no user reads.
+    foreach(demanded_level O0 O1 O2 O3 Os)
+        add_test(NAME cross_runtime_demanded_bits_${demanded_level}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/demanded_bits.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-demanded-bits-${demanded_level}
+                -DENTRY=test_entry -DEXPECTED=0 "-DCC_FLAGS=-${demanded_level};-fno-eval-calls"
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_demanded_bits_${demanded_level} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;middle;feature.optimization;opt.${demanded_level}")
+    endforeach()
+    add_test(NAME cross_runtime_demanded_bits_mips_O2
+        COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/demanded_bits.x
+            -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-demanded-bits-mips-O2
+            -DEXPECTED=P "-DCC_FLAGS=-O2;-fno-eval-calls"
+            -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+    set_tests_properties(cross_runtime_demanded_bits_mips_O2 PROPERTIES
+        LABELS "check.runtime;arch.mips;backend.native;middle;feature.optimization;isa.vr4300;isa.r3000;endian.big;endian.little;opt.O2"
+        SKIP_REGULAR_EXPRESSION "skipping MIPS")
+    add_test(NAME cross_demanded_bits_codegen
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/demanded_bits.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/demanded-bits-codegen
+                -P "${CMAKE_SOURCE_DIR}/test/middle/demanded_bits.cmake")
+    set_tests_properties(cross_demanded_bits_codegen PROPERTIES
+        LABELS "check.compile;arch.x86_64;middle;backend.native;feature.optimization;opt.O2")
+    add_test(NAME cross_range_tests_codegen
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/range_tests.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/range-tests-codegen
+                -P "${CMAKE_SOURCE_DIR}/test/middle/range_tests.cmake")
+    set_tests_properties(cross_range_tests_codegen PROPERTIES
+        LABELS "check.compile;arch.x86_64;middle;backend.native;feature.optimization;opt.O2")
     add_test(NAME cross_floating_select_codegen
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
@@ -5144,6 +5240,65 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
     set_tests_properties(cross_runtime_native_vectors PROPERTIES
         LABELS "check.runtime;arch.x86_64;backend.native;feature.vector;opt.O2")
+    # Vectors of constant lanes, which load as one literal.
+    foreach(constant_mode O0 O2 O2-avx2 O2-medium O3)
+        string(REGEX MATCH "^O[0-9s]" constant_level "${constant_mode}")
+        set(constant_flags "-${constant_level}")
+        if(constant_mode MATCHES "-avx2$")
+            list(APPEND constant_flags "-march=x86-64-v3")
+        elseif(constant_mode MATCHES "-medium$")
+            list(APPEND constant_flags "-mcmodel=medium")
+        endif()
+        add_test(NAME cross_runtime_vector_constant_lanes_${constant_mode}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/vector/constant_lanes.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-vector-constant-lanes-${constant_mode}
+                -DENTRY=test_entry -DEXPECTED=0
+                "-DCC_FLAGS=${constant_flags};-fno-eval-calls"
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_vector_constant_lanes_${constant_mode} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;feature.vector;opt.${constant_level}")
+    endforeach()
+    add_test(NAME cross_vector_constant_lanes_codegen
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/vector/constant_lanes.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/vector-constant-lanes
+                -P "${CMAKE_SOURCE_DIR}/test/backend/native/vector/constant_lanes.cmake")
+    set_tests_properties(cross_vector_constant_lanes_codegen PROPERTIES
+        LABELS "check.compile;arch.x86_64;backend.native;feature.vector;opt.O2")
+    # Splats of loads, stores of lanes, and partial SLP groups.
+    foreach(lane_mode O0 O2 O2-avx2 O2-avx2-unfolded O3-avx2 Os)
+        string(REGEX MATCH "^O[0-9s]" lane_level "${lane_mode}")
+        set(lane_flags "-${lane_level}")
+        if(lane_mode MATCHES "-avx2")
+            list(APPEND lane_flags "-march=x86-64-v3")
+        endif()
+        if(lane_mode MATCHES "-unfolded$")
+            list(APPEND lane_flags "-fno-fold-memory-operands")
+        endif()
+        add_test(NAME cross_runtime_vector_lane_memory_${lane_mode}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/vector/lane_memory.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-vector-lane-memory-${lane_mode}
+                -DENTRY=test_entry -DEXPECTED=0
+                "-DCC_FLAGS=${lane_flags};-fno-eval-calls"
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_vector_lane_memory_${lane_mode} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;feature.vector;opt.${lane_level}")
+    endforeach()
+    add_test(NAME cross_vector_lane_memory_codegen
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/vector/lane_memory.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/vector-lane-memory
+                -P "${CMAKE_SOURCE_DIR}/test/backend/native/vector/lane_memory.cmake")
+    set_tests_properties(cross_vector_lane_memory_codegen PROPERTIES
+        LABELS "check.compile;arch.x86_64;backend.native;feature.vector;opt.O2")
     add_test(NAME cross_vector_loop_optimization
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
@@ -5199,6 +5354,62 @@ if(BUILD_TESTING)
                     -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
         set_tests_properties(cross_runtime_native_vector_memory_alignment_${variant_name} PROPERTIES
             LABELS "check.runtime;arch.x86_64;backend.native;feature.vector;feature.optimization")
+    endforeach()
+    # Record members at power-of-two strides an index scale cannot encode.
+    add_test(NAME cross_x86_64_record_strides
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/record_strides.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/x86-64-record-strides
+                -P "${CMAKE_SOURCE_DIR}/test/backend/native/record_strides.cmake")
+    set_tests_properties(cross_x86_64_record_strides PROPERTIES
+        LABELS "check.compile;arch.x86_64;backend.native;feature.optimization;opt.O2")
+    foreach(variant IN ITEMS "O0;-O0" "O2;-O2" "O3;-O3" "Os;-Os"
+                             "uncombined;-O2;-fno-combine-addresses")
+        list(GET variant 0 variant_name)
+        list(REMOVE_AT variant 0)
+        add_test(NAME cross_runtime_x86_64_record_strides_${variant_name}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/record_strides.x
+                    -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-x86-64-record-strides-${variant_name}
+                    -DENTRY=test_entry -DEXPECTED=0
+                    "-DCC_FLAGS=${variant};-fno-eval-calls"
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        list(GET variant 0 stride_level)
+        string(SUBSTRING "${stride_level}" 1 -1 stride_level)
+        set_tests_properties(cross_runtime_x86_64_record_strides_${variant_name} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;feature.optimization;opt.${stride_level}")
+    endforeach()
+    # Selects of a decrement by its borrow and masked zero tests.
+    add_test(NAME cross_x86_64_borrow_selects
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/borrow_selects.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/x86-64-borrow-selects
+                -P "${CMAKE_SOURCE_DIR}/test/backend/native/borrow_selects.cmake")
+    set_tests_properties(cross_x86_64_borrow_selects PROPERTIES
+        LABELS "check.compile;arch.x86_64;backend.native;feature.optimization;opt.O2")
+    foreach(variant IN ITEMS "O0;-O0" "O2;-O2" "O3;-O3" "Os;-Os"
+                             "unfused;-O2;-fno-compare-select-fusion")
+        list(GET variant 0 variant_name)
+        list(REMOVE_AT variant 0)
+        add_test(NAME cross_runtime_x86_64_borrow_selects_${variant_name}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/borrow_selects.x
+                    -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-x86-64-borrow-selects-${variant_name}
+                    -DENTRY=test_entry -DEXPECTED=0
+                    "-DCC_FLAGS=${variant};-fno-eval-calls"
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        list(GET variant 0 borrow_level)
+        string(SUBSTRING "${borrow_level}" 1 -1 borrow_level)
+        set_tests_properties(cross_runtime_x86_64_borrow_selects_${variant_name} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;feature.optimization;opt.${borrow_level}")
     endforeach()
     # Pointer reads at a constant displacement as ALU and SSE memory operands.
     add_test(NAME cross_x86_64_memory_operands

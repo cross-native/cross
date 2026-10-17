@@ -93,8 +93,8 @@ global u32 mips_copy_edge_delay(in u32 seed, in u32 count) {
 [[abi("o32"), noinline]]
 global u32 mips_integer_immediates(in u32 value) {
     u32 result = value + 17u32;
-    result = result ^ 255u32;
     result = result >> 13u32;
+    result = result ^ 255u32;
     result = result - 32768u32;
     return result & 65535u32;
 }

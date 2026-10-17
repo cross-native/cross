@@ -96,6 +96,7 @@ compile_variant(no_reassoc -fno-tree-reassoc)
 compile_variant(console -mprofile=n64)
 compile_variant(no_ivopts -fno-ivopts)
 compile_variant(no_memory_if_conversion -fif-conversion-memory-limit=0)
+compile_variant(force_memory_if_conversion -fif-conversion-memory-limit=12)
 compile_variant(force_ordinary_if_conversion -fif-conversion-limit=12)
 compile_size_variant(size)
 compile_size_variant(size_no_machine_combine -fno-machine-combine)
@@ -714,13 +715,20 @@ if(NOT compact_risc MATCHES "[\t ]li[\t ]+\\\$[a-z0-9]+,-4\n" OR
         "RISC:\n${compact_risc}\nCISC:\n${compact_cisc}")
 endif()
 
+# The VR4300 selects with a branch, so the preset memory budget converts no
+# unpredictable top-bit test; an explicit budget still does.
 function_body("${OUTPUT}.enabled.s"
-              mips_high_bit_select high_bit_select)
+              mips_high_bit_select high_bit_default)
 function_body("${OUTPUT}.no_memory_if_conversion.s"
               mips_high_bit_select high_bit_branch)
-if(high_bit_select STREQUAL high_bit_branch)
+function_body("${OUTPUT}.force_memory_if_conversion.s"
+              mips_high_bit_select high_bit_select)
+if(NOT high_bit_default STREQUAL high_bit_branch OR
+   high_bit_select STREQUAL high_bit_branch)
     message(FATAL_ERROR
-        "the MIPS profile did not if-convert an unpredictable top-bit test")
+        "the VR4300 preset converted a top-bit test, or "
+        "-fif-conversion-memory-limit=12 did not\n"
+        "default:\n${high_bit_default}\nforced:\n${high_bit_select}")
 endif()
 
 function_body("${OUTPUT}.enabled.s"

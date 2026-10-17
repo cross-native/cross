@@ -73,7 +73,7 @@ foreach(level O2 O3 Os Oz)
         if((NOT polynomial MATCHES
             "cmpq[^\r\n]*\r?\n[\t ]+j(ae|e)[^\r\n]*\r?\n[.]Lcross[.]machine[^:]*:\r?\n[\t ]+movsd" AND
             NOT polynomial MATCHES
-            "cmpq[^\r\n]*\r?\n[\t ]+j(b|ne)[^\r\n]*\r?\n[.]Lcross[.]machine[^:]*:\r?\n[\t ]+movsd[\t ]+%xmm") OR
+            "cmpq[^\r\n]*\r?\n[\t ]+j(b|ne)[^\r\n]*\r?\n[.]Lcross[.]machine[^:]*:\r?\n[\t ]+mov(sd|aps)[\t ]+%xmm") OR
            polynomial MATCHES "\n[\t ]+j[a-ln-z][a-z]*[\t ][^\r\n]*\r?\n[\t ]+jmp")
             message(FATAL_ERROR
                 "nested polynomial loop body is not the fallthrough edge\n"

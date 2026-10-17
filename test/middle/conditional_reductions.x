@@ -120,6 +120,33 @@ static f32 distance(in f32 a, in f32 b) { return a > b ? a - b : b - a; }
     return bits;
 }
 
+// The call keeps the loop scalar, so its branches stay as they are.
+[[noinline]] global u32 weight_of(in uptr j) { return weights[j] & 3u32; }
+
+[[noinline]] global u32 called_contacts(in uptr k, in f32 x, in f32 y) {
+    u32 total = 0u32;
+    for (uptr j = 0; j < 32; ++j) {
+        if (j != k && distance(box_x[j], x) < 2.0f32 &&
+            distance(box_y[j], y) < 2.0f32) {
+            total = total + weight_of(j);
+        }
+    }
+    return total;
+}
+
+[[noinline]] global u32 called_contacts_reference(in uptr k, in f32 x,
+                                                  in f32 y) {
+    u32 total = 0u32;
+    for (uptr j = 32; j > 0; --j) {
+        const uptr at = j - 1;
+        if (at != k && distance(box_x[at], x) < 2.0f32 &&
+            distance(box_y[at], y) < 2.0f32) {
+            total = total + weight_of(at);
+        }
+    }
+    return total;
+}
+
 global u32 test_entry() {
     u32 seed = 12345u32;
     for (u32 j = 0u32; j < 32u32; ++j) {
@@ -135,6 +162,9 @@ global u32 test_entry() {
             const f32 x = (f32)(step * 4u32) + 0.5f32;
             const f32 y = (f32)(31u32 - step * 3u32) - 0.25f32;
             if (contacts(k, x, y) != contacts_reference(k, x, y)) return 1u32 + index;
+            if (called_contacts(k, x, y) != called_contacts_reference(k, x, y)) {
+                return 90u32 + index;
+            }
             if (skipped(k, x) != skipped_reference(k, x)) return 20u32 + index;
             if (marked(x) != marked_reference(x)) return 40u32 + step;
         }

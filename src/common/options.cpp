@@ -831,6 +831,12 @@ bool resolve_registered_options(
     }
     options.if_conversion_memory_limit = static_cast<unsigned>(
         resolved_unsigned(options, "f.if-conversion-memory-limit", 12));
+    if (const auto* limit =
+            find_resolved_option(options, "f.if-conversion-memory-limit")) {
+        options.if_conversion_memory_limit_explicit =
+            limit->origin == OptionOrigin::Profile ||
+            limit->origin == OptionOrigin::CommandLine;
+    }
     options.unroll_factor = static_cast<unsigned>(
         resolved_unsigned(options, "f.unroll-factor", 2));
     options.peel_limit = static_cast<unsigned>(

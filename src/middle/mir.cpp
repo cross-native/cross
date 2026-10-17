@@ -10440,8 +10440,10 @@ void factor_common_select_addends(ManagedFunction& function) {
     }
 }
 
+// Operands that are constants count by their value, as one constant in each
+// block that uses it is the same operand everywhere.
 std::optional<std::string> redundant_expression_key(
-    const ManagedValue& value) {
+    const ManagedFunction& function, const ManagedValue& value) {
     std::string result = std::to_string(static_cast<unsigned>(value.kind)) +
                          ':' + std::to_string(value.type.value);
     switch (value.kind) {
@@ -10489,7 +10491,16 @@ std::optional<std::string> redundant_expression_key(
     default: return std::nullopt;
     }
     for (const auto operand : value.operands) {
-        result += ':' + std::to_string(operand.value);
+        const auto& source = function.values[operand.value];
+        if (source.kind == ValueKind::ConstantInteger ||
+            source.kind == ValueKind::ConstantFloating) {
+            result += ":c" + std::to_string(static_cast<unsigned>(source.kind)) +
+                      '.' + std::to_string(source.type.value) + '.' +
+                      std::to_string(source.integer) + '.' +
+                      std::to_string(source.integer_high);
+        } else {
+            result += ':' + std::to_string(operand.value);
+        }
     }
     return result;
 }
@@ -10542,7 +10553,7 @@ void eliminate_fully_redundant_expressions(
             if (may_trap_floating(value, function, hir_module, environment)) {
                 continue;
             }
-            const auto key = redundant_expression_key(value);
+            const auto key = redundant_expression_key(function, value);
             if (!key) continue;
             if (const auto found = available.find(*key);
                 found != available.end()) {
@@ -10581,6 +10592,11 @@ void make_integer_constant(ManagedValue& value, UInt128 integer) {
     value.operands.clear();
     value.incoming.clear();
 }
+
+void fold_range_tests(ManagedFunction& function,
+                      const hir::Module& hir_module);
+void simplify_demanded_bits(ManagedFunction& function,
+                            const hir::Module& hir_module);
 
 void simplify_integer_operations(ManagedFunction& function,
                                  const hir::Module& hir_module) {
@@ -10680,6 +10696,591 @@ void simplify_integer_operations(ManagedFunction& function,
     }
     replacements.apply(function);
     remove_replaced_values(function, removed);
+    simplify_demanded_bits(function, hir_module);
+    fold_range_tests(function, hir_module);
+}
+
+// The values for which a test of an integer holds, as the circular range
+// [low, low + length) of BITS-bit unsigned integers; a length of zero is
+// no value and 2^BITS every value.
+struct IntegerRange {
+    ValueId tested;
+    unsigned bits{};
+    UInt128 low;
+    UInt128 length;
+};
+
+UInt128 range_modulus(unsigned bits) { return shift_left(UInt128{1}, bits); }
+
+IntegerRange complement_range(IntegerRange range) {
+    const auto modulus = range_modulus(range.bits);
+    range.low = mask_to(add(range.low, range.length), range.bits);
+    range.length = subtract(modulus, range.length);
+    return range;
+}
+
+// The union of two ranges of one value, when it is one range.
+std::optional<IntegerRange> union_range(IntegerRange left,
+                                        IntegerRange right) {
+    const auto modulus = range_modulus(left.bits);
+    if (left.length == UInt128{}) return right;
+    if (right.length == UInt128{}) return left;
+    if (left.length == modulus || right.length == modulus) {
+        left.length = modulus;
+        return left;
+    }
+    // RIGHT relative to the start of LEFT.
+    const auto start = mask_to(subtract(right.low, left.low), left.bits);
+    const auto end = add(start, right.length);
+    if (!(left.length < start)) {
+        // RIGHT begins inside LEFT or just after it.
+        left.length = !(end < modulus) ? modulus : std::max(left.length, end);
+        return left;
+    }
+    // A gap follows LEFT; RIGHT must wrap around to reach LEFT's start.
+    if (end < modulus) return std::nullopt;
+    const auto overlap = subtract(end, modulus);
+    right.length = add(subtract(modulus, start),
+                       std::max(left.length, overlap));
+    if (modulus < right.length) right.length = modulus;
+    return right;
+}
+
+// The range of the value a comparison with a constant tests, looking
+// through same-width reinterpretation and the addition or subtraction of a
+// constant, as `(x - c) <u n` tests x.
+std::optional<IntegerRange> comparison_range(const ManagedFunction& function,
+                                             const hir::Module& hir_module,
+                                             ValueId id) {
+    const auto& compare = function.values[id.value];
+    if (compare.kind != ValueKind::Binary || !comparison(compare.binary) ||
+        compare.operands.size() != 2) {
+        return std::nullopt;
+    }
+    const auto constant_of = [&](ValueId operand) -> std::optional<UInt128> {
+        const auto& value = function.values[operand.value];
+        if (value.kind != ValueKind::ConstantInteger) return std::nullopt;
+        return UInt128{value.integer, value.integer_high};
+    };
+    auto operation = compare.binary;
+    auto tested = compare.operands[0];
+    auto constant = constant_of(compare.operands[1]);
+    if (!constant) {
+        // A constant on the left mirrors the order.
+        constant = constant_of(compare.operands[0]);
+        tested = compare.operands[1];
+        if (!constant || constant_of(tested)) return std::nullopt;
+        switch (operation) {
+        case BinaryOperation::SignedLess:
+            operation = BinaryOperation::SignedGreater; break;
+        case BinaryOperation::SignedLessEqual:
+            operation = BinaryOperation::SignedGreaterEqual; break;
+        case BinaryOperation::SignedGreater:
+            operation = BinaryOperation::SignedLess; break;
+        case BinaryOperation::SignedGreaterEqual:
+            operation = BinaryOperation::SignedLessEqual; break;
+        case BinaryOperation::UnsignedLess:
+            operation = BinaryOperation::UnsignedGreater; break;
+        case BinaryOperation::UnsignedLessEqual:
+            operation = BinaryOperation::UnsignedGreaterEqual; break;
+        case BinaryOperation::UnsignedGreater:
+            operation = BinaryOperation::UnsignedLess; break;
+        case BinaryOperation::UnsignedGreaterEqual:
+            operation = BinaryOperation::UnsignedLessEqual; break;
+        default: break;
+        }
+    }
+    const auto type = function.values[tested.value].type;
+    const auto bits = type_bits(hir_module, type);
+    if (!integer_type(hir_module, type) ||
+        type == hir_module.builtin(BuiltinType::Bool) || bits == 0 ||
+        bits > 64) {
+        return std::nullopt;
+    }
+    const auto modulus = range_modulus(bits);
+    const auto value = mask_to(*constant, bits);
+    const auto sign = shift_left(UInt128{1}, bits - 1U);
+    IntegerRange range{tested, bits, {}, {}};
+    // Signed order is unsigned order with the sign bit flipped.
+    bool flipped = false;
+    auto bound = value;
+    switch (operation) {
+    case BinaryOperation::SignedLess:
+    case BinaryOperation::SignedLessEqual:
+    case BinaryOperation::SignedGreater:
+    case BinaryOperation::SignedGreaterEqual:
+        flipped = true;
+        bound = mask_to(add(value, sign), bits);
+        break;
+    default: break;
+    }
+    switch (operation) {
+    case BinaryOperation::Equal:
+        range.low = value;
+        range.length = UInt128{1};
+        break;
+    case BinaryOperation::NotEqual:
+        range.low = mask_to(add(value, UInt128{1}), bits);
+        range.length = subtract(modulus, UInt128{1});
+        break;
+    case BinaryOperation::SignedLess:
+    case BinaryOperation::UnsignedLess:
+        range.length = bound;
+        break;
+    case BinaryOperation::SignedLessEqual:
+    case BinaryOperation::UnsignedLessEqual:
+        range.length = add(bound, UInt128{1});
+        break;
+    case BinaryOperation::SignedGreater:
+    case BinaryOperation::UnsignedGreater:
+        range.low = add(bound, UInt128{1});
+        range.length = subtract(subtract(modulus, bound), UInt128{1});
+        break;
+    case BinaryOperation::SignedGreaterEqual:
+    case BinaryOperation::UnsignedGreaterEqual:
+        range.low = bound;
+        range.length = subtract(modulus, bound);
+        break;
+    default: return std::nullopt;
+    }
+    if (flipped) range.low = add(range.low, sign);
+    range.low = mask_to(range.low, bits);
+    if (range.length == UInt128{}) range.low = UInt128{};
+    // x in R holds for x = y + c exactly when y is in R - c.
+    while (true) {
+        const auto& source = function.values[range.tested.value];
+        const auto source_type = source.operands.size() == 1
+            ? function.values[source.operands[0].value].type
+            : hir::TypeId{};
+        if (source.kind == ValueKind::Cast &&
+            source.cast == CastOperation::Reinterpret &&
+            source.operands.size() == 1 &&
+            integer_type(hir_module, source_type) &&
+            source_type != hir_module.builtin(BuiltinType::Bool) &&
+            type_bits(hir_module, source_type) == bits) {
+            range.tested = source.operands[0];
+            continue;
+        }
+        if (source.kind != ValueKind::Binary || source.operands.size() != 2 ||
+            (source.binary != BinaryOperation::Add &&
+             source.binary != BinaryOperation::Subtract)) {
+            break;
+        }
+        const auto right = constant_of(source.operands[1]);
+        const auto left = source.binary == BinaryOperation::Add
+            ? constant_of(source.operands[0])
+            : std::nullopt;
+        if (right && !constant_of(source.operands[0])) {
+            range.low = source.binary == BinaryOperation::Add
+                ? subtract(range.low, *right) : add(range.low, *right);
+            range.tested = source.operands[0];
+        } else if (left && !right) {
+            range.low = subtract(range.low, *left);
+            range.tested = source.operands[1];
+        } else {
+            break;
+        }
+        range.low = mask_to(range.low, bits);
+    }
+    return range;
+}
+
+// The values for which `a && b` (CONJUNCTION) or `a || b` holds when A
+// and B test one integer against constants, when they form one range.
+std::optional<IntegerRange> combined_range(const ManagedFunction& function,
+                                           const hir::Module& hir_module,
+                                           ValueId left, ValueId right,
+                                           bool conjunction) {
+    const auto first = comparison_range(function, hir_module, left);
+    const auto second = comparison_range(function, hir_module, right);
+    if (!first || !second || first->tested != second->tested ||
+        first->bits != second->bits) {
+        return std::nullopt;
+    }
+    if (!conjunction) return union_range(*first, *second);
+    // `a && b` fails where either test fails.
+    const auto failing =
+        union_range(complement_range(*first), complement_range(*second));
+    if (!failing) return std::nullopt;
+    return complement_range(*failing);
+}
+
+std::optional<hir::TypeId> modular_multiply_type(const hir::Module& module,
+                                                 hir::TypeId id);
+
+struct RangeComparison {
+    BinaryOperation operation{};
+    ValueId offset;
+    ValueId span;
+};
+
+// The unsigned comparison that holds exactly for the values in RANGE,
+// which holds for some values but not all: the offset of the tested value
+// from the start of RANGE `<=u` its span or, when the complement is
+// shorter, the offset from the complement's start `>u` its span, in the
+// unsigned type of the value's width. The operands are appended to VALUES.
+std::optional<RangeComparison> emit_range_comparison(
+    ManagedFunction& function, const hir::Module& hir_module,
+    IntegerRange range, SourceLocation location,
+    std::optional<InlineSiteId> inline_site, std::vector<ValueId>& values) {
+    const auto modulus = range_modulus(range.bits);
+    const auto domain = modular_multiply_type(
+        hir_module, function.values[range.tested.value].type);
+    if (range.length == UInt128{} || range.length == modulus || !domain ||
+        type_bits(hir_module, *domain) != range.bits) {
+        return std::nullopt;
+    }
+    const bool inside = !(subtract(modulus, range.length) < range.length);
+    if (!inside) range = complement_range(range);
+    const auto append = [&](ManagedValue value) {
+        value.id = {static_cast<std::uint32_t>(function.values.size())};
+        value.type = *domain;
+        value.location = location;
+        value.inline_site = inline_site;
+        values.push_back(value.id);
+        function.values.push_back(std::move(value));
+        return values.back();
+    };
+    const auto constant = [&](UInt128 integer) {
+        ManagedValue value;
+        make_integer_constant(value, integer);
+        return append(std::move(value));
+    };
+    auto offset = range.tested;
+    if (function.values[offset.value].type != *domain) {
+        ManagedValue view;
+        view.kind = ValueKind::Cast;
+        view.cast = CastOperation::Reinterpret;
+        view.operands = {offset};
+        offset = append(std::move(view));
+    }
+    if (range.low != UInt128{}) {
+        ManagedValue difference;
+        difference.kind = ValueKind::Binary;
+        difference.binary = BinaryOperation::Subtract;
+        difference.operands = {offset, constant(range.low)};
+        offset = append(std::move(difference));
+    }
+    const auto span = constant(subtract(range.length, UInt128{1}));
+    return RangeComparison{inside ? BinaryOperation::UnsignedLessEqual
+                                  : BinaryOperation::UnsignedGreater,
+                           offset, span};
+}
+
+// Folds the conjunction or disjunction of two tests of one integer against
+// constants into one test when the values for which it holds form one
+// circular range: `x < -C || x > C` becomes `(unsigned)(x + C) > 2C`.
+// Lineage: GCC fold_range_test and reassoc optimize_range_tests, LLVM
+// InstCombine foldAndOrOfICmpsUsingRanges.
+void fold_range_tests(ManagedFunction& function,
+                      const hir::Module& hir_module) {
+    const auto boolean = hir_module.builtin(BuiltinType::Bool);
+    if (!boolean) return;
+    std::optional<UseLists> uses;
+    for (std::size_t block_index = 0; block_index < function.blocks.size();
+         ++block_index) {
+        for (std::size_t position = 0;
+             position < function.blocks[block_index].values.size();
+             ++position) {
+            const auto id = function.blocks[block_index].values[position];
+            const auto combine = function.values[id.value];
+            if (combine.kind != ValueKind::Binary ||
+                (combine.binary != BinaryOperation::BitOr &&
+                 combine.binary != BinaryOperation::BitAnd) ||
+                combine.operands.size() != 2 || combine.type != *boolean ||
+                combine.operands[0] == combine.operands[1]) {
+                continue;
+            }
+            const auto folded = combined_range(
+                function, hir_module, combine.operands[0], combine.operands[1],
+                combine.binary == BinaryOperation::BitAnd);
+            if (!folded) continue;
+            // The tests become dead, so the fold adds no operation.
+            if (!uses) uses.emplace(function);
+            if (combine.operands[0].value >= uses->value_count() ||
+                combine.operands[1].value >= uses->value_count() ||
+                uses->uses(combine.operands[0]).size() != 1 ||
+                uses->uses(combine.operands[1]).size() != 1) {
+                continue;
+            }
+            if (folded->length == UInt128{} ||
+                folded->length == range_modulus(folded->bits)) {
+                make_integer_constant(function.values[id.value],
+                                      folded->length == UInt128{}
+                                          ? UInt128{} : UInt128{1});
+                continue;
+            }
+            std::vector<ValueId> inserted;
+            const auto comparison = emit_range_comparison(
+                function, hir_module, *folded, combine.location,
+                combine.inline_site, inserted);
+            if (!comparison) continue;
+            auto& rewritten = function.values[id.value];
+            rewritten.binary = comparison->operation;
+            rewritten.operands = {comparison->offset, comparison->span};
+            auto& values = function.blocks[block_index].values;
+            values.insert(values.begin() + static_cast<std::ptrdiff_t>(position),
+                          inserted.begin(), inserted.end());
+            position += inserted.size();
+        }
+    }
+}
+
+// The low bits up to the highest one of DEMANDED: the bits of an addition,
+// subtraction, multiplication, or negation that those result bits read.
+UInt128 low_demanded_bits(UInt128 demanded) {
+    UInt128 result;
+    for (unsigned index = 128; index-- > 0;) {
+        if (bit(demanded, index)) {
+            return mask_to(bit_not(UInt128{}), index + 1U);
+        }
+    }
+    return result;
+}
+
+// Removes masking, setting, and offsetting that no user observes. A
+// backward pass over the SSA graph, through phis, finds which bits of each
+// integer value its users read; an operand then skips a bitwise operation
+// with a constant, or the addition or subtraction of a constant, that
+// leaves those bits unchanged: `(x + 16384) & 16383` reads `x & 16383`,
+// and a 16-bit counter `(h + t) & 65535` whose users read only its low 16
+// bits carries `h + t`. Lineage: LLVM SimplifyDemandedBits and BDCE.
+void simplify_demanded_bits(ManagedFunction& function,
+                            const hir::Module& hir_module) {
+    const auto boolean = hir_module.builtin(BuiltinType::Bool);
+    const auto count = function.values.size();
+    std::vector<unsigned> widths(count);
+    for (const auto& block : function.blocks) {
+        for (const auto id : block.values) {
+            const auto type = function.values[id.value].type;
+            const auto bits = type_bits(hir_module, type);
+            if (integer_type(hir_module, type) && type != boolean &&
+                bits != 0 && bits <= 128) {
+                widths[id.value] = bits;
+            }
+        }
+    }
+    const auto all_bits = [&](ValueId id) {
+        return mask_to(bit_not(UInt128{}), widths[id.value]);
+    };
+    const auto constant_of = [&](ValueId id) -> std::optional<UInt128> {
+        const auto& value = function.values[id.value];
+        if (value.kind != ValueKind::ConstantInteger) return std::nullopt;
+        return mask_to(UInt128{value.integer, value.integer_high},
+                       std::max(widths[id.value], 1U));
+    };
+    const auto shift_amount = [&](const ManagedValue& value)
+        -> std::optional<unsigned> {
+        const auto amount = constant_of(value.operands[1]);
+        if (!amount || amount->high != 0 ||
+            amount->low >= widths[value.id.value]) {
+            return std::nullopt;
+        }
+        return static_cast<unsigned>(amount->low);
+    };
+    // The bits of operand INDEX that VALUE reads when its users read
+    // DEMANDED of it, or no value when VALUE reads the whole operand.
+    const auto operand_demand =
+        [&](const ManagedValue& value, std::size_t index,
+            UInt128 demanded) -> std::optional<UInt128> {
+        const auto operand = value.operands[index];
+        if (widths[value.id.value] == 0 || widths[operand.value] == 0) {
+            return std::nullopt;
+        }
+        const auto width = widths[value.id.value];
+        const auto mask = mask_to(bit_not(UInt128{}), width);
+        switch (value.kind) {
+        case ValueKind::Phi:
+            return demanded;
+        case ValueKind::Select:
+            return index == 0 ? std::nullopt : std::optional(demanded);
+        case ValueKind::Unary:
+            if (value.unary == UnaryOperation::Negate) {
+                return low_demanded_bits(demanded);
+            }
+            if (value.unary == UnaryOperation::BitNot) return demanded;
+            return std::nullopt;
+        case ValueKind::Cast: {
+            const auto source = widths[operand.value];
+            const auto source_mask = mask_to(bit_not(UInt128{}), source);
+            switch (value.cast) {
+            case CastOperation::Truncate:
+            case CastOperation::Reinterpret:
+            case CastOperation::ZeroExtend:
+                return bit_and(demanded, source_mask);
+            case CastOperation::SignExtend: {
+                auto result = bit_and(demanded, source_mask);
+                if (bit_and(demanded, bit_not(source_mask)) != UInt128{}) {
+                    result = bit_or(result, shift_left(UInt128{1},
+                                                       source - 1U));
+                }
+                return result;
+            }
+            default: return std::nullopt;
+            }
+        }
+        case ValueKind::Binary:
+            break;
+        default: return std::nullopt;
+        }
+        if (value.operands.size() != 2 ||
+            widths[value.operands[0].value] != width) {
+            return std::nullopt;
+        }
+        const auto other = constant_of(value.operands[1U - index]);
+        switch (value.binary) {
+        case BinaryOperation::Add:
+        case BinaryOperation::Subtract:
+        case BinaryOperation::Multiply:
+            return low_demanded_bits(demanded);
+        case BinaryOperation::BitAnd:
+            return other ? bit_and(demanded, *other) : demanded;
+        case BinaryOperation::BitOr:
+            return other ? bit_and(demanded, bit_not(*other)) : demanded;
+        case BinaryOperation::BitXor:
+            return demanded;
+        case BinaryOperation::ShiftLeft:
+        case BinaryOperation::ShiftRightLogical:
+        case BinaryOperation::ShiftRightArithmetic: {
+            const auto amount = shift_amount(value);
+            if (index != 0 || !amount) return std::nullopt;
+            if (value.binary == BinaryOperation::ShiftLeft) {
+                return shift_right(demanded, *amount);
+            }
+            auto result = bit_and(shift_left(demanded, *amount), mask);
+            if (value.binary == BinaryOperation::ShiftRightArithmetic &&
+                *amount != 0 &&
+                shift_right(demanded, width - *amount) != UInt128{}) {
+                result = bit_or(result, shift_left(UInt128{1}, width - 1U));
+            }
+            return result;
+        }
+        default: return std::nullopt;
+        }
+    };
+
+    std::vector<UInt128> demanded(count);
+    std::vector<ValueId> work;
+    const auto demand = [&](ValueId id, UInt128 bits) {
+        if (id.value >= count || widths[id.value] == 0) return;
+        const auto merged = bit_or(demanded[id.value],
+                                   bit_and(bits, all_bits(id)));
+        if (merged == demanded[id.value]) return;
+        demanded[id.value] = merged;
+        work.push_back(id);
+    };
+    for (const auto& block : function.blocks) {
+        for (const auto id : block.values) {
+            const auto& value = function.values[id.value];
+            for (std::size_t index = 0; index < value.operands.size();
+                 ++index) {
+                // Users whose reads depend on their own demand propagate
+                // once they are demanded.
+                if (!operand_demand(value, index, all_bits(id))) {
+                    demand(value.operands[index], bit_not(UInt128{}));
+                }
+            }
+            for (const auto& argument : value.call_arguments) {
+                if (argument.value) demand(*argument.value, bit_not(UInt128{}));
+            }
+        }
+        if (block.terminator.value) {
+            demand(*block.terminator.value, bit_not(UInt128{}));
+        }
+    }
+    while (!work.empty()) {
+        const auto id = work.back();
+        work.pop_back();
+        const auto& value = function.values[id.value];
+        for (std::size_t index = 0; index < value.operands.size(); ++index) {
+            if (const auto bits =
+                    operand_demand(value, index, demanded[id.value])) {
+                demand(value.operands[index], *bits);
+            }
+        }
+        if (value.kind == ValueKind::Phi) {
+            for (const auto& incoming : value.incoming) {
+                demand(incoming.value, demanded[id.value]);
+            }
+        }
+    }
+
+    // Signed arithmetic may not overflow in GIMPLE serialized without
+    // -fwrapv, so only unsigned values skip their masks.
+    const auto skipped = [&](ValueId id, UInt128 bits) -> std::optional<ValueId> {
+        if (widths[id.value] == 0 ||
+            !unsigned_integer_type(hir_module, function.values[id.value].type)) {
+            return std::nullopt;
+        }
+        const auto& value = function.values[id.value];
+        if (value.kind != ValueKind::Binary || value.operands.size() != 2) {
+            return std::nullopt;
+        }
+        const auto right = constant_of(value.operands[1]);
+        const auto left = constant_of(value.operands[0]);
+        if (left && right) return std::nullopt;
+        const auto variable = right ? value.operands[0] : value.operands[1];
+        const auto constant = right ? right : left;
+        if (!constant) return std::nullopt;
+        switch (value.binary) {
+        case BinaryOperation::BitAnd:
+            if (bit_and(bits, bit_not(*constant)) == UInt128{}) return variable;
+            break;
+        case BinaryOperation::BitOr:
+        case BinaryOperation::BitXor:
+            if (bit_and(bits, *constant) == UInt128{}) return variable;
+            break;
+        case BinaryOperation::Add:
+            if (bit_and(*constant, low_demanded_bits(bits)) == UInt128{}) {
+                return variable;
+            }
+            break;
+        case BinaryOperation::Subtract:
+            if (right &&
+                bit_and(*constant, low_demanded_bits(bits)) == UInt128{}) {
+                return variable;
+            }
+            break;
+        default: break;
+        }
+        return std::nullopt;
+    };
+    const auto resolve = [&](ValueId id, UInt128 bits) {
+        while (const auto next = skipped(id, bits)) id = *next;
+        return id;
+    };
+    const auto signed_arithmetic = [&](const ManagedValue& value) {
+        if (!signed_type(hir_module, value.type)) return false;
+        return (value.kind == ValueKind::Binary &&
+                (value.binary == BinaryOperation::Add ||
+                 value.binary == BinaryOperation::Subtract ||
+                 value.binary == BinaryOperation::Multiply ||
+                 value.binary == BinaryOperation::ShiftLeft)) ||
+               (value.kind == ValueKind::Unary &&
+                value.unary == UnaryOperation::Negate) ||
+               value.kind == ValueKind::Cast || value.kind == ValueKind::Phi;
+    };
+    for (const auto& block : function.blocks) {
+        for (const auto id : block.values) {
+            auto& value = function.values[id.value];
+            if (signed_arithmetic(value)) continue;
+            for (std::size_t index = 0; index < value.operands.size();
+                 ++index) {
+                const auto bits =
+                    operand_demand(value, index, demanded[id.value]);
+                if (bits) {
+                    value.operands[index] =
+                        resolve(value.operands[index], *bits);
+                }
+            }
+            if (value.kind == ValueKind::Phi) {
+                for (auto& incoming : value.incoming) {
+                    incoming.value =
+                        resolve(incoming.value, demanded[id.value]);
+                }
+            }
+        }
+    }
 }
 
 // An integer conversion of a `source_bits`-wide constant.
@@ -12219,12 +12820,25 @@ std::optional<BinaryOperation> negated_integer_comparison(
 // a mask and from the unsigned comparisons of branches whose taken edge
 // dominates BLOCK; zero extensions keep the bound.
 std::optional<UInt128> unsigned_bound_in_block(
-    const ManagedFunction& function, const DominatorTree& dominance,
-    BlockId block, ValueId value) {
+    const ManagedFunction& function, const hir::Module& hir_module,
+    const DominatorTree& dominance, BlockId block, ValueId value) {
+    // Zero extensions and reinterpretations between integers of one width
+    // keep the unsigned value.
+    const auto same_width_integers = [&](hir::TypeId left, hir::TypeId right) {
+        return integer_type(hir_module, left) &&
+               integer_type(hir_module, right) &&
+               type_bits(hir_module, left) == type_bits(hir_module, right);
+    };
     const auto unextended = [&](ValueId id) {
         while (function.values[id.value].kind == ValueKind::Cast &&
-               function.values[id.value].cast == CastOperation::ZeroExtend &&
-               function.values[id.value].operands.size() == 1) {
+               function.values[id.value].operands.size() == 1 &&
+               (function.values[id.value].cast == CastOperation::ZeroExtend ||
+                (function.values[id.value].cast ==
+                     CastOperation::Reinterpret &&
+                 same_width_integers(
+                     function.values[function.values[id.value].operands[0].value]
+                         .type,
+                     function.values[id.value].type)))) {
             id = function.values[id.value].operands[0];
         }
         return id;
@@ -12304,6 +12918,93 @@ std::optional<UInt128> unsigned_bound_in_block(
     return bound;
 }
 
+// Widens `zext(x + c)` to `zext(x) + c` where the bound a mask or a
+// dominating branch proves for x keeps x + c from wrapping, so the constant
+// can join an address displacement: `i < 64 ? t[i + 1] : ...` reads
+// `t[zext(i)]` and the element after it. Lineage: LLVM InstCombine on
+// `zext(add nuw)`, which proves the no-wrap flag from ranges.
+bool widen_bounded_index_additions(ManagedFunction& function,
+                                   const hir::Module& hir_module) {
+    std::optional<DominatorTree> dominance;
+    bool changed = false;
+    for (auto& block : function.blocks) {
+        for (std::size_t position = 0; position < block.values.size();
+             ++position) {
+            const auto id = block.values[position];
+            const auto& cast = function.values[id.value];
+            if (cast.kind != ValueKind::Cast ||
+                cast.cast != CastOperation::ZeroExtend ||
+                cast.operands.size() != 1) {
+                continue;
+            }
+            const auto& sum = function.values[cast.operands[0].value];
+            const auto narrow = type_bits(hir_module, sum.type);
+            const auto wide = type_bits(hir_module, cast.type);
+            if (sum.kind != ValueKind::Binary ||
+                sum.binary != BinaryOperation::Add ||
+                sum.operands.size() != 2 ||
+                !unsigned_integer_type(hir_module, sum.type) ||
+                sum.type == hir_module.builtin(BuiltinType::Bool) ||
+                narrow == 0 || narrow >= wide || wide > 64) {
+                continue;
+            }
+            const auto constant_side =
+                function.values[sum.operands[1].value].kind ==
+                        ValueKind::ConstantInteger
+                    ? 1U
+                    : function.values[sum.operands[0].value].kind ==
+                              ValueKind::ConstantInteger
+                          ? 0U
+                          : 2U;
+            if (constant_side == 2U) continue;
+            const auto& constant = function.values[sum.operands[constant_side].value];
+            const auto addend = mask_to(UInt128{constant.integer,
+                                                constant.integer_high},
+                                        narrow);
+            const auto variable = sum.operands[1U - constant_side];
+            if (!dominance) dominance.emplace(function);
+            const auto bound = unsigned_bound_in_block(
+                function, hir_module, *dominance, block.id, variable);
+            // Every value below the bound plus the addend fits the type.
+            if (!bound || *bound == UInt128{} ||
+                range_modulus(narrow) <
+                    add(subtract(*bound, UInt128{1}), addend) ||
+                range_modulus(narrow) ==
+                    add(subtract(*bound, UInt128{1}), addend)) {
+                continue;
+            }
+            ManagedValue extended;
+            extended.id = {static_cast<std::uint32_t>(function.values.size())};
+            extended.location = cast.location;
+            extended.inline_site = cast.inline_site;
+            extended.type = cast.type;
+            extended.kind = ValueKind::Cast;
+            extended.cast = CastOperation::ZeroExtend;
+            extended.operands = {variable};
+            ManagedValue offset;
+            offset.id = {static_cast<std::uint32_t>(function.values.size() + 1U)};
+            offset.location = cast.location;
+            offset.inline_site = cast.inline_site;
+            offset.type = cast.type;
+            make_integer_constant(offset, addend);
+            const auto extended_id = extended.id;
+            const auto offset_id = offset.id;
+            function.values.push_back(std::move(extended));
+            function.values.push_back(std::move(offset));
+            auto& rewritten = function.values[id.value];
+            rewritten.kind = ValueKind::Binary;
+            rewritten.binary = BinaryOperation::Add;
+            rewritten.operands = {extended_id, offset_id};
+            block.values.insert(block.values.begin() +
+                                    static_cast<std::ptrdiff_t>(position),
+                                {extended_id, offset_id});
+            position += 2;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
 // Whether a load may run where the source does not run it: an ordinary load
 // of a defined, ordinary global object, at an element its index provably
 // stays within where BLOCK runs.
@@ -12357,8 +13058,8 @@ bool dereferenceable_load(const ManagedValue& load,
     if (stride == 0 || element == 0 || element > stride || size < stride) {
         return false;
     }
-    const auto bound = unsigned_bound_in_block(function, dominance, block,
-                                               address.operands[1]);
+    const auto bound = unsigned_bound_in_block(function, hir_module, dominance,
+                                               block, address.operands[1]);
     return bound && bound->high == 0 && bound->low <= size / stride;
 }
 
@@ -12495,14 +13196,14 @@ bool unpredictable_memory_condition(const ManagedFunction& function,
         comparison.binary != BinaryOperation::NotEqual) {
         return false;
     }
-    const auto is_zero = [&](ValueId id) {
-        const auto& value = function.values[id.value];
-        return value.kind == ValueKind::ConstantInteger &&
-               value.integer == 0 && value.integer_high == 0;
+    // Low bits of data compared with any constant, as the selectors of a
+    // multiway `(x & 3) == 1` ladder are.
+    const auto is_constant = [&](ValueId id) {
+        return function.values[id.value].kind == ValueKind::ConstantInteger;
     };
     std::optional<ValueId> masked;
-    if (is_zero(comparison.operands[0])) masked = comparison.operands[1];
-    else if (is_zero(comparison.operands[1])) masked = comparison.operands[0];
+    if (is_constant(comparison.operands[0])) masked = comparison.operands[1];
+    else if (is_constant(comparison.operands[1])) masked = comparison.operands[0];
     if (!masked || masked->value >= function.values.size()) return false;
     const auto& bit_and = function.values[masked->value];
     if (bit_and.kind != ValueKind::Binary ||
@@ -12781,7 +13482,9 @@ bool if_convert_one_diamond(ManagedFunction& function,
         // its misprediction with a select. Other diamonds retain the ordinary
         // profile-sensitive threshold because simultaneously live arm values
         // can cost more save/restore code than CMOV removes.
-        if (unpredictable_memory_condition(
+        if ((!selects_branch ||
+             options.if_conversion_memory_limit_explicit) &&
+            unpredictable_memory_condition(
                 function, hir_module, condition)) {
             limit = std::max(
                 limit,
@@ -12981,135 +13684,6 @@ bool if_convert_one_diamond(ManagedFunction& function,
     return true;
 }
 
-// The values of an integer for which its comparison with a constant holds,
-// as a closed interval whose bounds are biased by the signed minimum for a
-// signed comparison, so that unsigned order is the comparison's order.
-struct IntegerInterval {
-    ValueId value;
-    bool is_signed{};
-    unsigned bits{};
-    std::uint64_t low{};
-    std::uint64_t high{};
-};
-
-std::optional<IntegerInterval> comparison_interval(
-    const ManagedFunction& function, const hir::Module& hir_module,
-    ValueId id) {
-    const auto& compare = function.values[id.value];
-    if (compare.kind != ValueKind::Binary || compare.operands.size() != 2) {
-        return std::nullopt;
-    }
-    auto operation = compare.binary;
-    bool is_signed{};
-    switch (operation) {
-    case BinaryOperation::SignedLess:
-    case BinaryOperation::SignedLessEqual:
-    case BinaryOperation::SignedGreater:
-    case BinaryOperation::SignedGreaterEqual: is_signed = true; break;
-    case BinaryOperation::UnsignedLess:
-    case BinaryOperation::UnsignedLessEqual:
-    case BinaryOperation::UnsignedGreater:
-    case BinaryOperation::UnsignedGreaterEqual: break;
-    default: return std::nullopt;
-    }
-    auto value = compare.operands[0];
-    auto constant =
-        folded_integer_constant(function, hir_module, compare.operands[1]);
-    if (!constant) {
-        // `c < x` is `x > c`.
-        value = compare.operands[1];
-        constant =
-            folded_integer_constant(function, hir_module, compare.operands[0]);
-        switch (operation) {
-        case BinaryOperation::SignedLess: operation = BinaryOperation::SignedGreater; break;
-        case BinaryOperation::SignedLessEqual: operation = BinaryOperation::SignedGreaterEqual; break;
-        case BinaryOperation::SignedGreater: operation = BinaryOperation::SignedLess; break;
-        case BinaryOperation::SignedGreaterEqual: operation = BinaryOperation::SignedLessEqual; break;
-        case BinaryOperation::UnsignedLess: operation = BinaryOperation::UnsignedGreater; break;
-        case BinaryOperation::UnsignedLessEqual: operation = BinaryOperation::UnsignedGreaterEqual; break;
-        case BinaryOperation::UnsignedGreater: operation = BinaryOperation::UnsignedLess; break;
-        case BinaryOperation::UnsignedGreaterEqual: operation = BinaryOperation::UnsignedLessEqual; break;
-        default: break;
-        }
-    }
-    const auto bits = type_bits(hir_module, function.values[value.value].type);
-    if (!constant || bits == 0 || bits > 64 ||
-        !integer_type(hir_module, function.values[value.value].type) ||
-        folded_integer_constant(function, hir_module, value)) {
-        return std::nullopt;
-    }
-    const auto mask = bits == 64 ? ~std::uint64_t{0}
-                                 : (std::uint64_t{1} << bits) - 1U;
-    const auto bias = is_signed ? std::uint64_t{1} << (bits - 1U) : 0U;
-    const auto biased = (constant->low + bias) & mask;
-    IntegerInterval interval{value, is_signed, bits, 0, mask};
-    switch (operation) {
-    case BinaryOperation::SignedLess:
-    case BinaryOperation::UnsignedLess:
-        if (biased == 0) return std::nullopt;
-        interval.high = biased - 1U;
-        break;
-    case BinaryOperation::SignedLessEqual:
-    case BinaryOperation::UnsignedLessEqual:
-        interval.high = biased;
-        break;
-    case BinaryOperation::SignedGreater:
-    case BinaryOperation::UnsignedGreater:
-        if (biased == mask) return std::nullopt;
-        interval.low = biased + 1U;
-        break;
-    default:
-        interval.low = biased;
-        break;
-    }
-    if (interval.low == 0 && interval.high == mask) return std::nullopt;
-    return interval;
-}
-
-// `a && b` or `a || b` of comparisons of one integer with constants is a
-// test of the integer's offset from one range start: `x - lo <= hi - lo` or
-// `x - lo > hi - lo` in the unsigned type of its width.
-struct RangeTest {
-    ValueId value;
-    std::uint64_t start{};
-    std::uint64_t span{};
-    bool inside{};
-};
-
-std::optional<RangeTest> combined_range_test(const ManagedFunction& function,
-                                             const hir::Module& hir_module,
-                                             ValueId first_id,
-                                             ValueId second_id,
-                                             bool conjunction) {
-    const auto first = comparison_interval(function, hir_module, first_id);
-    const auto second = comparison_interval(function, hir_module, second_id);
-    if (!first || !second || first->value != second->value ||
-        first->is_signed != second->is_signed || first->bits != second->bits ||
-        (first->low == 0) == (second->low == 0)) {
-        return std::nullopt;
-    }
-    const auto& below = first->low == 0 ? *first : *second;
-    const auto& above = first->low == 0 ? *second : *first;
-    const auto mask = first->bits == 64 ? ~std::uint64_t{0}
-                                        : (std::uint64_t{1} << first->bits) - 1U;
-    if (above.high != mask) return std::nullopt;
-    std::uint64_t low{};
-    std::uint64_t high{};
-    if (conjunction) {
-        if (above.low > below.high) return std::nullopt;
-        low = above.low;
-        high = below.high;
-    } else {
-        if (below.high + 1U >= above.low) return std::nullopt;
-        low = below.high + 1U;
-        high = above.low - 1U;
-    }
-    const auto bias = first->is_signed ? std::uint64_t{1} << (first->bits - 1U)
-                                       : 0U;
-    return RangeTest{first->value, (low - bias) & mask, high - low,
-                     conjunction};
-}
-
 // Combines the branches of `if (a && b)` and `if (a || b)`: OWNER branches
 // to a block whose only predecessor it is and which computes a second
 // condition and branches to OWNER's other successor or to a block of its
@@ -13188,16 +13762,17 @@ bool combine_branch_conditions(
             });
         if (distinguishes) continue;
         const auto range = options.tree_reassoc
-            ? combined_range_test(
-                  function, hir_module,
-                  *function.blocks[owner_index].terminator.value,
-                  *inner.terminator.value, side == 0)
+            ? combined_range(function, hir_module,
+                             *function.blocks[owner_index].terminator.value,
+                             *inner.terminator.value, side == 0)
             : std::nullopt;
-        const auto domain = range
-            ? modular_multiply_type(hir_module,
-                                    function.values[range->value.value].type)
-            : std::nullopt;
-        if (!conditions && !domain) continue;
+        // The combined tests hold for some values but not all.
+        const bool range_test =
+            range && range->length != UInt128{} &&
+            range->length != range_modulus(range->bits) &&
+            modular_multiply_type(hir_module,
+                                  function.values[range->tested.value].type);
+        if (!conditions && !range_test) continue;
         unsigned cost = cost_scale;
         // The second block's work besides its comparison and constants.
         unsigned other_cost = 0;
@@ -13230,67 +13805,44 @@ bool combine_branch_conditions(
         }
         if (!speculatable) continue;
         // Without a branchless select, the combined condition rarely becomes
-        // one, so a preset's ordinary budget does not pay for the work.
-        unsigned limit =
-            subtarget.select_cost({32, false, false}) ||
-                    options.if_conversion_limit_explicit
+        // one, so a preset's budgets do not pay for the work.
+        const bool branchless = subtarget.select_cost({32, false, false}).has_value();
+        unsigned limit = branchless || options.if_conversion_limit_explicit
             ? options.if_conversion_limit * cost_scale : 0U;
-        if (unpredictable_memory_condition(function, hir_module,
+        if ((branchless || options.if_conversion_memory_limit_explicit) &&
+            unpredictable_memory_condition(function, hir_module,
                                            *inner.terminator.value)) {
             limit = std::max(limit,
                              options.if_conversion_memory_limit * cost_scale);
         }
         // A range test is cheaper than either branch it replaces.
-        if (domain ? other_cost > (conditions ? limit : 0U) : cost > limit) {
+        if (range_test ? other_cost > (conditions ? limit : 0U)
+                       : cost > limit) {
             continue;
         }
 
         std::vector<ValueId> emitted;
-        const auto emit = [&](ManagedValue value) {
-            value.id = {static_cast<std::uint32_t>(function.values.size())};
-            value.location = inner.terminator.location;
-            value.inline_site = inner.terminator.inline_site;
-            emitted.push_back(value.id);
-            function.values.push_back(std::move(value));
-            return emitted.back();
-        };
-        const auto constant = [&](hir::TypeId type, std::uint64_t bits) {
-            ManagedValue value;
-            value.kind = ValueKind::ConstantInteger;
-            value.type = type;
-            value.integer = bits;
-            return emit(std::move(value));
-        };
         ManagedValue combined;
         combined.type = *boolean;
         combined.kind = ValueKind::Binary;
-        if (domain) {
-            auto offset_value = range->value;
-            if (function.values[offset_value.value].type != *domain) {
-                ManagedValue view;
-                view.kind = ValueKind::Cast;
-                view.cast = CastOperation::Reinterpret;
-                view.type = *domain;
-                view.operands = {offset_value};
-                offset_value = emit(std::move(view));
-            }
-            ManagedValue offset;
-            offset.kind = ValueKind::Binary;
-            offset.binary = BinaryOperation::Subtract;
-            offset.type = *domain;
-            offset.operands = {offset_value, constant(*domain, range->start)};
-            const auto offset_id = emit(std::move(offset));
-            combined.binary = range->inside
-                ? BinaryOperation::UnsignedLessEqual
-                : BinaryOperation::UnsignedGreater;
-            combined.operands = {offset_id, constant(*domain, range->span)};
+        if (range_test) {
+            const auto comparison = emit_range_comparison(
+                function, hir_module, *range, inner.terminator.location,
+                inner.terminator.inline_site, emitted);
+            combined.binary = comparison->operation;
+            combined.operands = {comparison->offset, comparison->span};
         } else {
             combined.binary = side == 0 ? BinaryOperation::BitAnd
                                         : BinaryOperation::BitOr;
             combined.operands = {*function.blocks[owner_index].terminator.value,
                                  *inner.terminator.value};
         }
-        const auto combined_id = emit(std::move(combined));
+        combined.id = {static_cast<std::uint32_t>(function.values.size())};
+        combined.location = inner.terminator.location;
+        combined.inline_site = inner.terminator.inline_site;
+        const auto combined_id = combined.id;
+        function.values.push_back(std::move(combined));
+        emitted.push_back(combined_id);
 
         auto& merged = function.blocks[owner_index];
         auto& dead = function.blocks[inner_id.value];
@@ -13341,10 +13893,12 @@ bool combine_branch_conditions(
     return false;
 }
 
-bool if_convert_diamonds(ManagedFunction& function,
-                         const hir::Module& hir_module,
-                         const Subtarget& subtarget,
-                         const CompilerOptions& options) {
+// OWNERS, when given, limits the conversions to diamonds and branch pairs
+// that those blocks own.
+bool if_convert_diamonds(
+    ManagedFunction& function, const hir::Module& hir_module,
+    const Subtarget& subtarget, const CompilerOptions& options,
+    const std::unordered_set<std::uint32_t>* owners = nullptr) {
     // Converting a diamond can expose another one at the same owner (its
     // absorbed merge ends in a branch) or at an earlier block (an enclosing
     // diamond whose arm was this one), so sweep until nothing changes.
@@ -13353,6 +13907,9 @@ bool if_convert_diamonds(ManagedFunction& function,
     for (bool converted = true; converted;) {
         converted = false;
         for (std::size_t index = 0; index < function.blocks.size(); ++index) {
+            if (owners && !owners->contains(static_cast<std::uint32_t>(index))) {
+                continue;
+            }
             while (if_convert_one_diamond(function, hir_module, subtarget,
                                           index, options, forwarded) ||
                    combine_branch_conditions(function, hir_module, subtarget,
@@ -13757,12 +14314,14 @@ bool supports_loop_invariant(const ManagedValue& value,
                              const Subtarget& subtarget) {
     if (safely_loop_invariant(
             value, function, hir_module, subtarget)) return true;
-    // Small integer literals are deliberately rematerialized in ordinary
-    // loop bodies, but they must still participate in the invariant closure.
-    // Otherwise a cheap literal such as the mask in `bound & -16` pins the
+    // Small integer literals and floating literals are deliberately
+    // rematerialized in ordinary loop bodies, but they must still
+    // participate in the invariant closure. Otherwise a cheap literal such
+    // as the mask in `bound & -16`, or a lane of a packed constant, pins the
     // entire derived expression inside an enclosing loop. Only move such a
     // literal when a genuinely hoistable expression depends on it.
-    return value.kind == ValueKind::ConstantInteger &&
+    return (value.kind == ValueKind::ConstantInteger ||
+            value.kind == ValueKind::ConstantFloating) &&
            !value.effect_input && !value.effect_output &&
            !value.is_volatile_access && !value.patch_sink;
 }
@@ -16537,9 +17096,11 @@ bool split_constant_address_indices(ManagedFunction& function,
     return changed;
 }
 
-// A test of `(x >> c) & m` against zero tests `x & (m << c)`. The shift
-// disappears when the shifted mask costs no more than the mask to
-// materialize, as an immediate or one instruction a loop can hoist.
+// A test of `(x >> c) & m` against zero tests `x & (m << c)`, for an
+// arithmetic shift when the mask reads no copy of the sign. The shift
+// disappears when every user of it is such a mask and the shifted masks
+// cost no more than the masks to materialize, as an immediate or one
+// instruction a loop can hoist.
 bool fold_shifted_mask_tests(ManagedFunction& function,
                              const hir::Module& hir_module,
                              const Subtarget& subtarget) {
@@ -16561,67 +17122,98 @@ bool fold_shifted_mask_tests(ManagedFunction& function,
             folded_integer_constant(function, hir_module, *other);
         return constant && constant->low == 0 && constant->high == 0;
     };
+    struct Fold {
+        ValueId shift;
+        ValueId source;
+        UInt128 mask;
+    };
+    const auto fold_of = [&](ValueId id) -> std::optional<Fold> {
+        const auto& mask = function.values[id.value];
+        const auto bits = type_bits(hir_module, mask.type);
+        if (id.value >= uses.value_count() ||
+            mask.kind != ValueKind::Binary ||
+            mask.binary != BinaryOperation::BitAnd ||
+            mask.operands.size() != 2 || bits == 0 || bits > 64 ||
+            uses.uses(id).empty() ||
+            !std::all_of(uses.uses(id).begin(), uses.uses(id).end(),
+                         zero_test)) {
+            return std::nullopt;
+        }
+        std::optional<UInt128> constant;
+        std::optional<ValueId> shift_id;
+        for (unsigned side = 0; side < 2 && !constant; ++side) {
+            constant = folded_integer_constant(function, hir_module,
+                                               mask.operands[side]);
+            if (constant) shift_id = mask.operands[1U - side];
+        }
+        if (!constant || !shift_id) return std::nullopt;
+        const auto& shift = function.values[shift_id->value];
+        const bool arithmetic = shift.kind == ValueKind::Binary &&
+            shift.binary == BinaryOperation::ShiftRightArithmetic;
+        const auto amount = shift.kind == ValueKind::Binary &&
+                (shift.binary == BinaryOperation::ShiftRightLogical ||
+                 arithmetic) &&
+                shift.operands.size() == 2 && shift.type == mask.type
+            ? folded_integer_constant(function, hir_module,
+                                      shift.operands[1])
+            : std::nullopt;
+        if (!amount || amount->high != 0 || amount->low == 0 ||
+            amount->low >= bits) {
+            return std::nullopt;
+        }
+        const auto count = static_cast<unsigned>(amount->low);
+        // The bits a logical shift moved in stay clear; an arithmetic shift
+        // fills them with copies of the sign.
+        const auto kept = mask_to(*constant, bits - count);
+        const auto shifted = mask_to(shift_left(kept, count), bits);
+        if ((shifted.low == 0 && shifted.high == 0) ||
+            (arithmetic && kept != mask_to(*constant, bits)) ||
+            subtarget.integer_constant_materialization_cost(
+                {bits, shifted.low, shifted.high, false}) > 1) {
+            return std::nullopt;
+        }
+        return Fold{*shift_id, shift.operands[0], shifted};
+    };
+    std::unordered_set<std::uint32_t> folded;
     bool changed = false;
     for (auto& block : function.blocks) {
         std::vector<ValueId> rewritten;
         rewritten.reserve(block.values.size());
         for (const auto id : block.values) {
+            const auto fold = fold_of(id);
+            // Dead users, such as a mask demanded bits bypassed, go away.
+            const auto shift_folds = [&] {
+                const auto& users = uses.uses(fold->shift);
+                return std::all_of(
+                    users.begin(), users.end(), [&](const ValueUse& use) {
+                        if (!use.user || use.kind != UseKind::Operand) {
+                            return false;
+                        }
+                        const auto user = *use.user;
+                        return folded.contains(user.value) ||
+                               (uses.uses(user).empty() &&
+                                !is_effectful_value(
+                                    function.values[user.value])) ||
+                               fold_of(user);
+                    });
+            };
+            if (!fold || !shift_folds()) {
+                rewritten.push_back(id);
+                continue;
+            }
             const auto& mask = function.values[id.value];
-            const auto bits = type_bits(hir_module, mask.type);
-            if (mask.kind != ValueKind::Binary ||
-                mask.binary != BinaryOperation::BitAnd ||
-                mask.operands.size() != 2 || bits == 0 || bits > 64 ||
-                uses.uses(id).empty() ||
-                !std::all_of(uses.uses(id).begin(), uses.uses(id).end(),
-                             zero_test)) {
-                rewritten.push_back(id);
-                continue;
-            }
-            std::optional<UInt128> constant;
-            std::optional<ValueId> shift_id;
-            for (unsigned side = 0; side < 2 && !constant; ++side) {
-                constant = folded_integer_constant(function, hir_module,
-                                                   mask.operands[side]);
-                if (constant) shift_id = mask.operands[1U - side];
-            }
-            if (!constant || !shift_id || uses.uses(*shift_id).size() != 1) {
-                rewritten.push_back(id);
-                continue;
-            }
-            const auto& shift = function.values[shift_id->value];
-            const auto amount = shift.kind == ValueKind::Binary &&
-                    shift.binary == BinaryOperation::ShiftRightLogical &&
-                    shift.operands.size() == 2 && shift.type == mask.type
-                ? folded_integer_constant(function, hir_module,
-                                          shift.operands[1])
-                : std::nullopt;
-            if (!amount || amount->high != 0 || amount->low == 0 ||
-                amount->low >= bits) {
-                rewritten.push_back(id);
-                continue;
-            }
-            const auto count = static_cast<unsigned>(amount->low);
-            // Bits the shift moved out stay clear.
-            const auto kept = mask_to(*constant, bits - count);
-            const auto shifted = mask_to(shift_left(kept, count), bits);
-            if ((shifted.low == 0 && shifted.high == 0) ||
-                subtarget.integer_constant_materialization_cost(
-                    {bits, shifted.low, shifted.high, false}) > 1) {
-                rewritten.push_back(id);
-                continue;
-            }
             ManagedValue wide;
             wide.kind = ValueKind::ConstantInteger;
             wide.type = mask.type;
             wide.location = mask.location;
             wide.inline_site = mask.inline_site;
-            wide.integer = shifted.low;
-            wide.integer_high = shifted.high;
+            wide.integer = fold->mask.low;
+            wide.integer_high = fold->mask.high;
             wide.id = ValueId{static_cast<std::uint32_t>(function.values.size())};
             const auto wide_id = wide.id;
-            const auto source = shift.operands[0];
             function.values.push_back(std::move(wide));
-            function.values[id.value].operands = {source, wide_id};
+            function.values[id.value].operands = {fold->source, wide_id};
+            folded.insert(id.value);
             rewritten.push_back(wide_id);
             rewritten.push_back(id);
             changed = true;
@@ -18888,8 +19480,15 @@ SlpTree build_slp_tree(
                                    first, function.values[id.value]);
                     });
     if (!operations) {
+        // A leaf of constants is one literal of the packed type.
+        const bool constants = std::all_of(
+            result.lanes.begin(), result.lanes.end(), [&](ValueId id) {
+                const auto kind = function.values[id.value].kind;
+                return kind == ValueKind::ConstantInteger ||
+                       kind == ValueKind::ConstantFloating;
+            });
         if (cost.accounted_leaves.insert(key).second) {
-            cost.vector += all_equivalent
+            cost.vector += all_equivalent || constants
                                ? 1U
                                : static_cast<unsigned>(result.lanes.size());
         }
@@ -18954,17 +19553,29 @@ bool vectorize_slp_group(
             return found->second;
         }
         ValueId result;
+        // A constant lane is copied into the packed sequence, which may
+        // run before the block defines the constant.
+        const auto lane_value = [&](ValueId id) {
+            const auto& source = function.values[id.value];
+            if (source.kind != ValueKind::ConstantInteger &&
+                source.kind != ValueKind::ConstantFloating) {
+                return id;
+            }
+            auto copy = source;
+            return append(std::move(copy));
+        };
         if (!node.operation) {
             ManagedValue splat;
             splat.location =
                 function.values[node.lanes.front().value].location;
             splat.type = vector_type;
             splat.kind = ValueKind::Splat;
-            splat.operands = {node.lanes.front()};
+            splat.operands = {lane_value(node.lanes.front())};
             result = append(std::move(splat));
             const auto& first =
                 function.values[node.lanes.front().value];
-            for (unsigned lane = 1; lane < lanes; ++lane) {
+            // Padding lanes keep the first lane's value.
+            for (unsigned lane = 1; lane < node.lanes.size(); ++lane) {
                 if (equivalent_slp_leaf(
                         first, function.values[node.lanes[lane].value])) {
                     continue;
@@ -18974,7 +19585,8 @@ bool vectorize_slp_group(
                     function.values[node.lanes[lane].value].location;
                 insert.type = vector_type;
                 insert.kind = ValueKind::InsertElement;
-                insert.operands = {result, indices[lane], node.lanes[lane]};
+                insert.operands = {result, indices[lane],
+                                   lane_value(node.lanes[lane])};
                 result = append(std::move(insert));
             }
         } else {
@@ -18997,9 +19609,10 @@ bool vectorize_slp_group(
     };
 
     const auto packed = emit(tree);
+    const auto used = static_cast<unsigned>(tree.lanes.size());
     std::vector<ValueId> extracts;
-    extracts.reserve(lanes);
-    for (unsigned lane = 0; lane < lanes; ++lane) {
+    extracts.reserve(used);
+    for (unsigned lane = 0; lane < used; ++lane) {
         ManagedValue extract;
         extract.location = function.values[tree.lanes[lane].value].location;
         extract.type = scalar_type;
@@ -19008,29 +19621,56 @@ bool vectorize_slp_group(
         extracts.push_back(append(std::move(extract)));
     }
 
+    // The packed computation reads only the leaves, so it runs as soon as
+    // they are all defined; every use of a root in the block must follow.
     std::size_t insertion = 0;
-    for (const auto root : tree.lanes) {
-        const auto found = std::find(block.values.begin(),
-                                     block.values.end(), root);
-        if (found == block.values.end()) return false;
-        insertion = std::max(
-            insertion,
-            static_cast<std::size_t>(found - block.values.begin()) + 1U);
+    std::function<void(const SlpTree&)> leaves = [&](const SlpTree& node) {
+        if (node.operation) {
+            for (const auto& operand : node.operands) leaves(operand);
+            return;
+        }
+        for (const auto id : node.lanes) {
+            const auto kind = function.values[id.value].kind;
+            if (kind == ValueKind::ConstantInteger ||
+                kind == ValueKind::ConstantFloating) {
+                continue;
+            }
+            const auto found =
+                std::find(block.values.begin(), block.values.end(), id);
+            if (found != block.values.end()) {
+                insertion = std::max(
+                    insertion,
+                    static_cast<std::size_t>(found - block.values.begin()) +
+                        1U);
+            }
+        }
+    };
+    leaves(tree);
+    for (std::size_t position = 0; position < insertion; ++position) {
+        const auto& user = function.values[block.values[position].value];
+        if (std::any_of(user.operands.begin(), user.operands.end(),
+                        [&](ValueId operand) {
+                            return std::find(tree.lanes.begin(),
+                                             tree.lanes.end(), operand) !=
+                                   tree.lanes.end();
+                        })) {
+            return false;
+        }
     }
     block.values.insert(
         block.values.begin() + static_cast<std::ptrdiff_t>(insertion),
         inserted.begin(), inserted.end());
-    for (unsigned lane = 0; lane < lanes; ++lane) {
+    for (unsigned lane = 0; lane < used; ++lane) {
         replace_value_uses(function, tree.lanes[lane], extracts[lane]);
     }
     for (const auto id : tree.lanes) claimed.insert(id.value);
     return true;
 }
 
-void vectorize_slp(ManagedFunction& function, hir::Module& hir_module,
+bool vectorize_slp(ManagedFunction& function, hir::Module& hir_module,
                    const Subtarget& subtarget,
                    const CompilerOptions& options) {
-    if (options.optimize_for != OptimizationGoal::Speed) return;
+    if (options.optimize_for != OptimizationGoal::Speed) return false;
     // Prefer the smallest native packed width for isolated trees: wider
     // groups increase packing latency and register pressure without the
     // amortization available to a counted loop.
@@ -19043,10 +19683,11 @@ void vectorize_slp(ManagedFunction& function, hir::Module& hir_module,
             vector_bits = width.bits;
         }
     }
-    if (vector_bits == 0) return;
+    if (vector_bits == 0) return false;
 
     const auto definitions = value_definition_blocks(function);
     std::unordered_set<std::uint32_t> claimed;
+    bool changed = false;
     for (auto& block : function.blocks) {
         const auto original_values = block.values;
         for (auto cursor = original_values.rbegin();
@@ -19087,7 +19728,10 @@ void vectorize_slp(ManagedFunction& function, hir::Module& hir_module,
                     });
                 if (!dependent) roots.push_back(*candidate);
             }
-            if (roots.size() != lanes) continue;
+            // A partial group fills the remaining lanes with copies of the
+            // first lane's operands; its packed operations still replace
+            // as many scalar ones as it has roots.
+            if (roots.size() < 2) continue;
             std::reverse(roots.begin(), roots.end());
 
             SlpCost cost;
@@ -19095,7 +19739,8 @@ void vectorize_slp(ManagedFunction& function, hir::Module& hir_module,
             const auto tree = build_slp_tree(
                 function, hir_module, definitions, block.id,
                 roots, claimed, cost, nodes);
-            cost.vector += lanes; // materialize scalar users from packed root
+            // Scalar users read each root from the packed result.
+            cost.vector += static_cast<unsigned>(roots.size());
             if (!tree.operation || cost.operations < 2 ||
                 cost.scalar <= cost.vector + 1U) {
                 continue;
@@ -19105,8 +19750,130 @@ void vectorize_slp(ManagedFunction& function, hir::Module& hir_module,
                 continue;
             }
             claimed.insert(nodes.begin(), nodes.end());
+            changed = true;
         }
     }
+    return changed;
+}
+
+// A reduction loop the vectorizer accepts, with what vectorizing it needs.
+struct ReductionVectorPlan {
+    ReductionLoopPattern pattern;
+    std::unordered_set<std::uint32_t> required;
+    std::unordered_set<std::uint32_t> narrowed;
+    unsigned width{};
+    std::size_t packed_length{};
+    [[nodiscard]] unsigned lanes(const ManagedFunction& function,
+                                 const hir::Module& hir_module) const {
+        return width / type_bits(hir_module,
+                                 function.values[pattern.reduction.value].type);
+    }
+};
+
+std::optional<ReductionVectorPlan> plan_reduction_vectorization(
+    const ManagedFunction& function, const hir::Module& hir_module,
+    const Subtarget& subtarget, const CompilerOptions& options,
+    const std::vector<std::optional<BlockId>>& definitions,
+    const CanonicalLoop& loop) {
+    auto pattern = find_reduction_loop(function, hir_module, loop);
+    if (!pattern) return std::nullopt;
+    const auto scalar_type =
+        function.values[pattern->reduction.value].type;
+    const bool floating = floating_type(hir_module, scalar_type);
+    unsigned arithmetic_operations{};
+    std::unordered_set<std::uint32_t> required;
+    std::unordered_set<std::uint32_t> narrowed;
+    bool term_vectorizable = vectorizable_reduction_term(
+            function, hir_module, *pattern, definitions,
+            pattern->term, required, arithmetic_operations, narrowed) &&
+        (!pattern->condition ||
+         vectorizable_reduction_mask(
+             function, hir_module, *pattern, definitions,
+             *pattern->condition, required, arithmetic_operations,
+             narrowed));
+    for (const auto& store : pattern->stores) {
+        required.insert(store.store.value);
+        required.insert(store.address.value);
+        term_vectorizable = term_vectorizable &&
+            vectorizable_reduction_term(
+                function, hir_module, *pattern, definitions,
+                store.value, required, arithmetic_operations, narrowed);
+    }
+    if (!term_vectorizable) return std::nullopt;
+    pattern->load_bases.clear();
+    for (const auto id :
+         function.blocks[pattern->body.value].values) {
+        if (!required.contains(id.value)) continue;
+        const auto& value = function.values[id.value];
+        std::optional<ValueId> base;
+        if (value.kind == ValueKind::IndexedLoad &&
+            value.operands.size() == 2) {
+            base = value.operands[0];
+        } else if (value.kind == ValueKind::PointerLoad &&
+                   value.operands.size() == 1) {
+            const auto& address =
+                function.values[value.operands[0].value];
+            if (address.kind == ValueKind::IndexedAddress &&
+                address.operands.size() == 2) {
+                base = address.operands[0];
+            }
+        }
+        if (base &&
+            std::find(pattern->load_bases.begin(),
+                      pattern->load_bases.end(), *base) ==
+                pattern->load_bases.end()) {
+            pattern->load_bases.push_back(*base);
+        }
+    }
+    if (!pattern->stores.empty()) {
+        const auto& body_values =
+            function.blocks[pattern->body.value].values;
+        const auto store_position = std::find(
+            body_values.begin(), body_values.end(),
+            pattern->stores.front().store);
+        const bool load_after_store =
+            store_position != body_values.end() &&
+            std::any_of(store_position + 1, body_values.end(),
+                        [&](ValueId id) {
+                            const auto& value =
+                                function.values[id.value];
+                            return required.contains(id.value) &&
+                                (value.kind == ValueKind::PointerLoad ||
+                                 value.kind == ValueKind::IndexedLoad);
+                        });
+        if (load_after_store) return std::nullopt;
+    }
+    for (const auto id : function.blocks[pattern->body.value].values) {
+        const auto& value = function.values[id.value];
+        if ((value.effect_input || value.effect_output) &&
+            !required.contains(id.value)) {
+            return std::nullopt;
+        }
+    }
+    // Strict floating reductions preserve scalar addition order. The
+    // vectorized expression must contain enough arithmetic to amortize
+    // lane extraction and those ordered additions.
+    if (floating && !floating_reassociation(options) &&
+        arithmetic_operations < 2) {
+        return std::nullopt;
+    }
+    const auto element_bits = type_bits(hir_module, scalar_type);
+    const auto width =
+        preferred_vector_bits(subtarget, options, floating, element_bits);
+    if (width == 0) return std::nullopt;
+    // A zero-based loop to a constant bound needs at least one full vector.
+    if (const auto trip = folded_integer_constant(function, hir_module,
+                                                  pattern->bound);
+        trip && *trip < UInt128{width / element_bits}) {
+        return std::nullopt;
+    }
+    // Lanes computed one at a time cost more than the scalar loop.
+    const auto packed_length = packed_operation_length(
+        function, hir_module, *pattern, definitions, required, narrowed,
+        width, subtarget);
+    if (!packed_length) return std::nullopt;
+    return ReductionVectorPlan{std::move(*pattern), std::move(required),
+                               std::move(narrowed), width, *packed_length};
 }
 
 void vectorize_reduction_loops(ManagedFunction& function,
@@ -19117,105 +19884,97 @@ void vectorize_reduction_loops(ManagedFunction& function,
     if (options.optimize_for != OptimizationGoal::Speed) return;
     const auto definitions = value_definition_blocks(function);
     for (const auto& loop : loops) {
-        auto pattern =
-            find_reduction_loop(function, hir_module, loop);
-        if (!pattern) continue;
-        const auto scalar_type =
-            function.values[pattern->reduction.value].type;
-        const bool floating = floating_type(hir_module, scalar_type);
-        unsigned arithmetic_operations{};
-        std::unordered_set<std::uint32_t> required;
-        std::unordered_set<std::uint32_t> narrowed;
-        bool term_vectorizable = vectorizable_reduction_term(
-                function, hir_module, *pattern, definitions,
-                pattern->term, required, arithmetic_operations, narrowed) &&
-            (!pattern->condition ||
-             vectorizable_reduction_mask(
-                 function, hir_module, *pattern, definitions,
-                 *pattern->condition, required, arithmetic_operations,
-                 narrowed));
-        for (const auto& store : pattern->stores) {
-            required.insert(store.store.value);
-            required.insert(store.address.value);
-            term_vectorizable = term_vectorizable &&
-                vectorizable_reduction_term(
-                    function, hir_module, *pattern, definitions,
-                    store.value, required, arithmetic_operations, narrowed);
-        }
-        if (!term_vectorizable) continue;
-        pattern->load_bases.clear();
-        for (const auto id :
-             function.blocks[pattern->body.value].values) {
-            if (!required.contains(id.value)) continue;
-            const auto& value = function.values[id.value];
-            std::optional<ValueId> base;
-            if (value.kind == ValueKind::IndexedLoad &&
-                value.operands.size() == 2) {
-                base = value.operands[0];
-            } else if (value.kind == ValueKind::PointerLoad &&
-                       value.operands.size() == 1) {
-                const auto& address =
-                    function.values[value.operands[0].value];
-                if (address.kind == ValueKind::IndexedAddress &&
-                    address.operands.size() == 2) {
-                    base = address.operands[0];
+        const auto plan = plan_reduction_vectorization(
+            function, hir_module, subtarget, options, definitions, loop);
+        if (!plan) continue;
+        (void)vectorize_reduction_loop(
+            function, hir_module, plan->pattern, definitions, plan->required,
+            plan->narrowed, plan->width, plan->packed_length, options);
+    }
+}
+
+// Reduction vectorization takes single-block loop bodies. The arms of an
+// if-converted body run for every lane of a packed iteration, so the work
+// they speculate per element is the scalar work divided by the lanes. An
+// innermost loop whose branches the if-conversion budgets keep is converted
+// on a copy of the function, with the budgets scaled by the lanes of its
+// reduction, and the copy replaces the function only when the converted
+// loop vectorizes. Lineage: GCC tree-if-conv.cc, which versions the loop
+// for the vectorizer, and LLVM LoopVectorize predication.
+bool if_convert_vectorizable_loops(ManagedFunction& function,
+                                   const hir::Module& hir_module,
+                                   const Subtarget& subtarget,
+                                   const CompilerOptions& options) {
+    if (options.optimize_for != OptimizationGoal::Speed) return false;
+    // A reduction carrier has at least 32 bits.
+    const auto widest =
+        std::max(preferred_vector_bits(subtarget, options, false, 32),
+                 preferred_vector_bits(subtarget, options, true, 32)) / 32U;
+    if (widest < 2) return false;
+    bool changed = false;
+    // Loops already tried, by the value of their header's exit test, which
+    // also identifies the loop in the copy.
+    std::unordered_set<std::uint32_t> tried;
+    for (bool retry = true; retry;) {
+        retry = false;
+        const DominatorTree dominators(function);
+        const LoopForest forest(function, dominators);
+        for (const auto& loop : forest.canonical_loops()) {
+            const auto& header = function.blocks[loop.header.value];
+            const bool innermost = std::all_of(
+                forest.loops().begin(), forest.loops().end(),
+                [&](const NaturalLoop& natural) {
+                    return natural.header == loop.header ||
+                           !loop.blocks.contains(natural.header.value);
+                });
+            if (loop.blocks.size() <= 3 || !innermost ||
+                header.terminator.kind != TerminatorKind::ConditionalBranch ||
+                !header.terminator.value ||
+                !tried.insert(header.terminator.value->value).second) {
+                continue;
+            }
+            const auto marker = *header.terminator.value;
+            for (auto lanes = widest; lanes >= 2;) {
+                auto trial = function;
+                auto budget = options;
+                budget.if_conversion_limit *= lanes;
+                budget.if_conversion_memory_limit *= lanes;
+                // Packed selects never branch.
+                budget.if_conversion_limit_explicit = true;
+                budget.if_conversion_memory_limit_explicit = true;
+                if (!if_convert_diamonds(trial, hir_module, subtarget, budget,
+                                         &loop.blocks)) {
+                    break;
                 }
-            }
-            if (base &&
-                std::find(pattern->load_bases.begin(),
-                          pattern->load_bases.end(), *base) ==
-                    pattern->load_bases.end()) {
-                pattern->load_bases.push_back(*base);
-            }
-        }
-        if (!pattern->stores.empty()) {
-            const auto& body_values =
-                function.blocks[pattern->body.value].values;
-            const auto store_position = std::find(
-                body_values.begin(), body_values.end(),
-                pattern->stores.front().store);
-            const bool load_after_store =
-                store_position != body_values.end() &&
-                std::any_of(store_position + 1, body_values.end(),
-                            [&](ValueId id) {
-                                const auto& value =
-                                    function.values[id.value];
-                                return required.contains(id.value) &&
-                                    (value.kind == ValueKind::PointerLoad ||
-                                     value.kind == ValueKind::IndexedLoad);
-                            });
-            if (load_after_store) continue;
-        }
-        bool unrelated_effect = false;
-        for (const auto id : function.blocks[pattern->body.value].values) {
-            const auto& value = function.values[id.value];
-            if ((value.effect_input || value.effect_output) &&
-                !required.contains(id.value)) {
-                unrelated_effect = true;
+                if (options.tree_copy_prop) propagate_trivial_copies(trial);
+                const DominatorTree trial_dominators(trial);
+                const LoopForest trial_forest(trial, trial_dominators);
+                const auto converted = std::find_if(
+                    trial_forest.canonical_loops().begin(),
+                    trial_forest.canonical_loops().end(),
+                    [&](const CanonicalLoop& candidate) {
+                        return trial.blocks[candidate.header.value]
+                                   .terminator.value == marker;
+                    });
+                if (converted == trial_forest.canonical_loops().end()) break;
+                const auto plan = plan_reduction_vectorization(
+                    trial, hir_module, subtarget, options,
+                    value_definition_blocks(trial), *converted);
+                if (!plan) break;
+                // A wider reduction has fewer lanes to share the arms.
+                if (const auto planned = plan->lanes(trial, hir_module);
+                    planned < lanes) {
+                    lanes = planned;
+                    continue;
+                }
+                function = std::move(trial);
+                changed = retry = true;
                 break;
             }
+            if (retry) break;
         }
-        // Strict floating reductions preserve scalar addition order. The
-        // vectorized expression must contain enough arithmetic to amortize
-        // lane extraction and those ordered additions.
-        if (unrelated_effect ||
-            (floating && !floating_reassociation(options) &&
-             arithmetic_operations < 2)) {
-            continue;
-        }
-        const auto width = preferred_vector_bits(
-            subtarget, options, floating,
-            type_bits(hir_module, scalar_type));
-        if (width == 0) continue;
-        // Lanes computed one at a time cost more than the scalar loop.
-        const auto packed_length = packed_operation_length(
-            function, hir_module, *pattern, definitions, required, narrowed,
-            width, subtarget);
-        if (!packed_length) continue;
-        (void)vectorize_reduction_loop(
-            function, hir_module, *pattern, definitions, required, narrowed,
-            width, *packed_length, options);
     }
+    return changed;
 }
 
 struct EarlyExitLoopPattern {
@@ -20691,6 +21450,16 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
                 return PassResult::changed_values();
             });
     }
+    if (options.tree_loop_vectorize && options.if_conversion) {
+        pipeline.add(
+            PassId::IfConversion,
+            [&](ManagedFunction& function, FunctionAnalysisManager&) {
+                return if_convert_vectorizable_loops(function, hir_module,
+                                                     subtarget, options)
+                    ? PassResult::changed_cfg()
+                    : PassResult::unchanged();
+            });
+    }
     if (options.tree_loop_vectorize) {
         pipeline.add(
             PassId::ReductionVectorization,
@@ -20787,14 +21556,6 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
                     : PassResult::unchanged();
             });
     }
-    if (options.tree_slp_vectorize) {
-        pipeline.add(
-            PassId::SlpVectorization,
-            [&](ManagedFunction& function, FunctionAnalysisManager&) {
-                vectorize_slp(function, hir_module, subtarget, options);
-                return PassResult::changed_values();
-            });
-    }
     // Every level: the target lowers only the bit operations this leaves.
     // After value numbering and LICM have shared and hoisted the operations,
     // before the second rounds, which share and hoist their sequences.
@@ -20857,11 +21618,36 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
                     : PassResult::unchanged();
             });
     }
+    // After forwarding has made peeled loads of stored constants constant
+    // leaves; invariant leaves then pack once in a loop's preheader.
+    if (options.tree_slp_vectorize) {
+        pipeline.add(
+            PassId::SlpVectorization,
+            [&](ManagedFunction& function, FunctionAnalysisManager& analyses) {
+                if (!vectorize_slp(function, hir_module, subtarget, options)) {
+                    return PassResult::unchanged();
+                }
+                if (options.move_loop_invariants) {
+                    move_loop_invariants(
+                        function, hir_module, subtarget,
+                        options.floating_environment,
+                        analyses.loops().canonical_loops());
+                }
+                return PassResult::changed_values();
+            });
+    }
     if (options.tree_ccp) {
         pipeline.add(
             PassId::IntegerSimplification,
             [&](ManagedFunction& function, FunctionAnalysisManager&) {
                 simplify_integer_operations(function, hir_module);
+                if (widen_bounded_index_additions(function, hir_module) &&
+                    options.tree_fre) {
+                    // The widened operand is often extended already.
+                    eliminate_fully_redundant_expressions(
+                        function, hir_module, subtarget,
+                        options.floating_environment);
+                }
                 if (options.tree_copy_prop) {
                     propagate_trivial_copies(function);
                 }
