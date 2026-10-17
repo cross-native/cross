@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
 # `as` rejects invalid assembly with a diagnostic at the offending line and
-# column, warns where GNU as warns, and writes no object after an error.
+# column, warns where GNU as warns, and writes no object after an error; it
+# also reports the GNU forms it does not implement.
 
 foreach(required AS OUTPUT)
     if(NOT DEFINED ${required} OR "${${required}}" STREQUAL "")
@@ -98,4 +99,32 @@ expect(fatal error "        addu $1, $2, $3"
 expect(nomacro warning ".set nomacro|        li $2, 0x12345678"
        "nomacro.s:2:16: warning: macro instruction expanded into multiple instructions" ${o32})
 expect(error-directive error ".error \"stop here\"" "error-directive.s:1:1: error: stop here" ${o32})
+expect(module-late error "        nop|.module fp=xx"
+       "module-late.s:2:1: error: .module is not permitted after code or a .set directive" ${o32})
+expect(module-option error ".module frob"
+       "module-option.s:1:1: error: unsupported .module option 'frob'" ${o32})
+expect(module-gp64 error ".module gp=64"
+       "module-gp64.s:1:1: error: gp=64 needs an ABI with 64-bit registers, not [a-z0-9]+" ${o32})
+expect(module-fp64 warning ".module fp=64"
+       "module-fp64.s:1:1: warning: fp=64 with the 32-bit registers of the [a-z0-9]+ ABI" ${o32})
+expect(set-option error ".set frob" "set-option.s:1:1: error: unsupported .set option 'frob'" ${o32})
+expect(set-cpu error ".set arch=frob" "set-cpu.s:1:1: error: unknown CPU 'frob'" ${o32})
+expect(fpr-number error "        add.s $f0, $2, $f4"
+       "fpr-number.s:1:20: error: expected a floating-point register" ${o32})
+expect(gp32-macro error "        ld $2, 0($4)"
+       "gp32-macro.s:1:9: error: 'ld' with 32-bit GPRs is a two-word macro that is not supported" ${o32})
+expect(half-symbol error "        .2byte symbol"
+       "half-symbol.s:1:16: error: an o32 object has no relocation for a 2-byte field" ${o32})
+expect(deferred-li error ".set noreorder|a: li $2, b - a|        .space 0x10000|b: nop"
+       "deferred-li.s:2:11: error: immediate 65540 is out of range \\[-32768, 32767\\]" ${o32})
+expect(gprel-addend error ".data|.space 0x10000|far: .word 0|.text|        lw $2, %gp_rel(far+0x8000)($28)"
+       "gprel-addend.s:5:16: error: the %gp_rel addend 32768 does not fit the 16-bit field of an o32 relocation"
+       ${o32})
+expect(noat-macro error ".set noat|        slt $2, $3, 0x12345"
+       "noat-macro.s:2:9: error: this macro needs [$]at, which \".set noat\" reserves" ${o32})
+expect(trap-allegrex error "        teq $2, $3"
+       "trap-allegrex.s:1:9: error: instruction 'teq' is not available in mips2"
+       -target mipsallegrexel-sony-psp-elf -march=allegrex)
+expect(command-gp64 error "        nop"
+       "<command line>:1:1: error: gp=64 needs an ABI with 64-bit registers" ${o32} -mgp64)
 message(STATUS "${cases} diagnostics matched")

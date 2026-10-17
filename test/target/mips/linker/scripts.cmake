@@ -34,12 +34,12 @@ run_checked("headers" "${LLVM_READELF}" -h -l -S --wide "${image}")
 set(headers "${run_stdout}")
 # A NOLOAD section without :PHDR joins no segment.
 expect("headers" "${headers}" "Entry point address: +0x80100000"
-       "LOAD +0x[0-9a-f]+ 0x80100000 0x80100000 0x00055 0x00055 R E"
+       "LOAD +0x[0-9a-f]+ 0x80100000 0x80100000 0x00058 0x00058 R E"
        "LOAD +0x[0-9a-f]+ 0x80100100 0x80200000 0x00008 0x00008 RW "
        "[.]text +PROGBITS +80100000 [0-9a-f]+ 000048 "
        "[.]rodata +PROGBITS +80100048 [0-9a-f]+ 000009 "
-       "[.]rodata[.]orphan +PROGBITS +80100051 [0-9a-f]+ 000004 "
-       "[.]bss +NOBITS +80100110 ")
+       "[.]rodata[.]orphan +PROGBITS +80100054 [0-9a-f]+ 000004 "
+       "[.]bss +NOBITS +80100108 ")
 if(headers MATCHES "[.]comment")
     message(FATAL_ERROR "/DISCARD/ kept .comment\n${headers}")
 endif()
@@ -47,7 +47,7 @@ foreach(name text_size data_start data_load _end)
     symbol_value("${image}" ${name} ${name})
 endforeach()
 if(NOT text_size STREQUAL "48" OR NOT data_start STREQUAL "80100100" OR
-   NOT data_load STREQUAL "80200000" OR NOT _end STREQUAL "80100120")
+   NOT data_load STREQUAL "80200000" OR NOT _end STREQUAL "80100118")
     message(FATAL_ERROR "script symbols: ${text_size} ${data_start} ${data_load} ${_end}")
 endif()
 section_hex("${image}" .rodata rodata)
@@ -80,7 +80,7 @@ if(GNU_LD)
 endif()
 
 # MEMORY regions: .data runs in ram and loads after the code in rom.
-file(WRITE "${OUTPUT}/memory.s" ".text\n.globl _start\n_start: nop\n.data\n.word 5\n.bss\n.space 16\n")
+file(WRITE "${OUTPUT}/memory.s" ".text\n.globl _start\n_start: nop\n.data\n.word 5\n.bss\n.balign 16\n.space 16\n")
 run_checked("memory input" "${AS}" -target mips-unknown-elf "${OUTPUT}/memory.s" -o "${OUTPUT}/memory.o")
 run_checked("memory" "${LD}" -T "${sources}/memory.ld" --defsym EXTRA=0 "${OUTPUT}/memory.o"
             -o "${OUTPUT}/memory.elf")

@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
 # Each instruction is accepted from the ISA levels that have it, as `.set`
-# selects them, and rejected below; a CPU extension follows -march.
+# selects them, and rejected below; a CPU extension follows -march and
+# `.set arch=`, and, as in GNU as, a `.set` ISA level drops it.
 
 foreach(required AS OUTPUT)
     if(NOT DEFINED ${required} OR "${${required}}" STREQUAL "")
@@ -49,6 +50,6 @@ level("cvt.s.l $f0, $f2" "mips3;mips32r2" "mips32" ${cpu})
 level("rotr $2, $3, 1" "mips32r2;mips64r2" "mips32;mips64" ${cpu})
 level("mfhc1 $2, $f2" "mips32r2" "mips5;mips32" ${cpu})
 level("dclz $2, $3" "mips64" "mips32r2;mips5" ${cpu})
-level("wsbw $2, $3" "mips2" "" -target mipsallegrexel-sony-psp-elf -march=allegrex)
+level("wsbw $2, $3" "mips0;arch=allegrex" "mips2" -target mipsallegrexel-sony-psp-elf -march=allegrex)
 level("wsbw $2, $3" "" "mips2;mips32r2" ${cpu})
 message(STATUS "${checked} ISA checks matched")

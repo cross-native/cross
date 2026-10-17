@@ -26,6 +26,7 @@ inline constexpr std::uint32_t r_mips_64 = 18;
 inline constexpr std::uint32_t r_mips_sub = 24;
 inline constexpr std::uint32_t r_mips_higher = 28;
 inline constexpr std::uint32_t r_mips_highest = 29;
+inline constexpr std::uint32_t r_mips_rel16 = 33;
 inline constexpr std::uint32_t r_mips_jalr = 37;
 inline constexpr std::uint32_t r_mips_pc32 = 248;
 

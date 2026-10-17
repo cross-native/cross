@@ -193,43 +193,117 @@ COFF/PE, or Mach-O as the triple names (`x86_64-unknown-linux-gnu`,
 | `-mabi=NAME`, `-32`, `-64` | The ABI, which fixes the ELF class and ABI flags: `-mabi=32` and `-32` select o32, `-mabi=64` and `-64` n64 (also switching the triple to `mips64`), `-mabi=eabi` EABI32. |
 | `-EB`, `-EL` | Big- or little-endian output. |
 | `-mFEATURE`, `-mno-FEATURE`, `-mnan=2008\|legacy` | Target features, such as `-msoft-float`, `-msingle-float`, `-mfp32`, `-mfpxx`, and `-mfp64`, which set the floating-point ABI that `.MIPS.abiflags` records. |
+| `-mgp32`, `-mgp64` | MIPS: the width of the general registers that `.MIPS.abiflags` records and the macros assume, as `.module gp=32` or `gp=64` sets it; by default the narrower of the ISA's and the ABI's registers, 32 bits for o32. |
+| `-O0`, `-O1`, `-O2` | MIPS `.set reorder` code: keep every hazard `nop` the CPU might need, keep only the needed ones, or also fill delay slots (the default; `-O` is `-O1`). |
 | `-I DIR` | A further directory to search for `.include` and `.incbin` files. |
 | `--fatal-warnings`, `-W` | Treat warnings as errors, or suppress them. |
 
 Without `-target` or `-mprofile`, `as` uses the default target of `cc`. Accepted
 directives include sections and their flags and COMDAT groups (`.section`,
 `.text`, `.data`, `.bss`, `.rdata`, `.sdata`, `.sbss`, `.pushsection`,
-`.popsection`, `.previous`), symbols (`.globl`, `.local`, `.weak`, `.hidden`,
-`.internal`, `.protected`, `.type`, `.size`, `.set` and `=`, `.equ`,
-`.equiv`, `.comm`, `.lcomm`), data (`.byte`, `.2byte`, `.half`, `.short`,
-`.4byte`, `.word`, `.long`, `.8byte`, `.dword`, `.quad`, `.uleb128`,
-`.sleb128`, `.ascii`, `.asciz`, `.string`, `.float`, `.double`, `.zero`,
-`.space`, `.fill`, `.incbin`), layout (`.p2align`, `.balign`, `.align`,
-`.org`), source structure (`.include`, `.macro`, `.rept`, `.if` and its
-variants, `.error`), DWARF (`.file`, `.loc`, and the `.cfi_*` directives,
-which produce `.debug_line`, `.debug_frame`, and `.eh_frame`), and the MIPS
-`.set` options (`push`, `pop`, `reorder`, `noreorder`, `at`, `noat`, `macro`,
-`nomacro`, `mips0` ... `mips64r2`), `.option pic0`, `.ent`, `.end`, `.frame`,
-`.mask`, `.fmask`, and `.nan`. The instructions are the integer, multiply
-and divide, load and store, branch, jump, FPU, FPU control, CP0, TLB, cache,
-and `sync` instructions of MIPS I-V, MIPS32, and MIPS64 Release 1 and 2,
-each accepted where the current ISA level has it; `madd`, `msub`,
-`mul`, `ext`, `ins`, `seb`, `seh`, traps, `pref`, `round`, `ceil`, `floor`,
-coprocessor 2, MIPS16, microMIPS, and Allegrex instructions other than `wsbw`
-are not. The relocation operators are `%hi`, `%lo`, `%gp_rel`, `%higher`, and
-`%highest`; the macros are `li`, `dli`, `move`, `b`, `bal`, `beqz`, `bnez`,
-`beqzl`, `bnezl`, `negu`, `neg`, and `not`, expanded as LLVM MC expands them.
-Objects carry the MIPS ELF header flags, `.MIPS.abiflags`, `.reginfo` (ELF32)
-or `.MIPS.options` (ELF64), and `.pdr` for each `.end`. Unlike GNU as:
+`.popsection`, `.previous`), subsections (`.subsection N`, `.text N` and the
+other section directives with a number, `.pushsection NAME, N`), symbols
+(`.globl`, `.local`, `.weak`, `.hidden`, `.internal`, `.protected`, `.type`,
+`.size`, `.set` and `=`, `.equ`, `.equiv`, `.comm`, `.lcomm`), data (`.byte`,
+`.2byte`, `.half`, `.short`, `.4byte`, `.word`, `.long`, `.8byte`, `.dword`,
+`.quad`, `.uleb128`, `.sleb128`, `.ascii`, `.asciz`, `.string`, `.float`,
+`.double`, `.zero`, `.space`, `.fill`, `.incbin`), layout (`.p2align`,
+`.balign`, `.align`, `.org`), source structure (`.include`, `.macro`,
+`.altmacro` and `.noaltmacro`, `.rept`, `.if` and its variants, `.error`),
+and DWARF (`.file`, `.loc`, and the `.cfi_*` directives, which produce
+`.debug_line`, `.debug_frame`, and `.eh_frame`). A subsection's contents
+follow those of the lower-numbered subsections of its section, and `.org`
+counts from the section's start. Data, fill counts, `.org`, symbol
+assignments, and instruction immediates may use label differences that only
+layout settles. A quoted macro argument passes its text without the quotes;
+in `.altmacro` mode, an argument `%expr` passes the expression's decimal
+value, `<text>` passes text, parameters may be named without a backslash, and
+`LOCAL` names labels unique to an expansion.
 
-- `.word`, `.half`, `.dword`, `.float`, and `.double` do not align their data;
-- in `.set reorder` mode a branch's delay slot gets a `nop`, but instructions
-  are not reordered and no MIPS I hazard `nop`s are inserted;
-- `.L` local labels stay out of the symbol table unless a relocation must
-  name one;
+For MIPS, `as` reads the GNU as dialect of GCC output and hand-written
+assembly and writes the object GNU as writes for embedded MIPS ELF. The MIPS
+directives are `.set` (`push`, `pop`, `reorder`, `noreorder`, `at`, `noat`,
+`macro`, `nomacro`, `move` and `volatile`, `mips0` ... `mips64r2`,
+`arch=CPU`, `gp=32`, `gp=64`, `fp=32`, `fp=xx`, `fp=64`, `oddspreg`,
+`nooddspreg`, and the `default` forms), `.module` before any code (`arch=`,
+`mipsN`, `gp=`, `fp=`, `oddspreg`, `nooddspreg`, `softfloat`, `hardfloat`,
+`singlefloat`, `doublefloat`), `.option pic0`, `.ent`, `.end`, `.frame`,
+`.mask`, `.fmask`, and `.nan`. As in GNU as, `.set mipsN` selects the model's
+CPU of that name, dropping a CPU extension such as Allegrex's, and also sets
+64-bit general and floating-point registers for a 64-bit ISA.
+
+The instructions are the integer, multiply and divide, load and store,
+branch, jump, FPU, FPU control, CP0, TLB, cache, and `sync` instructions of
+MIPS I-V, MIPS32, and MIPS64 Release 1 and 2, with multiply-accumulate,
+`mul`, `ext`, `ins`, `seb`, `seh`, traps, `pref`, every rounding conversion
+and FPU comparison, and the Allegrex instructions (`clz`, `clo`, `max`, `min`,
+`bitrev`, `wsbw`, `mfic`, `mtic`, and its own multiply-accumulate encodings),
+each accepted where the current ISA and CPU have it; coprocessor 2, MIPS16,
+and microMIPS are not. A floating-point register may be written `$N` in a
+load, store, or move (`lwc1 $4, 0($5)`, `mtc1 $2, $6`), where it counts in no
+register mask, but not in arithmetic. The relocation operators are `%hi`,
+`%lo`, `%gp_rel`, `%higher`, and `%highest`. The macros are `li` and `dli`,
+expanded as GNU as expands 32-bit values (a `li` value that only layout
+settles becomes one `addiu`, whose immediate must then fit), `move`, `b`,
+`bal`, `beqz`, `bnez`, `beqzl`, `bnezl`, `negu`, `neg`, `not`, `mul` without
+the MIPS32 instruction (`multu` and `mflo`), shifts and rotates by a register
+written with the immediate mnemonic, and three-register operations and traps
+whose last operand is a constant: the immediate instruction when it fits,
+otherwise the constant loaded into `$at`.
+
+In `.set reorder` code, `as` separates each pair of instructions with the
+`nop`s the CPU needs unless the CPU model has the interlock: after a load or
+a coprocessor 0 move (`load-interlocks`), an FPU move
+(`fpu-transfer-interlocks`), an FPU compare (`fpu-compare-interlocks`), or a
+HI/LO read (`hilo-interlocks`). A branch takes the place of the instruction
+before it, which moves into the delay slot, unless that instruction is in a
+`.set noreorder` block or has a label, the branch depends on it, or the move
+would create a hazard at either end; otherwise the delay slot gets a `nop`.
+Branch-likely instructions always get a `nop`. A label before an instruction
+that needs hazard `nop`s moves past them, and `.set noreorder` adds the `nop`s
+earlier instructions may need, keeping only those the instructions after it
+need.
+
+The objects carry the MIPS ELF header flags, `.MIPS.abiflags`, `.reginfo`
+(ELF32) or `.MIPS.options` (ELF64), neither loaded into the image, `.pdr`
+with a record for each `.end`, and `.gnu.attributes` with the floating-point
+ABI. As in GNU as, `.half`, `.word`, `.dword`, `.float`, and `.double` align
+their values and move the labels before them to the aligned address, and so
+does `.align`, while `.align 0` turns that alignment off until the next
+section change; `.lcomm` aligns by size; sections are as aligned as their
+contents and code sections end padded to their alignment; `.sdata`, `.sbss`,
+`.lit4`, and `.lit8` sections are gp-relative (`SHF_MIPS_GPREL`); in ELF32
+objects every name starting with `$`, such as GCC's `$L` labels, stays out of
+the symbol table unless a relocation must name it, as `.L` names do in every
+object; the first `.file` gives the file symbol, and `.file` without `.loc`
+gives no line table; and `.2byte` or `.half` of a symbol is an error in an o32
+object, which has no 2-byte data relocation, and `R_MIPS_REL16` in an n64
+object. Unlike GNU as:
+
+- the hazard `nop`s follow the CPU model rather than GNU as's tables: the
+  shipped `vr4300` model has no FPU transfer or compare interlocks, so
+  `.set reorder` code gets a `nop` after `mtc1` and before a `bc1t` that reads
+  a compare, where GNU as puts none, while the `allegrex` model's FPU transfer
+  interlocks, and the load interlocks that cover `mfc0` and `mtc0` on MIPS II
+  and MIPS III CPUs, leave out `nop`s that GNU as inserts;
+- a `%gp_rel` of a local symbol more than 32 KiB into its section names the
+  symbol in an o32 object, where GNU as reports a relocation overflow;
+- a `li` value that only layout settles must fit 16 bits, where GNU as keeps
+  its low half;
+- `ld` and `sd` with 32-bit general registers, which GNU as expands into word
+  pairs, are errors; select 64-bit registers with `.set gp=64` or `.set mips3`;
+- `.lcomm` and `.comm` objects stay in `.bss` and common storage, where GNU as
+  puts those of up to 8 bytes in `.sbss` and small common storage;
 - the `div` and `divu` macros, address macros such as `la` and `lw REG,
-  symbol`, and PIC code (`-mabicalls`, `.cpload`) are not available: write
-  `div $zero, rs, rt` and `%hi`/`%lo` pairs.
+  symbol`, `.insn`, `-g` line tables for assembly source, and PIC code
+  (`-mabicalls`, `.cpload`) are not available: write `div $zero, rs, rt` and
+  `%hi`/`%lo` pairs.
+
+`cc -c` assembles its own MIPS output with the same assembler and the object
+conventions of LLVM MC: `.text`, `.data`, and `.bss` aligned to 16 bytes, an
+allocated `.reginfo`, register masks of every operand, no `.gnu.attributes` or
+empty `.pdr`, and data that does not align itself; there `.set mipsN` changes
+only the ISA level of the selected CPU.
 
 For an x86-64 target `as` reads AT&T syntax: operand order source then
 destination, `%` registers, `$` immediates, `disp(base, index, scale)` memory

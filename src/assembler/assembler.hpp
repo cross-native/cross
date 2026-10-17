@@ -73,6 +73,7 @@ inline constexpr std::uint32_t sht_init_array = 14;
 inline constexpr std::uint32_t sht_fini_array = 15;
 inline constexpr std::uint32_t sht_preinit_array = 16;
 inline constexpr std::uint32_t sht_group = 17;
+inline constexpr std::uint32_t sht_gnu_attributes = 0x6ffffff5;
 inline constexpr std::uint64_t shf_write = 0x1;
 inline constexpr std::uint64_t shf_alloc = 0x2;
 inline constexpr std::uint64_t shf_execinstr = 0x4;
@@ -242,6 +243,9 @@ struct Fixup {
 
 struct Fragment {
     enum class Kind : std::uint8_t { Data, Align, Leb, Fill, Org, Relaxable } kind{};
+    // The subsection that holds the fragment; layout orders a section's
+    // subsections by number.
+    std::int64_t subsection{};
     std::vector<std::uint8_t> bytes;
     std::vector<Fixup> fixups;
     // Align: boundary, fill byte (or the target's no-op), and skip limit.
@@ -385,6 +389,12 @@ struct Relocation {
     bool pc_relative{};
     std::uint8_t length{};
     bool external{true};
+    // ELF: the fixup's place among its section's fixups in the order they
+    // were created, and the symbol and addend it named before a local
+    // symbol became its section's symbol.
+    std::uint32_t sequence{};
+    SymbolId target{};
+    std::int64_t target_addend{};
 };
 
 class Assembler;
@@ -398,10 +408,24 @@ public:
     [[nodiscard]] virtual unsigned word_size() const { return 4; }
     // Whether `.align N` aligns to 2^N rather than N bytes.
     [[nodiscard]] virtual bool power_of_two_align() const { return true; }
-    // The section type the target uses for a named section.
+    // A private label name of the target, beyond the format's `.L` (`L` in
+    // Mach-O); private labels stay out of the symbol table.
+    [[nodiscard]] virtual bool private_label(std::string_view) const { return false; }
+    // Whether `.file` alone, without `.loc` rows, yields a line table, as in
+    // LLVM MC; GNU as writes none.
+    [[nodiscard]] virtual bool line_table_without_rows() const { return true; }
+    // The alignment of `.lcomm NAME, SIZE` without an alignment operand.
+    [[nodiscard]] virtual std::uint64_t local_common_alignment(std::uint64_t) const {
+        return 1;
+    }
+    // The section type and flags the target uses for a named section.
     [[nodiscard]] virtual std::uint32_t section_type(
         std::string_view, std::uint32_t type) const {
         return type;
+    }
+    [[nodiscard]] virtual std::uint64_t section_flags(
+        std::string_view, std::uint64_t flags) const {
+        return flags;
     }
     [[nodiscard]] virtual std::optional<unsigned> dwarf_register(
         std::string_view name) const = 0;
@@ -421,6 +445,12 @@ public:
     // Handles a directive the target defines or overrides; false when the
     // generic directives should handle it.
     virtual bool directive(Assembler& assembler, Statement& statement) = 0;
+    // A source label, or a `.` reference, was defined at the current
+    // position.
+    virtual void label(Assembler&, SymbolId) {}
+    // Runs before a directive emits something other than an instruction or
+    // changes the section, and after the last statement.
+    virtual void flush(Assembler&) {}
     // Runs after the last statement and before layout.
     virtual void finish(Assembler& assembler) = 0;
     // Runs after layout and the call-frame tables, before the line table.
@@ -436,8 +466,14 @@ public:
     virtual std::optional<RelocationChoice> relocation(
         Assembler& assembler, const Fixup& fixup, const Value& value,
         const Symbol& symbol, const Section* symbol_section) const = 0;
-    // Orders one section's relocations, which arrive sorted by offset.
-    virtual void order_relocations(std::vector<Relocation>&) const {}
+    // Orders one section's REL relocations, which arrive in the order their
+    // fixups were created; by default by offset.
+    virtual void order_relocations(std::vector<Relocation>& relocations) const {
+        std::stable_sort(relocations.begin(), relocations.end(),
+                         [](const Relocation& left, const Relocation& right) {
+                             return left.offset < right.offset;
+                         });
+    }
     // Mach-O: resolves one fixup of `section` into its field value and
     // relocations; false after a diagnostic.
     virtual bool macho_relocation(Assembler&, SectionId, const Fixup&, std::uint64_t /*place*/,
@@ -456,6 +492,12 @@ struct Options {
     // The input is the compiler's own output, so object metadata may follow
     // the conventions the target's code generator keeps.
     bool compiler_output{};
+    // GNU as -O: 0 keeps every hazard nop the target may need, 1 removes
+    // the unneeded ones, 2 also fills delay slots.
+    unsigned optimize{2};
+    // Directives processed before the first source, for command options
+    // that mean what a directive means (MIPS -mgp32 is `.module gp=32`).
+    std::vector<std::string> directives;
 };
 
 // Assembles `sources`, in order, into one relocatable object. Returns no
@@ -477,6 +519,7 @@ public:
     void warning(SourceLocation location, std::string_view message);
     [[nodiscard]] const ObjectInfo& object() const { return object_; }
     [[nodiscard]] const Options& options() const { return options_; }
+    [[nodiscard]] Diagnostics& diagnostics() { return diagnostics_; }
 
     // Expressions.
     std::optional<ExpressionId> parse_expression(Cursor& cursor);
@@ -513,6 +556,10 @@ public:
     }
     [[nodiscard]] const std::vector<Symbol>& symbols() const { return symbols_; }
     void define_label(SymbolId id, SourceLocation location);
+    // Moves a label of the current section to the current position.
+    void move_label(SymbolId id);
+    // Adds an STT_FILE symbol, as `.file NAME` does.
+    void add_file_symbol(std::string name);
     void assign(SymbolId id, ExpressionId value, SourceLocation location);
     // `.set NAME, EXPR` and the equivalent directives.
     void assignment_statement(Statement& statement);
@@ -536,12 +583,16 @@ public:
     }
     [[nodiscard]] const std::vector<Section>& sections() const { return sections_; }
     [[nodiscard]] SectionId current_section() const { return current_; }
-    void switch_section(SectionId id);
-    void push_section(SectionId id);
+    [[nodiscard]] std::int64_t current_subsection() const;
+    void switch_section(SectionId id, std::int64_t subsection = 0);
+    void push_section(SectionId id, std::int64_t subsection = 0);
     void pop_section(SourceLocation location);
 
     // Emission into the current section.
     void emit_bytes(std::span<const std::uint8_t> bytes);
+    // Emits bytes the target inserts on its own, such as hazard padding,
+    // which do not take a pending `.loc` row.
+    void emit_padding(std::span<const std::uint8_t> bytes);
     void emit_integer(std::uint64_t value, unsigned size);
     // Records a fixup at the current position for the next emitted bytes.
     void add_fixup(FixupKind kind, ExpressionId expression,

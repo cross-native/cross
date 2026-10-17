@@ -10,12 +10,14 @@
 #include <array>
 #include <bit>
 #include <charconv>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <functional>
 #include <iterator>
 #include <limits>
 #include <map>
+#include <numeric>
 #include <sstream>
 #include <unordered_map>
 #include <utility>
@@ -268,7 +270,11 @@ struct Assembler::Impl {
     std::optional<Capture> capture;
     unsigned expansion_depth{};
     std::uint64_t macro_counter{};
+    std::uint64_t local_counter{};
     bool exit_macro{};
+    // `.altmacro`: `%expr` and `<text>` arguments, parameters named without
+    // a backslash, and `LOCAL` names.
+    bool alternate_macro{};
     bool in_block_comment{};
     std::uint32_t definitions{};
     // Mach-O atom-defining labels per section in (fragment, offset,
@@ -301,8 +307,15 @@ struct Assembler::Impl {
     // Sections ---------------------------------------------------------------
     std::map<std::tuple<std::string, std::uint32_t, std::uint64_t>, SectionId>
         section_map;
-    std::vector<std::pair<SectionId, SectionId>> section_stack;
-    SectionId previous{};
+    // A section and subsection, for `.previous` and the section stack.
+    struct Position {
+        SectionId section{};
+        std::int64_t subsection{};
+        friend bool operator==(const Position&, const Position&) = default;
+    };
+    std::vector<std::pair<Position, Position>> section_stack;
+    Position previous{};
+    bool has_subsections{};
     std::unordered_map<std::string, SymbolId> symbol_map;
     std::unordered_map<std::uint64_t, std::uint64_t> local_label_instances;
     std::vector<bool> resolving;
@@ -432,6 +445,12 @@ struct Assembler::Impl {
     void macro_directive(Statement& statement);
     void repeat(Statement& statement);
     std::optional<unsigned> cfi_register(Cursor& cursor);
+    // The current section and subsection; switching to a subsection starts
+    // a fragment in it unless it is the section's last one.
+    [[nodiscard]] Position here() const { return {as.current_, as.current_subsection()}; }
+    void select(Position position);
+    // Orders each section's fragments by subsection before layout.
+    void merge_subsections();
 
     // Layout and output.
     void materialize_row();
@@ -447,7 +466,7 @@ struct Assembler::Impl {
     std::optional<SymbolId> atom_at(std::size_t section_index, std::uint32_t fragment,
                                     std::uint64_t offset);
     bool record_elf(std::size_t section_index, Fragment& fragment, Fixup& fixup, FixupInfo& info,
-                    Value& value, std::span<std::uint8_t> bytes);
+                    Value& value, std::span<std::uint8_t> bytes, std::uint32_t sequence);
     bool record_coff(std::size_t section_index, Fragment& fragment, Fixup& fixup, FixupInfo& info,
                      Value& value, std::span<std::uint8_t> bytes);
     bool apply(const Fixup& fixup, const FixupInfo& info, std::int64_t number,
@@ -460,6 +479,17 @@ struct Assembler::Impl {
         return section.fragments[symbol.fragment].address + symbol.offset;
     }
 };
+
+namespace {
+
+// Appends a fragment to the section's current subsection.
+Fragment& append_fragment(Section& section, Fragment fragment = {}) {
+    fragment.subsection = section.fragments.back().subsection;
+    section.fragments.push_back(std::move(fragment));
+    return section.fragments.back();
+}
+
+} // namespace
 
 // ---------------------------------------------------------------------------
 // Assembler basics
@@ -493,7 +523,7 @@ Assembler::Assembler(Target& target, const Options& options,
         break;
     }
     switch_section(text);
-    impl_->previous = text;
+    impl_->previous = {text, 0};
 }
 
 Assembler::~Assembler() = default;
@@ -536,8 +566,9 @@ SymbolId Assembler::symbol(std::string_view name, SourceLocation location) {
     const SymbolId id{static_cast<std::uint32_t>(symbols_.size())};
     Symbol entry;
     entry.name = std::string(name);
-    entry.temporary = object_.format == Format::MachO ? name.starts_with("L")
-                                                      : name.starts_with(".L");
+    entry.temporary = (object_.format == Format::MachO ? name.starts_with("L")
+                                                       : name.starts_with(".L")) ||
+                      target_.private_label(name);
     entry.location = location;
     symbols_.push_back(std::move(entry));
     impl_->resolving.push_back(false);
@@ -566,13 +597,27 @@ void Assembler::define_label(SymbolId id, SourceLocation location) {
         current.fragments.back().kind != Fragment::Kind::Data ||
         (object_.format == Format::MachO && !entry.temporary &&
          !current.fragments.back().bytes.empty())) {
-        current.fragments.emplace_back();
+        append_fragment(current);
     }
     entry.section = current_;
     entry.fragment = static_cast<std::uint32_t>(current.fragments.size() - 1);
     entry.offset = current.fragments.back().bytes.size();
     entry.definition = ++impl_->definitions;
     if (location.valid()) entry.location = location;
+}
+
+void Assembler::add_file_symbol(std::string name) {
+    impl_->file_symbols.push_back(std::move(name));
+    impl_->file_symbol_order.push_back(static_cast<std::uint32_t>(symbols_.size()));
+}
+
+void Assembler::move_label(SymbolId id) {
+    auto& current = section(current_);
+    if (current.fragments.back().kind != Fragment::Kind::Data) append_fragment(current);
+    auto& entry = symbol(id);
+    entry.section = current_;
+    entry.fragment = static_cast<std::uint32_t>(current.fragments.size() - 1);
+    entry.offset = current.fragments.back().bytes.size();
 }
 
 void Assembler::assign(SymbolId id, ExpressionId value,
@@ -626,7 +671,7 @@ SectionId Assembler::section(std::string_view name, std::uint32_t type,
     Section entry;
     entry.name = std::string(name);
     entry.type = target_.section_type(name, type);
-    entry.flags = flags | (group ? elf::shf_group : 0);
+    entry.flags = target_.section_flags(name, flags) | (group ? elf::shf_group : 0);
     entry.entry_size = entry_size;
     entry.group = group;
     entry.comdat = comdat;
@@ -674,14 +719,30 @@ SectionId Assembler::macho_section(std::string_view segment, std::string_view na
     return impl_->add_section(std::move(entry), key);
 }
 
-void Assembler::switch_section(SectionId id) {
-    if (!(id == current_)) impl_->previous = current_;
-    current_ = id;
+std::int64_t Assembler::current_subsection() const {
+    return sections_[current_.value].fragments.back().subsection;
 }
 
-void Assembler::push_section(SectionId id) {
-    impl_->section_stack.emplace_back(current_, impl_->previous);
-    switch_section(id);
+void Assembler::Impl::select(Position position) {
+    as.current_ = position.section;
+    auto& section = as.sections_[position.section.value];
+    if (section.fragments.back().subsection == position.subsection) return;
+    Fragment fragment;
+    fragment.subsection = position.subsection;
+    section.fragments.push_back(std::move(fragment));
+    has_subsections = true;
+}
+
+void Assembler::switch_section(SectionId id, std::int64_t subsection) {
+    const auto here = impl_->here();
+    const Impl::Position next{id, subsection};
+    if (!(next == here)) impl_->previous = here;
+    impl_->select(next);
+}
+
+void Assembler::push_section(SectionId id, std::int64_t subsection) {
+    impl_->section_stack.emplace_back(impl_->here(), impl_->previous);
+    switch_section(id, subsection);
 }
 
 void Assembler::pop_section(SourceLocation location) {
@@ -689,16 +750,20 @@ void Assembler::pop_section(SourceLocation location) {
         error(location, ".popsection without a matching .pushsection");
         return;
     }
-    current_ = impl_->section_stack.back().first;
+    impl_->select(impl_->section_stack.back().first);
     impl_->previous = impl_->section_stack.back().second;
     impl_->section_stack.pop_back();
 }
 
 void Assembler::emit_bytes(std::span<const std::uint8_t> bytes) {
     impl_->materialize_row();
+    emit_padding(bytes);
+}
+
+void Assembler::emit_padding(std::span<const std::uint8_t> bytes) {
     auto& current = section(current_);
     if (current.fragments.back().kind != Fragment::Kind::Data) {
-        current.fragments.emplace_back();
+        append_fragment(current);
     }
     auto& data = current.fragments.back().bytes;
     data.insert(data.end(), bytes.begin(), bytes.end());
@@ -715,7 +780,7 @@ void Assembler::add_fixup(FixupKind kind, ExpressionId expression,
     impl_->materialize_row();
     auto& current = section(current_);
     if (current.fragments.back().kind != Fragment::Kind::Data) {
-        current.fragments.emplace_back();
+        append_fragment(current);
     }
     auto& fragment = current.fragments.back();
     fragment.fixups.push_back(
@@ -751,7 +816,7 @@ void Assembler::emit_alignment(std::uint64_t alignment,
     fragment.max_skip = max_skip;
     fragment.fill = fill.value_or(0);
     fragment.code_fill = !fill && current.code;
-    current.fragments.push_back(std::move(fragment));
+    append_fragment(current, std::move(fragment));
 }
 
 void Assembler::emit_relaxable(std::vector<std::uint8_t> bytes, std::uint32_t offset,
@@ -768,7 +833,7 @@ void Assembler::emit_relaxable(std::vector<std::uint8_t> bytes, std::uint32_t of
     fragment.relaxed = std::move(relaxed);
     fragment.relaxed_fixup = {index, relaxed_offset, relaxed_kind, expression, location};
     fragment.location = location;
-    current.fragments.push_back(std::move(fragment));
+    append_fragment(current, std::move(fragment));
 }
 
 void Assembler::begin_instruction() {
@@ -974,7 +1039,9 @@ std::optional<ExpressionId> Assembler::parse_expression(Cursor& cursor) {
         }
         if (c == '.' && (rest.size() == 1 || !identifier_char(rest[1]))) {
             cursor.set_position(cursor.position() + 1);
-            return symbol_reference(temporary_label(), location);
+            const auto dot = temporary_label();
+            target_.label(*this, dot);
+            return symbol_reference(dot, location);
         }
         if (identifier_start(c) || c == '"') {
             const auto name = cursor.symbol_name();
@@ -1259,8 +1326,9 @@ std::string Assembler::Impl::numeric_label_name(std::uint64_t number,
 void Assembler::Impl::define_numeric_label(std::uint64_t number,
                                            SourceLocation location) {
     ++local_label_instances[number];
-    as.define_label(as.symbol(numeric_label_name(number, false), location),
-                    location);
+    const auto id = as.symbol(numeric_label_name(number, false), location);
+    as.define_label(id, location);
+    as.target_.label(as, id);
 }
 
 void Assembler::Impl::process_text(std::string_view text, const SourceFile* file,
@@ -1437,6 +1505,7 @@ void Assembler::Impl::statement(std::string_view text, SourceLocation location,
                              ".cfi_startproc / .cfi_endproc pairs");
                 }
                 as.define_label(id, label_location);
+                as.target_.label(as, id);
             }
             continue;
         }
@@ -1590,12 +1659,25 @@ void Assembler::Impl::expand_macro(const Macro& macro, Statement& statement) {
             const char c = rest[index];
             if (quoted) {
                 current.push_back(c);
-                if (c == '"') quoted = false;
+                if (c == '\\' && index + 1 < rest.size()) {
+                    current.push_back(rest[++index]);
+                } else if (c == '"') {
+                    quoted = false;
+                }
                 continue;
             }
             if (c == '"') {
                 quoted = true;
                 current.push_back(c);
+                pending = true;
+                continue;
+            }
+            if (alternate_macro && c == '<' && current.empty()) {
+                // `<text>` quotes text; `!` escapes the next character.
+                for (++index; index < rest.size() && rest[index] != '>'; ++index) {
+                    if (rest[index] == '!' && index + 1 < rest.size()) ++index;
+                    current.push_back(rest[index]);
+                }
                 pending = true;
                 continue;
             }
@@ -1628,6 +1710,39 @@ void Assembler::Impl::expand_macro(const Macro& macro, Statement& statement) {
         }
         if (pending || !pieces.empty()) pieces.push_back(current);
     }
+    // An argument's text: in alternate mode `%expr` passes the expression's
+    // decimal value; otherwise a quoted argument passes its text, adjacent
+    // quoted strings joining and a doubled quote standing for one.
+    const auto argument_text = [&](std::string text) -> std::optional<std::string> {
+        if (alternate_macro && text.starts_with('%')) {
+            Cursor expression(std::string_view(text).substr(1), statement.location, false);
+            const auto value = as.parse_absolute(expression);
+            if (!value) return std::nullopt;
+            return std::to_string(*value);
+        }
+        if (alternate_macro || !text.starts_with('"')) return text;
+        std::string result;
+        std::size_t index = 0;
+        while (index < text.size() && text[index] == '"') {
+            bool escaped = false;
+            for (++index; index < text.size(); ++index) {
+                const char c = text[index];
+                if (!escaped && c == '"') {
+                    if (index + 1 < text.size() && text[index + 1] == '"') {
+                        result.push_back('"');
+                        ++index;
+                        continue;
+                    }
+                    ++index;
+                    break;
+                }
+                escaped = !escaped && c == '\\';
+                result.push_back(c);
+            }
+        }
+        result.append(text, index);
+        return result;
+    };
     std::size_t positional = 0;
     for (auto& piece : pieces) {
         const auto first = piece.find_first_not_of(" \t");
@@ -1640,11 +1755,18 @@ void Assembler::Impl::expand_macro(const Macro& macro, Statement& statement) {
             const auto found = std::find_if(macro.parameters.begin(), macro.parameters.end(),
                                             [&](const auto& p) { return p.name == key; });
             if (found != macro.parameters.end()) {
+                const auto value = argument_text(piece.substr(equals + 1));
+                if (!value) return;
                 const auto index = static_cast<std::size_t>(found - macro.parameters.begin());
-                arguments[index] = piece.substr(equals + 1);
+                arguments[index] = *value;
                 given[index] = true;
                 continue;
             }
+        }
+        if (auto value = argument_text(piece)) {
+            piece = std::move(*value);
+        } else {
+            return;
         }
         if (positional >= macro.parameters.size()) {
             as.error(statement.location, "too many arguments for macro '" + macro.name + "'");
@@ -1672,10 +1794,57 @@ void Assembler::Impl::expand_macro(const Macro& macro, Statement& statement) {
         if (!given[index]) arguments[index] = macro.parameters[index].default_value;
     }
     const auto counter = macro_counter++;
+    // `LOCAL name, ...` lines of an alternate-mode expansion name labels
+    // unique to it.
+    std::vector<std::pair<std::string, std::string>> locals;
+    const auto local_line = [&](std::string_view line) {
+        Cursor probe(line, statement.location, false);
+        const auto word = probe.identifier();
+        return alternate_macro && word && lower(*word) == "local" &&
+               (probe.at_end() || space(probe.rest().front()));
+    };
+    for (const auto& line : macro.body) {
+        if (!local_line(line)) continue;
+        Cursor names(line, statement.location, false);
+        (void)names.identifier();
+        while (const auto name = names.identifier()) {
+            char buffer[24];
+            std::snprintf(buffer, sizeof buffer, ".LL%04llx",
+                          static_cast<unsigned long long>(++local_counter));
+            locals.emplace_back(std::string(*name), buffer);
+            names.consume(",");
+        }
+    }
+    const auto substitute = [&](std::string_view name) -> const std::string* {
+        for (std::size_t index = 0; index < macro.parameters.size(); ++index) {
+            if (macro.parameters[index].name == name) return &arguments[index];
+        }
+        for (const auto& [local, replacement] : locals) {
+            if (local == name) return &replacement;
+        }
+        return nullptr;
+    };
     std::string body;
     for (const auto& line : macro.body) {
+        if (local_line(line)) {
+            body.push_back('\n');
+            continue;
+        }
         for (std::size_t index = 0; index < line.size(); ++index) {
             const char c = line[index];
+            if (alternate_macro && identifier_start(c) &&
+                (index == 0 || !identifier_char(line[index - 1]))) {
+                std::size_t end = index;
+                while (end < line.size() && identifier_char(line[end])) ++end;
+                const auto name = std::string_view(line).substr(index, end - index);
+                if (const auto* replacement = substitute(name)) {
+                    body += *replacement;
+                } else {
+                    body += name;
+                }
+                index = end - 1;
+                continue;
+            }
             if (c != '\\' || index + 1 >= line.size()) {
                 body.push_back(c);
                 continue;
@@ -1694,14 +1863,13 @@ void Assembler::Impl::expand_macro(const Macro& macro, Statement& statement) {
                    line[end] != '$') {
                 ++end;
             }
-            const auto parameter = line.substr(index + 1, end - index - 1);
-            const auto found = std::find_if(macro.parameters.begin(), macro.parameters.end(),
-                                            [&](const auto& p) { return p.name == parameter; });
-            if (found == macro.parameters.end()) {
+            const auto* replacement =
+                substitute(std::string_view(line).substr(index + 1, end - index - 1));
+            if (!replacement) {
                 body.push_back(c);
                 continue;
             }
-            body += arguments[static_cast<std::size_t>(found - macro.parameters.begin())];
+            body += *replacement;
             index = end - 1;
         }
         body.push_back('\n');
@@ -1810,28 +1978,48 @@ void Assembler::Impl::directive(Statement& statement) {
     if (name == ".incbin") return incbin(statement);
     if (name == ".include") return include(statement);
     if (name == ".text" || name == ".data" || name == ".bss") {
+        as.target_.flush(as);
+        std::int64_t subsection = 0;
         if (!cursor.at_end()) {
-            const auto subsection = as.parse_absolute(cursor);
-            if (subsection && *subsection != 0) {
-                as.error(statement.location, "subsections are not supported");
-            }
+            const auto value = as.parse_absolute(cursor);
+            if (!value) return;
+            subsection = *value;
         }
+        expect_end();
         const auto flags = name == ".text" ? elf::shf_alloc | elf::shf_execinstr
                                            : elf::shf_alloc | elf::shf_write;
         as.switch_section(as.section(name, name == ".bss" ? elf::sht_nobits : elf::sht_progbits,
-                                     flags));
+                                     flags),
+                          subsection);
         return;
     }
     if (name == ".section") return section_directive(statement, false);
     if (name == ".pushsection") return section_directive(statement, true);
     if (name == ".popsection") {
+        as.target_.flush(as);
         expect_end();
         as.pop_section(statement.location);
         return;
     }
     if (name == ".previous") {
+        as.target_.flush(as);
         expect_end();
-        std::swap(as.current_, previous);
+        const auto next = previous;
+        previous = here();
+        select(next);
+        return;
+    }
+    if (name == ".subsection") {
+        as.target_.flush(as);
+        const auto value = as.parse_absolute(cursor);
+        if (!value) return;
+        expect_end();
+        as.switch_section(as.current_, *value);
+        return;
+    }
+    if (name == ".altmacro" || name == ".noaltmacro") {
+        expect_end();
+        alternate_macro = name == ".altmacro";
         return;
     }
     if (name == ".globl" || name == ".global") return symbol_binding(statement, Binding::Global);
@@ -2401,6 +2589,7 @@ bool Assembler::Impl::macho_directive(std::string_view name, Statement& statemen
 
 void Assembler::Impl::data(Statement& statement, unsigned size) {
     auto& cursor = statement.operands;
+    as.target_.flush(as);
     if (cursor.at_end()) return;
     do {
         const auto location = cursor.location();
@@ -2446,13 +2635,14 @@ void Assembler::Impl::leb(Statement& statement, bool is_signed) {
         fragment.expression = *expression;
         fragment.is_signed = is_signed;
         fragment.location = location;
-        as.section(as.current_).fragments.push_back(std::move(fragment));
+        append_fragment(as.section(as.current_), std::move(fragment));
     } while (cursor.consume(","));
     if (!cursor.at_end()) as.error(cursor.location(), "expected ',' between values");
 }
 
 void Assembler::Impl::ascii(Statement& statement, bool terminate) {
     auto& cursor = statement.operands;
+    as.target_.flush(as);
     do {
         const auto text = cursor.string_literal(as.diagnostics_);
         if (!text) {
@@ -2469,6 +2659,7 @@ void Assembler::Impl::ascii(Statement& statement, bool terminate) {
 
 void Assembler::Impl::floating(Statement& statement, unsigned size) {
     auto& cursor = statement.operands;
+    as.target_.flush(as);
     do {
         cursor.skip_space();
         const auto location = cursor.location();
@@ -2511,6 +2702,7 @@ void Assembler::Impl::floating(Statement& statement, unsigned size) {
 
 void Assembler::Impl::reserve(Statement& statement, bool zero) {
     auto& cursor = statement.operands;
+    as.target_.flush(as);
     const auto location = cursor.location();
     const auto count = as.parse_expression(cursor);
     if (!count) return;
@@ -2529,7 +2721,7 @@ void Assembler::Impl::reserve(Statement& statement, bool zero) {
         if (current.zero_fill && fill_byte != 0) {
             as.error(location, "a NOBITS section cannot hold nonzero data");
         }
-        if (current.fragments.back().kind != Fragment::Kind::Data) current.fragments.emplace_back();
+        if (current.fragments.back().kind != Fragment::Kind::Data) append_fragment(current);
         auto& bytes = current.fragments.back().bytes;
         bytes.insert(bytes.end(), static_cast<std::size_t>(*value), fill_byte);
         return;
@@ -2539,11 +2731,12 @@ void Assembler::Impl::reserve(Statement& statement, bool zero) {
     fragment.expression = *count;
     fragment.fill = fill_byte;
     fragment.location = location;
-    as.section(as.current_).fragments.push_back(std::move(fragment));
+    append_fragment(as.section(as.current_), std::move(fragment));
 }
 
 void Assembler::Impl::fill(Statement& statement) {
     auto& cursor = statement.operands;
+    as.target_.flush(as);
     const auto repeat_count = as.parse_absolute(cursor);
     if (!repeat_count) return;
     std::int64_t size = 1;
@@ -2572,6 +2765,7 @@ void Assembler::Impl::fill(Statement& statement) {
 
 void Assembler::Impl::align(Statement& statement, bool power) {
     auto& cursor = statement.operands;
+    as.target_.flush(as);
     const auto location = cursor.location();
     const auto amount = as.parse_absolute(cursor);
     if (!amount) return;
@@ -2611,6 +2805,7 @@ void Assembler::Impl::align(Statement& statement, bool power) {
 
 void Assembler::Impl::org(Statement& statement) {
     auto& cursor = statement.operands;
+    as.target_.flush(as);
     const auto location = cursor.location();
     const auto target = as.parse_expression(cursor);
     if (!target) return;
@@ -2625,7 +2820,7 @@ void Assembler::Impl::org(Statement& statement) {
     fragment.expression = *target;
     fragment.fill = fill_byte;
     fragment.location = location;
-    as.section(as.current_).fragments.push_back(std::move(fragment));
+    append_fragment(as.section(as.current_), std::move(fragment));
 }
 
 namespace {
@@ -2648,6 +2843,7 @@ std::optional<std::filesystem::path> find_file(
 
 void Assembler::Impl::incbin(Statement& statement) {
     auto& cursor = statement.operands;
+    as.target_.flush(as);
     const auto name = cursor.string_literal(as.diagnostics_);
     if (!name) {
         as.error(cursor.location(), "expected a file name");
@@ -2719,6 +2915,7 @@ void Assembler::Impl::include(Statement& statement) {
 
 void Assembler::Impl::section_directive(Statement& statement, bool push) {
     auto& cursor = statement.operands;
+    as.target_.flush(as);
     cursor.skip_space();
     std::string name;
     if (cursor.peek() == '"') {
@@ -2758,7 +2955,19 @@ void Assembler::Impl::section_directive(Statement& statement, bool push) {
     std::optional<SymbolId> group;
     bool comdat = false;
     std::uint64_t unique = 0;
-    if (cursor.consume(",")) {
+    std::int64_t subsection = 0;
+    bool more = cursor.consume(",");
+    // `.pushsection NAME, SUBSECTION[, FLAGS...]`
+    if (more && push) {
+        cursor.skip_space();
+        if (digit(cursor.peek())) {
+            const auto value = as.parse_absolute(cursor);
+            if (!value) return;
+            subsection = *value;
+            more = cursor.consume(",");
+        }
+    }
+    if (more) {
         cursor.skip_space();
         const auto flag_location = cursor.location();
         const auto text = cursor.string_literal(as.diagnostics_);
@@ -2874,7 +3083,8 @@ void Assembler::Impl::section_directive(Statement& statement, bool push) {
     const auto existing = section_map.find(key);
     if (existing != section_map.end()) {
         const auto& entry = as.sections_[existing->second.value];
-        if (flags_given && (entry.flags & ~elf::shf_group) != flags) {
+        if (flags_given &&
+            (entry.flags & ~elf::shf_group) != as.target_.section_flags(name, flags)) {
             as.error(statement.location, "changed section flags for " + name);
             return;
         }
@@ -2884,7 +3094,7 @@ void Assembler::Impl::section_directive(Statement& statement, bool push) {
         }
     }
     const auto id = as.section(name, type, flags, entry_size, group, comdat, unique);
-    if (push) as.push_section(id);
+    if (push) as.push_section(id, subsection);
     else as.switch_section(id);
 }
 
@@ -2975,6 +3185,10 @@ void Assembler::Impl::common(Statement& statement, bool local) {
     const auto size_value = as.parse_absolute(cursor);
     if (!size_value) return;
     std::int64_t alignment = 1;
+    if (local && *size_value > 0) {
+        alignment = static_cast<std::int64_t>(
+            as.target_.local_common_alignment(static_cast<std::uint64_t>(*size_value)));
+    }
     if (cursor.consume(",")) {
         const auto value = as.parse_absolute(cursor);
         if (!value) return;
@@ -3033,6 +3247,7 @@ void Assembler::Impl::common(Statement& statement, bool local) {
 }
 
 void Assembler::Impl::ident(Statement& statement) {
+    as.target_.flush(as);
     const auto text = statement.operands.string_literal(as.diagnostics_);
     if (!text) {
         as.error(statement.operands.location(), "expected a string");
@@ -3551,6 +3766,42 @@ bool Assembler::Impl::layout(bool report) {
     return pass(true).second;
 }
 
+void Assembler::Impl::merge_subsections() {
+    for (std::size_t index = 0; index < as.sections_.size(); ++index) {
+        auto& fragments = as.sections_[index].fragments;
+        const auto first = fragments.front().subsection;
+        if (std::all_of(fragments.begin(), fragments.end(),
+                        [&](const Fragment& fragment) { return fragment.subsection == first; })) {
+            continue;
+        }
+        std::vector<std::uint32_t> order(fragments.size());
+        std::iota(order.begin(), order.end(), 0U);
+        std::stable_sort(order.begin(), order.end(), [&](std::uint32_t left, std::uint32_t right) {
+            return fragments[left].subsection < fragments[right].subsection;
+        });
+        std::vector<std::uint32_t> moved(fragments.size());
+        std::vector<Fragment> sorted;
+        sorted.reserve(fragments.size());
+        for (std::uint32_t position = 0; position < order.size(); ++position) {
+            moved[order[position]] = position;
+            sorted.push_back(std::move(fragments[order[position]]));
+        }
+        for (auto& fragment : sorted) {
+            for (auto& fixup : fragment.fixups) fixup.fragment = moved[fixup.fragment];
+            fragment.relaxed_fixup.fragment = moved[fragment.relaxed_fixup.fragment];
+        }
+        fragments = std::move(sorted);
+        // A section symbol keeps naming the section's start.
+        for (auto& symbol : as.symbols_) {
+            if (symbol.section && symbol.section->value == index &&
+                symbol.type != elf::stt_section) {
+                symbol.fragment = moved[symbol.fragment];
+            }
+        }
+    }
+    atom_definitions = ~0U;
+}
+
 std::optional<SymbolId> Assembler::Impl::atom(const Symbol& symbol) {
     if (!symbol.section || symbol.type == elf::stt_section) return std::nullopt;
     const SymbolId id{static_cast<std::uint32_t>(&symbol - as.symbols_.data())};
@@ -3911,6 +4162,11 @@ void Assembler::Impl::emit_frames(bool eh) {
 
 void Assembler::Impl::emit_line_table() {
     if (!line_table) return;
+    if (!as.target_.line_table_without_rows() &&
+        std::all_of(line_sections.begin(), line_sections.end(),
+                    [](const auto& entry) { return entry.second.empty(); })) {
+        return;
+    }
     const unsigned version = root_file ? 5 : 4;
     const auto facts = as.target_.frame_facts();
     const unsigned address_size = as.object_.elf64 ? 8 : 4;
@@ -4121,7 +4377,8 @@ bool local_binding(const Symbol& symbol) {
 } // namespace
 
 bool Assembler::Impl::record_elf(std::size_t section_index, Fragment& fragment, Fixup& fixup,
-                                 FixupInfo& info, Value& value, std::span<std::uint8_t> bytes) {
+                                 FixupInfo& info, Value& value, std::span<std::uint8_t> bytes,
+                                 std::uint32_t sequence) {
     const auto place = fragment.address + fixup.offset;
     if (fixup.kind == fixup::section_offset4) fixup.kind = fixup::data4;
     if (value.subtract) {
@@ -4178,7 +4435,11 @@ bool Assembler::Impl::record_elf(std::size_t section_index, Fragment& fragment, 
     } else if (!apply(fixup, info, addend, bytes, true)) {
         return false;
     }
-    relocations[section_index].push_back({place, choice->type, relocated, addend});
+    Relocation record{place, choice->type, relocated, addend};
+    record.sequence = sequence;
+    record.target = *value.add;
+    record.target_addend = value.constant;
+    relocations[section_index].push_back(record);
     return true;
 }
 
@@ -4245,9 +4506,11 @@ bool Assembler::Impl::resolve_fixups() {
     bool ok = true;
     for (std::size_t section_index = 0; section_index < as.sections_.size(); ++section_index) {
         auto& section = as.sections_[section_index];
+        std::uint32_t sequence = 0;
         for (auto& fragment : section.fragments) {
             for (const auto& original : fragment.fixups) {
                 auto fixup = original;
+                ++sequence;
                 FixupInfo info;
                 if (fixup.kind.value < FixupKind::target_base) {
                     info.pc_relative = fixup.kind == fixup::data4_pc || fixup.kind == fixup::data8_pc;
@@ -4270,7 +4533,9 @@ bool Assembler::Impl::resolve_fixups() {
                 }
                 switch (as.object_.format) {
                 case Format::Elf:
-                    if (!record_elf(section_index, fragment, fixup, info, *value, bytes)) ok = false;
+                    if (!record_elf(section_index, fragment, fixup, info, *value, bytes, sequence)) {
+                        ok = false;
+                    }
                     break;
                 case Format::Coff:
                     if (!record_coff(section_index, fragment, fixup, info, *value, bytes)) ok = false;
@@ -4330,12 +4595,13 @@ bool Assembler::Impl::resolve_fixups() {
         }
     }
     for (auto& entries : relocations) {
-        std::stable_sort(entries.begin(), entries.end(),
-                         [](const Relocation& left, const Relocation& right) {
-                             return left.offset < right.offset;
-                         });
         if (as.object_.format == Format::Elf && !as.object_.rela) {
             as.target_.order_relocations(entries);
+        } else {
+            std::stable_sort(entries.begin(), entries.end(),
+                             [](const Relocation& left, const Relocation& right) {
+                                 return left.offset < right.offset;
+                             });
         }
     }
     return ok;
@@ -4634,6 +4900,12 @@ std::vector<std::uint8_t> Assembler::Impl::write_elf_object() {
 std::optional<std::vector<std::uint8_t>> Assembler::run(
     const std::vector<const SourceFile*>& sources) {
     const auto errors = diagnostics_.errors();
+    if (!options_.directives.empty()) {
+        std::string text;
+        for (const auto& line : options_.directives) text += line + '\n';
+        const auto* command = sources_.add("<command line>", std::move(text));
+        impl_->process_text(command->text, command, 0, 1, std::nullopt);
+    }
     for (const auto* source : sources) {
         impl_->in_block_comment = false;
         impl_->process_text(source->text, source, 0, 1, std::nullopt);
@@ -4647,8 +4919,10 @@ std::optional<std::vector<std::uint8_t>> Assembler::run(
         error(impl_->frames[*impl_->open_frame].location, "missing .cfi_endproc");
     }
     if (diagnostics_.errors() != errors) return std::nullopt;
+    target_.flush(*this);
     impl_->pending_row.reset();
     target_.finish(*this);
+    if (impl_->has_subsections) impl_->merge_subsections();
     if (diagnostics_.errors() != errors) return std::nullopt;
     if (!impl_->layout(true)) return std::nullopt;
     if (!impl_->frames.empty()) {

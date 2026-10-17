@@ -44,7 +44,7 @@ selection(wide "-target mips-unknown-elf -64" "Class: +ELF64" "Flags: +0x6000000
           "CPR1 size: 64")
 selection(narrow "-target mips64el-unknown-elf -32" "Class: +ELF32" "little endian" "o32")
 selection(vr4300 "-mprofile=vr4300-o32" "Flags: +0x20001101, noreorder, 32bitmode, o32, mips3"
-          "GPR size: 64" "FP ABI: Hard float [(]double precision[)]" "FLAGS 1: 00000000")
+          "GPR size: 32" "FP ABI: Hard float [(]double precision[)]" "FLAGS 1: 00000000")
 selection(gnu-isa "-target mips-unknown-elf -mips3" "Flags: +0x20001101" "ISA: MIPS3")
 selection(fpxx "-target mips-unknown-elf -march=vr4300 -mfpxx" "FP ABI: Hard float [(]32-bit CPU, Any FPU[)]")
 selection(fp64 "-target mips-unknown-elf -march=vr4300 -mfp64"

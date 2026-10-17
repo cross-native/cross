@@ -282,6 +282,10 @@ struct AssemblerCommand {
     std::optional<unsigned> address_bits;
     bool fatal_warnings{};
     bool no_warnings{};
+    // The GNU as -O level: 0, 1, or 2 (the default).
+    unsigned optimize{2};
+    // Target options that mean what a directive means, as directives.
+    std::vector<std::string> directives;
 };
 bool parse_as_options(int argc, char** argv, CompilerOptions& options,
                       AssemblerCommand& command, Diagnostics& diagnostics);

@@ -1720,6 +1720,49 @@ if(BUILD_TESTING)
         set_tests_properties(cross_mips_assembler_${name} PROPERTIES
             LABELS "feature.assembler;arch.mips;check.compile;endian.big;endian.little")
     endforeach()
+    # GNU as compatibility: one source per feature, its .text words in the
+    # comments, compared with GNU as when installed. ARGN: extra -D options.
+    function(cross_mips_assembler_words name source options gnu_options labels)
+        add_test(NAME cross_mips_assembler_${name}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DAS=$<TARGET_FILE:cross_as>
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/assembler/${source}
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-assembler/${name}
+                    "-DOPTIONS=${options}" "-DGNU_OPTIONS=${gnu_options}" ${ARGN}
+                    -P "${CMAKE_SOURCE_DIR}/test/target/mips/assembler/words.cmake")
+        set_tests_properties(cross_mips_assembler_${name} PROPERTIES
+            LABELS "feature.assembler;arch.mips;check.compile;${labels}")
+    endfunction()
+    set(mips_assembler_checks ${CMAKE_SOURCE_DIR}/test/target/mips/assembler)
+    cross_mips_assembler_words(fpr_names fpr_names.s
+        "-target mips-unknown-elf -march=vr4300 -mabi=32" "-EB -march=vr4300 -mabi=32"
+        "endian.big" -DCHECK=${mips_assembler_checks}/fpr_names_check.cmake)
+    cross_mips_assembler_words(subsections subsections.s
+        "-target mips-unknown-elf" "-EB -march=mips1 -mabi=32"
+        "endian.big" -DCHECK=${mips_assembler_checks}/subsections_check.cmake)
+    cross_mips_assembler_words(deferred deferred.s
+        "-target mips-unknown-elf" "-EB -march=mips1 -mabi=32"
+        "endian.big" -DCHECK=${mips_assembler_checks}/deferred_check.cmake)
+    cross_mips_assembler_words(instructions_mips32r2 instructions_r2.s
+        "-target mips-unknown-elf -march=mips32r2" "-EB -march=mips32r2 -mabi=32" "endian.big")
+    cross_mips_assembler_words(instructions_vr4300 instructions_mips3.s
+        "-target mips-unknown-elf -march=vr4300" "-EB -march=vr4300 -mabi=32" "endian.big")
+    cross_mips_assembler_words(instructions_allegrex instructions_allegrex.s
+        "-target mipsallegrexel-sony-psp-elf -march=allegrex" "-EL -march=allegrex"
+        "endian.little" -DORDER=little -DGNU_WORDS=1)
+    cross_mips_assembler_words(conventions conventions.s
+        "-target mips-unknown-elf -march=vr4300 -mabi=32 -mgp32 -O2"
+        "-EB -O2 -march=vr4300 -mabi=32 -mgp32"
+        "endian.big" -DCHECK=${mips_assembler_checks}/conventions_check.cmake)
+    foreach(name module reorder data_relocations)
+        add_test(NAME cross_mips_assembler_${name}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DAS=$<TARGET_FILE:cross_as>
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-assembler/${name}
+                    -P "${CMAKE_SOURCE_DIR}/test/target/mips/assembler/${name}.cmake")
+        set_tests_properties(cross_mips_assembler_${name} PROPERTIES
+            LABELS "feature.assembler;arch.mips;check.compile;endian.big")
+    endforeach()
     add_test(NAME cross_mips_assembler_isa
         COMMAND "${CMAKE_COMMAND}"
                 -DAS=$<TARGET_FILE:cross_as>

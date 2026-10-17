@@ -41,7 +41,7 @@ foreach(order before after named)
     run_checked("${order}" "${LD}" -T "${script}" ${inputs} -o "${OUTPUT}/${order}.elf")
     run_checked("symbols" "${LLVM_NM}" --format=posix "${OUTPUT}/${order}.elf")
     expect("${order}" "${run_stdout}" "(^|\n)_start T 80100000" "(^|\n)alpha T 80100010"
-           "(^|\n)beta T 80100020")
+           "(^|\n)beta T 80100018")
     # Neither the unneeded member nor the weak reference (as in GNU ld)
     # reaches the symbol table.
     if(run_stdout MATCHES "(^|\n)(delta|gamma) ")

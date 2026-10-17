@@ -1261,6 +1261,19 @@ bool parse_as_options(int argc, char** argv, CompilerOptions& options,
                                std::string(argument));
             continue;
         }
+        // GNU as -O: -O0 keeps every hazard nop, -O and -O1 drop the
+        // unneeded ones, and higher levels also fill delay slots.
+        if (argument.starts_with("-O")) {
+            command.optimize = argument == "-O0"                    ? 0U
+                               : argument == "-O" || argument == "-O1" ? 1U
+                                                                       : 2U;
+            continue;
+        }
+        // The MIPS GPR width, which `.module gp=` also sets.
+        if (argument == "-mgp32" || argument == "-mgp64") {
+            command.directives.push_back(".module gp=" + std::string(argument.substr(4)));
+            continue;
+        }
         if (argument == "-mnan=2008" || argument == "-mnan=legacy") {
             add_command_option(options, "m.nan2008", argument == "-mnan=2008",
                                std::string(argument));
@@ -1373,6 +1386,9 @@ void print_as_help() {
   -mFEATURE/-mno-FEATURE
                         enable or disable a registered target feature
   -mnan=2008|legacy     select the NaN encoding
+  -mgp32, -mgp64        assume 32- or 64-bit general registers
+  -O0, -O1, -O2         keep every hazard nop, drop unneeded ones, or also
+                        fill delay slots in .set reorder code (default -O2)
   --model=FILE          load a named compiler-definition file
   --model-path=DIR      add a compiler-definition search directory
   --fatal-warnings      treat warnings as errors

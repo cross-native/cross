@@ -104,6 +104,8 @@ int assemble_main(int argc, char** argv) {
     assembler_options.include_paths = options.include_paths;
     assembler_options.fatal_warnings = command.fatal_warnings;
     assembler_options.no_warnings = command.no_warnings;
+    assembler_options.optimize = command.optimize;
+    assembler_options.directives = command.directives;
     if (!options.inputs.empty() && options.inputs.front() != "-") {
         assembler_options.source_directory = options.inputs.front().parent_path();
     }

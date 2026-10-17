@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 # Data, layout, symbol, conditional, and macro directives; directives.cmake
-# lists the bytes and symbols they produce, which LLVM MC also produces.
+# lists the bytes and symbols they produce, which GNU as also produces.
         .set noreorder
         .text
         .globl start

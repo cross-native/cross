@@ -34,17 +34,18 @@ assemble(main "-target mips-unknown-elf"
          ".text\n.globl _start\n_start:\njal helper\nnop\n.section .text.unused,\"ax\",@progbits\n.globl unused\nunused:\njr $31\nnop\n.section .text.helper,\"ax\",@progbits\n.globl helper\nhelper:\nlui $2, %hi(value)\njr $31\nlw $2, %lo(value)($2)\n.data\n.globl value\nvalue:\n.word 7\n")
 
 # Without a script: GNU ld's default addresses, a.out in the working directory.
+# The object's .reginfo is not allocated, as from GNU as for embedded ELF.
 execute_process(COMMAND "${LD}" main.o WORKING_DIRECTORY "${OUTPUT}" RESULT_VARIABLE status
                 ERROR_VARIABLE stderr)
 if(NOT status EQUAL 0 OR NOT EXISTS "${OUTPUT}/a.out")
     message(FATAL_ERROR "default link failed\n${stderr}")
 endif()
 run_checked("default layout" "${LLVM_READELF}" -h -l -S "${OUTPUT}/a.out")
-expect("default layout" "${run_stdout}" "Entry point address: +0x400030"
-       "ABIFLAGS +0x001000 0x00400000 " "REGINFO +0x001018 0x00400018 "
-       "LOAD +0x001000 0x00400000 0x00400000 0x0004c 0x0004c R E"
-       "LOAD +0x001050 0x00401050 0x00401050 0x00004 0x00004 RW "
-       "[.]text +PROGBITS +00400030 ")
+expect("default layout" "${run_stdout}" "Entry point address: +0x400018"
+       "ABIFLAGS +0x001000 0x00400000 "
+       "LOAD +0x001000 0x00400000 0x00400000 0x00034 0x00034 R E"
+       "LOAD +0x001034 0x00401034 0x00401034 0x00004 0x00004 RW "
+       "[.]text +PROGBITS +00400018 ")
 
 run_checked("-Ttext" "${LD}" -Ttext=0x80010000 -e helper --defsym extra=0x1234 "${OUTPUT}/main.o"
             -Map "${OUTPUT}/main.map" -o "${OUTPUT}/ttext.elf")
