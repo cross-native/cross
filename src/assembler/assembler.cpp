@@ -2618,6 +2618,7 @@ void Assembler::Impl::data(Statement& statement, unsigned size) {
 
 void Assembler::Impl::leb(Statement& statement, bool is_signed) {
     auto& cursor = statement.operands;
+    as.target_.flush(as);
     do {
         const auto location = cursor.location();
         const auto expression = as.parse_expression(cursor);

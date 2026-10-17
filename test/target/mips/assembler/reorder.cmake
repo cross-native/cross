@@ -60,6 +60,8 @@ reorder_case(tentative "${r3000}" "${gnu_r3000}"
 # Data after an instruction gets its hazard nops first.
 reorder_case(flush "${r3000}" "${gnu_r3000}" "mfhi $2|.word 0x12345678"
              "00001010;00000000;00000000;12345678")
+reorder_case(flush-leb "${r3000}" "${gnu_r3000}" "mfhi $2|.uleb128 1000|.byte 0, 0"
+             "00001010;00000000;00000000;e8070000")
 # -O1 keeps the delay-slot nops; -O0 also keeps every possible hazard nop.
 reorder_case(no-swap "${r3000} -O1" "${gnu_r3000} -O1" "addu $5, $6, $7|jr $31"
              "00c72821;03e00008;00000000")

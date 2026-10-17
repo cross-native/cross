@@ -1263,10 +1263,16 @@ bool parse_as_options(int argc, char** argv, CompilerOptions& options,
         }
         // GNU as -O: -O0 keeps every hazard nop, -O and -O1 drop the
         // unneeded ones, and higher levels also fill delay slots.
-        if (argument.starts_with("-O")) {
-            command.optimize = argument == "-O0"                    ? 0U
-                               : argument == "-O" || argument == "-O1" ? 1U
-                                                                       : 2U;
+        if (argument == "-O" ||
+            (argument.size() > 2 && argument.starts_with("-O") &&
+             std::all_of(argument.begin() + 2, argument.end(),
+                         [](char c) { return c >= '0' && c <= '9'; }))) {
+            unsigned level = 1;
+            if (argument.size() > 2) {
+                std::from_chars(argument.data() + 2,
+                                argument.data() + argument.size(), level);
+            }
+            command.optimize = std::min(level, 2U);
             continue;
         }
         // The MIPS GPR width, which `.module gp=` also sets.
