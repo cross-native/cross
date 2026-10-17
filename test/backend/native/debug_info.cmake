@@ -131,7 +131,9 @@ expect("variables" "${info}"
     "DW_AT_name\t[(]\"low\"[)]\n[^\n]*DW_AT_type\t[(]0x[0-9a-f]+ \"u32\"[)]\n[^\n]*DW_AT_bit_size\t[(]3[)]\n[^\n]*DW_AT_data_bit_offset\t[(]32[)]"
     "DW_AT_name\t[(]\"high\"[)]\n[^\n]*DW_AT_type[^\n]*\n[^\n]*DW_AT_bit_size\t[(]5[)]\n[^\n]*DW_AT_data_bit_offset\t[(]35[)]"
     "DW_TAG_enumeration_type\n[^\n]*DW_AT_name\t[(]\"mode\"[)]\n[^\n]*DW_AT_byte_size\t[(]1[)]\n[^\n]*DW_AT_type\t[(]0x[0-9a-f]+ \"u8\"[)]\n\n[^\n]*DW_TAG_enumerator\n[^\n]*DW_AT_name\t[(]\"idle\"[)]\n[^\n]*DW_AT_const_value\t[(]0[)]\n\n[^\n]*DW_TAG_enumerator\n[^\n]*DW_AT_name\t[(]\"busy\"[)]\n[^\n]*DW_AT_const_value\t[(]4[)]"
-    "DW_TAG_array_type\n[^\n]*DW_AT_type\t[(]0x[0-9a-f]+ \"cell\"[)]\n\n[^\n]*DW_TAG_subrange_type\n[^\n]*DW_AT_count\t[(]2[)]")
+    "DW_TAG_array_type\n[^\n]*DW_AT_type\t[(]0x[0-9a-f]+ \"cell\"[)]\n\n[^\n]*DW_TAG_subrange_type\n[^\n]*DW_AT_count\t[(]2[)]"
+    "DW_AT_name\t[(]\"narrow_pair\"[)]\n[^\n]*DW_AT_decl_file[^\n]*\n[^\n]*DW_AT_decl_line[^\n]*\n[^\n]*DW_AT_type\t[(]0x[0-9a-f]+ \"pair<u32,u8>\"[)]"
+    "DW_AT_name\t[(]\"wide_pair\"[)]\n[^\n]*DW_AT_decl_file[^\n]*\n[^\n]*DW_AT_decl_line[^\n]*\n[^\n]*DW_AT_type\t[(]0x[0-9a-f]+ \"pair<u8,u32>\"[)]")
 # dwarf-lines describes no variables or types.
 compile(lines-only.o -g=dwarf-lines -target ${linux} "${input}")
 run("dwarf-lines info" "${LLVM_DWARFDUMP}" --debug-info "${OUTPUT}/lines-only.o")

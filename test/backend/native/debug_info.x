@@ -47,3 +47,8 @@ global i32 inspect(in i32 index) {
     local.low = 1;
     return local.value + (i32)state;
 }
+
+// Each instance of a generic record has its own type name.
+struct pair<A, B> { A first; B second; };
+global struct pair<u32, u8> narrow_pair;
+global struct pair<u8, u32> wide_pair;

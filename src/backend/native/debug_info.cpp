@@ -557,8 +557,11 @@ private:
     std::vector<std::string> record(Die& die, hir::RecordId id) {
         const auto& source = module_.record(id);
         auto path = name_components(source.source_name);
-        const auto name = path.back();
+        auto name = path.back();
         path.pop_back();
+        // An instance of a generic record is named with its arguments.
+        if (!name.empty() && source.source_key.arguments)
+            name += canonical_nominal_arguments(*source.source_key.arguments);
         die.tag = source.is_union ? dw::tag_union_type : dw::tag_structure_type;
         if (!name.empty())
             die.attributes.push_back({dw::at_name, dw::form_strp, writer_.string(name)});
