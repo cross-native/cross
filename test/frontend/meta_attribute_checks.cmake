@@ -276,7 +276,7 @@ foreach(attribute always_inline noinline)
 endforeach()
 # A translation-only helper has no emitted symbol or call boundary either,
 # whether or not it runs.
-foreach(attribute "abi(\"cross\")" "alias(\"other\")" "aligned(16)" "clobber(\"r8\")"
+foreach(attribute "abi(\"x\")" "alias(\"other\")" "aligned(16)" "clobber(\"r8\")"
                   "interrupt(\"irq\")" "link_name(\"other\")" naked raw_inline retain returns_twice
                   "section(\".text\")" "stack_cleanup(\"caller\")" used
                   "variadic(uptr state \"gp\")" "visibility(\"hidden\")" weak "weakref(\"other\")")
@@ -331,7 +331,7 @@ foreach(role macro syntax_expander)
         endforeach()
     endforeach()
     # No resolved profile can give an erased expansion a physical boundary.
-    foreach(attribute "abi(\"cross\")" "alias(\"other\")" "aligned(16)" "clobber(\"r8\")"
+    foreach(attribute "abi(\"x\")" "alias(\"other\")" "aligned(16)" "clobber(\"r8\")"
                       "interrupt(\"irq\")" "link_name(\"other\")" naked raw_inline retain returns_twice
                       "section(\".text\")" "stack_cleanup(\"caller\")" used
                       "variadic(uptr state \"gp\")" "visibility(\"hidden\")" weak "weakref(\"other\")")

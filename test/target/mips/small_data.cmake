@@ -174,7 +174,7 @@ expect(no_literal "${text}" "near_pi:\n[^\n]*\n[^\n]*\n(\t[^\n]*\n)*\tdmtc1\t")
 # the Cross ABI may clobber: the base register is reserved.
 set(bridge "${OUTPUT}/bridge.x")
 file(WRITE "${bridge}" "global u32 counter;
-[[abi(\"cross\")]] global u32 cross_callee(u32 x);
+[[abi(\"x\")]] global u32 cross_callee(u32 x);
 
 global u32 o32_caller(u32 x) {
     counter = counter + cross_callee(x);

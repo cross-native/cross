@@ -66,11 +66,11 @@ if(code MATCHES "\tsw\t[$]a[0-3],")
     message(FATAL_ERROR "o32_ignore homes registers without bindings\n${code}")
 endif()
 
-# cross32 saves a0-a3, t0-t9, and s0-s7, then the eight floating argument
+# x32 saves a0-a3, t0-t9, and s0-s7, then the eight floating argument
 # registers, in one area of the frame.
-body(cross32_leaf code)
+body(x32_leaf code)
 if(NOT code MATCHES "\tsw\t[$]a0,([0-9]+)[(][$]sp[)]\n")
-    message(FATAL_ERROR "cross32_leaf does not save a0\n${code}")
+    message(FATAL_ERROR "x32_leaf does not save a0\n${code}")
 endif()
 set(area ${CMAKE_MATCH_1})
 foreach(entry "sw|s7|84" "sdc1|f12|88" "sdc1|f10|144")
@@ -79,11 +79,11 @@ foreach(entry "sw|s7|84" "sdc1|f12|88" "sdc1|f10|144")
     list(GET parts 1 reg)
     list(GET parts 2 displacement)
     math(EXPR offset "${area} + ${displacement}")
-    expect(cross32_leaf "${code}" "\t${opcode}\t[$]${reg},${offset}[(][$]sp[)]\n")
+    expect(x32_leaf "${code}" "\t${opcode}\t[$]${reg},${offset}[(][$]sp[)]\n")
 endforeach()
 foreach(displacement 4 88)
     math(EXPR offset "${area} + ${displacement}")
-    expect(cross32_leaf "${code}" "\taddiu\t[$][a-z0-9]+,[$]sp,${offset}\n")
+    expect(x32_leaf "${code}" "\taddiu\t[$][a-z0-9]+,[$]sp,${offset}\n")
 endforeach()
 
 body(call_counted code)

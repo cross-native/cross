@@ -50,20 +50,25 @@ command-line order, wherever those options appear. A `--model-path`
 directory is searched only for `--model` names; nothing else in it is
 loaded. Loading the same file twice has no further effect. Include paths
 (`-I`) play no part in model lookup. Once every file is loaded, all entries
-are checked, whether or not the compilation selects them; an error stops the
-compilation and is reported at the file and line of the entry or property,
-the same under `cc` and `cpp`. An entry may name entries of any loaded file.
+are checked, whether or not the compilation selects them, except for the
+properties that a base may omit ([Inheritance](#inheritance)); an error
+stops the compilation and is reported at the file and line of the entry or
+property, the same under `cc` and `cpp`. An entry may name entries of any
+loaded file.
 
 A later file cannot replace an entry: reusing the name of a loaded entry, or
 an ABI alias, is an error. Mangling, optimization, and profile names are
 unique across all architectures. ABI names and aliases are unique per
-`architecture` and `address_bits`, so ABIs with different address widths may
-share a name. A shared name resolves to the entry whose `address_bits`
-equals that of the triple's default ABI, which is the `abi` of the profile
-that `default_for` selects for the triple. On MIPS, `cross` therefore
-denotes `cross32` for 32-bit triples and `cross-n64` for `mips64` triples. A
-profile that is a triple's default must name its ABI unambiguously, for
-example by its canonical name.
+`architecture` and address width, so ABIs with different address widths may
+share a name. A shared name resolves to the entry with the address width of
+the target triple's objects: 32 bits for `mips`, `mipsel`, and
+`mipsallegrexel` triples, and 64 bits for `mips64`, `mips64el`, and x86-64
+triples. An entry without `address_bits` ([Entry
+properties](#entry-properties)) has every address width of its
+architecture's triples. One of its aliases may also name an entry of the
+same file that states `address_bits`; at that width, the alias denotes the
+entry that states it. On MIPS, `x` therefore denotes `x32` for 32-bit
+triples and `x64` for `mips64` triples.
 
 `-mprofile=NAME`, `-O=NAME`, `-mabi=NAME`, and `-mmangling=NAME` select
 entries; `-mabi` also accepts an alias. Naming an entry that is not loaded
@@ -136,6 +141,57 @@ Profiles may set `f.unwind-model = "platform"` and `f.unwind-tables = true`
 for platforms whose unwinder must walk Cross frames; the defaults are
 `"none"` and `false`. Presets cannot set these two options but may set
 `f.elide-noreturn-saves`. Models cannot describe unwind record formats.
+
+### Inheritance
+
+`optimization` and `cpu` entries name their bases with `inherits`: a text
+naming one entry, or a list naming several entries, each once. A base is an
+entry of the same kind, and for a `cpu` entry of the same architecture,
+declared anywhere in any loaded file; an inheritance cycle is an error. An
+entry starts from its bases, in list order, and then applies its own
+properties and blocks:
+
+- A property or block that the entry sets replaces what its bases give.
+- Any other property, and any block of a given name such as
+  `instruction "mult"`, comes from the nearest bases that set it. Direct
+  bases have depth 1, their bases depth 2, and so on; a base reached along
+  several paths counts once, at its smallest depth. Nearest bases that set
+  different values are an error that the entry resolves by setting the
+  property or block itself; deeper bases do not take part.
+- A list that holds a set, the `features` of a `cpu` entry, is the union of
+  what the bases give, in order, unless the entry sets it. A base gives its
+  own list or, without one, the union of its bases' lists. The union is
+  checked like a list that the entry states.
+
+A base used only for composition need not be complete: a property that an
+entry needs only when it is selected, such as the `targets` of a preset with
+`m.*` properties, may come from the selected entry or any of its bases, and
+is checked only for the entry that `-O`, `-march`, `-mtune`, a profile, or a
+preset selects. Every other check applies to every entry.
+
+In this example, `board` combines an ISA level with an FPU. Its features are
+the union of its bases' features, and it has the `div.d` costs of
+`fpu-r4000`; if `isa-mips3` also described `div.d`, with other costs,
+`board` would have to describe it too:
+
+```text
+cpu "isa-mips3" {
+    architecture = "mips";
+    features = ["mips3", "llsc", "branch-likely", "load-interlocks"];
+}
+
+cpu "fpu-r4000" {
+    architecture = "mips";
+    features = ["hard-float", "fp32"];
+    instruction "div.d" { latency = 58; issue = 58; }
+}
+
+cpu "board" {
+    architecture = "mips";
+    inherits = ["isa-mips3", "fpu-r4000"];
+    instruction "mult" { latency = 5; issue = 5; }
+}
+```
 
 ## ABI entries
 
@@ -220,7 +276,7 @@ abi "example-regs" {
 | Property | Type | Default | Required |
 | --- | --- | --- | --- |
 | `architecture` | text | | yes |
-| `address_bits` | integer | | yes |
+| `address_bits` | integer | the triple's | no |
 | `stack_alignment` | integer | | yes |
 | `stack_slot_bytes` | integer | | yes |
 | `aliases` | list | `[]` | no |
@@ -246,7 +302,10 @@ in [Variadic functions](#variadic-functions).
   `x86-64` or `mips`. Any other name is an error.
 - `address_bits` is the nonzero width of addresses: of pointers, of the
   addresses passed for `out` and `inout` parameters, and of the addresses
-  that `indirect` rules pass.
+  that `indirect` rules pass. Without it, the entry takes the address width
+  of each target triple of its architecture
+  ([Loading and selection](#loading-and-selection)), and loading checks the
+  entry at each of those widths.
 - `aliases` lists further names for the entry.
 - `compilation_selectable` allows `-mabi` and a profile's `abi` to make the
   entry the ABI of a compilation. `function_selectable` allows
@@ -286,8 +345,8 @@ ABI may change, the compiler saves and restores that storage in the calling
 function. Of a general register that the list omits, other than the stack
 and frame pointers, a call preserves only as many low bits as the
 `register_bits` of the entry's narrowest `"integer"` bank: on a MIPS CPU with
-64-bit registers, a call under `o32` or `cross32` may change the upper 32
-bits of `s0`-`s7`.
+64-bit registers, a call under `o32` or `x32` may change the upper 32 bits
+of `s0`-`s7`.
 
 `elf_abi_tag` sets the ELF ABI tag of objects compiled with the entry as
 their ABI (`-mabi` or the profile's `abi`); without it, objects get the tag
@@ -301,14 +360,14 @@ marker sections.
 `-fprivate-abi` uses on MIPS for calls to functions defined without `global`
 in the same compilation
 ([language.md](language.md#abis-and-interoperability)). It applies on CPUs
-whose general registers have that many bits: the shipped `cross32` sets 32
-for MIPS I and II, and `cross64` and `cross-n64` set 64 for MIPS III and
-later. At most one entry per `architecture`, `address_bits`, and width may
-set it. A function whose signature the entry cannot place keeps its normal
-ABI. x86-64 ignores the property.
+whose general registers have that many bits: the shipped `x32` sets 32 for
+MIPS I and II, and `x64` sets 64 for MIPS III and later. At most one entry
+per `architecture`, address width, and register width may set it. A
+function whose signature the entry cannot place keeps its normal ABI.
+x86-64 ignores the property.
 
-On MIPS, every entry with `address_bits = 64`, shipped or user-defined,
-produces ELF64 objects as described in [targets.md](targets.md#mips).
+On MIPS, every entry with 64-bit addresses, shipped or user-defined, produces
+ELF64 objects as described in [targets.md](targets.md#mips).
 
 ### Register banks
 
@@ -357,9 +416,9 @@ Rules match a value by its kind:
 - `"pair"`: no value on x86-64 or MIPS, so it matches nothing there; and
 - `"any"`: every value.
 
-A value's width is its size in bits; a pointer's width is `address_bits`.
-An `out` or `inout` parameter passes the address of its value, so rules see
-it as a `"pointer"` of `address_bits` width.
+A value's width is its size in bits; a pointer's width is the entry's
+address width. An `out` or `inout` parameter passes the address of its value,
+so rules see it as a `"pointer"` of that width.
 
 ### Rules
 
@@ -518,7 +577,7 @@ stops the compilation.
 | `variadic_home_bank` | text | none | no |
 | `variadic_home_base` | integer | `0` | no |
 | `variadic_home_stride` | integer | `0` | no |
-| `variadic_va_list_bytes` | integer | `0` | no |
+| `variadic_va_list_bytes` | integer | see below | no |
 | `variadic_va_list_alignment` | integer | `1` | no |
 
 `variadic_supported = true` allows variadic functions (`...`) under the
@@ -622,14 +681,20 @@ bindings reserves no storage for them.
 `-emit-llvm` describes the `llvm.va_start` area with
 `variadic_va_list_bytes`, `variadic_va_list_alignment`, and each state's
 `llvm_va_list_offset`, which must be less than `variadic_va_list_bytes`.
-These properties do not affect native code.
+Without `variadic_va_list_bytes`, the area is a record of the entry's
+variadic states in order, each of its `type`: a state with
+`llvm_va_list_offset` at that offset, any other at the next offset after the
+state before it that its alignment allows; its size is the end of the last
+field, rounded up to the larger of `variadic_va_list_alignment` and the
+largest field alignment, and 0 without states. Its pointer fields follow the
+entry's address width. These properties do not affect native code.
 
 ### Shipped ABIs
 
-The shipped x86-64 model defines the default `cross` ABI and the C ABIs
-`sysv_abi` and `ms_abi`. The shipped MIPS model defines the Cross ABIs
-`cross32` and `cross64`, with 32-bit addresses, and `cross-n64`, with 64-bit
-addresses, and the C ABIs `o32`, `n64`, and `eabi32`.
+The shipped x86-64 model defines the default Cross ABI `x` and the C ABIs
+`sysv_abi` and `ms_abi`. The shipped MIPS model defines the Cross ABIs `x32`,
+with 32-bit registers and addresses, and `x64`, with 64-bit registers and the
+address width of the triple, and the C ABIs `o32`, `n64`, and `eabi32`.
 [targets.md](targets.md) describes them.
 
 ## Mangling entries
@@ -812,8 +877,8 @@ follows:
   cleanup is `caller` or `callee`. The clobbers are their count, `_`, and
   the sorted names. The parameters are `_`, their count, `_`, and for each
   parameter `i`, `o`, or `b` (`in`, `out`, or `inout`), its type, and its
-  location. For example, `u32 (*)(in u32 x, out u32 y)` under the `cross`
-  ABI is `PF5_cross3_u324_auto6_caller0__2_i3_u324_autoo3_u324_autoE`.
+  location. For example, `u32 (*)(in u32 x, out u32 y)` under the `x` ABI
+  is `PF1_x3_u324_auto6_caller0__2_i3_u324_autoo3_u324_autoE`.
 
 A value argument is spelled as its value followed by its type, as in
 `4uptr` and `-3i32`; a `bool` is spelled `0u8` or `1u8`. A value of an
@@ -883,20 +948,22 @@ optimization "O2-tuned" {
 
 | Property | Type | Default | Required |
 | --- | --- | --- | --- |
-| `inherits` | text | none | no |
+| `inherits` | text or list | none | no |
 | `targets` | list | `[]` | with `m.*` |
 | `f.*`, `m.*` | option value | | no |
 
-An entry inherits from at most one parent, named by `inherits`, which may
-be declared anywhere in any loaded file; an inheritance cycle is an error.
-A child replaces individual values of its parent, and options that no
-entry of the chain sets keep their defaults.
+`inherits` names the entry's bases ([Inheritance](#inheritance)). The entry
+replaces individual option values of its bases, and options that neither the
+entry nor a base sets keep their defaults.
 
 A preset may set only the options that `cc --print-options` marks
-`presettable: yes`. An entry with `m.*` properties needs `targets`, a list
-of architecture names as printed by `cc --print-targets`; each `m.*`
-property must be an option of every listed architecture, and selecting the
-entry for another architecture is an error. The presettable target options are
+`presettable: yes`. `targets` is a list of architecture names as printed by
+`cc --print-targets`; each `m.*` property of the entry must be an option of
+every listed architecture, or without `targets` of some architecture.
+Selecting a preset for an architecture that it or one of its bases does not
+list is an error, and so is selecting a preset whose settings include `m.*`
+properties when neither it nor a base has `targets`. The presettable target
+options are
 `m.tune` and `m.risc-cisc-balance`, and on x86-64 also
 `m.prefer-vector-width`; `m.arch`, `m.cmodel`, `m.red-zone`, and the
 instruction-set features belong in a profile or on the command line.
@@ -920,7 +987,7 @@ This example profile configures kernel code:
 ```text
 profile "x86_64-kernel" {
     target = "x86_64-unknown-elf";
-    abi = "cross";
+    abi = "x";
     mangling = "cross";
     optimization = "O2";
 
@@ -1029,15 +1096,16 @@ cpu "vr4300" {
 | Property | Type | Default | Required |
 | --- | --- | --- | --- |
 | `architecture` | text | none | yes |
-| `inherits` | text | none | no |
+| `inherits` | text or list | none | no |
 | `features` | list | `[]` | no |
 | `issue_width` | integer | `1` | no |
 
 `architecture` names a compiled-in architecture as `cc --print-targets`
-prints it; CPU names are unique per architecture. `inherits` names a `cpu`
-entry of the same architecture whose properties and blocks this entry starts
-from; the entry replaces individual properties and `instruction` blocks, and
-an inheritance cycle is an error. `features` lists the instruction-set
+prints it; CPU names are unique per architecture. `inherits` names the
+entry's bases ([Inheritance](#inheritance)), whose properties and blocks the
+entry starts from; the entry replaces individual properties and
+`instruction` blocks, and its `features` replace its bases' union.
+`features` lists the instruction-set
 features the processor implements by the names of the `-m` feature options
 (`cc --print-options=target`); each is enabled as its option would enable it,
 and two features that conflict, directly or through what they enable, are an
@@ -1054,8 +1122,8 @@ An `instruction "NAME"` block describes one instruction, named as
 | `available` | bool | `true` | `false` removes an instruction that the features would allow. |
 
 The target gives each instruction a default latency and issue cost, 1 unless
-it states otherwise; an instruction that no entry of the chain describes, or
-a property that its block omits, has the default. `cc --print-costs` shows
+it states otherwise; an instruction that neither the entry nor a base
+describes, or a property that its block omits, has the default. `cc --print-costs` shows
 the costs in effect.
 
 `-march=NAME` (`m.arch`) selects the entry whose `features` and `available`
@@ -1170,15 +1238,16 @@ These options list what the loaded models define:
 
 - `--print-models` lists the loaded model sources: `shipped:NAME` for each
   shipped file and the path of each `--model` file.
-- `--print-abis` lists the ABIs of the selected target with their aliases
-  and whether they are selectable, and the target's default ABI; it does
-  not reflect `-mabi`.
+- `--print-abis` lists the ABIs of the selected target with the aliases
+  that name them for its triple and whether they are selectable, and the
+  target's default ABI; it does not reflect `-mabi`.
 - `--print-manglings` lists the manglings.
 - `--print-profiles` lists each profile's target, ABI, mangling, preset,
   and option settings.
-- `--print-optimizations` lists each preset, its parent, and its settings.
+- `--print-optimizations` lists each preset, its bases, and its own
+  settings.
 - `--print-cpus` lists the selected target's `cpu` entries with their
-  parents and features, and `--print-costs` prints the latency, issue cost,
+  bases and features, and `--print-costs` prints the latency, issue cost,
   and availability of every instruction for the selected `-march` and
   `-mtune`.
 - `--print-data-bases` lists the `data_base` entries.

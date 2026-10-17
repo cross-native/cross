@@ -97,8 +97,8 @@ foreach(expression
     "sizeof((part!(T) *)0uptr)"
     "sizeof((T part!(*))0uptr)"
     "sizeof((T (*)(part!(in T)))0uptr)"
-    "sizeof(T (*)(in T) [[part!(abi(\"cross\"))]])"
-    "sizeof(T (*)(in T) part!([[abi(\"cross\")]]))")
+    "sizeof(T (*)(in T) [[part!(abi(\"x\"))]])"
+    "sizeof(T (*)(in T) part!([[abi(\"x\")]]))")
     check("[[aligned(early(unknown!()) + 0uptr * ${expression})]] static T test<T>(in T value)
 [[last!(hot)]] { return value; }
 $::static_assert(test(300u32) == 300u32, \"generic binding lost\");")

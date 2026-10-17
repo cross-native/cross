@@ -555,8 +555,7 @@ std::vector<InstructionCostEntry> declared_instructions() {
     };
 }
 
-TargetInfo make_target(ByteOrder order,
-                       std::vector<std::string_view> prefixes) {
+TargetInfo make_target(ByteOrder order, std::vector<TriplePrefix> prefixes) {
     TargetInfo result{
         "mips", std::move(prefixes),
         {order, 8, 16, 8,
@@ -623,10 +622,12 @@ TargetInfo make_target(ByteOrder order,
     return result;
 }
 
+// mips64 triples produce ELF64 objects with 64-bit addresses.
 const TargetInfo big_endian = make_target(
-    ByteOrder::Big, {"mipsallegrex", "mips64", "mips"});
+    ByteOrder::Big, {{"mipsallegrex", 32}, {"mips64", 64}, {"mips", 32}});
 const TargetInfo little_endian = make_target(
-    ByteOrder::Little, {"mipsallegrexel", "mips64el", "mipsel"});
+    ByteOrder::Little,
+    {{"mipsallegrexel", 32}, {"mips64el", 64}, {"mipsel", 32}});
 
 } // namespace
 

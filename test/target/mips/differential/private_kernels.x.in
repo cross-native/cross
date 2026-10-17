@@ -3,7 +3,7 @@
 
 // Private-ABI and projected-parameter kernels, merged: helpers carry no abi
 // attribute, so surviving calls use the optimizer-selected private contract
-// (cross64 on MIPS III, cross32 on earlier CPUs, cross on x86-64); the
+// (x64 on MIPS III, x32 on earlier CPUs, x on x86-64); the
 // k_proj_* kernels additionally exercise a u64 o32 pair parameter used both
 // as its low-word projection and as the whole value. Every kernel here is
 // integer-only (k_p_float moved to float_kernels.x.in, since MIPS I diagnoses

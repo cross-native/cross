@@ -78,7 +78,7 @@ static u32 check_exhaustive() {
 #if $::has_abi("sysv_abi")
 #define REGION_ABI "sysv_abi"
 #elif $::target::pointer_bytes == 4
-#define REGION_ABI "cross32"
+#define REGION_ABI "x32"
 #else
 #define REGION_ABI "n64"
 #endif

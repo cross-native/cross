@@ -14,10 +14,14 @@
 namespace cross {
 
 bool TargetInfo::matches(std::string_view triple) const {
-    for (const auto prefix : triple_prefixes) {
-        if (triple.starts_with(prefix)) return true;
+    return address_bits(triple) != 0;
+}
+
+unsigned TargetInfo::address_bits(std::string_view triple) const {
+    for (const auto& entry : triple_prefixes) {
+        if (triple.starts_with(entry.prefix)) return entry.address_bits;
     }
-    return false;
+    return 0;
 }
 
 std::string_view TargetInfo::default_abi(std::string_view triple) const {

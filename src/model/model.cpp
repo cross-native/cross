@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "model/model.hpp"
 
+#include "common/builtin_type.hpp"
 #include "common/diagnostic.hpp"
 #include "common/options.hpp"
 #include "target/target.hpp"
@@ -12,8 +13,11 @@
 #include <cctype>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <sstream>
 #include <stdexcept>
+#include <tuple>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -183,6 +187,95 @@ const TargetInfo* architecture_target(std::string_view architecture) {
     return nullptr;
 }
 
+// The address widths of the objects that the triples of `architecture`
+// produce, in increasing order.
+std::vector<unsigned> triple_address_widths(std::string_view architecture) {
+    std::vector<unsigned> result;
+    for (const auto* target : all_targets()) {
+        if (target->architecture != architecture) continue;
+        for (const auto& prefix : target->triple_prefixes) {
+            if (std::find(result.begin(), result.end(), prefix.address_bits) ==
+                result.end()) {
+                result.push_back(prefix.address_bits);
+            }
+        }
+    }
+    std::sort(result.begin(), result.end());
+    return result;
+}
+
+// The size and alignment in bytes of a variadic-state type: a builtin
+// scalar type, or a builtin type followed by one or more `*`.
+std::optional<std::pair<unsigned, unsigned>> variadic_state_layout(
+    std::string_view type, unsigned address_bits,
+    const TargetDataLayout& layout) {
+    bool pointer{};
+    while (type.ends_with('*')) {
+        pointer = true;
+        type.remove_suffix(1);
+    }
+    const auto kind = builtin_kind(type);
+    if (!kind) return std::nullopt;
+    const auto size = pointer ? std::optional<std::uint64_t>(
+                                    (address_bits + 7U) / 8U)
+                              : builtin_storage_size(*kind, address_bits,
+                                                     layout.f80_storage_bytes);
+    if (!size) return std::nullopt;
+    const auto alignment = natural_storage_alignment(
+        *size, !pointer && *kind == BuiltinType::F80,
+        layout.natural_alignment_limit, layout.f80_alignment);
+    return std::pair{static_cast<unsigned>(*size),
+                     static_cast<unsigned>(alignment)};
+}
+
+// Why a cpu's features are invalid, or nothing: each must be a target
+// feature, listed once, and none may conflict with another or with what
+// another enables.
+std::optional<std::string> feature_problem(
+    const TargetInfo& target, const std::vector<std::string>& features) {
+    const auto& table = target.subtargets->features;
+    // The index of a feature, or the table size.
+    const auto find = [&](std::string_view name) {
+        return static_cast<std::size_t>(
+            std::find_if(table.begin(), table.end(),
+                         [&](const SubtargetFeature& feature) {
+                             return feature.name == name;
+                         }) -
+            table.begin());
+    };
+    std::vector<bool> enabled(table.size());
+    std::vector<std::string_view> pending;
+    for (const auto& name : features) {
+        if (find(name) == table.size()) {
+            return "unknown " + std::string(target.architecture) +
+                   " feature '" + name + "'";
+        }
+        if (std::count(features.begin(), features.end(), name) > 1) {
+            return "cpu features list '" + name + "' twice";
+        }
+        pending.push_back(name);
+    }
+    while (!pending.empty()) {
+        const auto index = find(pending.back());
+        pending.pop_back();
+        if (index == table.size() || enabled[index]) continue;
+        enabled[index] = true;
+        pending.insert(pending.end(), table[index].prerequisites.begin(),
+                       table[index].prerequisites.end());
+    }
+    for (std::size_t index = 0; index < table.size(); ++index) {
+        if (!enabled[index]) continue;
+        for (const auto conflict : table[index].conflicts) {
+            const auto other = find(conflict);
+            if (other != table.size() && enabled[other]) {
+                return "cpu features '" + std::string(table[index].name) +
+                       "' and '" + std::string(conflict) + "' conflict";
+            }
+        }
+    }
+    return std::nullopt;
+}
+
 // Whether `name` is a target extension that `cc --print-features` lists.
 bool target_extension(const TargetInfo& target, std::string_view name) {
     const auto& features = target.subtargets->features;
@@ -246,9 +339,11 @@ public:
                 continue;
             }
             if (domain == "abi") {
-                if (auto entry = parse_abi(std::move(name), line)) {
-                    entry->source = position(line);
-                    result.abis.push_back(std::move(*entry));
+                if (auto entries = parse_abi(std::move(name), line)) {
+                    for (auto& entry : *entries) {
+                        entry.source = position(line);
+                        result.abis.push_back(std::move(entry));
+                    }
                 }
                 continue;
             }
@@ -1187,8 +1282,8 @@ private:
         return result;
     }
 
-    std::optional<AbiEntry> parse_abi(std::string name,
-                                      unsigned entry_line) {
+    std::optional<std::vector<AbiEntry>> parse_abi(std::string name,
+                                                   unsigned entry_line) {
         ModelProperties properties;
         AbiBlocks blocks;
         while (current_.kind != ModelTokenKind::RightBrace &&
@@ -1278,6 +1373,29 @@ private:
             return std::nullopt;
         }
         return found->second.value.list;
+    }
+
+    // A text naming one entry or a list naming several, each once.
+    std::vector<std::string> names_property(
+        const ModelProperties& properties, std::string_view name) {
+        const auto found = properties.find(std::string(name));
+        if (found == properties.end()) return {};
+        const auto& value = found->second.value;
+        if (value.kind == ModelValue::Kind::Text) return {value.text};
+        if (value.kind != ModelValue::Kind::List) {
+            fail(found->second.line, "model property '" + std::string(name) +
+                                         "' must be text or a list");
+            return {};
+        }
+        for (auto item = value.list.begin(); item != value.list.end(); ++item) {
+            if (std::find(value.list.begin(), item, *item) != item) {
+                fail(found->second.line, "model property '" +
+                                             std::string(name) + "' lists '" +
+                                             *item + "' twice");
+                return {};
+            }
+        }
+        return value.list;
     }
 
     std::optional<bool> bool_property(
@@ -1375,7 +1493,9 @@ private:
         return std::nullopt;
     }
 
-    std::optional<AbiEntry> make_abi(
+    // One entry, or without address_bits one per address width of the
+    // architecture's triples, each checked at its width.
+    std::optional<std::vector<AbiEntry>> make_abi(
         std::string name, const ModelProperties& properties,
         const AbiBlocks& blocks, unsigned line) {
         if (!known_properties(
@@ -1411,23 +1531,16 @@ private:
         result.architecture = *architecture;
         const auto address_bits =
             unsigned_property(properties, "address_bits");
-        if (!address_bits && error_.empty()) {
-            fail(line, "missing required ABI property 'address_bits'");
-        }
-        if (!address_bits || *address_bits == 0 ||
-            *address_bits > std::numeric_limits<std::uint16_t>::max() ||
-            !error_.empty()) {
-            if (address_bits && *address_bits == 0 && error_.empty()) {
-                fail(line, "ABI address_bits must be nonzero");
-            } else if (address_bits &&
-                       *address_bits >
-                           std::numeric_limits<std::uint16_t>::max() &&
-                       error_.empty()) {
-                fail(line, "ABI address_bits exceeds the supported range");
-            }
+        if (!error_.empty()) return std::nullopt;
+        if (address_bits && *address_bits == 0) {
+            fail(line, "ABI address_bits must be nonzero");
             return std::nullopt;
         }
-        result.address_bits = *address_bits;
+        if (address_bits &&
+            *address_bits > std::numeric_limits<std::uint16_t>::max()) {
+            fail(line, "ABI address_bits exceeds the supported range");
+            return std::nullopt;
+        }
         if (const auto llvm =
                 text_property(properties, "llvm_calling_convention")) {
             result.llvm_calling_convention = *llvm;
@@ -1976,10 +2089,63 @@ private:
                  "ABI variadic policy requires variadic_supported = true");
             return std::nullopt;
         }
-        if (!check_abi(*target_info, result, properties, blocks, line)) {
-            return std::nullopt;
+        std::vector<AbiEntry> entries;
+        if (address_bits) {
+            result.address_bits = *address_bits;
+            entries.push_back(std::move(result));
+        } else {
+            for (const auto bits : triple_address_widths(result.architecture)) {
+                auto& entry = entries.emplace_back(result);
+                entry.address_bits = bits;
+                entry.address_bits_from_triple = true;
+            }
         }
-        return result;
+        for (auto& entry : entries) {
+            if (!variadic_layout(*target_info, entry, properties, blocks) ||
+                !check_abi(*target_info, entry, properties, blocks, line)) {
+                return std::nullopt;
+            }
+        }
+        return entries;
+    }
+
+    // Checks the type of each variadic state and, without
+    // variadic_va_list_bytes, sizes the va_list area as a record of the
+    // states: one with llvm_va_list_offset at that offset, any other after
+    // the state before it.
+    bool variadic_layout(const TargetInfo& target, AbiEntry& abi,
+                         const ModelProperties& properties,
+                         const AbiBlocks& blocks) {
+        unsigned end{};
+        unsigned next{};
+        unsigned alignment = abi.variadic_va_list_alignment;
+        for (std::size_t index = 0; index < abi.variadic_states.size();
+             ++index) {
+            const auto& state = abi.variadic_states[index];
+            const auto layout = variadic_state_layout(
+                state.type, abi.address_bits, target.data_layout);
+            if (!layout) {
+                fail(blocks.variadic_states[index].line,
+                     "ABI variadic-state type '" + state.type +
+                         "' is not a scalar or pointer type");
+                return false;
+            }
+            const auto [size, field_alignment] = *layout;
+            const auto offset =
+                state.llvm_va_list_offset
+                    ? *state.llvm_va_list_offset
+                    : (next + field_alignment - 1U) / field_alignment *
+                          field_alignment;
+            next = offset + size;
+            end = std::max(end, next);
+            alignment = std::max(alignment, field_alignment);
+        }
+        if (!properties.contains("variadic_va_list_bytes") &&
+            !abi.variadic_states.empty()) {
+            abi.variadic_va_list_bytes =
+                (end + alignment - 1U) / alignment * alignment;
+        }
+        return true;
     }
 
     // Checks an ABI entry against its architecture and the references among
@@ -1987,7 +2153,12 @@ private:
     bool check_abi(const TargetInfo& target, const AbiEntry& abi,
                    const ModelProperties& properties, const AbiBlocks& blocks,
                    unsigned line) {
-        const auto model = "ABI model '" + abi.canonical_name + "'";
+        const auto model =
+            "ABI model '" + abi.canonical_name + "'" +
+            (abi.address_bits_from_triple
+                 ? " with " + std::to_string(abi.address_bits) +
+                       "-bit addresses"
+                 : std::string{});
         const auto property_line = [](const ModelProperties& owner,
                                       std::string_view name) {
             return owner.at(std::string(name)).line;
@@ -2401,25 +2572,15 @@ private:
     }
 
     std::optional<OptimizationEntry> make_optimization(
-        std::string name, const ModelProperties& properties, unsigned line) {
+        std::string name, const ModelProperties& properties, unsigned) {
         OptimizationEntry result;
         result.canonical_name = std::move(name);
-        result.inherits = text_property(properties, "inherits");
+        result.inherits = names_property(properties, "inherits");
         if (const auto targets = list_property(properties, "targets")) {
             result.targets = *targets;
         }
         if (!collect_option_properties(
                 properties, {"inherits", "targets"}, result.options)) {
-            return std::nullopt;
-        }
-        if (result.targets.empty() &&
-            std::any_of(result.options.begin(), result.options.end(),
-                        [](const OptionAssignment& option) {
-                            return option.name.starts_with("m.");
-                        })) {
-            fail(line,
-                 "optimization entry with m.* options requires a targets "
-                 "restriction");
             return std::nullopt;
         }
         if (!error_.empty()) return std::nullopt;
@@ -2651,58 +2812,6 @@ private:
         return value;
     }
 
-    // Each feature is a target feature; enabled with its prerequisites, no
-    // two conflict.
-    bool cpu_features(const TargetInfo& target,
-                      const std::vector<std::string>& features,
-                      unsigned line) {
-        const auto& table = target.subtargets->features;
-        // The index of a feature, or the table size.
-        const auto find = [&](std::string_view name) {
-            return static_cast<std::size_t>(
-                std::find_if(table.begin(), table.end(),
-                             [&](const SubtargetFeature& feature) {
-                                 return feature.name == name;
-                             }) -
-                table.begin());
-        };
-        std::vector<bool> enabled(table.size());
-        std::vector<std::string_view> pending;
-        for (const auto& name : features) {
-            if (find(name) == table.size()) {
-                fail(line, "unknown " + std::string(target.architecture) +
-                               " feature '" + name + "'");
-                return false;
-            }
-            if (std::count(features.begin(), features.end(), name) > 1) {
-                fail(line, "cpu features list '" + name + "' twice");
-                return false;
-            }
-            pending.push_back(name);
-        }
-        while (!pending.empty()) {
-            const auto index = find(pending.back());
-            pending.pop_back();
-            if (index == table.size() || enabled[index]) continue;
-            enabled[index] = true;
-            pending.insert(pending.end(), table[index].prerequisites.begin(),
-                           table[index].prerequisites.end());
-        }
-        for (std::size_t index = 0; index < table.size(); ++index) {
-            if (!enabled[index]) continue;
-            for (const auto conflict : table[index].conflicts) {
-                const auto other = find(conflict);
-                if (other != table.size() && enabled[other]) {
-                    fail(line, "cpu features '" +
-                                   std::string(table[index].name) + "' and '" +
-                                   std::string(conflict) + "' conflict");
-                    return false;
-                }
-            }
-        }
-        return true;
-    }
-
     std::optional<CpuEntry> make_cpu(
         std::string name, const ModelProperties& properties,
         const std::vector<AbiNestedBlock>& blocks, unsigned line) {
@@ -2722,10 +2831,10 @@ private:
             return std::nullopt;
         }
         result.architecture = *architecture;
-        result.inherits = text_property(properties, "inherits");
+        result.inherits = names_property(properties, "inherits");
         if (auto features = list_property(properties, "features")) {
-            if (!cpu_features(*target, *features,
-                              properties.at("features").line)) {
+            if (auto problem = feature_problem(*target, *features)) {
+                fail(properties.at("features").line, std::move(*problem));
                 return std::nullopt;
             }
             result.features = std::move(*features);
@@ -2816,6 +2925,102 @@ private:
     std::string error_;
 };
 
+// An entry and its bases, each once, by inheritance depth: the entry has
+// depth 0 and its direct bases depth 1; a base reached along several paths
+// counts once, at its smallest depth. `base` finds a base by name.
+template <typename Entry, typename Base>
+std::vector<std::pair<const Entry*, unsigned>> inheritance_graph(
+    const Entry& entry, Base base) {
+    std::vector<std::pair<const Entry*, unsigned>> result{{&entry, 0U}};
+    for (std::size_t index = 0; index < result.size(); ++index) {
+        const auto [item, depth] = result[index];
+        for (const auto& name : item->inherits) {
+            const auto* found = base(*item, name);
+            if (found && std::none_of(result.begin(), result.end(),
+                                      [&](const auto& seen) {
+                                          return seen.first == found;
+                                      })) {
+                result.emplace_back(found, depth + 1);
+            }
+        }
+    }
+    return result;
+}
+
+// The inheritance cycle through `entry`, as "a -> b -> a", or nothing.
+template <typename Entry, typename Base>
+std::optional<std::string> inheritance_cycle(const Entry& entry, Base base) {
+    std::vector<const Entry*> path{&entry};
+    std::vector<const Entry*> finished;
+    const auto visit = [&](const auto& self, const Entry& item) -> bool {
+        for (const auto& name : item.inherits) {
+            const auto* next = base(item, name);
+            if (!next) continue;
+            if (next == &entry) {
+                path.push_back(next);
+                return true;
+            }
+            if (std::find(path.begin(), path.end(), next) != path.end() ||
+                std::find(finished.begin(), finished.end(), next) !=
+                    finished.end()) {
+                continue;
+            }
+            path.push_back(next);
+            if (self(self, *next)) return true;
+            path.pop_back();
+            finished.push_back(next);
+        }
+        return false;
+    };
+    if (!visit(visit, entry)) return std::nullopt;
+    std::string result;
+    for (const auto* item : path) {
+        result += (result.empty() ? "" : " -> ") + item->canonical_name;
+    }
+    return result;
+}
+
+// Why an entry's nearest bases set different values of something that the
+// entry does not set, or nothing. `values(entry)` maps the name of each
+// property or block that an entry sets itself to its value.
+template <typename Entry, typename Values>
+std::optional<std::string> inheritance_conflict(
+    const std::vector<std::pair<const Entry*, unsigned>>& graph,
+    Values values) {
+    using Value = std::invoke_result_t<Values, const Entry&>;
+    struct Nearest {
+        typename Value::mapped_type value;
+        const Entry* owner{};
+        unsigned depth{};
+    };
+    const auto own = values(*graph.front().first);
+    std::map<typename Value::key_type, Nearest> nearest;
+    for (const auto& [item, depth] : graph) {
+        if (depth == 0) continue;
+        for (const auto& [key, value] : values(*item)) {
+            if (own.contains(key)) continue;
+            const auto [found, inserted] =
+                nearest.emplace(key, Nearest{value, item, depth});
+            if (!inserted && found->second.depth == depth &&
+                !(found->second.value == value)) {
+                return "inherits different values of " + key + " from '" +
+                       found->second.owner->canonical_name + "' and '" +
+                       item->canonical_name + "'";
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+// The costs of an instruction block; omitted properties have the target's.
+InstructionCost block_cost(const TargetInfo& target,
+                           const CpuInstructionEntry& block) {
+    const auto& defaults = target.instruction_costs[block.instruction.value];
+    return {block.latency.value_or(defaults.latency),
+            block.issue.value_or(defaults.issue),
+            block.available.value_or(true)};
+}
+
 std::string normalized(const std::filesystem::path& path) {
     std::error_code error;
     const auto canonical = std::filesystem::weakly_canonical(path, error);
@@ -2872,7 +3077,10 @@ bool ModelRegistry::load_text(std::string_view text, std::string origin,
     }
 
     // Names and private-call candidates are unique per architecture and
-    // address width; find_abi resolves a name shared by address models.
+    // address width; find_abi resolves a name shared by address widths. An
+    // entry that takes its width from the triple uses its names at each
+    // width, except an alias that an entry of the same file states for that
+    // width.
     const auto abi_key = [](const AbiEntry& entry, std::string_view item) {
         return entry.architecture + '\n' +
                std::to_string(entry.address_bits) + '\n' + std::string(item);
@@ -2889,20 +3097,27 @@ bool ModelRegistry::load_text(std::string_view text, std::string origin,
                 entry, std::to_string(entry.private_carrier_bits)));
         }
     }
-    for (const auto& entry : document->abis) {
+    std::unordered_set<std::string> stated_names;
+    const auto claim = [&](const AbiEntry& entry) {
         const auto model = " for " + entry.architecture + " with " +
                            std::to_string(entry.address_bits) +
                            "-bit addresses";
-        const auto add_name = [&](std::string_view name) {
-            if (abi_names.insert(abi_key(entry, name)).second) return true;
+        const auto add_name = [&](std::string_view name, bool alias) {
+            const auto key = abi_key(entry, name);
+            if (entry.address_bits_from_triple && alias &&
+                stated_names.contains(key)) {
+                return true;
+            }
+            if (!entry.address_bits_from_triple) stated_names.insert(key);
+            if (abi_names.insert(key).second) return true;
             diagnostics.file_error(entry.source,
                                    "duplicate ABI model name or alias '" +
                                        std::string(name) + "'" + model);
             return false;
         };
-        if (!add_name(entry.canonical_name)) return false;
+        if (!add_name(entry.canonical_name, false)) return false;
         for (const auto& alias : entry.aliases) {
-            if (!add_name(alias)) return false;
+            if (!add_name(alias, true)) return false;
         }
         if (entry.private_carrier_bits != 0 &&
             !private_conventions
@@ -2916,6 +3131,14 @@ bool ModelRegistry::load_text(std::string_view text, std::string origin,
                     std::to_string(entry.private_carrier_bits) +
                     "-bit carriers" + model);
             return false;
+        }
+        return true;
+    };
+    for (const bool from_triple : {false, true}) {
+        for (const auto& entry : document->abis) {
+            if (entry.address_bits_from_triple == from_triple && !claim(entry)) {
+                return false;
+            }
         }
     }
 
@@ -3067,31 +3290,36 @@ const AbiEntry* ModelRegistry::find_abi(
     if (name.empty() || name == "default") {
         name = default_abi(architecture, triple);
     }
-    // Zero address bits accept any address model; a shared name is then
-    // ambiguous and yields null.
-    const auto unique = [&](std::string_view sought,
-                            unsigned address_bits) -> const AbiEntry* {
-        const AbiEntry* found{};
+    // The entries of `architecture` that `name` names, at the address width
+    // `address_bits` or, when it is zero, at any width.
+    const auto named = [&](unsigned address_bits) {
+        std::vector<const AbiEntry*> result;
         for (const auto& entry : abis_) {
-            if (entry.architecture != architecture ||
-                (address_bits != 0 && entry.address_bits != address_bits) ||
-                (entry.canonical_name != sought &&
+            if (entry.architecture == architecture &&
+                (address_bits == 0 || entry.address_bits == address_bits) &&
+                (entry.canonical_name == name ||
                  std::find(entry.aliases.begin(), entry.aliases.end(),
-                           sought) == entry.aliases.end())) {
-                continue;
+                           name) != entry.aliases.end())) {
+                result.push_back(&entry);
             }
-            if (found) return nullptr;
-            found = &entry;
         }
-        return found;
+        return result;
     };
-    if (const auto* entry = unique(name, 0)) return entry;
-    // A name shared by several address models, such as each MIPS model's
-    // `cross`, follows the address model of the triple's default ABI.
-    const auto* profile = default_profile(triple);
-    const auto* model =
-        profile && profile->abi ? unique(*profile->abi, 0) : nullptr;
-    return model ? unique(name, model->address_bits) : nullptr;
+    if (const auto entries = named(0); entries.size() == 1) {
+        return entries.front();
+    }
+    // A name shared by several address widths, such as each MIPS width's
+    // `x`, names the entry of the triple's width; there an entry that states
+    // its width takes precedence over one that takes it from the triple.
+    const auto* target = target_for_triple(triple);
+    if (!target || target->architecture != architecture) return nullptr;
+    const auto entries = named(target->address_bits(triple));
+    const auto stated = std::find_if(
+        entries.begin(), entries.end(), [](const AbiEntry* entry) {
+            return !entry->address_bits_from_triple;
+        });
+    if (stated != entries.end()) return *stated;
+    return entries.size() == 1 ? entries.front() : nullptr;
 }
 
 const AbiEntry* ModelRegistry::find_abi(AbiId id) const {
@@ -3152,31 +3380,65 @@ const DataBaseEntry* ModelRegistry::find_data_base(
 
 ResolvedCpu ModelRegistry::resolve_cpu(const TargetInfo& target,
                                        const CpuEntry& entry) const {
-    // Loading checked that every chain of parents ends; values apply from
-    // the root down.
-    std::vector<const CpuEntry*> chain;
-    for (const auto* item = &entry; item && chain.size() <= cpus_.size();
-         item = item->inherits ? find_cpu(item->architecture, *item->inherits)
-                               : nullptr) {
-        chain.push_back(item);
-    }
+    const auto base = [&](const CpuEntry& item, std::string_view name) {
+        return find_cpu(item.architecture, name);
+    };
     ResolvedCpu result;
+    // The features are the entry's own or the union of its bases', in order.
+    std::vector<const CpuEntry*> visited;
+    const auto collect = [&](const auto& self, const CpuEntry& item) -> void {
+        if (std::find(visited.begin(), visited.end(), &item) != visited.end()) {
+            return;
+        }
+        visited.push_back(&item);
+        if (!item.features) {
+            for (const auto& name : item.inherits) {
+                if (const auto* next = base(item, name)) self(self, *next);
+            }
+            return;
+        }
+        for (const auto& feature : *item.features) {
+            if (std::find(result.features.begin(), result.features.end(),
+                          feature) == result.features.end()) {
+                result.features.push_back(feature);
+            }
+        }
+    };
+    collect(collect, entry);
     for (const auto& instruction : target.instruction_costs) {
         result.instructions.push_back(
             {instruction.latency, instruction.issue, true});
     }
-    for (auto item = chain.rbegin(); item != chain.rend(); ++item) {
-        if ((*item)->features) result.features = *(*item)->features;
-        if ((*item)->issue_width) result.issue_width = *(*item)->issue_width;
-        for (const auto& block : (*item)->instructions) {
-            const auto& defaults =
-                target.instruction_costs[block.instruction.value];
-            result.instructions[block.instruction.value] = {
-                block.latency.value_or(defaults.latency),
-                block.issue.value_or(defaults.issue),
-                block.available.value_or(true)};
+    // Other values come from the nearest entry that sets them, and loading
+    // rejected nearest entries that disagree, so deeper entries apply first.
+    const auto graph = inheritance_graph(entry, base);
+    for (auto item = graph.rbegin(); item != graph.rend(); ++item) {
+        const auto& cpu = *item->first;
+        if (cpu.issue_width) result.issue_width = *cpu.issue_width;
+        for (const auto& block : cpu.instructions) {
+            result.instructions[block.instruction.value] =
+                block_cost(target, block);
         }
     }
+    return result;
+}
+
+std::vector<OptionAssignment> ModelRegistry::resolve_optimization(
+    const OptimizationEntry& entry) const {
+    // Each option comes from the nearest entry that sets it, and loading
+    // rejected nearest entries that disagree, so deeper entries apply first.
+    const auto graph = inheritance_graph(
+        entry, [&](const OptimizationEntry&, std::string_view name) {
+            return find_optimization(name);
+        });
+    std::map<std::string, OptionAssignment> settings;
+    for (auto item = graph.rbegin(); item != graph.rend(); ++item) {
+        for (const auto& setting : item->first->options) {
+            settings.insert_or_assign(setting.name, setting);
+        }
+    }
+    std::vector<OptionAssignment> result;
+    for (auto& [name, setting] : settings) result.push_back(std::move(setting));
     return result;
 }
 
@@ -3284,31 +3546,30 @@ bool check_cpu_options(const ModelRegistry& registry,
 // parents, architectures, targets, ABIs, manglings, presets, and options.
 bool check_entries(const ModelRegistry& registry, Diagnostics& diagnostics) {
     const auto& presets = registry.optimizations();
+    const auto preset_base = [&](const OptimizationEntry&,
+                                 std::string_view name) {
+        return registry.find_optimization(name);
+    };
+    const auto preset_failure = [&](const OptimizationEntry& preset,
+                                    std::string message) {
+        diagnostics.file_error(preset.source, "optimization preset '" +
+                                                  preset.canonical_name +
+                                                  "' " + std::move(message));
+        return false;
+    };
     for (const auto& preset : presets) {
         const auto fail = [&](std::string message) {
-            diagnostics.file_error(preset.source,
-                                   "optimization preset '" +
-                                       preset.canonical_name + "' " +
-                                       std::move(message));
-            return false;
+            return preset_failure(preset, std::move(message));
         };
-        if (preset.inherits &&
-            !registry.find_optimization(*preset.inherits)) {
-            return fail("inherits unknown preset '" + *preset.inherits +
-                        "'");
-        }
-        std::string cycle = preset.canonical_name;
-        const auto* parent = &preset;
-        for (std::size_t step = 0; step < presets.size() && parent->inherits;
-             ++step) {
-            parent = registry.find_optimization(*parent->inherits);
-            if (!parent) break;
-            cycle += " -> " + parent->canonical_name;
-            if (parent == &preset) {
-                diagnostics.file_error(
-                    preset.source, "optimization inheritance cycle: " + cycle);
-                return false;
+        for (const auto& name : preset.inherits) {
+            if (!registry.find_optimization(name)) {
+                return fail("inherits unknown preset '" + name + "'");
             }
+        }
+        if (const auto cycle = inheritance_cycle(preset, preset_base)) {
+            diagnostics.file_error(preset.source,
+                                   "optimization inheritance cycle: " + *cycle);
+            return false;
         }
         std::vector<const TargetInfo*> targets;
         for (const auto& architecture : preset.targets) {
@@ -3324,6 +3585,19 @@ bool check_entries(const ModelRegistry& registry, Diagnostics& diagnostics) {
                                diagnostics)) {
             return false;
         }
+    }
+    // The nearest bases that set an option agree, unless the entry sets it.
+    for (const auto& preset : presets) {
+        const auto problem = inheritance_conflict(
+            inheritance_graph(preset, preset_base),
+            [](const OptimizationEntry& entry) {
+                std::map<std::string, OptionValue> result;
+                for (const auto& setting : entry.options) {
+                    result.emplace("'" + setting.name + "'", setting.value);
+                }
+                return result;
+            });
+        if (problem) return preset_failure(preset, *problem);
     }
     for (const auto& profile : registry.profiles()) {
         const auto fail = [&](std::string message) {
@@ -3381,36 +3655,66 @@ bool check_entries(const ModelRegistry& registry, Diagnostics& diagnostics) {
             return false;
         }
     }
+    const auto cpu_base = [&](const CpuEntry& item, std::string_view name) {
+        return registry.find_cpu(item.architecture, name);
+    };
+    const auto cpu_failure = [&](const CpuEntry& cpu, std::string message) {
+        diagnostics.file_error(cpu.source, "cpu '" + cpu.canonical_name +
+                                               "' " + std::move(message));
+        return false;
+    };
     for (const auto& cpu : registry.cpus()) {
-        if (!cpu.inherits) continue;
-        const auto fail = [&](std::string message) {
-            diagnostics.file_error(cpu.source, "cpu '" + cpu.canonical_name +
-                                                   "' " + std::move(message));
-            return false;
-        };
-        if (!registry.find_cpu(cpu.architecture, *cpu.inherits)) {
+        for (const auto& name : cpu.inherits) {
+            if (registry.find_cpu(cpu.architecture, name)) continue;
             for (const auto& other : registry.cpus()) {
-                if (other.canonical_name == *cpu.inherits) {
-                    return fail("inherits '" + *cpu.inherits +
-                                "' of architecture " + other.architecture +
-                                ", not " + cpu.architecture);
+                if (other.canonical_name == name) {
+                    return cpu_failure(cpu, "inherits '" + name +
+                                                "' of architecture " +
+                                                other.architecture + ", not " +
+                                                cpu.architecture);
                 }
             }
-            return fail("inherits unknown cpu '" + *cpu.inherits + "'");
+            return cpu_failure(cpu, "inherits unknown cpu '" + name + "'");
         }
-        std::string cycle = cpu.canonical_name;
-        const auto* parent = &cpu;
-        for (std::size_t step = 0;
-             step < registry.cpus().size() && parent && parent->inherits;
-             ++step) {
-            parent = registry.find_cpu(cpu.architecture, *parent->inherits);
-            if (!parent) break;
-            cycle += " -> " + parent->canonical_name;
-            if (parent == &cpu) {
-                diagnostics.file_error(cpu.source,
-                                       "cpu inheritance cycle: " + cycle);
-                return false;
-            }
+        if (const auto cycle = inheritance_cycle(cpu, cpu_base)) {
+            diagnostics.file_error(cpu.source, "cpu inheritance cycle: " + *cycle);
+            return false;
+        }
+    }
+    // The nearest bases that set issue_width or describe an instruction
+    // agree unless the entry sets it, and the union of the bases' features
+    // is consistent.
+    for (const auto& cpu : registry.cpus()) {
+        if (cpu.inherits.empty()) continue;
+        const auto& target = *architecture_target(cpu.architecture);
+        const auto graph = inheritance_graph(cpu, cpu_base);
+        auto problem = inheritance_conflict(graph, [](const CpuEntry& entry) {
+            std::map<std::string, unsigned> result;
+            if (entry.issue_width) result.emplace("'issue_width'", *entry.issue_width);
+            return result;
+        });
+        if (!problem) {
+            problem = inheritance_conflict(graph, [&](const CpuEntry& entry) {
+                std::map<std::string, std::tuple<unsigned, unsigned, bool>>
+                    result;
+                for (const auto& block : entry.instructions) {
+                    const auto cost = block_cost(target, block);
+                    result.emplace(
+                        "instruction '" +
+                            std::string(target.instruction_costs
+                                            [block.instruction.value]
+                                                .name) +
+                            "'",
+                        std::tuple{cost.latency, cost.issue, cost.available});
+                }
+                return result;
+            });
+        }
+        if (problem) return cpu_failure(cpu, *problem);
+        if (cpu.features) continue;
+        if (const auto features = feature_problem(
+                target, registry.resolve_cpu(target, cpu).features)) {
+            return cpu_failure(cpu, "inherits conflicting features: " + *features);
         }
     }
     return true;
@@ -3587,35 +3891,35 @@ bool configure_models(CompilerOptions& options, Diagnostics& diagnostics) {
         return false;
     }
 
-    // Loading checked that every chain of parents ends; settings apply from
-    // the root down.
-    std::vector<const OptimizationEntry*> chain;
-    for (const auto* entry = optimization; entry;
-         entry = entry->inherits ? registry.find_optimization(*entry->inherits)
-                                 : nullptr) {
-        chain.push_back(entry);
-    }
-    std::vector<OptionAssignment> preset_options;
-    std::unordered_map<std::string, std::size_t> preset_indices;
-    for (auto entry = chain.rbegin(); entry != chain.rend(); ++entry) {
-        const auto& targets = (*entry)->targets;
-        if (!targets.empty() &&
-            (!selected_target ||
-             std::find(targets.begin(), targets.end(),
-                       selected_target->architecture) == targets.end())) {
+    // The targets of the preset and of each base restrict its use, and its
+    // m.* settings need such a restriction.
+    bool restricted{};
+    for (const auto& [entry, depth] : inheritance_graph(
+             *optimization,
+             [&](const OptimizationEntry&, std::string_view name) {
+                 return registry.find_optimization(name);
+             })) {
+        const auto& targets = entry->targets;
+        if (targets.empty()) continue;
+        restricted = true;
+        if (!selected_target ||
+            std::find(targets.begin(), targets.end(),
+                      selected_target->architecture) == targets.end()) {
             diagnostics.command_error(
-                "optimization preset '" + (*entry)->canonical_name +
+                "optimization preset '" + entry->canonical_name +
                 "' is unavailable for target '" + options.target + "'");
             return false;
         }
-        for (const auto& setting : (*entry)->options) {
-            const auto found = preset_indices.find(setting.name);
-            if (found == preset_indices.end()) {
-                preset_indices.emplace(setting.name, preset_options.size());
-                preset_options.push_back(setting);
-            } else {
-                preset_options[found->second] = setting;
-            }
+    }
+    const auto preset_options = registry.resolve_optimization(*optimization);
+    for (const auto& setting : preset_options) {
+        if (!restricted && setting.name.starts_with("m.")) {
+            diagnostics.file_error(
+                optimization->source,
+                "optimization preset '" + optimization->canonical_name +
+                    "' sets '" + setting.name +
+                    "', so it or a base needs a targets restriction");
+            return false;
         }
     }
 

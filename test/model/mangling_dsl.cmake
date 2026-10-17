@@ -78,7 +78,7 @@ global u64 pick(u64 x, u32 y) {
             set(expected "_Z6largerIyEyy")
         else()
             set(expected "larger__u64__inu64_inu64"
-                "apply__u32__inPF5_cross3_u324_auto6_caller0__1_i3_u324_autoE_inu32")
+                "apply__u32__inPF1_x3_u324_auto6_caller0__1_i3_u324_autoE_inu32")
         endif()
         foreach(symbol IN LISTS expected)
             if(NOT assembly MATCHES "${symbol}")

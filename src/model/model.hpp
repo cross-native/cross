@@ -128,7 +128,7 @@ struct ProfileEntry {
 struct OptimizationEntry {
     std::string canonical_name;
     std::string source;  // "file:line" of the declaration
-    std::optional<std::string> inherits;
+    std::vector<std::string> inherits;  // the bases, in order
     std::vector<std::string> targets;
     std::vector<OptionAssignment> options;
 };
@@ -158,7 +158,7 @@ struct CpuEntry {
     std::string canonical_name;
     std::string source;  // "file:line" of the declaration
     std::string architecture;
-    std::optional<std::string> inherits;
+    std::vector<std::string> inherits;  // the bases, in order
     std::optional<std::vector<std::string>> features;
     std::optional<unsigned> issue_width;
     std::vector<CpuInstructionEntry> instructions;
@@ -178,7 +178,7 @@ struct DataBaseEntry {
     bool literal{};
 };
 
-// A cpu entry with its parents applied.
+// A cpu entry with its bases applied.
 struct ResolvedCpu {
     std::vector<std::string> features;
     unsigned issue_width{1};
@@ -219,6 +219,9 @@ public:
         std::string_view name) const;
     [[nodiscard]] ResolvedCpu resolve_cpu(const TargetInfo& target,
                                           const CpuEntry& entry) const;
+    // The f.* and m.* settings of a preset with its bases applied, by name.
+    [[nodiscard]] std::vector<OptionAssignment> resolve_optimization(
+        const OptimizationEntry& entry) const;
     // The profiles whose default_for patterns match `triple` most
     // specifically; more than one is an ambiguous default.
     [[nodiscard]] std::vector<const ProfileEntry*> default_profiles(

@@ -4,13 +4,13 @@
 # Startup for the 64-bit-address Cross ABI under
 # qemu-system-mips64 -M malta -cpu MIPS64R2-generic.
 #
-# Tests 1-7 call the Cross definitions of cross_n64_callee.x directly, with
-# every argument placed as the cross-n64 model assigns it: integers in
+# Tests 1-7 call the Cross definitions of x64_callee.x directly, with
+# every argument placed as the x64 model assigns it: integers in
 # a0-a3 ($4-$7), t0-t9 ($8-$15, $24, $25), then s0-s7 ($16-$23); floating
 # values in f12, f14, f16, f18, f4, f6, f8, f10; then packed 8-byte stack
 # slots from 0($sp).  Results use v0/v1 ($2/$3) and f0.  Cross preserves
 # s0-s7 and the frame pointer $30.  Tests 8-D call the n64 entry points of
-# the separately compiled cross_n64_caller.x, which must also preserve gp
+# the separately compiled x64_caller.x, which must also preserve gp
 # and f24-f31 around their Cross calls.  The expected values come from an
 # independent C reference.
 #
@@ -67,7 +67,7 @@ _start:
         dli     $22,0x0000001500000015
         dli     $23,0x0000001600000016
         dli     $30,0x5e5e5e5e0000001e
-        jal     cross_n64_weighted
+        jal     x64_weighted
         nop
         dli     $1,0x0000132400001324
         bne     $2,$1,.Lfail
@@ -101,7 +101,7 @@ _start:
         bne     $30,$1,.Lfail
         nop
 
-        # 2: cross_n64_mixed(3, 2.5, 0.5f32, 100) = 113.5.  Independent
+        # 2: x64_mixed(3, 2.5, 0.5f32, 100) = 113.5.  Independent
         # cursors place the doubles in f12/f14 and the integers in a0/a1;
         # decoys sit where a shared n64 cursor would look.
         daddiu  $26,$0,'2'
@@ -118,7 +118,7 @@ _start:
         dmtc1   $1,$f15
         daddiu  $6,$0,77
         daddiu  $7,$0,77
-        jal     cross_n64_mixed
+        jal     x64_mixed
         nop
         dmfc1   $24,$f0
         dli     $1,0x405c600000000000
@@ -150,7 +150,7 @@ _start:
         dmtc1   $1,$f8
         dli     $1,0x401e000000000000
         dmtc1   $1,$f10
-        jal     cross_n64_float_weighted
+        jal     x64_float_weighted
         nop
         dmfc1   $24,$f0
         dli     $1,0x4070680000000000
@@ -167,7 +167,7 @@ _start:
         dli     $4,0x0123456789abcdef
         dli     $5,0x0fedcba987654321
         daddiu  $6,$0,0x1000
-        jal     cross_n64_swap
+        jal     x64_swap
         nop
         dli     $1,0x0fedcba987655321
         bne     $2,$1,.Lfail
@@ -183,13 +183,13 @@ _start:
         daddiu  $26,$0,'5'
         jal     set_sentinels
         nop
-        lui     $4,%hi(cross_n64_spread_area)
-        daddiu  $4,$4,%lo(cross_n64_spread_area)
+        lui     $4,%hi(x64_spread_area)
+        daddiu  $4,$4,%lo(x64_spread_area)
         dli     $5,0x0000000100000000
-        jal     cross_n64_spread
+        jal     x64_spread
         nop
-        lui     $12,%hi(cross_n64_spread_area)
-        daddiu  $12,$12,%lo(cross_n64_spread_area)
+        lui     $12,%hi(x64_spread_area)
+        daddiu  $12,$12,%lo(x64_spread_area)
         ld      $13,0($12)
         dli     $1,0x0000000100000000
         bne     $13,$1,.Lfail
@@ -220,20 +220,20 @@ _start:
         nop
         dli     $4,0x0000000123456789
         daddiu  $5,$0,1000
-        lui     $6,%hi(cross_n64_quotient)
-        daddiu  $6,$6,%lo(cross_n64_quotient)
-        lui     $7,%hi(cross_n64_remainder)
-        daddiu  $7,$7,%lo(cross_n64_remainder)
-        jal     cross_n64_divide
+        lui     $6,%hi(x64_quotient)
+        daddiu  $6,$6,%lo(x64_quotient)
+        lui     $7,%hi(x64_remainder)
+        daddiu  $7,$7,%lo(x64_remainder)
+        jal     x64_divide
         nop
-        lui     $12,%hi(cross_n64_quotient)
-        daddiu  $12,$12,%lo(cross_n64_quotient)
+        lui     $12,%hi(x64_quotient)
+        daddiu  $12,$12,%lo(x64_quotient)
         ld      $13,0($12)
         dli     $1,4886718
         bne     $13,$1,.Lfail
         nop
-        lui     $12,%hi(cross_n64_remainder)
-        daddiu  $12,$12,%lo(cross_n64_remainder)
+        lui     $12,%hi(x64_remainder)
+        daddiu  $12,$12,%lo(x64_remainder)
         ld      $13,0($12)
         daddiu  $1,$0,345
         bne     $13,$1,.Lfail
@@ -241,12 +241,12 @@ _start:
         jal     check_sentinels
         nop
 
-        # 7: cross_n64_keep keeps five values live across two calls.
+        # 7: x64_keep keeps five values live across two calls.
         daddiu  $26,$0,'7'
         jal     set_sentinels
         nop
         daddiu  $4,$0,1000
-        jal     cross_n64_keep
+        jal     x64_keep
         nop
         dli     $1,607861
         bne     $2,$1,.Lfail
@@ -262,7 +262,7 @@ _start:
         jal     set_n64_sentinels
         nop
         dli     $4,0x0000000100000003
-        jal     cross_n64_entry_weighted
+        jal     x64_entry_weighted
         nop
         dli     $1,0x012191218998e443
         bne     $2,$1,.Lfail
@@ -280,7 +280,7 @@ _start:
         nop
         dli     $1,0x3ff8000000000000
         dmtc1   $1,$f12
-        jal     cross_n64_entry_floats
+        jal     x64_entry_floats
         nop
         dmfc1   $24,$f0
         dli     $1,0x4073e80000000000
@@ -298,7 +298,7 @@ _start:
         jal     set_n64_sentinels
         nop
         dli     $4,0x0000000200000005
-        jal     cross_n64_entry_records
+        jal     x64_entry_records
         nop
         dli     $1,0x000002976e1673b7
         bne     $2,$1,.Lfail
@@ -315,7 +315,7 @@ _start:
         jal     set_n64_sentinels
         nop
         dli     $4,0x0000000300000007
-        jal     cross_n64_entry_indirect
+        jal     x64_entry_indirect
         nop
         dli     $1,0x000180c90003b565
         bne     $2,$1,.Lfail
@@ -331,20 +331,20 @@ _start:
         nop
         jal     set_n64_sentinels
         nop
-        lui     $4,%hi(cross_n64_cells)
-        daddiu  $4,$4,%lo(cross_n64_cells)
+        lui     $4,%hi(x64_cells)
+        daddiu  $4,$4,%lo(x64_cells)
         dli     $1,0x1111111111111111
         sd      $1,0($4)
         dli     $1,0x2222222222222222
         sd      $1,8($4)
         daddiu  $5,$0,0x1000
-        jal     cross_n64_entry_private
+        jal     x64_entry_private
         nop
         dli     $1,0x6666666666668667
         bne     $2,$1,.Lfail
         nop
-        lui     $12,%hi(cross_n64_cells)
-        daddiu  $12,$12,%lo(cross_n64_cells)
+        lui     $12,%hi(x64_cells)
+        daddiu  $12,$12,%lo(x64_cells)
         ld      $13,16($12)
         dli     $1,0x3333333333334333
         bne     $13,$1,.Lfail
@@ -354,7 +354,7 @@ _start:
         jal     check_n64_sentinels
         nop
 
-        # D: an n64 entry calls cross_n64_clobber below, which clobbers
+        # D: an n64 entry calls x64_clobber below, which clobbers
         # every register the Cross contract permits, gp and f24-f31
         # included.  n64 passes the f64 after one integer in f13.
         daddiu  $26,$0,'D'
@@ -365,7 +365,7 @@ _start:
         dli     $4,0x0000000400000009
         dli     $1,0x3ff8000000000000
         dmtc1   $1,$f13
-        jal     cross_n64_entry_bridge
+        jal     x64_entry_bridge
         nop
         dli     $1,0x00000060000000da
         bne     $2,$1,.Lfail
@@ -507,12 +507,12 @@ check_n64_sentinels:
         .end    _start
 
 # A Cross-ABI function: value in a0, 2 * value + 1 in v0.  Every register
-# the cross-n64 contract lets a callee clobber receives junk; s0-s7, sp, and
+# the x64 contract lets a callee clobber receives junk; s0-s7, sp, and
 # fp stay intact.
         .text
-        .globl  cross_n64_clobber
-        .ent    cross_n64_clobber
-cross_n64_clobber:
+        .globl  x64_clobber
+        .ent    x64_clobber
+x64_clobber:
         daddu   $2,$4,$4
         daddiu  $2,$2,1
         dli     $1,0x0badc0de0badc0de
@@ -568,15 +568,15 @@ cross_n64_clobber:
         dmtc1   $1,$f31
         jr      $31
         nop
-        .end    cross_n64_clobber
+        .end    x64_clobber
 
         .section .bss,"aw",@nobits
         .p2align 3
-cross_n64_spread_area:
+x64_spread_area:
         .space  40
-cross_n64_quotient:
+x64_quotient:
         .space  8
-cross_n64_remainder:
+x64_remainder:
         .space  8
-cross_n64_cells:
+x64_cells:
         .space  24

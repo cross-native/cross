@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "common/builtin_type.hpp"
 #include "common/pointer_join.hpp"
 #include "common/continuation_query.hpp"
 
@@ -26,13 +27,6 @@
 #include <vector>
 
 namespace cross {
-
-enum class BuiltinType {
-    Void, Bool, I8, U8, I16, U16, I32, U32, I64, U64, I128, U128, Iptr, Uptr,
-    F32, F64, F80, F128, Fptr, Label,
-};
-
-std::optional<BuiltinType> builtin_kind(std::string_view spelling);
 
 struct Type;
 struct Expr;
@@ -204,12 +198,6 @@ bool is_meta_type(const TypePtr& type);
 bool is_vector(const TypePtr& type);
 bool is_nominal(const TypePtr& type);
 unsigned type_bits(const TypePtr& type);
-// Natural storage of builtin scalars and fixed vectors, shared by target layout
-// and translation-time evaluation. Void has no storage.
-std::optional<std::uint64_t> builtin_storage_size(BuiltinType type, unsigned address_bits,
-                                                  unsigned f80_storage_bytes);
-std::uint64_t natural_storage_alignment(std::uint64_t size, bool f80,
-                                        unsigned alignment_limit, unsigned f80_alignment);
 struct StorageLayout {
     std::uint64_t size{};
     std::uint64_t alignment{1};

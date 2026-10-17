@@ -2304,7 +2304,7 @@ private:
     }
 
     // A call preserves only as many low bits of the GPRs it does not clobber
-    // as its ABI's narrowest integer bank has: 32 under o32 and cross32, even
+    // as its ABI's narrowest integer bank has: 32 under o32 and x32, even
     // on a MIPS III CPU whose GPRs have 64.
     unsigned call_preserved_gpr_bits(const machine::Instruction& call) const {
         const unsigned register_bits =

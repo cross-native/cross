@@ -198,6 +198,10 @@ struct AbiEntry {
     std::vector<std::string> aliases;
     std::string architecture;
     unsigned address_bits{};
+    // The model entry states no address_bits: loading makes one entry for
+    // each address width of the architecture's triples, and a triple selects
+    // the entry of its width.
+    bool address_bits_from_triple{};
     std::string llvm_calling_convention;
     std::string gcc_calling_attribute;
     bool compilation_selectable{true};
@@ -698,9 +702,16 @@ struct IntrinsicFormEntry {
     std::string_view instruction;
 };
 
+// A target-triple prefix and the address width of the objects its triples
+// produce, such as ELF32 for 32 and ELF64 for 64.
+struct TriplePrefix {
+    std::string_view prefix;
+    unsigned address_bits{};
+};
+
 struct TargetInfo {
     std::string_view architecture;
-    std::vector<std::string_view> triple_prefixes;
+    std::vector<TriplePrefix> triple_prefixes;
     TargetDataLayout data_layout;
     std::vector<RegisterEntry> registers;
     std::vector<PatchValueMaterializerEntry> patch_value_materializers;
@@ -741,6 +752,8 @@ struct TargetInfo {
     LinkerTarget linker{};
 
     [[nodiscard]] bool matches(std::string_view triple) const;
+    // The address width of `triple`'s objects; 0 when no prefix matches.
+    [[nodiscard]] unsigned address_bits(std::string_view triple) const;
     [[nodiscard]] std::string_view default_abi(std::string_view triple) const;
 };
 

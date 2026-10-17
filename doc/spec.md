@@ -3013,8 +3013,9 @@ Every ABI model entry defines:
 
 - a nonempty case-sensitive ASCII canonical name and aliases;
 - compilation/function selection permission and availability conditions;
-- architecture and address width; data-model constraints are explicit model
-  properties, never inferred from an ABI name;
+- architecture and address width, which an entry may instead take from each
+  target triple of its architecture; data-model constraints are explicit
+  model properties, never inferred from an ABI name;
 - ordered register banks and value-classification rules;
 - argument/result exhaustion, stack-region order, clobbers, alignment, and
   return-address facts; and
@@ -3049,8 +3050,9 @@ pointer/layout/object properties is compilation-selectable; its function
 attribute is valid only as an assertion of the active `-mabi`, unless the target
 defines a bridge. Cross never silently marshals incompatible data models.
 
-Shipped generic profiles select the target's `cross` entry for their data
-model. A platform profile may select its platform ABI instead, as the PSP
+Shipped generic profiles select the target's Cross ABI (`x` on x86-64, `x32`
+or `x64` on MIPS) for their data model. A platform profile may select its
+platform ABI instead, as the PSP
 profile selects `eabi32`. The selected entry applies, unless an `abi` attribute
 or manual locations override it, to `global` functions, unresolved declarations,
 indirect calls, and adapters for address-taken dynamic functions. `global`
@@ -3065,17 +3067,18 @@ caller-clobbered. This is a model property, not a universal Cross rule. When a
 function with a stronger registered contract calls such an entry, the caller
 preserves the difference with ordinary target save/unwind machinery.
 
-For a MIPS ELF32/address32 data model, the shipped `cross32` entry (aliased as
-`cross`) always uses 32-bit integer carriers, independent of the selected ISA,
-and preserves `s0`-`s7`. The separate `cross64` entry requires MIPS III or
-later and uses 64-bit GPR carriers without changing pointer width, aggregate
-layout, or object class.
-Selecting a wider ISA never mutates an already selected registered contract;
-the compiler may nevertheless choose 64-bit carriers for a dynamic local
-interface. For the MIPS ELF64/address64 data model, the shipped `cross-n64`
-entry, also aliased as `cross`, uses 64-bit carriers and pointers and preserves
-`s0`-`s7` like `cross64`. A name shared by entries of different data models
-denotes the entry of the target triple's data model.
+For a MIPS ELF32/address32 data model, the shipped `x32` entry always uses
+32-bit integer carriers, independent of the selected ISA, and preserves
+`s0`-`s7`. The separate `x64` entry requires MIPS III or later and uses
+64-bit GPR carriers; it takes its address width from the target triple and
+so leaves pointer width, aggregate layout, and object class to it. Selecting a
+wider ISA never mutates an already selected registered contract; the compiler
+may nevertheless choose 64-bit carriers for a dynamic local interface. For
+the MIPS ELF64/address64 data model, `x64` uses 64-bit carriers and pointers
+and preserves `s0`-`s7`. `x` names the target's Cross ABI: `x` itself on
+x86-64, `x32` for a 32-bit MIPS triple, and `x64` for a 64-bit one. A name
+shared by entries of different data models denotes the entry of the target
+triple's data model.
 
 A source primarily implementing a platform interface may select its C ABI for
 the whole compilation with `-mabi=name`. Mixed source normally keeps the Cross

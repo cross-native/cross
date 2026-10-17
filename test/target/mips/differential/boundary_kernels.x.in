@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 // u64 values crossing ABI boundaries: helpers carry no abi attribute, so they
-// use the compilation's ABI (o32 or cross32, which carry a u64 in two 32-bit
+// use the compilation's ABI (o32 or x32, which carry a u64 in two 32-bit
 // pieces, n64 in one register, the host's own ABI on x86-64). Their bodies
 // use parameters as halves, as shifted ranges, and whole, and build results
 // from halves, extensions, constants, and whole values, so that both a

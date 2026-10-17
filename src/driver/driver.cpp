@@ -235,7 +235,7 @@ void install_early_evaluation_layout(Program& program, const CompilerOptions& op
 void print_targets() {
     for (const auto* target : all_targets()) {
         std::cout << target->architecture << "  triples:";
-        for (const auto prefix : target->triple_prefixes) std::cout << ' ' << prefix << "-*";
+        for (const auto& entry : target->triple_prefixes) std::cout << ' ' << entry.prefix << "-*";
         std::cout << '\n';
     }
 }
@@ -244,10 +244,20 @@ void print_abis(const CompilerOptions& options) {
     const auto* target = target_for_triple(options.target);
     if (!target) return;
     std::cout << target->architecture << " ABI registry for " << options.target << ":\n";
+    const auto address_bits = target->address_bits(options.target);
     for (const auto& abi : model_registry().abis()) {
-        if (abi.architecture != target->architecture) continue;
+        // An entry that takes its width from the triple appears once.
+        if (abi.architecture != target->architecture ||
+            (abi.address_bits_from_triple && abi.address_bits != address_bits)) {
+            continue;
+        }
         std::cout << "  " << abi.canonical_name << "  aliases:";
-        for (const auto& alias : abi.aliases) std::cout << ' ' << alias;
+        for (const auto& alias : abi.aliases) {
+            // An alias that names another entry for this triple is not shown.
+            if (find_abi(*target, alias, options.target) == &abi) {
+                std::cout << ' ' << alias;
+            }
+        }
         std::cout << "  compilation-selectable: " << (abi.compilation_selectable ? "yes" : "no")
                   << "  function-selectable: " << (abi.function_selectable ? "yes" : "no")
                   << "  banks: " << abi.banks.size()
@@ -320,12 +330,16 @@ void print_manglings() {
     }
 }
 
+void print_inherits(const std::vector<std::string>& bases) {
+    for (std::size_t index = 0; index < bases.size(); ++index) {
+        std::cout << (index == 0 ? "  inherits: " : ", ") << bases[index];
+    }
+}
+
 void print_optimizations() {
     for (const auto& optimization : model_registry().optimizations()) {
         std::cout << optimization.canonical_name;
-        if (optimization.inherits) {
-            std::cout << "  inherits: " << *optimization.inherits;
-        }
+        print_inherits(optimization.inherits);
         if (!optimization.targets.empty()) {
             std::cout << "  targets:";
             for (const auto& target : optimization.targets) {
@@ -347,7 +361,7 @@ void print_cpus(const CompilerOptions& options) {
         if (cpu.architecture != target->architecture) continue;
         const auto resolved = model_registry().resolve_cpu(*target, cpu);
         std::cout << cpu.canonical_name;
-        if (cpu.inherits) std::cout << "  inherits: " << *cpu.inherits;
+        print_inherits(cpu.inherits);
         std::cout << "  features: ";
         for (std::size_t index = 0; index < resolved.features.size();
              ++index) {

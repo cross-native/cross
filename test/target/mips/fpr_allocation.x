@@ -48,17 +48,17 @@ global f32 points[32];
     return value * 2.0f64;
 }
 
-[[noinline, runtime_only, abi("cross")]] global f32 next32_cross(
+[[noinline, runtime_only, abi("x")]] global f32 next32_cross(
     in f32 value) {
     return value + 1.0f32;
 }
 
-[[noinline, runtime_only, abi("cross")]] global f64 twice64_cross(
+[[noinline, runtime_only, abi("x")]] global f64 twice64_cross(
     in f64 value) {
     return value * 2.0f64;
 }
 
-[[noinline, runtime_only, abi("cross")]] global f64 across(
+[[noinline, runtime_only, abi("x")]] global f64 across(
     in f64 a, in f64 b, in f32 c) {
     const f64 product = a * b;
     const f32 square = c * c;

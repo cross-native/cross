@@ -61,7 +61,8 @@ foreach(target x86_64-unknown-linux-gnu x86_64-w64-windows-gnu)
         OUTPUT_VARIABLE registry
         ERROR_VARIABLE registry_stderr
     )
-    if(NOT registry_status EQUAL 0 OR NOT registry MATCHES "default: cross")
+    if(NOT registry_status EQUAL 0 OR NOT registry MATCHES "default: x\n" OR
+       NOT registry MATCHES "\n  x  aliases:  ")
         message(FATAL_ERROR
             "${target} does not select the Cross ABI by default\n"
             "${registry}\n${registry_stderr}")
@@ -106,4 +107,34 @@ if(status EQUAL 0 OR NOT compile_stderr MATCHES
    "conflict[.]x:2:[0-9]+: error: incompatible redeclaration of function 'conflict'")
     message(FATAL_ERROR "conflicting ABI redeclaration was not diagnosed\n"
         "${compile_stdout}\n${compile_stderr}")
+endif()
+
+# `-mabi=x` and `[[abi("x")]]` name the Cross ABI; the cross spellings do not.
+execute_process(
+    COMMAND "${CC}" -S -O0 -fno-eval-calls -target x86_64-unknown-linux-gnu
+            -mabi=x "${SOURCE}" -o "${OUTPUT}-x.s"
+    RESULT_VARIABLE status OUTPUT_VARIABLE compile_stdout ERROR_VARIABLE compile_stderr)
+if(NOT status EQUAL 0)
+    message(FATAL_ERROR "-mabi=x failed\n${compile_stdout}\n${compile_stderr}")
+endif()
+foreach(name cross cross_abi)
+    execute_process(
+        COMMAND "${CC}" -S -target x86_64-unknown-linux-gnu -mabi=${name}
+                "${SOURCE}" -o "${OUTPUT}-${name}.s"
+        RESULT_VARIABLE status OUTPUT_VARIABLE compile_stdout ERROR_VARIABLE compile_stderr)
+    if(status EQUAL 0 OR NOT compile_stderr MATCHES
+       "unknown ABI model '${name}' for target 'x86_64-unknown-linux-gnu'")
+        message(FATAL_ERROR "-mabi=${name} was not rejected\n${compile_stderr}")
+    endif()
+endforeach()
+file(WRITE "${OUTPUT}-removed.x" [=[
+[[abi("cross")]] global u64 removed(in u64 value) { return value; }
+]=])
+execute_process(
+    COMMAND "${CC}" -S -target x86_64-unknown-linux-gnu "${OUTPUT}-removed.x"
+            -o "${OUTPUT}-removed.s"
+    RESULT_VARIABLE status OUTPUT_VARIABLE compile_stdout ERROR_VARIABLE compile_stderr)
+if(status EQUAL 0 OR NOT compile_stderr MATCHES
+   "removed[.]x:1:[0-9]+: error: unknown ABI model 'cross' for target 'x86_64-unknown-linux-gnu'")
+    message(FATAL_ERROR "[[abi(\"cross\")]] was not rejected\n${compile_stderr}")
 endif()

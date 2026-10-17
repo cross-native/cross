@@ -82,16 +82,16 @@ is an error. At run time a wider integer keeps its low address bits.
 
 | Triple | Format | Default ABI |
 | --- | --- | --- |
-| `x86_64-w64-windows-gnu` | COFF | `cross` |
-| `x86_64-unknown-linux-gnu` | ELF | `cross` |
-| `x86_64-apple-darwin` | Mach-O | `cross` |
+| `x86_64-w64-windows-gnu` | COFF | `x` |
+| `x86_64-unknown-linux-gnu` | ELF | `x` |
+| `x86_64-apple-darwin` | Mach-O | `x` |
 
 `amd64-*` is accepted for `x86_64-*`. The `x86_64-windows` and `x86_64-elf`
 profiles select the first two triples. ABIs:
 
 | ABI | Aliases | Use |
 | --- | --- | --- |
-| `cross` | `cross_abi` | Default for global, unresolved, and indirect calls. |
+| `x` | | The Cross ABI: default for global, unresolved, and indirect calls. |
 | `sysv_abi` | `linux` | The System V AMD64 C ABI. |
 | `ms_abi` | `ms`, `win64`, `windows` | The Microsoft x64 C ABI. |
 
@@ -168,23 +168,23 @@ a spill, or a stack object is an error.
 
 | Triple | Byte order | Address size | Default ABI |
 | --- | --- | --- | --- |
-| `mips-unknown-elf` | Big | 32-bit | `cross32` |
-| `mipsel-unknown-elf` | Little | 32-bit | `cross32` |
+| `mips-unknown-elf` | Big | 32-bit | `x32` |
+| `mipsel-unknown-elf` | Little | 32-bit | `x32` |
 | `mipsallegrexel-sony-psp-elf` | Little | 32-bit | `eabi32` |
-| `mips64-unknown-elf` | Big | 64-bit | `cross-n64` |
-| `mips64el-unknown-elf` | Little | 64-bit | `cross-n64` |
+| `mips64-unknown-elf` | Big | 64-bit | `x64` |
+| `mips64el-unknown-elf` | Little | 64-bit | `x64` |
 
 | Profile | Triple | CPU | ABI |
 | --- | --- | --- | --- |
-| `mips-elf`, `mipsel-elf` | `mips-unknown-elf`, `mipsel-unknown-elf` | generic | `cross32` |
+| `mips-elf`, `mipsel-elf` | `mips-unknown-elf`, `mipsel-unknown-elf` | generic | `x32` |
 | `r3000-o32` | `mips-unknown-elf` | MIPS I (R3000) | `o32` |
 | `r6000-eabi` | `mips-unknown-elf` | MIPS II (R6000) | `eabi32` |
 | `vr4300-o32` | `mips-unknown-elf` | MIPS III (VR4300) | `o32` |
-| `vr4300-cross64` | `mips-unknown-elf` | MIPS III (VR4300) | `cross64` |
+| `vr4300-x64` | `mips-unknown-elf` | MIPS III (VR4300) | `x64` |
 | `n64` | `mips-unknown-elf` | MIPS III (VR4300), `-mfix4300` | `o32` |
 | `psp-allegrex` | `mipsallegrexel-sony-psp-elf` | Allegrex | `eabi32` |
 | `allegrex-o32` | `mipsallegrexel-sony-psp-elf` | Allegrex | `o32` |
-| `mips64-n64`, `mips64el-n64` | `mips64-unknown-elf`, `mips64el-unknown-elf` | MIPS64 | `cross-n64` |
+| `mips64-n64`, `mips64el-n64` | `mips64-unknown-elf`, `mips64el-unknown-elf` | MIPS64 | `x64` |
 
 For example, these two commands select the same CPU and ABI:
 
@@ -238,22 +238,24 @@ ABIs:
 
 | ABI | Aliases | Notes |
 | --- | --- | --- |
-| `cross32` | `cross`, `cross_abi`, `cross-32` | Cross ABI with 32-bit registers. |
-| `cross64` | `cross-64` | Cross ABI with 64-bit registers and 32-bit addresses; needs MIPS III or later. |
-| `cross-n64` | `cross`, `cross_abi` | Cross ABI with 64-bit addresses; needs a `mips64` triple. |
+| `x32` | `x` on 32-bit triples | Cross ABI with 32-bit registers; needs a 32-bit triple. |
+| `x64` | `x` on `mips64` triples | Cross ABI with 64-bit registers and the triple's address width; needs MIPS III or later. |
 | `o32` | `32`, `abi32` | The standard 32-bit C ABI. |
 | `eabi32` | `eabi`, `eabi-32` | The embedded ABI used by the PSP toolchain. A single-precision FPU with odd single-precision registers, such as Allegrex, passes `f32` arguments in consecutive registers from `f12`; other FPUs pass each in an even register, as GCC does. |
 | `n64` | `64`, `abi64` | The standard 64-bit C ABI; needs a `mips64` triple. |
 
-`cross` and `cross_abi` name `cross-n64` on `mips64` and `mips64el` triples
-and `cross32` on the others. The Cross ABIs are not compatible with the C
-ABIs. Across calls, `cross32`, `cross64`, and `cross-n64` preserve `s0`–`s7`,
-`sp`, and `fp`. Under `cross32`, `o32`, and `eabi32`, whose integer registers
-have 32 bits, a call preserves only the low 32 bits of `s0`–`s7`, also on a
-CPU with 64-bit registers; under `cross64`, `cross-n64`, and `n64` it
-preserves all 64 bits. Select `o32`, `n64`, or `eabi32` at C boundaries, per
-declaration with `[[abi("n64")]]` or for the whole compilation with
-`-mabi=n64`.
+`x` names `x64` on `mips64` and `mips64el` triples and `x32` on the others.
+`x64` has 32-bit addresses and produces ELF32 objects on `mips` and `mipsel`
+triples, and 64-bit addresses and ELF64 objects on `mips64` and `mips64el`
+triples; its registers and cursors are the same at both widths, and a record
+result of up to 256 bits returns in registers, a larger one through a hidden
+pointer. The Cross ABIs are not compatible with the C ABIs. Across calls,
+`x32` and `x64` preserve `s0`–`s7`, `sp`, and `fp`. Under `x32`, `o32`, and
+`eabi32`, whose integer registers have 32 bits, a call preserves only the low
+32 bits of `s0`–`s7`, also on a CPU with 64-bit registers; under `x64` and
+`n64` it preserves all 64 bits. Select `o32`, `n64`, or `eabi32` at C
+boundaries, per declaration with `[[abi("n64")]]` or for the whole
+compilation with `-mabi=n64`.
 
 `-march=` and `-mtune=` name `cpu` model entries
 ([models.md](models.md#cpu-entries)). `model/mips.xm` ships `generic`,
@@ -279,8 +281,9 @@ options adjust them:
 | `-mcmodel=large` | Materialize full 64-bit addresses and call through registers. |
 | `-mlong-calls` | Call every function through a register (`lui`, `addiu`, `jalr`), so callers and callees need not lie in the same 256 MB region that `jal` reaches. |
 
-`cross-n64` and `n64` code uses 64-bit addresses and produces ELF64 objects
-that assume a 64-bit FPU; the other ABIs produce ELF32, even on a 64-bit CPU.
+Code with 64-bit addresses (`n64`, and `x64` on `mips64` triples) produces
+ELF64 objects that assume a 64-bit FPU; the other ABIs produce ELF32, even on
+a 64-bit CPU.
 The objects record the CPU's ISA level, the ABI (`o32` or `eabi32` in ELF32),
 `32bitmode` for 64-bit registers in ELF32, `noreorder`, and `nan2008` in the
 header flags, and the floating-point ABI in `.MIPS.abiflags`: soft float,
@@ -393,10 +396,10 @@ ABI. Under `o32`, `arg_area` (`void *`) is the C `va_start` address: the
 definition stores `a0`–`a3` in the 16 bytes that the caller reserves for them,
 so the unnamed arguments form one sequence of 4-byte slots in which `f64` and
 `i64` values start at a multiple of 8, and the pointer may be passed to a C
-function that takes a `va_list`. Under `cross32`, `cross64`, and `cross-n64`,
-`gp_arg_area` and `fp_arg_area` point at the saved integer and floating
-argument registers that follow the named arguments and `overflow_arg_area` at
-the stack arguments that follow them; `n64` has `gp_arg_area` for its one
+function that takes a `va_list`. Under `x32` and `x64`, `gp_arg_area` and
+`fp_arg_area` point at the saved integer and floating argument registers that
+follow the named arguments and `overflow_arg_area` at the stack arguments
+that follow them; `n64` has `gp_arg_area` for its one
 sequence of argument registers and `overflow_arg_area`. Under `eabi32`,
 `arg_area` reaches only the unnamed arguments passed on the stack.
 

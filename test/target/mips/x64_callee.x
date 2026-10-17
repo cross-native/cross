@@ -2,15 +2,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 // Cross-ABI definitions for the 64-bit MIPS address model. This unit is
-// compiled separately from its callers: cross_n64_caller.x and the startup
-// in cross_n64_runtime.s, which places every argument by hand.
+// compiled separately from its callers: x64_caller.x and the startup
+// in x64_runtime.s, which places every argument by hand.
 
-struct cross_n64_pair { u64 low; u64 high; };
-struct cross_n64_spread { u64 parts[5]; };
+struct x64_pair { u64 low; u64 high; };
+struct x64_spread { u64 parts[5]; };
 
 // Twenty-four arguments: a0-a3, t0-t9, s0-s7, then two packed stack slots.
 [[noinline]]
-global u64 cross_n64_weighted(
+global u64 x64_weighted(
     in u64 x0, in u64 x1, in u64 x2, in u64 x3, in u64 x4, in u64 x5,
     in u64 x6, in u64 x7, in u64 x8, in u64 x9, in u64 x10, in u64 x11,
     in u64 x12, in u64 x13, in u64 x14, in u64 x15, in u64 x16, in u64 x17,
@@ -26,8 +26,8 @@ global u64 cross_n64_weighted(
 // Integer and floating arguments use independent cursors: count in a0,
 // scale in f12, bias in f14, and offset in a1.
 [[noinline]]
-global f64 cross_n64_mixed(in u32 count, in f64 scale, in f32 bias,
-                           in i32 offset) {
+global f64 x64_mixed(in u32 count, in f64 scale, in f32 bias,
+                     in i32 offset) {
     f64 widened = bias;
     f64 counted = count;
     f64 shifted = offset;
@@ -36,7 +36,7 @@ global f64 cross_n64_mixed(in u32 count, in f64 scale, in f32 bias,
 
 // Nine doubles: f12, f14, f16, f18, f4, f6, f8, f10, then one stack slot.
 [[noinline]]
-global f64 cross_n64_float_weighted(
+global f64 x64_float_weighted(
     in f64 y0, in f64 y1, in f64 y2, in f64 y3, in f64 y4, in f64 y5,
     in f64 y6, in f64 y7, in f64 y8) {
     return y0 + 2.0f64 * y1 + 3.0f64 * y2 + 4.0f64 * y3 + 5.0f64 * y4 +
@@ -45,9 +45,9 @@ global f64 cross_n64_float_weighted(
 
 // A two-doubleword record arrives in a0/a1 and returns in v0/v1.
 [[noinline]]
-global struct cross_n64_pair cross_n64_swap(in struct cross_n64_pair value,
-                                            in u64 bias) {
-    struct cross_n64_pair result;
+global struct x64_pair x64_swap(in struct x64_pair value,
+                                in u64 bias) {
+    struct x64_pair result;
     result.low = value.high + bias;
     result.high = value.low ^ bias;
     return result;
@@ -56,8 +56,8 @@ global struct cross_n64_pair cross_n64_swap(in struct cross_n64_pair value,
 // A five-doubleword result returns through a hidden pointer in a0, so
 // `seed` arrives in a1.
 [[noinline]]
-global struct cross_n64_spread cross_n64_spread(in u64 seed) {
-    struct cross_n64_spread result;
+global struct x64_spread x64_spread(in u64 seed) {
+    struct x64_spread result;
     result.parts[0] = seed;
     result.parts[1] = seed * 2u64 + 1u64;
     result.parts[2] = seed * 3u64 + 2u64;
@@ -68,28 +68,28 @@ global struct cross_n64_spread cross_n64_spread(in u64 seed) {
 
 // Output channels are whole 64-bit pointers in a2 and a3.
 [[noinline]]
-global void cross_n64_divide(in u64 dividend, in u64 divisor,
-                             out u64 quotient, out u64 remainder) {
+global void x64_divide(in u64 dividend, in u64 divisor,
+                       out u64 quotient, out u64 remainder) {
     quotient = dividend / divisor;
     remainder = dividend % divisor;
 }
 
 [[noinline]]
-global u64 cross_n64_leaf(in u64 value) {
+global u64 x64_leaf(in u64 value) {
     return value * 3u64 + 1u64;
 }
 
 // Values live across the calls stay in s-registers, which this definition
 // must in turn preserve for its own caller.
 [[noinline]]
-global u64 cross_n64_keep(in u64 seed) {
+global u64 x64_keep(in u64 seed) {
     u64 a = seed + 1u64;
     u64 b = seed * 3u64;
     u64 c = seed ^ 0x55u64;
     u64 d = seed << 7u64;
     u64 e = seed - 9u64;
-    u64 f = cross_n64_leaf(seed);
-    u64 g = cross_n64_leaf(f);
+    u64 f = x64_leaf(seed);
+    u64 g = x64_leaf(f);
     return a + 2u64 * b + 3u64 * c + 4u64 * d + 5u64 * e + 6u64 * f +
            7u64 * g;
 }

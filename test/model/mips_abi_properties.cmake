@@ -124,22 +124,104 @@ function(entry_text variable name address_bits properties)
 " PARENT_SCOPE)
 endfunction()
 
-# A name may repeat in another address model. Here `cross` gains a 16-bit
+# A name may repeat in another address model. Here `x` gains a 16-bit
 # entry, and each triple still resolves the entry of its own address model.
 set(shared_model "${OUTPUT}/shared-name.y")
-entry_text(shared_text narrow_cross 16 "aliases = [\"cross\"];")
+entry_text(shared_text narrow_x 16 "aliases = [\"x\"];")
 file(WRITE "${shared_model}" "${shared_text}")
 foreach(triple mips-unknown-elf mips64-unknown-elf)
     execute_process(
         COMMAND "${CC}" "--model=${shared_model}" -S -O2 -target ${triple}
-                -march=vr4300 -mabi=cross "${source}"
+                -march=vr4300 -mabi=x "${source}"
                 -o "${OUTPUT}/shared-${triple}.s"
         RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
     if(NOT status EQUAL 0)
         message(FATAL_ERROR
-            "-mabi=cross with a shared name failed for ${triple}\n${stdout}\n${stderr}")
+            "-mabi=x with a shared name failed for ${triple}\n${stdout}\n${stderr}")
     endif()
 endforeach()
+
+# A user entry without address_bits follows the triple: one object class
+# per triple, as the shipped x64 does.
+set(follow_model "${OUTPUT}/follow.y")
+file(WRITE "${follow_model}" "abi \"user_follow\" {
+    architecture = \"mips\";
+    stack_alignment = 8;
+    stack_slot_bytes = 8;
+    bank \"integer\" {
+        class = \"integer\";
+        register_bits = 64;
+        arguments = [\"a0\", \"a1\", \"a2\", \"a3\"];
+        results = [\"v0\"];
+    }
+    rule \"integer\" {
+        match = [\"integer\", \"pointer\"];
+        action = \"direct\";
+        bank = \"integer\";
+        max_bits = 64;
+        requires_features = [\"mips3\"];
+    }
+    rule \"argument-memory\" {
+        match = [\"any\"];
+        action = \"stack\";
+        applies_to = [\"arguments\"];
+    }
+}
+")
+foreach(variant "mips-unknown-elf|32" "mips64el-unknown-elf|64")
+    string(REPLACE "|" ";" variant "${variant}")
+    list(GET variant 0 triple)
+    list(GET variant 1 bits)
+    execute_process(
+        COMMAND "${CC}" "--model=${follow_model}" -c -O2 -target ${triple}
+                -march=vr4300 -mabi=user_follow "${source}"
+                -o "${OUTPUT}/follow-${bits}.o"
+        RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+    if(NOT status EQUAL 0)
+        message(FATAL_ERROR
+            "user_follow failed for ${triple}\n${stdout}\n${stderr}")
+    endif()
+    read_header("${OUTPUT}/follow-${bits}.o" follow_header)
+    if(NOT follow_header MATCHES "Class: ${bits}-bit")
+        message(FATAL_ERROR
+            "user_follow on ${triple} is not ELF${bits}\n${follow_header}")
+    endif()
+endforeach()
+
+# Checks of an entry without address_bits apply at each width, and the
+# aliases of such an entry do not take a name another file uses.
+function(expect_follow_error label expected text)
+    set(model "${OUTPUT}/${label}.y")
+    file(WRITE "${model}" "${text}")
+    execute_process(
+        COMMAND "${CC}" "--model=${model}" -S -O2 -target mips-unknown-elf
+                -march=vr4300 "${source}" -o "${OUTPUT}/${label}.s"
+        RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+    if(status EQUAL 0 OR NOT stderr MATCHES "${expected}")
+        message(FATAL_ERROR
+            "${label} did not report '${expected}'\n${stdout}\n${stderr}")
+    endif()
+endfunction()
+file(READ "${follow_model}" follow_text)
+string(REPLACE "user_follow\" {" "follow_eabi\" {\n    elf_abi_tag = \"eabi32\";"
+       tagged_text "${follow_text}")
+expect_follow_error(follow-eabi
+    "follow-eabi[.]y:2: error: ABI model 'follow_eabi' with 64-bit addresses requests ELF ABI tag 'eabi32', which requires 32-bit addresses"
+    "${tagged_text}")
+string(REPLACE "user_follow\" {" "follow_x\" {\n    aliases = [\"x\"];"
+       alias_text "${follow_text}")
+expect_follow_error(follow-alias
+    "follow-alias[.]y:1: error: duplicate ABI model name or alias 'x' for mips with 32-bit addresses"
+    "${alias_text}")
+string(REPLACE "    rule \"integer\" {" "    variadic_supported = true;
+    variadic_state \"area\" {
+        type = \"q32*\";
+        kind = \"stack_address\";
+    }
+    rule \"integer\" {" state_text "${follow_text}")
+expect_follow_error(follow-state
+    "follow-state[.]y:[0-9]+: error: ABI variadic-state type 'q32[*]' is not a scalar or pointer type"
+    "${state_text}")
 
 # Invalid user entries, one fault per model file.
 function(expect_model_error label expected name address_bits properties)
@@ -171,5 +253,5 @@ expect_model_error(second-private
 expect_model_error(zero-private "ABI private_carrier_bits must be nonzero"
     zero_private 32 "private_carrier_bits = 0;")
 expect_model_error(same-model-name
-    "duplicate ABI model name or alias 'cross' for mips with 64-bit addresses"
-    second_cross 64 "aliases = [\"cross\"];")
+    "duplicate ABI model name or alias 'x' for mips with 64-bit addresses"
+    second_x 64 "aliases = [\"x\"];")

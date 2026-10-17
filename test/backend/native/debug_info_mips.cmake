@@ -85,12 +85,12 @@ endfunction()
 foreach(config
         "o32-be;mips-unknown-elf;o32;4;BigEndian;32-bit"
         "o32-le;mipsel-unknown-elf;o32;4;LittleEndian;32-bit"
-        "cross32-be;mips-unknown-elf;cross32;4;BigEndian;32-bit"
-        "cross32-le;mipsel-unknown-elf;cross32;4;LittleEndian;32-bit"
+        "x32-be;mips-unknown-elf;x32;4;BigEndian;32-bit"
+        "x32-le;mipsel-unknown-elf;x32;4;LittleEndian;32-bit"
         "n64-be;mips64-unknown-elf;n64;8;BigEndian;64-bit"
         "n64-le;mips64el-unknown-elf;n64;8;LittleEndian;64-bit"
-        "cross-n64-be;mips64-unknown-elf;cross-n64;8;BigEndian;64-bit"
-        "cross-n64-le;mips64el-unknown-elf;cross-n64;8;LittleEndian;64-bit")
+        "x64-be;mips64-unknown-elf;x64;8;BigEndian;64-bit"
+        "x64-le;mips64el-unknown-elf;x64;8;LittleEndian;64-bit")
     list(GET config 0 name)
     list(GET config 1 triple)
     list(GET config 2 abi)

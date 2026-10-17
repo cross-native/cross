@@ -963,7 +963,7 @@ TargetInfo with_instruction_costs(TargetInfo info) {
 
 const TargetInfo target = with_instruction_costs({
     "x86-64",
-    {"x86_64", "amd64"},
+    {{"x86_64", 64}, {"amd64", 64}},
     {ByteOrder::Little, 16, 16, 16,
      BitFieldOrder::LeastSignificantFirst,
      BitFieldUnitSharing::SameStorageSize,

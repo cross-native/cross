@@ -241,10 +241,9 @@ mangling "msvc" {
     );
 }
 
-abi "cross" {
+abi "x" {
     architecture = "x86-64";
     address_bits = 64;
-    aliases = ["cross_abi"];
     llvm_calling_convention = "";
     gcc_calling_attribute = "";
     compilation_selectable = true;
@@ -1239,7 +1238,7 @@ profile "x86_64-windows" {
         "amd64-*-windows-*", "amd64-*-mingw*"
     ];
     target = "x86_64-w64-windows-gnu";
-    abi = "cross";
+    abi = "x";
     mangling = "cross";
     m.risc-cisc-balance = 100;
 }
@@ -1247,7 +1246,7 @@ profile "x86_64-windows" {
 profile "x86_64-elf" {
     default_for = ["x86_64", "x86_64-*", "amd64", "amd64-*"];
     target = "x86_64-unknown-linux-gnu";
-    abi = "cross";
+    abi = "x";
     mangling = "cross";
     m.risc-cisc-balance = 100;
     m.red-zone = true;

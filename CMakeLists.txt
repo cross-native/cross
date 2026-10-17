@@ -86,6 +86,7 @@ function(cross_tool target)
 endfunction()
 
 add_library(cross_common
+    src/common/builtin_type.cpp
     src/common/diagnostic.cpp
     src/common/floating_bits.cpp
     src/common/floating_semantics.cpp
@@ -2086,32 +2087,32 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.cmake")
     set_tests_properties(cross_mips_n64_runtime_large PROPERTIES
         LABELS "check.runtime;arch.mips;backend.native;feature.codegen")
-    add_test(NAME cross_mips_cross_n64
+    add_test(NAME cross_mips_x64
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
-                -DCALLEE=${CMAKE_SOURCE_DIR}/test/target/mips/cross_n64_callee.x
-                -DCALLER=${CMAKE_SOURCE_DIR}/test/target/mips/cross_n64_caller.x
-                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-cross-n64
-                -P "${CMAKE_SOURCE_DIR}/test/target/mips/cross_n64.cmake")
-    set_tests_properties(cross_mips_cross_n64 PROPERTIES
-        LABELS "check.compile;arch.mips;backend.native;feature.abi;profile.n64")
-    # Separately compiled caller and callee; the callee spells -mabi=cross.
-    foreach(cross_n64_endian big little)
-        foreach(cross_n64_level O0 O2)
-            set(cross_n64_test cross_mips_cross_n64_runtime_${cross_n64_endian}_${cross_n64_level})
-            add_test(NAME ${cross_n64_test}
+                -DCALLEE=${CMAKE_SOURCE_DIR}/test/target/mips/x64_callee.x
+                -DCALLER=${CMAKE_SOURCE_DIR}/test/target/mips/x64_caller.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-x64
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/x64.cmake")
+    set_tests_properties(cross_mips_x64 PROPERTIES
+        LABELS "check.compile;diagnostics;arch.mips;backend.native;feature.abi;profile.x64")
+    # Separately compiled caller and callee; the callee spells -mabi=x.
+    foreach(x64_endian big little)
+        foreach(x64_level O0 O2)
+            set(x64_test cross_mips_x64_runtime_${x64_endian}_${x64_level})
+            add_test(NAME ${x64_test}
                 COMMAND "${CMAKE_COMMAND}"
                     -DCC=$<TARGET_FILE:cross_cc>
-                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/cross_n64_caller.x
-                    -DCALLEE_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/cross_n64_callee.x
-                    -DCALLEE_FLAGS=-mabi=cross -DMIPS64_ABI=default
-                    -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/cross_n64_runtime.s
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/x64_caller.x
+                    -DCALLEE_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/x64_callee.x
+                    -DCALLEE_FLAGS=-mabi=x -DMIPS64_ABI=default
+                    -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/x64_runtime.s
                     -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare-n64.ld
-                    -DN64_ENDIAN=${cross_n64_endian} -DEXTRA_FLAGS=-${cross_n64_level}
-                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-cross-n64-runtime-${cross_n64_endian}-${cross_n64_level}
+                    -DN64_ENDIAN=${x64_endian} -DEXTRA_FLAGS=-${x64_level}
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-x64-runtime-${x64_endian}-${x64_level}
                     -P "${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.cmake")
-            set_tests_properties(${cross_n64_test} PROPERTIES
-                LABELS "check.runtime;arch.mips;backend.native;feature.abi;profile.n64;endian.${cross_n64_endian};opt.${cross_n64_level}")
+            set_tests_properties(${x64_test} PROPERTIES
+                LABELS "check.runtime;arch.mips;backend.native;feature.abi;profile.x64;endian.${x64_endian};opt.${x64_level}")
         endforeach()
     endforeach()
     # A call under a 32-bit-register ABI preserves only the low halves of the
@@ -2123,7 +2124,7 @@ if(BUILD_TESTING)
         -P "${CMAKE_SOURCE_DIR}/test/target/mips/preserved_width.cmake")
     set_tests_properties(cross_mips_preserved_width_assembly PROPERTIES
         LABELS "check.compile;arch.mips;backend.native;feature.abi;feature.register_allocation;opt.O2")
-    foreach(abi o32 cross32)
+    foreach(abi o32 x32)
         foreach(endian big little)
             string(SUBSTRING ${endian} 0 1 endian_letter)
             foreach(level O0 O2)
@@ -2142,9 +2143,9 @@ if(BUILD_TESTING)
             endforeach()
         endforeach()
     endforeach()
-    # Variadic calls and definitions: o32 and cross32 on MIPS III and MIPS I
-    # CPUs, o32 interoperation with a Clang-compiled C reference, and
-    # cross-n64 on MIPS64.
+    # Variadic calls and definitions: o32 and x32 on MIPS III and MIPS I CPUs,
+    # x64 with 32-bit addresses on MIPS III, o32 interoperation with a
+    # Clang-compiled C reference, and x64 with 64-bit addresses on MIPS64.
     add_test(NAME cross_mips_variadic_assembly COMMAND "${CMAKE_COMMAND}"
         -DCC=$<TARGET_FILE:cross_cc>
         -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/variadic_assembly.x
@@ -2159,7 +2160,10 @@ if(BUILD_TESTING)
             foreach(level O0 O2)
                 set(variadic_case ${cpu}_${endian_letter}_${level})
                 set(variadic_labels "check.runtime;arch.mips;backend.native;feature.variadic;feature.abi;isa.${cpu};endian.${endian};opt.${level}")
-                set(variadic_runs o32 cross32)
+                set(variadic_runs o32 x32)
+                if(cpu STREQUAL "vr4300")
+                    list(APPEND variadic_runs x64)
+                endif()
                 if(level STREQUAL "O2")
                     list(APPEND variadic_runs o32_c)
                 endif()
@@ -2172,11 +2176,16 @@ if(BUILD_TESTING)
                         list(APPEND variadic_sources
                             -DCALLEE_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/variadic_o32_c.x
                             -DREFERENCE_C=${CMAKE_SOURCE_DIR}/test/target/mips/variadic_o32.c)
-                    elseif(run STREQUAL "cross32")
+                    elseif(run STREQUAL "x32")
                         set(variadic_sources
                             -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/variadic_cross.x)
-                        set(variadic_flags "-DCC_FLAGS=-mabi=cross32;-DGP=u32;-${level}")
-                        set(variadic_profile cross32)
+                        set(variadic_flags "-DCC_FLAGS=-mabi=x32;-DGP=u32;-${level}")
+                        set(variadic_profile x32)
+                    elseif(run STREQUAL "x64")
+                        set(variadic_sources
+                            -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/variadic_cross.x)
+                        set(variadic_flags "-DCC_FLAGS=-mabi=x64;-DGP=u64;-${level}")
+                        set(variadic_profile x64)
                     endif()
                     set(name cross_mips_variadic_${run}_${variadic_case})
                     add_test(NAME ${name} COMMAND "${CMAKE_COMMAND}"
@@ -2196,7 +2205,7 @@ if(BUILD_TESTING)
     endforeach()
     foreach(endian big little)
         foreach(level O0 O2)
-            set(name cross_mips_variadic_cross_n64_${endian}_${level})
+            set(name cross_mips_variadic_x64_mips64_${endian}_${level})
             add_test(NAME ${name} COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
                 -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/variadic_cross.x
@@ -2204,10 +2213,10 @@ if(BUILD_TESTING)
                 -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare-n64.ld
                 -DMIPS64_ABI=default -DN64_ENDIAN=${endian}
                 "-DEXTRA_FLAGS=-DGP=u64 -${level}"
-                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-variadic-cross-n64-${endian}-${level}
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-variadic-x64-mips64-${endian}-${level}
                 -P "${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.cmake")
             set_tests_properties(${name} PROPERTIES
-                LABELS "check.runtime;arch.mips;backend.native;feature.variadic;feature.abi;profile.n64;endian.${endian};opt.${level}")
+                LABELS "check.runtime;arch.mips;backend.native;feature.variadic;feature.abi;profile.x64;endian.${endian};opt.${level}")
         endforeach()
     endforeach()
     add_test(NAME cross_model_mips_abi_properties
@@ -2532,7 +2541,7 @@ if(BUILD_TESTING)
         set_tests_properties(cross_mips_differential_quality_${quality_name} PROPERTIES
             LABELS "check.runtime;arch.mips;backend.native;feature.optimization;isa.${quality_isa};endian.${quality_endian_label};opt.${quality_level_label}")
     endforeach()
-    # u64 parameters and results at o32, cross32, and n64 boundaries in both
+    # u64 parameters and results at o32, x32, and n64 boundaries in both
     # byte orders, with and without the boundary narrowing. Each entry:
     # name|ISA|endian|address model|QEMU CPU|optimization|flags.
     foreach(boundary_case
@@ -2542,10 +2551,10 @@ if(BUILD_TESTING)
             "o32_le_o0|vr4300|LE|32|R4000|-O0|-target mipsel-unknown-elf -mabi=o32 -march=vr4300"
             "o32_le_o2|vr4300|LE|32|R4000|-O2|-target mipsel-unknown-elf -mabi=o32 -march=vr4300"
             "console_o3|vr4300|BE|32|R4000|-O3|-mprofile=n64"
-            "cross32_o0|vr4300|BE|32|R4000|-O0|-target mips-unknown-elf -march=vr4300"
-            "cross32_o2|vr4300|BE|32|R4000|-O2|-target mips-unknown-elf -march=vr4300"
-            "cross32_le_o0|vr4300|LE|32|R4000|-O0|-target mipsel-unknown-elf -march=vr4300"
-            "cross32_le_o2|vr4300|LE|32|R4000|-O2|-target mipsel-unknown-elf -march=vr4300"
+            "x32_o0|vr4300|BE|32|R4000|-O0|-target mips-unknown-elf -march=vr4300"
+            "x32_o2|vr4300|BE|32|R4000|-O2|-target mips-unknown-elf -march=vr4300"
+            "x32_le_o0|vr4300|LE|32|R4000|-O0|-target mipsel-unknown-elf -march=vr4300"
+            "x32_le_o2|vr4300|LE|32|R4000|-O2|-target mipsel-unknown-elf -march=vr4300"
             "r3000_o2|r3000|BE|32|R4000|-O2|-mprofile=r3000-o32"
             "n64_o0|mips64|BE|64|MIPS64R2-generic|-O0|-mprofile=mips64-n64 -mabi=n64"
             "n64_o2|mips64|BE|64|MIPS64R2-generic|-O2|-mprofile=mips64-n64 -mabi=n64"
@@ -2633,6 +2642,13 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/model/cpu_entries.cmake")
     set_tests_properties(cross_model_cpu_entries PROPERTIES
         LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;feature.model;feature.driver;feature.optimization")
+    add_test(NAME cross_model_inheritance
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/model-inheritance
+                -P "${CMAKE_SOURCE_DIR}/test/model/model_inheritance.cmake")
+    set_tests_properties(cross_model_inheritance PROPERTIES
+        LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;feature.model;feature.optimization")
     add_test(NAME cross_model_data_base_entries
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
@@ -5304,7 +5320,7 @@ if(BUILD_TESTING)
         set(scratch_host_abi sysv_abi)
     endif()
     foreach(level O0 O2)
-        foreach(abi ms_abi cross)
+        foreach(abi ms_abi x)
             set(scratch_flags -${level} -mabi=${abi} "-DHOST_ABI=\"${scratch_host_abi}\"")
             add_test(NAME cross_runtime_native_implicit_scratch_${level}_${abi}
                 COMMAND "${CMAKE_COMMAND}"
@@ -6728,7 +6744,7 @@ if(BUILD_TESTING)
             LABELS "check.runtime;arch.x86_64;backend.native;feature.abi;feature.frame;opt.${level}")
     endforeach()
     # Each MIPS registration owns one ABI, CPU, and byte order.
-    foreach(abi_cpu cross32:r3000 cross32:vr4300 cross64:vr4300)
+    foreach(abi_cpu x32:r3000 x32:vr4300 x64:vr4300)
         string(REPLACE ":" ";" abi_cpu "${abi_cpu}")
         list(GET abi_cpu 0 abi)
         list(GET abi_cpu 1 cpu)
@@ -8366,7 +8382,7 @@ if(BUILD_TESTING)
     # `out`/`inout` copy-in and copy-out: host runs per private-function ABI,
     # QEMU runs per ABI, CPU and byte order, and a frame-traffic check.
     foreach(level O0 O2)
-        foreach(mode native cross custom)
+        foreach(mode native x custom)
             add_test(NAME cross_parameter_copy_out_${mode}_${level}
                 COMMAND "${CMAKE_COMMAND}"
                     -DCC=$<TARGET_FILE:cross_cc>

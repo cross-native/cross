@@ -32,10 +32,10 @@ global u32 o32_ignore(in const u8 *format, ...) {
     return format[0];
 }
 
-// cross32 saves its 22 integer and 8 floating argument registers in one
-// area: gp_arg_area skips the named format, fp_arg_area starts 88 bytes in.
-[[abi("cross32"), variadic(u32 *gp "gp_arg_area", f64 *fp "fp_arg_area")]]
-global u32 cross32_leaf(in const u8 *format, ...) {
+// x32 saves its 22 integer and 8 floating argument registers in one area:
+// gp_arg_area skips the named format, fp_arg_area starts 88 bytes in.
+[[abi("x32"), variadic(u32 *gp "gp_arg_area", f64 *fp "fp_arg_area")]]
+global u32 x32_leaf(in const u8 *format, ...) {
     return gp[0] + (u32)fp[0];
 }
 

@@ -964,7 +964,7 @@ global u32 mips_scratch_rotations(in u32 a, in u32 b, in u32 c) {
 }
 
 // The Cross ABI passes arguments in t2 and t3, so they stay free.
-[[abi("cross32"), noinline]]
+[[abi("x32"), noinline]]
 global u32 mips_scratch_cross(in u32 a, in u32 b, in u32 c) {
     u32 v0 = a;
     u32 v1 = b;

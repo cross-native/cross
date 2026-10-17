@@ -32,12 +32,12 @@ global u64 narrow_keep(u64 x) {
 }
 
 // A caller whose own ABI preserves whole registers saves them itself.
-[[abi("cross"), noinline]]
+[[abi("x"), noinline]]
 global u64 wide_caller(u64 x) {
     return (u64)narrow_scramble((u32)x) + x;
 }
 
-[[abi("cross"), noinline]]
+[[abi("x"), noinline]]
 global u64 wide_keep(u64 x) {
     u64 a = x * 5u64;
     u64 b = x ^ 0x0f0f0f0f0f0f0f0fu64;

@@ -210,3 +210,113 @@ abi "rust_native" {
         applies_to = ["arguments"];
     }
 }
+
+# Without variadic_va_list_bytes the va_list area is a record of the
+# variadic states: one with llvm_va_list_offset at that offset, any other
+# after the state before it, rounded up to the area's alignment.
+abi "derived_va_list" {
+    architecture = "x86-64";
+    address_bits = 64;
+    stack_alignment = 16;
+    stack_slot_bytes = 8;
+    variadic_supported = true;
+    variadic_save_banks = ["integer"];
+    variadic_va_list_alignment = 8;
+
+    bank "integer" {
+        class = "integer";
+        register_bits = 64;
+        arguments = ["rdi", "rsi"];
+        results = ["rax"];
+    }
+
+    variadic_state "gp_offset" {
+        type = "u32";
+        kind = "cursor_offset";
+        cursor = "integer";
+        stride = 8;
+    }
+
+    variadic_state "fp_offset" {
+        type = "u32";
+        kind = "cursor_offset";
+        cursor = "integer";
+        stride = 8;
+    }
+
+    variadic_state "overflow_arg_area" {
+        type = "void*";
+        kind = "stack_address";
+        llvm_va_list_offset = 8;
+    }
+
+    variadic_state "reg_save_area" {
+        type = "u64*";
+        kind = "register_save_address";
+        llvm_va_list_offset = 16;
+    }
+
+    rule "integer" {
+        match = ["integer", "pointer"];
+        action = "direct";
+        bank = "integer";
+        max_bits = 64;
+    }
+
+    rule "argument-memory" {
+        match = ["any"];
+        action = "stack";
+        applies_to = ["arguments"];
+    }
+}
+
+# Without address_bits the entry follows the triple, and so do its pointers
+# and its va_list area of a 64-bit and two pointer states.
+abi "derived_follow" {
+    architecture = "mips";
+    stack_alignment = 16;
+    stack_slot_bytes = 8;
+    variadic_supported = true;
+    variadic_save_banks = ["integer"];
+    variadic_va_list_alignment = 4;
+
+    bank "integer" {
+        class = "integer";
+        register_bits = 64;
+        arguments = ["a0", "a1", "a2", "a3"];
+        results = ["v0"];
+    }
+
+    variadic_state "count" {
+        type = "u64";
+        kind = "cursor_offset";
+        cursor = "integer";
+        stride = 8;
+    }
+
+    variadic_state "overflow_arg_area" {
+        type = "void*";
+        kind = "stack_address";
+    }
+
+    variadic_state "gp_arg_area" {
+        type = "u64*";
+        kind = "register_save_address";
+        cursor = "integer";
+        stride = 8;
+    }
+
+    rule "integer" {
+        match = ["integer", "pointer"];
+        action = "direct";
+        bank = "integer";
+        max_bits = 64;
+        requires_features = ["mips3"];
+    }
+
+    rule "argument-memory" {
+        match = ["any"];
+        action = "stack";
+        applies_to = ["arguments"];
+    }
+}

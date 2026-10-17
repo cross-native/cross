@@ -589,9 +589,9 @@ in a static initializer.
 Calls to functions defined without `global` in the same compilation may use a
 convention the compiler chooses. Global functions, calls to functions defined
 elsewhere, and calls through pointers use the compilation's ABI, which is the
-target's Cross ABI unless a profile or `-mabi=` selects another. The Cross ABI
-is not a C ABI. To call C or be called from C, select a platform ABI per
-declaration or for the whole compilation:
+target's Cross ABI unless a profile or `-mabi=` selects another; `x` names it
+on every target. The Cross ABI is not a C ABI. To call C or be called from C,
+select a platform ABI per declaration or for the whole compilation:
 
 ```x
 [[abi("sysv_abi"), link_name("write")]]

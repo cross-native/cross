@@ -94,8 +94,8 @@ foreach(model shipped custom)
     else()
         list(APPEND flags -mabi=ms_abi)
         set(default ms_abi)
-        set(canonical cross_abi)
-        set(alias cross)
+        set(canonical sysv_abi)
+        set(alias linux)
     endif()
     check(alias_${model} accept
         "typedef u32 (*Default)(in u32);\ntypedef u32 (*Explicit)(in u32) [[abi(\"${default}\")]];\ntypedef u32 (*Alias)(in u32) [[abi(\"${canonical}\")]];\n[[abi(\"${alias}\")]] global u32 stable(in u32 value) { return value; }\nglobal u32 default_function(in u32 value) { return value; }\nstatic $::meta::tokens helper(in $::meta::tokens input) { Alias callback = stable; Alias *nested = &callback; Alias copied = *nested; Explicit implicit_default = default_function; Default held_default = implicit_default; return input; }\n[[macro]] static $::meta::tokens apply(in $::meta::tokens input) { Alias callback = stable; Explicit implicit_default = default_function; if (0u32) { Alias adapted = default_function; callback = default_function; } return helper(input); }\nglobal u32 entry() { Alias callback = stable; Explicit implicit_default = default_function; return apply!(9u32); }"

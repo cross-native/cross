@@ -75,7 +75,7 @@ give such files different spellings, for example with `-ffile-prefix-map`.
 | `-march=CPU`, `-mtune=CPU` | A `cpu` model entry ([models.md](models.md#cpu-entries)): `-march` the instruction set, `-mtune` the instruction costs that guide instruction choice and scheduling (default: the `-march` CPU). |
 | `-mFEATURE`, `-mno-FEATURE` | Target features, such as `-mavx2` or `-mno-red-zone`. |
 | `-mOPTION=VALUE` | Other target options, such as `-mcmodel=large`. |
-| `-mabi=NAME` | ABI for global, unresolved, and indirect calls (normally the Cross ABI). |
+| `-mabi=NAME` | ABI for global, unresolved, and indirect calls (normally the Cross ABI, which `-mabi=x` names on every target). |
 | `-mmangling=NAME` | Link-name encoding: `cross` (default), `simple`, `itanium`, or `msvc`. `itanium` and `msvc` match C++ names only for scalar and pointer-to-scalar types. |
 | `-mprofile=NAME` | A profile: target, ABI, mangling, optimization preset, and options together. |
 | `-mdata-bases=NAME[,NAME...]` | `data_base` model entries ([models.md](models.md#data-base-entries)): small objects placed where one register reaches them, such as MIPS small data through `$gp`; `-mdata-bases=none`, the default, selects none. Targets without base-relative data addressing, such as x86-64, reject an entry. |
@@ -190,7 +190,7 @@ COFF/PE, or Mach-O as the triple names (`x86_64-unknown-linux-gnu`,
 | `-o FILE` | The object file (default `a.out`). |
 | `-target TRIPLE`, `-mprofile=NAME` | The target and its defaults, as for `cc`. |
 | `-march=CPU`, `-mips1` ... `-mips64r2` | The CPU or ISA level whose instructions are accepted, until a `.set` directive changes it. |
-| `-mabi=NAME`, `-32`, `-64` | The ABI, which fixes the ELF class and ABI flags: `-mabi=32` and `-32` select o32, `-mabi=64` and `-64` n64 (also switching the triple to `mips64`), `-mabi=eabi` EABI32. |
+| `-mabi=NAME`, `-32`, `-64` | The ABI, which fixes the ELF class and ABI flags: `-mabi=32` and `-32` select o32, `-mabi=64` and `-64` n64 (also switching the triple to `mips64`), `-mabi=eabi` EABI32. An ABI without a fixed address width, such as `x64`, takes the ELF class of the triple. |
 | `-EB`, `-EL` | Big- or little-endian output. |
 | `-mFEATURE`, `-mno-FEATURE`, `-mnan=2008\|legacy` | Target features, such as `-msoft-float`, `-msingle-float`, `-mfp32`, `-mfpxx`, and `-mfp64`, which set the floating-point ABI that `.MIPS.abiflags` records. |
 | `-mgp32`, `-mgp64` | MIPS: the width of the general registers that `.MIPS.abiflags` records and the macros assume, as `.module gp=32` or `gp=64` sets it; by default the narrower of the ISA's and the ABI's registers, 32 bits for o32. |

@@ -72,7 +72,7 @@ $::static_assert(assertion_stack(14i32) == 14i32,
 $::static_assert(assertion_memory(22u32).low == 22u64,
     "assertion instantiates indirect-memory result interface");
 
-[[abi("cross")]] global i32 generic_angle_custom_abi_entry() {
+[[abi("x")]] global i32 generic_angle_custom_abi_entry() {
     odd_callback callback = add_seven;
     odd_callback inferred = copy(callback);
     odd_callback explicit_type = copy<odd_callback>(callback);

@@ -162,7 +162,8 @@ public:
         // The ABI's address model and the triple's ELF class must agree: the
         // object class follows the address width, which a mips64 triple
         // names, so a mismatch would mislabel every object.
-        const bool wide_triple = options.target.starts_with("mips64");
+        const bool wide_triple =
+            subtarget.target().address_bits(options.target) > 32;
         const bool wide_abi = subtarget.abi_info().address_bits > 32;
         if (wide_abi && !wide_triple) {
             diagnostics.command_error(
@@ -174,7 +175,7 @@ public:
             diagnostics.command_error(
                 "the MIPS '" + std::string(subtarget.abi()) +
                 "' ABI has 32-bit addresses and cannot be selected for a "
-                "mips64 target triple; use -mabi=cross, -mabi=n64, or a "
+                "mips64 target triple; use -mabi=x, -mabi=n64, or a "
                 "mips/mipsel triple");
         }
         if (wide_abi && !subtarget.has_feature(Feature::Mips3)) {

@@ -1,9 +1,10 @@
 # Copyright (C) 2026 Cross contributors
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# Under o32 and cross32 a call preserves only the low 32 bits of s0-s7, so on
-# VR4300 a u64 live across a call is reloaded after it. Under cross64 and
-# cross-n64 the whole register survives and the value may stay in it.
+# Under o32 and x32 a call preserves only the low 32 bits of s0-s7, so on
+# VR4300 a u64 live across a call is reloaded after it. Under x64, with 32-
+# or 64-bit addresses, the whole register survives and the value may stay in
+# it.
 foreach(required CC SOURCE OUTPUT)
     if(NOT DEFINED ${required} OR "${${required}}" STREQUAL "")
         message(FATAL_ERROR "${required} must be defined")
@@ -12,9 +13,9 @@ endforeach()
 
 # Each entry: name|flags separated by commas|split or kept.
 foreach(case "o32|-target,mips-unknown-elf,-march=vr4300,-mabi=o32|split"
-             "cross32|-target,mips-unknown-elf,-march=vr4300,-mabi=cross32|split"
-             "cross64|-target,mips-unknown-elf,-march=vr4300,-mabi=cross64|kept"
-             "cross-n64|-mprofile=mips64-n64|kept")
+             "x32|-target,mips-unknown-elf,-march=vr4300,-mabi=x32|split"
+             "x64-32|-target,mips-unknown-elf,-march=vr4300,-mabi=x64|kept"
+             "x64-64|-mprofile=mips64-n64|kept")
     string(REPLACE "|" ";" parts "${case}")
     list(GET parts 0 name)
     list(GET parts 1 flags)

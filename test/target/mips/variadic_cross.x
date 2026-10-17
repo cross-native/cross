@@ -1,11 +1,11 @@
 // Copyright (C) 2026 Cross contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// Cross ABI variadic calls and definitions: cross32 with -DGP=u32 and
-// cross-n64 with -DGP=u64. Unnamed arguments take the integer and floating
-// register positions that the named ones leave, which a definition reads
-// through gp_arg_area and fp_arg_area, then the packed stack area at
-// overflow_arg_area. Under cross32 an i64 is two words, each in the next
+// Cross ABI variadic calls and definitions: x32 with -DGP=u32 and x64, with
+// 32- or 64-bit addresses, with -DGP=u64. Unnamed arguments take the integer
+// and floating register positions that the named ones leave, which a
+// definition reads through gp_arg_area and fp_arg_area, then the packed stack
+// area at overflow_arg_area. Under x32 an i64 is two words, each in the next
 // integer position or stack slot, in memory order. The unnamed argument k of
 // each format (1-based) has a known value.
 
@@ -95,7 +95,7 @@ global u32 cross_one(in const u8 *format, ...) {
 }
 
 // One integer and one floating register remain, so later unnamed arguments
-// go to the stack; under cross32 an i64 may straddle s7 and the stack.
+// go to the stack; under x32 an i64 may straddle s7 and the stack.
 [[runtime_only, noinline,
   variadic(GP *gp "gp_arg_area", f64 *fp "fp_arg_area",
            void *overflow "overflow_arg_area")]]

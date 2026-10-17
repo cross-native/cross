@@ -77,12 +77,10 @@ optimization "Og" {
     f.combine-addresses = true;
 }
 
+# O1 enables what Og enables, and more.
 optimization "O1" {
-    inherits = "O0";
+    inherits = "Og";
     f.optimize-for = "speed";
-    f.tree-ccp = true;
-    f.tree-bit-ccp = true;
-    f.div-by-constant = true;
     f.loop-bounds-from-extents = true;
     f.tree-copy-prop = true;
     f.tree-dce = true;
@@ -95,11 +93,7 @@ optimization "O1" {
     f.align-loops = true;
     f.move-loop-invariants = true;
     f.ipa-reference-addressable = true;
-    f.tree-cfg-cleanup = true;
-    f.machine-combine = true;
     f.machine-dce = true;
-    f.compare-branch-fusion = true;
-    f.combine-addresses = true;
     f.optimize-sibling-calls = true;
     f.cprop-registers = true;
     f.peephole2 = true;

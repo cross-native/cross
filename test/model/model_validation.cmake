@@ -297,7 +297,7 @@ profile "user-mips" {
     m.arch = "r6000";
 }
 profile "any-target" {
-    abi = "cross";
+    abi = "x";
     m.cmodel = "medium";
 }
 ]=])

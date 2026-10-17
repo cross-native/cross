@@ -5,7 +5,7 @@
 // frame homes. A phi destination may share its home with another phi's
 // source on the same edge, so edge copies must be ordered by home.
 
-[[abi("cross"), noinline]]
+[[abi("x"), noinline]]
 global u64 phi_frame_mix(u64 x) {
     return (x ^ (x >> 29)) * 0xbf58476d1ce4e5b9u64;
 }
