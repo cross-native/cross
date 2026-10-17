@@ -2345,6 +2345,10 @@ bool Assembler::Impl::macho_directive(std::string_view name, Statement& statemen
             as.error(cursor.location(), "expected a section name");
             return true;
         }
+        if (segment->size() > 16 || section_name->size() > 16) {
+            as.error(statement.location, "Mach-O segment and section names have at most 16 characters");
+            return true;
+        }
         const auto id = as.macho_section(*segment, *section_name, macho::s_zerofill);
         if (!cursor.consume(",")) {
             expect_end();
@@ -3532,9 +3536,16 @@ bool Assembler::Impl::layout(bool report) {
         }
         return changed;
     };
-    for (unsigned iteration = 0; iteration < 4096; ++iteration) {
+    // Relaxation only grows instructions, so it stops; other size changes
+    // (alignment padding, sizes that depend on labels) may oscillate.
+    for (unsigned unrelaxed = 0;;) {
         const bool sizes_changed = pass(false).first;
-        if (!relax() && !sizes_changed) break;
+        const bool relaxed = relax();
+        if (!relaxed && !sizes_changed) break;
+        if (!relaxed && ++unrelaxed == 4096) {
+            as.error({}, "section layout does not converge");
+            return false;
+        }
     }
     if (!report) return true;
     return pass(true).second;

@@ -43,4 +43,6 @@ case(bad_mask "vaddps %zmm1, %zmm2, %zmm3 {%k0}" "mask register")
 case(macho_frame_label "_f:\n\t.cfi_startproc\n\t.globl _g\n_g:\n\tretq\n\t.cfi_endproc"
      "macho_frame_label.s:4:1: error: non-private labels cannot appear between"
      x86_64-apple-darwin)
+case(macho_long_zerofill "\t.zerofill __DATA,__seventeen_chars,_buffer,64"
+     "at most 16 characters" x86_64-apple-darwin)
 message(STATUS "diagnostics checks passed")
