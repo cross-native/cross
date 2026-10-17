@@ -5180,9 +5180,34 @@ private:
         return changed;
     }
 
+    // A store of one register to memory, which the scheduler keeps in order
+    // with the region's loads, stores, and operations that may trap.
+    static bool ordered_store(const machine::Instruction& instruction) {
+        if (instruction.kind != machine::InstructionKind::Target ||
+            instruction.patch || !instruction.defs.empty() ||
+            !instruction.clobbers.empty() ||
+            std::any_of(instruction.uses.begin(), instruction.uses.end(),
+                        [](machine::Register value) {
+                            return value.kind == machine::RegisterKind::Physical;
+                        })) {
+            return false;
+        }
+        switch (decode_opcode(instruction.opcode)) {
+        case Opcode::Store:
+        case Opcode::Fstore:
+        case Opcode::PointerStore:
+        case Opcode::FpointerStore:
+        case Opcode::GlobalStore:
+        case Opcode::FglobalStore: return true;
+        default: return false;
+        }
+    }
+
     bool scheduling_barrier(const machine::Instruction& instruction) const {
-        // An operation that may trap keeps its order with loads and other
+        // An operation that may trap, and a store outside functions with
+        // registry instruction forms, keeps its order with loads and other
         // such operations through dependencies instead.
+        if (ordered_stores_ && ordered_store(instruction)) return false;
         if (instruction.kind != machine::InstructionKind::Target ||
             instruction.may_store ||
             (instruction.has_side_effects && !trap_only(instruction)) ||
@@ -5446,9 +5471,30 @@ private:
         return changed;
     }
 
+    // The values of each register bank that a region does not read or
+    // write but that are live through it, and the bank's volatile colors.
+    struct RegionPressure {
+        std::array<unsigned, 4> through{};
+        std::array<unsigned, 4> volatile_colors{};
+        // The values live after the region.
+        std::unordered_set<std::uint32_t> live_after;
+    };
+
+    // How often a block runs relative to the function's entry: eight times
+    // per loop that contains it.
+    static std::vector<std::uint64_t> block_weights(
+        const machine::Function& function) {
+        std::vector<std::uint64_t> weights;
+        for (const auto depth : native::loop_depths(function)) {
+            weights.push_back(std::uint64_t{1} << (3U * std::min(depth, 6U)));
+        }
+        return weights;
+    }
+
     bool schedule_region(std::vector<machine::Instruction>& instructions,
                          std::size_t begin, std::size_t end,
-                         machine::BlockId owner) {
+                         machine::BlockId owner,
+                         const RegionPressure& region_pressure) {
         const auto count = end - begin;
         if (count < 2) return false;
 
@@ -5525,9 +5571,14 @@ private:
         // Operations that may fault run in their original order: one that
         // may trap follows the previous one and every load since, and a
         // load follows the previous operation that may trap; earlier ones
-        // precede those transitively.
+        // precede those transitively. A store follows the previous store,
+        // every load since, and the previous operation that may trap, and
+        // loads and operations that may trap follow it: memory keeps its
+        // order, while other operations move past stores.
         std::optional<std::size_t> last_trapping;
         std::vector<std::size_t> loads_since;
+        std::optional<std::size_t> last_store;
+        std::vector<std::size_t> loads_since_store;
         for (std::size_t index = 0; index < count; ++index) {
             std::unordered_set<std::size_t> dependencies;
             for (const auto& value : instructions[begin + index].uses) {
@@ -5543,8 +5594,20 @@ private:
             }
             const auto& current = instructions[begin + index];
             const bool trapping = trap_only(current);
-            if ((trapping || current.may_load) && last_trapping) {
+            const bool store = current.may_store;
+            if ((trapping || current.may_load || store) && last_trapping) {
                 dependencies.insert(*last_trapping);
+            }
+            if ((trapping || current.may_load || store) && last_store) {
+                dependencies.insert(*last_store);
+            }
+            if (store) {
+                dependencies.insert(loads_since_store.begin(),
+                                    loads_since_store.end());
+                loads_since_store.clear();
+                last_store = index;
+            } else if (current.may_load) {
+                loads_since_store.push_back(index);
             }
             if (trapping) {
                 dependencies.insert(loads_since.begin(), loads_since.end());
@@ -5570,13 +5633,20 @@ private:
                 }
             }
         };
-        for (std::size_t index = end; index < instructions.size(); ++index) {
-            mark_external_uses(instructions[index]);
-        }
-        for (const auto& block : current_.blocks) {
-            if (block.id == owner) continue;
-            for (const auto& value : block.instructions) {
-                mark_external_uses(value);
+        if (latency_schedules_) {
+            // Values live after the region, from liveness.
+            for (const auto id : region_pressure.live_after) {
+                if (id < external_use.size()) external_use[id] = true;
+            }
+        } else {
+            for (std::size_t index = end; index < instructions.size(); ++index) {
+                mark_external_uses(instructions[index]);
+            }
+            for (const auto& block : current_.blocks) {
+                if (block.id == owner) continue;
+                for (const auto& value : block.instructions) {
+                    mark_external_uses(value);
+                }
             }
         }
         for (std::size_t id = 0; id < external_use.size(); ++id) {
@@ -6130,12 +6200,19 @@ private:
             return stalls;
         };
         // Without an interlock, a transferred register read by the next
-        // operation costs the emitter a NOP.
+        // operation costs the emitter a NOP, and under -mfix4300 so does a
+        // floating multiply after another.
         const auto transfer_nops = [&](const std::vector<std::size_t>& plan) {
-            if (subtarget_.has_feature(Feature::FpuTransferInterlocks)) {
-                return 0U;
-            }
             unsigned nops{};
+            if (subtarget_.has_feature(Feature::Fix4300)) {
+                for (std::size_t at = 1; at < plan.size(); ++at) {
+                    nops += opcode_at(plan[at - 1]) == Opcode::Fmul &&
+                            opcode_at(plan[at]) == Opcode::Fmul;
+                }
+            }
+            if (subtarget_.has_feature(Feature::FpuTransferInterlocks)) {
+                return nops;
+            }
             for (std::size_t at = 1; at < plan.size(); ++at) {
                 const auto& previous = instructions[begin + plan[at - 1]];
                 const auto opcode = decode_opcode(previous.opcode);
@@ -6169,6 +6246,54 @@ private:
                     order = *alternative;
                 }
             }
+        }
+        // A latency-scored schedule that also keeps loaded values from being
+        // used before they are ready replaces the region's order when it
+        // finishes sooner, needs no more separating NOPs, and needs no
+        // further preserved register: with the values live through the
+        // region, no bank's peak passes both the region's and the bank's
+        // volatile colors, less the colors that loop PHIs and emitter
+        // staging take (as for loop constants).
+        if (latency_schedules_) {
+            // Candidates that avoid waits, weighting pressure lightly and as
+            // the plain schedule does; the one that finishes soonest wins.
+            std::optional<std::vector<std::size_t>> best;
+            unsigned best_cycles = estimated_cycles(original);
+            for (const bool light : {true, false}) {
+                const auto alternative = greedy(light, true);
+                if (!alternative || *alternative == original) continue;
+                const auto peak = measure_pressure(*alternative).peak;
+                bool fits = true;
+                for (std::size_t bank = 0; bank < peak.size(); ++bank) {
+                    const auto through = region_pressure.through[bank];
+                    const auto headroom =
+                        bank == static_cast<std::size_t>(
+                                    machine::VirtualRegisterClass::Floating)
+                        ? 2U : 3U;
+                    const auto colors = region_pressure.volatile_colors[bank];
+                    fits = fits &&
+                        peak[bank] + through <=
+                            std::max(original_pressure.peak[bank] + through,
+                                     colors > headroom ? colors - headroom : 0U);
+                }
+                const auto cycles = estimated_cycles(*alternative);
+                if (fits &&
+                    transfer_nops(*alternative) <= transfer_nops(original) &&
+                    hilo_stalls(*alternative) <= hilo_stalls(original) &&
+                    cycles < best_cycles) {
+                    best = alternative;
+                    best_cycles = cycles;
+                }
+            }
+            if (!best) return false;
+            std::vector<machine::Instruction> scheduled;
+            scheduled.reserve(count);
+            for (const auto index : *best) {
+                scheduled.push_back(std::move(instructions[begin + index]));
+            }
+            std::move(scheduled.begin(), scheduled.end(),
+                      instructions.begin() + static_cast<std::ptrdiff_t>(begin));
+            return true;
         }
         if (order == original) return false;
         const auto scheduled_pressure = measure_pressure(order);
@@ -6283,11 +6408,233 @@ private:
         return changed;
     }
 
+    // The virtual registers live out of each block; a PHI's uses are live
+    // out of the predecessor they arrive from.
+    static std::vector<std::unordered_set<std::uint32_t>>
+    virtual_live_out(const machine::Function& function) {
+        using LiveSet = std::unordered_set<std::uint32_t>;
+        const auto count = function.blocks.size();
+        std::vector<LiveSet> uses(count), defs(count), live_in(count),
+            live_out(count);
+        std::vector<std::unordered_map<std::uint32_t, LiveSet>> edge_uses(count);
+        for (const auto& block : function.blocks) {
+            for (const auto& instruction : block.instructions) {
+                if (decode_opcode(instruction.opcode) == Opcode::Phi) {
+                    for (std::size_t index = 0;
+                         index + 1 < instruction.operands.size(); index += 2) {
+                        const auto* from = std::get_if<machine::BlockOperand>(
+                            &instruction.operands[index]);
+                        const auto* value = std::get_if<machine::RegisterOperand>(
+                            &instruction.operands[index + 1]);
+                        if (from && value &&
+                            value->value.kind == machine::RegisterKind::Virtual) {
+                            edge_uses[block.id.value][from->target.value].insert(
+                                value->value.id);
+                        }
+                    }
+                } else {
+                    for (const auto& use : instruction.uses) {
+                        if (use.kind == machine::RegisterKind::Virtual &&
+                            !defs[block.id.value].contains(use.id)) {
+                            uses[block.id.value].insert(use.id);
+                        }
+                    }
+                }
+                for (const auto& definition : instruction.defs) {
+                    if (definition.kind == machine::RegisterKind::Virtual) {
+                        defs[block.id.value].insert(definition.id);
+                    }
+                }
+            }
+        }
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (std::size_t block = count; block-- > 0;) {
+                LiveSet out;
+                for (const auto successor : function.blocks[block].successors) {
+                    if (successor.value >= count) continue;
+                    out.insert(live_in[successor.value].begin(),
+                               live_in[successor.value].end());
+                    const auto& from = edge_uses[successor.value];
+                    if (const auto found = from.find(
+                            static_cast<std::uint32_t>(block));
+                        found != from.end()) {
+                        out.insert(found->second.begin(), found->second.end());
+                    }
+                }
+                LiveSet in = uses[block];
+                for (const auto id : out) {
+                    if (!defs[block].contains(id)) in.insert(id);
+                }
+                if (out != live_out[block] || in != live_in[block]) {
+                    live_out[block] = std::move(out);
+                    live_in[block] = std::move(in);
+                    changed = true;
+                }
+            }
+        }
+        return live_out;
+    }
+
+    // At a speed goal, a second pass over the scheduled function lets each
+    // region take a load-latency schedule, where stores order with memory
+    // operations instead of ending regions, so that other operations move
+    // past them. The allocator may still not fit the live values of those
+    // schedules in the colors the first pass needs, so register allocation
+    // colors the function both ways and keeps the latency schedules unless
+    // they save more preserved registers, leave more values without a
+    // color, or need more moves.
     bool schedule_instructions(machine::Function& function) {
         if (!options_.schedule_insns) return false;
         bool changed = split_hilo_operations(function);
         changed = split_fpu_transfers(function) || changed;
+        schedule_fallback_.reset();
+        ordered_stores_ = false;
+        latency_schedules_ = false;
+        if (options_.optimize_for != OptimizationGoal::Speed ||
+            !options_.register_allocation) {
+            return schedule_regions(function) || changed;
+        }
+        changed = schedule_regions(function) || changed;
+        auto fallback = function;
+        // A store's pending data-cache write is a registry form's hazard
+        // event, which the hazard model times from the store's position.
+        ordered_stores_ = std::none_of(
+            function.blocks.begin(), function.blocks.end(),
+            [](const machine::Block& block) {
+                return std::any_of(
+                    block.instructions.begin(), block.instructions.end(),
+                    [](const machine::Instruction& value) {
+                        return decode_opcode(value.opcode) == Opcode::Machine;
+                    });
+            });
+        latency_schedules_ = true;
+        const bool latency = schedule_regions(function);
+        ordered_stores_ = false;
+        latency_schedules_ = false;
+        if (latency) schedule_fallback_ = std::move(fallback);
+        return changed || latency;
+    }
+
+    // Values that allocation left without a color.
+    static std::size_t uncolored_values(const machine::Function& function) {
+        std::unordered_set<std::uint32_t> uncolored;
+        for (const auto& block : function.blocks) {
+            for (const auto& instruction : block.instructions) {
+                for (const auto* list : {&instruction.defs, &instruction.uses}) {
+                    for (const auto& value : *list) {
+                        if (value.kind == machine::RegisterKind::Virtual &&
+                            value.id < function.virtual_register_assignments.size() &&
+                            function.virtual_register_classes[value.id] !=
+                                machine::VirtualRegisterClass::Memory &&
+                            !function.virtual_register_assignments[value.id]) {
+                            uncolored.insert(value.id);
+                        }
+                    }
+                }
+            }
+        }
+        return uncolored.size();
+    }
+
+    // The moves that an allocation's register copies and PHIs whose
+    // incoming values have other colors cost, each weighted by how often
+    // its block runs.
+    static std::uint64_t weighted_moves(const machine::Function& function) {
+        const auto weights = block_weights(function);
+        const auto color = [&](const machine::Register& value)
+            -> std::optional<machine::PhysicalRegisterId> {
+            if (value.kind == machine::RegisterKind::Physical) {
+                return machine::PhysicalRegisterId{value.id};
+            }
+            if (value.id >= function.virtual_register_assignments.size()) {
+                return std::nullopt;
+            }
+            return function.virtual_register_assignments[value.id];
+        };
+        std::uint64_t moves{};
+        for (const auto& block : function.blocks) {
+            for (const auto& instruction : block.instructions) {
+                if (decode_opcode(instruction.opcode) == Opcode::Phi &&
+                    instruction.defs.size() == 1) {
+                    const auto target = color(instruction.defs.front());
+                    for (std::size_t index = 0;
+                         index + 1 < instruction.operands.size(); index += 2) {
+                        const auto* from = std::get_if<machine::BlockOperand>(
+                            &instruction.operands[index]);
+                        const auto* value = std::get_if<machine::RegisterOperand>(
+                            &instruction.operands[index + 1]);
+                        if (from && value && color(value->value) != target &&
+                            from->target.value < weights.size()) {
+                            moves += weights[from->target.value];
+                        }
+                    }
+                } else if (instruction.kind == machine::InstructionKind::Copy &&
+                           instruction.defs.size() == 1 &&
+                           instruction.uses.size() == 1 &&
+                           color(instruction.defs.front()) !=
+                               color(instruction.uses.front()) &&
+                           block.id.value < weights.size()) {
+                    moves += weights[block.id.value];
+                }
+            }
+        }
+        return moves;
+    }
+
+    bool allocate_scheduled_registers(machine::Function& function) {
+        if (!schedule_fallback_) return allocate_with_scratch_colors(function);
+        auto fallback = std::move(*schedule_fallback_);
+        schedule_fallback_.reset();
+        (void)split_entry_parameters(fallback);
+        const bool changed = allocate_with_scratch_colors(function);
+        (void)allocate_with_scratch_colors(fallback);
+        // The latency schedules stay when they need no further preserved
+        // register, uncolored value, or move.
+        const auto moves = weighted_moves(function);
+        const auto fallback_moves = weighted_moves(fallback);
+        if (function.callee_saved_registers.size() >
+                fallback.callee_saved_registers.size() ||
+            uncolored_values(function) > uncolored_values(fallback) ||
+            moves > fallback_moves) {
+            function = std::move(fallback);
+        }
+        return changed;
+    }
+
+    bool schedule_regions(machine::Function& function) {
+        bool changed = false;
+        const auto live_out = virtual_live_out(function);
+        // Only speed goals read the pressure of values live through a region.
+        RegionPressure pressure;
+        if (const auto* abi = managed_abi_model(
+                hir_, hir_.function(function.source), subtarget_, options_)) {
+            const auto clobbered = [&](std::string_view name) {
+                return std::find(abi->call_clobbers.begin(),
+                                 abi->call_clobbers.end(),
+                                 name) != abi->call_clobbers.end();
+            };
+            for (const auto color : allocatable_gprs(function)) {
+                pressure.volatile_colors[static_cast<std::size_t>(
+                    machine::VirtualRegisterClass::Integer)] +=
+                    clobbered(gpr_name(color));
+            }
+            for (const auto color : allocatable_fprs()) {
+                pressure.volatile_colors[static_cast<std::size_t>(
+                    machine::VirtualRegisterClass::Floating)] +=
+                    clobbered(fpr_name(color));
+            }
+        }
+        const auto bank_of = [&](std::uint32_t id) -> std::optional<std::size_t> {
+            if (id >= function.virtual_register_classes.size() ||
+                function.virtual_register_classes[id] ==
+                    machine::VirtualRegisterClass::Memory) {
+                return std::nullopt;
+            }
+            return static_cast<std::size_t>(function.virtual_register_classes[id]);
+        };
         for (auto& block : function.blocks) {
+            std::vector<std::pair<std::size_t, std::size_t>> regions;
             std::size_t begin{};
             while (begin < block.instructions.size()) {
                 if (scheduling_barrier(block.instructions[begin])) {
@@ -6299,9 +6646,54 @@ private:
                        !scheduling_barrier(block.instructions[end])) {
                     ++end;
                 }
-                changed = schedule_region(block.instructions, begin, end,
-                                          block.id) || changed;
+                regions.push_back({begin, end});
                 begin = end;
+            }
+            // Live values after each region, from the block's end backward.
+            std::vector<RegionPressure> region_pressure(regions.size(), pressure);
+            auto live = live_out[block.id.value];
+            auto at = block.instructions.size();
+            for (std::size_t region = regions.size(); region-- > 0;) {
+                const auto [first, last] = regions[region];
+                for (; at > last; --at) {
+                    const auto& instruction = block.instructions[at - 1];
+                    for (const auto& definition : instruction.defs) {
+                        if (definition.kind == machine::RegisterKind::Virtual) {
+                            live.erase(definition.id);
+                        }
+                    }
+                    if (decode_opcode(instruction.opcode) == Opcode::Phi) continue;
+                    for (const auto& use : instruction.uses) {
+                        if (use.kind == machine::RegisterKind::Virtual) {
+                            live.insert(use.id);
+                        }
+                    }
+                }
+                std::unordered_set<std::uint32_t> touched;
+                for (auto index = first; index < last; ++index) {
+                    for (const auto* list : {&block.instructions[index].defs,
+                                             &block.instructions[index].uses}) {
+                        for (const auto& value : *list) {
+                            if (value.kind == machine::RegisterKind::Virtual) {
+                                touched.insert(value.id);
+                            }
+                        }
+                    }
+                }
+                for (const auto id : live) {
+                    if (touched.contains(id)) continue;
+                    if (const auto bank = bank_of(id)) {
+                        ++region_pressure[region].through[*bank];
+                    }
+                }
+                if (latency_schedules_) region_pressure[region].live_after = live;
+            }
+            for (std::size_t region = 0; region < regions.size(); ++region) {
+                changed = schedule_region(block.instructions,
+                                          regions[region].first,
+                                          regions[region].second, block.id,
+                                          region_pressure[region]) ||
+                    changed;
             }
         }
         return changed;
@@ -6779,7 +7171,7 @@ private:
             {{LoweringPass::AllocateRegisters}, Stage::RegisterAllocation,
               "allocate-registers"},
             [this](machine::Function& function) {
-                return allocate_with_scratch_colors(function);
+                return allocate_scheduled_registers(function);
             });
         passes.add(
             {{LoweringPass::DuplicateBranchBlocks},
@@ -7051,6 +7443,10 @@ private:
     // The allocation may color t2 and t3, which the instructions whose
     // expansions use them as scratches clobber.
     bool scratch_colors_{};
+    // Speed-goal load-latency schedules; see schedule_instructions.
+    bool latency_schedules_{};
+    bool ordered_stores_{};
+    std::optional<machine::Function> schedule_fallback_;
     std::unordered_map<std::uint32_t, machine::PhysicalRegisterId>
         hard_slots_;
 };

@@ -106,8 +106,24 @@ int main() {
                     o2->machine_load_cse && o2->machine_dce &&
                     !o2->expensive_optimizations &&
                     o2->register_allocation && o2->schedule_insns &&
-                    o2->schedule_insns2,
+                    o2->schedule_insns2 && o2->thread_jumps &&
+                    o2->thread_jumps_limit == 6 && o2->size_loop_growth == 0,
                 "O2 preset does not resolve to the model-defined passes") &&
+         ok;
+
+    // Size goals rotate loops and thread jumps within their budgets, and
+    // -Os alone spends instructions on loops.
+    const auto os = parse({"cc", "-Os"});
+    const auto oz = parse({"cc", "-Oz"});
+    const auto oz_growth = parse({"cc", "-fsize-loop-growth=3", "-Oz",
+                                  "-fthread-jumps-limit=2"});
+    ok = expect(os && oz && oz_growth && os->tree_loop_rotate &&
+                    oz->tree_loop_rotate && os->thread_jumps &&
+                    os->thread_jumps_limit == 0 && os->size_loop_growth == 2 &&
+                    oz->thread_jumps_limit == 0 && oz->size_loop_growth == 0 &&
+                    oz_growth->size_loop_growth == 3 &&
+                    oz_growth->thread_jumps_limit == 2,
+                "size presets do not resolve their loop and threading budgets") &&
          ok;
 
     const auto o3_override = parse(

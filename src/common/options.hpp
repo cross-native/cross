@@ -144,6 +144,8 @@ struct CompilerOptions {
     unsigned if_conversion_memory_limit{12};
     unsigned unroll_factor{2};
     unsigned peel_limit{};
+    unsigned thread_jumps_limit{};
+    unsigned size_loop_growth{};
     unsigned vector_interleave{2};
     unsigned risc_cisc_balance{50};
     unsigned function_alignment{};

@@ -9,6 +9,8 @@ optimization "O0" {
     f.if-conversion-memory-limit = 6;
     f.unroll-factor = 2;
     f.peel-limit = 0;
+    f.thread-jumps-limit = 0;
+    f.size-loop-growth = 0;
     f.vector-interleave = 2;
     f.tree-ccp = false;
     f.tree-bit-ccp = false;
@@ -109,6 +111,7 @@ optimization "O2" {
     f.if-conversion-memory-limit = 12;
     f.unroll-factor = 2;
     f.peel-limit = 96;
+    f.thread-jumps-limit = 6;
     f.vector-interleave = 2;
     f.inline-limit = 96;
     f.ipa-ra = true;
@@ -156,7 +159,8 @@ optimization "O3" {
 optimization "Os" {
     inherits = "O2";
     f.optimize-for = "size";
-    f.tree-loop-rotate = false;
+    f.thread-jumps-limit = 0;
+    f.size-loop-growth = 2;
     f.if-conversion-limit = 5;
     f.inline-limit = 24;
     f.unroll-loops = false;
@@ -168,6 +172,7 @@ optimization "Os" {
 optimization "Oz" {
     inherits = "Os";
     f.optimize-for = "minimum-size";
+    f.size-loop-growth = 0;
     f.if-conversion-limit = 3;
     f.inline-limit = 8;
 }

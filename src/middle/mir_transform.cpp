@@ -1094,11 +1094,13 @@ bool cloneable_rotated_guard_value(const ManagedValue& value) {
 
 // Whether the guard operations, in evaluation order, fold an operation to a
 // constant or to one of its operands when the header phis take the constant
-// values in `known`.
+// values in `known`. `condition`, when given, receives the last operation's
+// constant, if it folds to one.
 bool static_first_test(const ManagedFunction& function,
                        const hir::Module& hir_module,
                        std::span<const ValueId> guard,
-                       std::unordered_map<std::uint32_t, UInt128> known) {
+                       std::unordered_map<std::uint32_t, UInt128> known,
+                       std::optional<UInt128>* condition = nullptr) {
     const auto constant = [&](ValueId id) -> std::optional<UInt128> {
         if (const auto found = known.find(id.value); found != known.end()) {
             return found->second;
@@ -1158,13 +1160,19 @@ bool static_first_test(const ManagedFunction& function,
             folds = true;
         }
     }
+    if (condition && !guard.empty()) {
+        if (const auto found = known.find(guard.back().value);
+            found != known.end()) {
+            *condition = found->second;
+        }
+    }
     return folds;
 }
 
 bool rotate_one_guarded_loop(ManagedFunction& function,
                              const hir::Module& hir_module,
                              const NaturalLoop& loop,
-                             const UseLists& uses) {
+                             const UseLists& uses, bool size_goal) {
     if (!loop.preheader || loop.latches.size() != 1 ||
         loop.header.value >= function.blocks.size()) {
         return false;
@@ -1372,25 +1380,28 @@ bool rotate_one_guarded_loop(ManagedFunction& function,
         return true;
     };
     if (!collect_guard(collect_guard, condition_id)) return false;
+    std::unordered_map<std::uint32_t, UInt128> entry;
+    for (const auto& state : states) {
+        const auto& initial = function.values[state.initial.value];
+        const auto bits = scalar_integer_bits(hir_module, initial.type);
+        if (initial.kind == ValueKind::ConstantInteger && bits != 0) {
+            entry.emplace(state.header.value,
+                          mask_to(UInt128{initial.integer,
+                                          initial.integer_high},
+                                  bits));
+        }
+    }
+    std::optional<UInt128> first_test;
+    const bool specializes = static_first_test(
+        function, hir_module, guard_clone_order, std::move(entry), &first_test);
     // A top test of an inner loop, or of a loop whose body is its latch,
     // costs no more than a bottom test once the target lays the loop out;
-    // copying it pays only when the first test specializes.
-    if (loop.parent || *body_id == latch_id) {
-        std::unordered_map<std::uint32_t, UInt128> entry;
-        for (const auto& state : states) {
-            const auto& initial = function.values[state.initial.value];
-            const auto bits = scalar_integer_bits(hir_module, initial.type);
-            if (initial.kind == ValueKind::ConstantInteger && bits != 0) {
-                entry.emplace(state.header.value,
-                              mask_to(UInt128{initial.integer,
-                                              initial.integer_high},
-                                      bits));
-            }
-        }
-        if (!static_first_test(function, hir_module, guard_clone_order,
-                               std::move(entry))) {
-            return false;
-        }
+    // copying it pays only when the first test specializes. Under a size
+    // goal rotation must add nothing: the guard folds to a constant.
+    if (size_goal) {
+        if (!first_test) return false;
+    } else if ((loop.parent || *body_id == latch_id) && !specializes) {
+        return false;
     }
 
     // Validate the immutable use-list coordinates before allocating any new
@@ -1956,7 +1967,7 @@ bool factor_common_phi_tails(ManagedFunction& function,
 }
 
 bool rotate_guarded_loops(ManagedFunction& function,
-                          const hir::Module& hir_module) {
+                          const hir::Module& hir_module, bool size_goal) {
     bool changed = false;
     // Each rotation rewires the latch and invalidates every CFG-derived
     // analysis. Rebuild before considering another loop; the original block
@@ -1968,7 +1979,8 @@ bool rotate_guarded_loops(ManagedFunction& function,
         const UseLists uses(function);
         bool rotated = false;
         for (const auto& loop : loops.loops()) {
-            if (!rotate_one_guarded_loop(function, hir_module, loop, uses)) {
+            if (!rotate_one_guarded_loop(function, hir_module, loop, uses,
+                                         size_goal)) {
                 continue;
             }
             changed = true;

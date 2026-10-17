@@ -842,3 +842,59 @@ global u32 k_q_scratch_pressure(in u32 a, in u32 b, in u32 c) {
     return v0 ^ v1 ^ v2 ^ v3 ^ v4 ^ v5 ^ v6 ^ v7 ^ v8 ^ v9 ^ v10 ^ v11 ^
            v12 ^ v13;
 }
+
+// The release path of a slot allocator: with 64 or more live slots the
+// pick (seed >> 8) & 63 is below the count, so the path bypasses the test
+// of the count and the pick's reduction loop, and the halfword loads of the
+// pick and of the last slot are scheduled around the stores between them.
+global u16 q_release_live[128];
+global u32 q_release_bits[8];
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_release(in u32 a, in u32 b, in u32 c) {
+    for (u32 k = 0u32; k < 128u32; ++k) {
+        q_release_live[k] = (u16)((a * (k + 1u32)) & 255u32);
+    }
+    for (u32 k = 0u32; k < 8u32; ++k) q_release_bits[k] = b ^ (k * 16843009u32);
+    u32 live = (c & 127u32) + 1u32;
+    u32 seed = a ^ c;
+    u32 sum = 0u32;
+    for (u32 n = 0u32; n < 12u32; ++n) {
+        seed = seed * 1664525u32 + 1013904223u32;
+        if (live < 64u32 && ((seed >> 16) & 3u32) != 0u32) {
+            sum = sum * 31u32 + live;
+            live = live + 1u32;
+        } else if (live != 0u32) {
+            u32 pick = (seed >> 8) & 63u32;
+            while (pick >= live) pick = pick - live;
+            const u32 slot = (u32)q_release_live[pick];
+            q_release_bits[slot >> 5] =
+                q_release_bits[slot >> 5] & ~(1u32 << (slot & 31u32));
+            live = live - 1u32;
+            q_release_live[pick] = q_release_live[live];
+            sum = sum ^ (slot << 3) ^ live;
+        }
+    }
+    for (u32 k = 0u32; k < 8u32; ++k) sum = sum * 31u32 + q_release_bits[k];
+    return sum;
+}
+
+// A load after a store to an element of the same array at another index,
+// which may be the same one, keeps its order with the store, while the
+// arithmetic around them moves.
+global u32 q_ordered[8];
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_ordered(in u32 a, in u32 b, in u32 c) {
+    for (u32 k = 0u32; k < 8u32; ++k) q_ordered[k] = a + k;
+    u32 sum = 0u32;
+    for (u32 n = 0u32; n < 8u32; ++n) {
+        const u32 i = (b >> n) & 7u32;
+        const u32 j = (c >> n) & 7u32;
+        const u32 x = q_ordered[i];
+        q_ordered[j] = x * 3u32 + n;
+        const u32 y = q_ordered[i];
+        sum = sum * 31u32 + y + (x ^ n);
+    }
+    return sum;
+}

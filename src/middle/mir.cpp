@@ -15005,6 +15005,14 @@ bool reduce_affine_address_inductions(
                 }
             }
             if (chosen == 0) return false;
+            // A scale that an unchosen group keeps indexing with keeps its
+            // shift.
+            for (std::size_t index = 0; index < groups.size(); ++index) {
+                if (!selected[index]) {
+                    scales.erase(groups[index].element_size *
+                                 groups[index].scale);
+                }
+            }
             // Whether the index then only counts passes: the header tests it
             // for equality with an invariant bound, the loop has no other
             // exit, and everything else that reads it is an address of a
@@ -15099,13 +15107,20 @@ bool reduce_affine_address_inductions(
             // A recurrence that does not take the index's place holds one
             // more register across the loop, and so does the end address of
             // a bound that is not constant, which usually stays live itself;
-            // a tie does not pay for that register.
+            // a tie does not pay for that register. Otherwise the
+            // instructions the recurrences save in each pass buy the
+            // preset's growth (-fsize-loop-growth) in instructions each,
+            // counting a register a recurrence adds as an instruction.
             const bool same_registers =
                 counts && function.values[bound->value].kind ==
                               ValueKind::ConstantInteger;
+            const auto added = after + (counts ? 0U : chosen);
             return after < before ||
                    (same_registers && after == before &&
-                    chosen < before_pass);
+                    chosen < before_pass) ||
+                   (chosen < before_pass &&
+                    added <= before + options.size_loop_growth *
+                                          (before_pass - chosen));
         };
 
     for (const auto& loop : loops) {
@@ -15383,11 +15398,21 @@ bool reduce_affine_address_inductions(
                 if (!index_recurrences_fit_size(index_phi_id, update_id,
                                                 loop, latch, groups, all)) {
                     // A group with several accesses still shares one
-                    // recurrence among them.
+                    // recurrence among them; another takes one alone when
+                    // that fits.
                     for (std::size_t index = 0; index < groups.size();
                          ++index) {
                         selected[index] = all[index] &&
                                           groups[index].accesses.size() >= 2;
+                    }
+                    for (std::size_t index = 0; index < groups.size();
+                         ++index) {
+                        if (!all[index] || selected[index]) continue;
+                        std::vector<bool> alone(groups.size());
+                        alone[index] = true;
+                        selected[index] = index_recurrences_fit_size(
+                            index_phi_id, update_id, loop, latch, groups,
+                            alone);
                     }
                 }
             }
@@ -21893,6 +21918,22 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
                     : PassResult::unchanged();
             });
     }
+    // After if-conversion, so that only the branches selects do not replace
+    // remain: value bounds decide some of them on every path to them, others
+    // on the path from one edge.
+    if (options.thread_jumps) {
+        pipeline.add(
+            PassId::BranchThreading,
+            [&](ManagedFunction& function, FunctionAnalysisManager&) {
+                if (!thread_decided_branches(function, hir_module,
+                                             options.thread_jumps_limit)) {
+                    return PassResult::unchanged();
+                }
+                (void)fold_constant_branches(function);
+                if (options.tree_copy_prop) propagate_trivial_copies(function);
+                return PassResult::changed_cfg();
+            });
+    }
     // Preserve complete diamonds until if-conversion has had the opportunity
     // to form semantic selects. Forwarding one empty arm first would turn a
     // diamond into a triangle and hide the target-independent conversion.
@@ -22276,7 +22317,11 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
             PassId::LoopRotation,
             [&](ManagedFunction& function, FunctionAnalysisManager&) {
                 const bool changed =
-                    rotate_guarded_loops(function, hir_module);
+                    rotate_guarded_loops(
+                        function, hir_module,
+                        options.optimize_for == OptimizationGoal::Size ||
+                            options.optimize_for ==
+                                OptimizationGoal::MinimumSize);
                 if (changed) {
                     // Rotation clones the continuation predicate after the
                     // ordinary scalar simplification rounds. Re-canonicalize

@@ -960,7 +960,7 @@ function_body("${OUTPUT}.no_machine_combine.s" mips_narrow_sum
 if(narrow_sum MATCHES ",65535\n" OR narrow_sum MATCHES "[\t ]sra[\t ]" OR
    narrow_sum MATCHES ",31\n" OR
    NOT narrow_sum MATCHES "[\t ]lhu[\t ]" OR
-   NOT narrow_sum_extended MATCHES "[\t ]lhu[^\n]*\n[\t ]+andi[^\n]*,65535\n" OR
+   NOT narrow_sum_extended MATCHES "[\t ]lhu[^\n]*\n([^\n]*\n)*[\t ]+andi[^\n]*,65535\n" OR
    NOT narrow_sum_extended MATCHES "[\t ]sra[\t ]")
     message(FATAL_ERROR
         "MIPS extended loads or masked shift amounts were normalized again, "
@@ -1232,4 +1232,46 @@ if(NOT ring_step_r3000 MATCHES "[\t ]bne[\t ][^\n]*\n[\t ]+addiu[\t ][^\n]*,-1\n
         "an R3000 branch did not run its taken arm in its delay slot, or "
         "-fno-schedule-insns2 was ignored\n"
         "r3000:\n${ring_step_r3000}\nwithout:\n${ring_step_unfilled}")
+endif()
+# A speed goal's load-latency schedule moves arithmetic past a store, which
+# keeps its place among the loads; size goals and -fno-schedule-insns keep
+# the store a scheduling barrier.
+function_body("${OUTPUT}.enabled.s" release_slot latency_release)
+function_body("${OUTPUT}.no_schedule.s" release_slot latency_release_plain)
+function_body("${OUTPUT}.size.s" release_slot latency_release_size)
+foreach(variant latency_release latency_release_plain latency_release_size)
+    string(FIND "${${variant}}" "\tsw\t" ${variant}_store)
+    string(REGEX MATCH "\taddiu\t[^\n]*,-1\n" ${variant}_decrement "${${variant}}")
+    string(FIND "${${variant}}" "${${variant}_decrement}" ${variant}_decrement_at)
+endforeach()
+if(latency_release_store EQUAL -1 OR latency_release_decrement STREQUAL "" OR
+   NOT latency_release_decrement_at LESS latency_release_store OR
+   NOT latency_release_plain_store LESS latency_release_plain_decrement_at OR
+   NOT latency_release_size_store LESS latency_release_size_decrement_at OR
+   NOT latency_release MATCHES "\tsw\t[^\n]*\n(\t[^\n]*\n)*\tlhu\t")
+    message(FATAL_ERROR
+        "the speed schedule did not move arithmetic past a store, moved a "
+        "load before it, or a size goal or -fno-schedule-insns moved it\n"
+        "O2:\n${latency_release}\nno schedule:\n${latency_release_plain}\n"
+        "Oz:\n${latency_release_size}")
+endif()
+# Size goals rotate a loop whose first test folds; -Os spends its growth
+# on a pointer for the table, -fsize-loop-growth=0 does not.
+compile_variant(size_speed -Os)
+compile_variant(size_speed_no_growth -Os -fsize-loop-growth=0)
+compile_size_variant(size_no_rotation -fno-tree-loop-rotate)
+function_body("${OUTPUT}.size.s" size_skip_sum size_skip)
+function_body("${OUTPUT}.size_no_rotation.s" size_skip_sum size_skip_top)
+function_body("${OUTPUT}.size_speed.s" size_skip_sum size_skip_os)
+function_body("${OUTPUT}.size_speed_no_growth.s" size_skip_sum
+              size_skip_os_indexed)
+if(size_skip MATCHES "[\t ]b[\t ]" OR
+   NOT size_skip_top MATCHES "[\t ]b[\t ]" OR
+   size_skip_os MATCHES "[\t ]sll[\t ]" OR
+   NOT size_skip_os_indexed MATCHES "[\t ]sll[\t ]")
+    message(FATAL_ERROR
+        "a size goal did not rotate a loop whose first test folds, "
+        "-fno-tree-loop-rotate was ignored, or -Os did not spend its growth "
+        "on a pointer\nOz:\n${size_skip}\nno rotation:\n${size_skip_top}\n"
+        "Os:\n${size_skip_os}\nno growth:\n${size_skip_os_indexed}")
 endif()

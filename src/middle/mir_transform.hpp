@@ -54,9 +54,22 @@ canonicalize_bitwise_operations(ManagedFunction& function,
 // or one whose body is its latch, rotates only when its first test, given
 // the constant values its header phis enter with, folds an operation:
 // duplicating a test that does not specialize costs code without saving
-// work.
+// work. Under a size goal a loop rotates only when that first test folds to
+// a constant, so that no guard remains.
 [[nodiscard]] bool rotate_guarded_loops(ManagedFunction& function,
-                                        const hir::Module& hir_module);
+                                        const hir::Module& hir_module,
+                                        bool size_goal = false);
+
+// Folds a branch that the branch edges dominating it decide, and threads an
+// edge into a join past the branches that the path from it decides, through
+// copies of the path's blocks that keep at most `limit` operations. Integer
+// bounds and relations come from constants, arithmetic, masks, shifts, and
+// conversions, from the comparisons of the edges, and from the values phis
+// take on the path. A thread keeps the loops it starts in and enters no loop
+// body but leaves a loop it enters at its header.
+[[nodiscard]] bool thread_decided_branches(ManagedFunction& function,
+                                           const hir::Module& hir_module,
+                                           unsigned limit);
 
 // Lowers each bit intrinsic and rotation to the target's instructions or to
 // an inline sequence, whichever the subtarget's costs favor; afterwards the

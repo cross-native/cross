@@ -359,6 +359,11 @@ std::span<const OptionDefinition> common_option_definitions() {
          std::uint64_t{0}, {}, 0, 4096, OptionCategory::Optimization, true,
          OptionImplementation::Implemented,
          "maximum MIR operations of a completely peeled loop"},
+        {"f.size-loop-growth", {}, OptionValueKind::Unsigned,
+         std::uint64_t{0}, {}, 0, 64, OptionCategory::Optimization, true,
+         OptionImplementation::Implemented,
+         "under a size goal, the most instructions a pointer recurrence may "
+         "add for each instruction it saves in every pass of its loop"},
         {"f.vector-interleave", {}, OptionValueKind::Unsigned,
          std::uint64_t{2}, {}, 1, 16, OptionCategory::Optimization, true,
          OptionImplementation::Implemented,
@@ -387,7 +392,13 @@ std::span<const OptionDefinition> common_option_definitions() {
          "factor profitable common SSA tails before machine selection"},
         {"f.thread-jumps", {}, OptionValueKind::Boolean, false, {}, 0, 0,
          OptionCategory::Optimization, true, OptionImplementation::Implemented,
-         "thread branches through proven boolean SSA phis"},
+         "thread branches through proven boolean SSA phis, fold branches "
+         "that dominating conditions decide, and bypass branches that value "
+         "ranges decide on a path"},
+        {"f.thread-jumps-limit", {}, OptionValueKind::Unsigned,
+         std::uint64_t{0}, {}, 0, 1024, OptionCategory::Optimization, true,
+         OptionImplementation::Implemented,
+         "maximum MIR operations copied to bypass the branches a path decides"},
         {"f.tree-cfg-cleanup", {}, OptionValueKind::Boolean, false, {}, 0, 0,
          OptionCategory::Optimization, true, OptionImplementation::Implemented,
          "remove forwarding blocks and repair value/effect SSA"},
@@ -846,6 +857,10 @@ bool resolve_registered_options(
         resolved_unsigned(options, "f.unroll-factor", 2));
     options.peel_limit = static_cast<unsigned>(
         resolved_unsigned(options, "f.peel-limit"));
+    options.thread_jumps_limit = static_cast<unsigned>(
+        resolved_unsigned(options, "f.thread-jumps-limit"));
+    options.size_loop_growth = static_cast<unsigned>(
+        resolved_unsigned(options, "f.size-loop-growth"));
     options.vector_interleave = static_cast<unsigned>(
         resolved_unsigned(options, "f.vector-interleave", 2));
     options.risc_cisc_balance = static_cast<unsigned>(

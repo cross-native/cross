@@ -179,6 +179,7 @@ add_library(cross_middle
     src/middle/mir_bits.cpp
     src/middle/mir_memory.cpp
     src/middle/mir_pass.cpp
+    src/middle/mir_ranges.cpp
     src/middle/mir_transform.cpp
     src/middle/shrink_wrap.cpp
 )
@@ -3560,6 +3561,57 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/middle/loop_peeling_codegen.cmake")
     set_tests_properties(cross_loop_peeling_codegen PROPERTIES
         LABELS "check.compile;arch.x86_64;arch.mips;middle;backend.native;feature.optimization;isa.vr4300;opt.O1;opt.O2;opt.O3;opt.Os")
+    # Branches that value bounds decide on every path to them, or on the
+    # path from one edge, folded and threaded.
+    foreach(thread_mode O0 O2 O3 Os Oz O2-no-thread-jumps O3-thread-jumps-limit)
+        string(REGEX MATCH "^O[0-9sz]" thread_level "${thread_mode}")
+        if(thread_mode STREQUAL "O2-no-thread-jumps")
+            set(thread_flags "-O2;-fno-thread-jumps")
+        elseif(thread_mode STREQUAL "O3-thread-jumps-limit")
+            set(thread_flags "-O3;-fthread-jumps-limit=64")
+        else()
+            set(thread_flags "-${thread_mode}")
+        endif()
+        add_test(NAME cross_runtime_jump_threading_${thread_mode}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/jump_threading.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-jump-threading-${thread_mode}
+                -DENTRY=test_entry -DEXPECTED=0 "-DCC_FLAGS=${thread_flags};-fno-eval-calls"
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_jump_threading_${thread_mode} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;middle;feature.optimization;opt.${thread_level}")
+    endforeach()
+    foreach(thread_mode O2 O3 Oz O2-no-thread-jumps O3-thread-jumps-limit)
+        string(REGEX MATCH "^O[0-9sz]" thread_level "${thread_mode}")
+        if(thread_mode STREQUAL "O2-no-thread-jumps")
+            set(thread_flags "-O2;-fno-thread-jumps")
+        elseif(thread_mode STREQUAL "O3-thread-jumps-limit")
+            set(thread_flags "-O3;-fthread-jumps-limit=64")
+        else()
+            set(thread_flags "-${thread_mode}")
+        endif()
+        add_test(NAME cross_runtime_jump_threading_mips_${thread_mode}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/jump_threading.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-jump-threading-mips-${thread_mode}
+                -DEXPECTED=P "-DCC_FLAGS=${thread_flags};-fno-eval-calls"
+                -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(cross_runtime_jump_threading_mips_${thread_mode} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;middle;feature.optimization;isa.vr4300;isa.r3000;endian.big;endian.little;opt.${thread_level}"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS")
+    endforeach()
+    add_test(NAME cross_jump_threading_codegen
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/jump_threading_codegen.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/jump-threading-codegen
+                -P "${CMAKE_SOURCE_DIR}/test/middle/jump_threading_codegen.cmake")
+    set_tests_properties(cross_jump_threading_codegen PROPERTIES
+        LABELS "check.compile;arch.x86_64;arch.mips;middle;backend.native;feature.optimization;isa.vr4300;opt.O2;opt.O3;opt.Os;opt.Oz")
     # Floating selects from if-conversion: SSE logic, SSE4.1 BLENDV, and AVX
     # VBLENDV masks, a boolean mask, and the branches they replace.
     foreach(select_mode O0 O2 O3 Os O2-sse41 O2-avx O3-avx O2-no-if-conversion

@@ -943,3 +943,33 @@ global u32 mips_scratch_cross(in u32 a, in u32 b, in u32 c) {
     return v0 ^ v1 ^ v2 ^ v3 ^ v4 ^ v5 ^ v6 ^ v7 ^ v8 ^ v9 ^ v10 ^ v11 ^
            v12 ^ v13;
 }
+
+// At a speed goal the scheduler moves the decrement of `live` and the
+// address of the last slot past the store to the bitmap, between the
+// halfword load of the pick and its uses; the store keeps its order with
+// the loads around it.
+global u16 mips_release_live[128];
+global u32 mips_release_bits[8];
+
+global u32 release_slot(in u32 pick, in u32 live) {
+    const u32 slot = (u32)mips_release_live[pick & 127u32];
+    mips_release_bits[slot >> 5] =
+        mips_release_bits[slot >> 5] & ~(1u32 << (slot & 31u32));
+    const u32 rest = live - 1u32;
+    mips_release_live[pick & 127u32] = mips_release_live[rest & 127u32];
+    return rest * 8u32 + (slot << 3);
+}
+
+// Under a size goal the loop rotates, as its first test folds, and so ends
+// without a jump back; -Os also gives the table access a pointer, whose
+// step costs fewer instructions in each pass than the scaled index it
+// replaces.
+global u32 mips_size_table[32];
+
+global u32 size_skip_sum(in u32 k, in u32 x) {
+    u32 sum = 0u32;
+    for (u32 j = 0u32; j < 32u32; ++j) {
+        if (j != k) sum = sum + (mips_size_table[j] ^ x);
+    }
+    return sum;
+}

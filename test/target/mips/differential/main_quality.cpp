@@ -46,6 +46,8 @@ unsigned k_q_scratch_colors(unsigned, unsigned, unsigned);
 unsigned k_q_scratch_pressure(unsigned, unsigned, unsigned);
 unsigned k_q_inner_swap(unsigned, unsigned, unsigned);
 unsigned k_q_call_constants(unsigned, unsigned, unsigned);
+unsigned k_q_release(unsigned, unsigned, unsigned);
+unsigned k_q_ordered(unsigned, unsigned, unsigned);
 }
 
 int main() {
@@ -277,5 +279,17 @@ int main() {
     std::printf("%08x\n", k_q_scratch_pressure(0x12345678u, 0x9abcdef0u, 0x2bu)); std::fflush(stdout);
     std::printf("%08x\n", k_q_scratch_pressure(0x80000000u, 0xffffffffu, 0x10u)); std::fflush(stdout);
     std::printf("%08x\n", k_q_scratch_pressure(0xfu, 0x10u, 0x21u)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_release(0x1u, 0x3u, 0x5u)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_release(0x7u, 0x2u, 0x0u)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_release(0xffffffffu, 0x80000000u, 0x7fffffffu)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_release(0x12345678u, 0x9abcdef0u, 0x2bu)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_release(0x80000000u, 0xffffffffu, 0x10u)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_release(0xfu, 0x10u, 0x21u)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_ordered(0x1u, 0x3u, 0x5u)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_ordered(0x7u, 0x2u, 0x0u)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_ordered(0xffffffffu, 0x80000000u, 0x7fffffffu)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_ordered(0x12345678u, 0x9abcdef0u, 0x2bu)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_ordered(0x80000000u, 0xffffffffu, 0x10u)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_ordered(0xfu, 0x10u, 0x21u)); std::fflush(stdout);
     return 0;
 }
