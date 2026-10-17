@@ -31,9 +31,9 @@ source or binary compatibility with one another.
 
 ## Quick start
 
-You need CMake 3.20 or later and a C++20 compiler. `cc -c` for x86-64 also
-needs `llvm-mc` on `PATH`; MIPS objects need no other tool. With the example
-above saved as `example.x`:
+You need CMake 3.20 or later and a C++20 compiler, and nothing else: `cc -c`
+assembles objects in process for every target. With the example above saved as
+`example.x`:
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release

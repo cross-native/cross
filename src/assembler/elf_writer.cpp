@@ -29,6 +29,51 @@ std::uint32_t StringTable::add(std::string_view text) {
     return entry->second;
 }
 
+void MergedStringTable::finalize(std::uint32_t prefix, std::uint32_t alignment) {
+    std::vector<std::pair<const std::string, std::uint32_t>*> order;
+    order.reserve(strings_.size());
+    for (auto& entry : strings_) order.push_back(&entry);
+    // Descending by characters from the end; a string that is a suffix of
+    // another follows it.
+    std::sort(order.begin(), order.end(), [](const auto* a, const auto* b) {
+        const auto& x = a->first;
+        const auto& y = b->first;
+        for (std::size_t position = 0;; ++position) {
+            const int cx = position < x.size() ? static_cast<unsigned char>(x[x.size() - 1 - position]) : -1;
+            const int cy = position < y.size() ? static_cast<unsigned char>(y[y.size() - 1 - position]) : -1;
+            if (cx != cy) return cx > cy;
+            if (cx == -1) return false;
+        }
+    });
+    size_ = prefix;
+    std::string_view previous;
+    for (auto* entry : order) {
+        const std::string_view text = entry->first;
+        if (previous.size() >= text.size() &&
+            previous.substr(previous.size() - text.size()) == text) {
+            entry->second = size_ - static_cast<std::uint32_t>(text.size()) - 1;
+            continue;
+        }
+        entry->second = size_;
+        size_ += static_cast<std::uint32_t>(text.size()) + 1;
+        previous = text;
+    }
+    if (alignment > 1) size_ = (size_ + alignment - 1) / alignment * alignment;
+}
+
+std::uint32_t MergedStringTable::offset(std::string_view text) const {
+    const auto found = strings_.find(std::string(text));
+    return found == strings_.end() ? 0 : found->second;
+}
+
+std::vector<std::uint8_t> MergedStringTable::data(std::uint32_t prefix) const {
+    std::vector<std::uint8_t> bytes(size_ - prefix, 0);
+    for (const auto& [text, offset] : strings_) {
+        std::copy(text.begin(), text.end(), bytes.begin() + (offset - prefix));
+    }
+    return bytes;
+}
+
 std::vector<std::uint8_t> write_elf(const ObjectInfo& object,
                                     std::uint32_t flags,
                                     std::span<const ElfSection> sections,

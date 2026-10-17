@@ -319,8 +319,8 @@ public:
     bool apply_fixup(Assembler& as, const assembler::Fixup& fixup, std::int64_t value,
                      std::span<std::uint8_t> bytes, bool relocated) const override;
     std::optional<assembler::RelocationChoice> relocation(
-        Assembler& as, const assembler::Fixup& fixup, const assembler::Symbol& symbol,
-        const assembler::Section* symbol_section) const override;
+        Assembler& as, const assembler::Fixup& fixup, const assembler::Value& value,
+        const assembler::Symbol& symbol, const assembler::Section* symbol_section) const override;
     void order_relocations(std::vector<assembler::Relocation>& relocations) const override;
 
 private:
@@ -1500,8 +1500,8 @@ bool MipsTarget::apply_fixup(Assembler& as, const assembler::Fixup& fixup, std::
 }
 
 std::optional<assembler::RelocationChoice> MipsTarget::relocation(
-    Assembler& as, const assembler::Fixup& fixup, const assembler::Symbol&,
-    const assembler::Section* symbol_section) const {
+    Assembler& as, const assembler::Fixup& fixup, const assembler::Value&,
+    const assembler::Symbol&, const assembler::Section* symbol_section) const {
     const bool merge = symbol_section && (symbol_section->flags & elf::shf_merge) != 0;
     switch (fixup.kind.value) {
     case 1:

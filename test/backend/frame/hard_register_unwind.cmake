@@ -9,7 +9,6 @@ foreach(required CC HOST_CXX SOURCE OUTPUT)
         message(FATAL_ERROR "${required} must be defined")
     endif()
 endforeach()
-find_program(LLVM_MC NAMES llvm-mc REQUIRED)
 find_program(LLVM_DWARFDUMP NAMES llvm-dwarfdump REQUIRED)
 find_program(LLVM_READOBJ NAMES llvm-readobj REQUIRED)
 set(here "${CMAKE_CURRENT_LIST_DIR}")
@@ -90,8 +89,8 @@ foreach(flags "-O0" "-O2" "-O2;-fno-omit-frame-pointer")
     run_checked("ELF assembly (${flags})" "${CC}" ${flags} -funwind-tables
         -target x86_64-unknown-linux-gnu -S "${SOURCE}" -o "${elf}.s")
     check_cfi_offsets("${elf}.s")
-    run_checked("ELF object (${flags})" "${LLVM_MC}" -triple x86_64-unknown-linux-gnu
-        -filetype=obj "${elf}.s" -o "${elf}.o")
+    run_checked("ELF object (${flags})" "${AS}" -target x86_64-unknown-linux-gnu
+        "${elf}.s" -o "${elf}.o")
     run_checked("ELF unwind dump (${flags})" "${LLVM_DWARFDUMP}" --eh-frame "${elf}.o")
     # One FDE per function, in source order.
     string(REPLACE " FDE cie=" ";" fdes "${stdout}")
@@ -115,8 +114,8 @@ foreach(flags "-O0" "-O2" "-O2;-fno-omit-frame-pointer")
     set(coff "${OUTPUT}${name}-coff")
     run_checked("COFF assembly (${flags})" "${CC}" ${flags} -funwind-tables
         -target x86_64-w64-windows-gnu -S "${SOURCE}" -o "${coff}.s")
-    run_checked("COFF object (${flags})" "${LLVM_MC}" -triple x86_64-w64-windows-gnu
-        -filetype=obj "${coff}.s" -o "${coff}.o")
+    run_checked("COFF object (${flags})" "${AS}" -target x86_64-w64-windows-gnu
+        "${coff}.s" -o "${coff}.o")
     run_checked("COFF unwind dump (${flags})" "${LLVM_READOBJ}" --unwind "${coff}.o")
     string(REPLACE "RuntimeFunction {" ";" entries "${stdout}")
     foreach(function IN LISTS functions)

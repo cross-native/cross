@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "assembler/assembler.hpp"
 
+#include "assembler/coff_writer.hpp"
 #include "assembler/elf_writer.hpp"
+#include "assembler/macho_writer.hpp"
 
 #include <algorithm>
 #include <array>
@@ -268,6 +270,33 @@ struct Assembler::Impl {
     std::uint64_t macro_counter{};
     bool exit_macro{};
     bool in_block_comment{};
+    std::uint32_t definitions{};
+    // Mach-O atom-defining labels per section in (fragment, offset,
+    // definition) order, computed when `atom_definitions` labels existed.
+    std::vector<std::vector<std::tuple<std::uint32_t, std::uint64_t, std::uint32_t, SymbolId>>> atoms;
+    std::uint32_t atom_definitions{~0U};
+    void build_atoms() {
+        if (atom_definitions == definitions && atoms.size() == as.sections_.size()) return;
+        atom_definitions = definitions;
+        atoms.assign(as.sections_.size(), {});
+        for (std::uint32_t index = 0; index < as.symbols_.size(); ++index) {
+            const auto& entry = as.symbols_[index];
+            if (!entry.section || entry.temporary || entry.alt_entry ||
+                entry.type == elf::stt_section) {
+                continue;
+            }
+            atoms[entry.section->value].emplace_back(entry.fragment, entry.offset,
+                                                     entry.definition, SymbolId{index});
+        }
+        for (auto& list : atoms) std::sort(list.begin(), list.end(), [](const auto& a, const auto& b) {
+            return std::tuple{std::get<0>(a), std::get<1>(a), std::get<2>(a)} <
+                   std::tuple{std::get<0>(b), std::get<1>(b), std::get<2>(b)};
+        });
+    }
+    // COFF: the symbol of an open `.def`.
+    std::optional<SymbolId> coff_definition;
+    // Mach-O: `.subsections_via_symbols`.
+    bool subsections_via_symbols{};
 
     // Sections ---------------------------------------------------------------
     std::map<std::tuple<std::string, std::uint32_t, std::uint64_t>, SectionId>
@@ -340,7 +369,25 @@ struct Assembler::Impl {
 
     // Output relocations per section.
     std::vector<std::vector<Relocation>> relocations;
+    // Mach-O section addresses, set after the final layout.
+    std::vector<std::uint64_t> section_addresses;
     bool layout_known{};
+
+    SectionId add_section(Section entry, std::tuple<std::string, std::uint32_t, std::uint64_t> key) {
+        const SectionId id{static_cast<std::uint32_t>(as.sections_.size())};
+        entry.symbol = SymbolId{static_cast<std::uint32_t>(as.symbols_.size())};
+        Symbol section_symbol;
+        section_symbol.type = elf::stt_section;
+        section_symbol.binding = Symbol::Binding::Local;
+        section_symbol.section = id;
+        as.symbols_.push_back(std::move(section_symbol));
+        resolving.push_back(false);
+        entry.fragments.emplace_back();
+        as.sections_.push_back(std::move(entry));
+        relocations.emplace_back();
+        section_map.emplace(std::move(key), id);
+        return id;
+    }
 
     // ---------------------------------------------------------------------------
     void process_text(std::string_view text, const SourceFile* file,
@@ -376,6 +423,12 @@ struct Assembler::Impl {
     void loc(Statement& statement);
     void cfi(Statement& statement);
     void ident(Statement& statement);
+    bool coff_directive(std::string_view name, Statement& statement);
+    bool macho_directive(std::string_view name, Statement& statement);
+    void coff_section_directive(Statement& statement, bool push);
+    void macho_section_directive(Statement& statement, bool push);
+    SectionId frame_section(bool eh);
+    SectionId debug_section(std::string_view name);
     void macro_directive(Statement& statement);
     void repeat(Statement& statement);
     std::optional<unsigned> cfi_register(Cursor& cursor);
@@ -386,7 +439,21 @@ struct Assembler::Impl {
     void emit_frames(bool eh);
     void emit_line_table();
     bool resolve_fixups();
+    // Whether a fixup's value is known after layout without a relocation.
+    bool resolves_in_place(const Value& value, std::size_t section_index, const Fixup& fixup);
+    // Mach-O atoms: of a label (through its base symbol for aliases), and
+    // of a position within a section.
+    std::optional<SymbolId> atom(const Symbol& symbol);
+    std::optional<SymbolId> atom_at(std::size_t section_index, std::uint32_t fragment,
+                                    std::uint64_t offset);
+    bool record_elf(std::size_t section_index, Fragment& fragment, Fixup& fixup, FixupInfo& info,
+                    Value& value, std::span<std::uint8_t> bytes);
+    bool record_coff(std::size_t section_index, Fragment& fragment, Fixup& fixup, FixupInfo& info,
+                     Value& value, std::span<std::uint8_t> bytes);
+    bool apply(const Fixup& fixup, const FixupInfo& info, std::int64_t number,
+               std::span<std::uint8_t> bytes, bool relocated);
     std::vector<std::uint8_t> write();
+    std::vector<std::uint8_t> write_elf_object();
 
     [[nodiscard]] std::uint64_t address(const Symbol& symbol) const {
         const auto& section = as.sections_[symbol.section->value];
@@ -402,8 +469,29 @@ Assembler::Assembler(Target& target, const Options& options,
     : target_(target), options_(options), sources_(sources),
       diagnostics_(diagnostics), object_(target.object()),
       impl_(std::make_unique<Impl>(*this)) {
-    const auto text = section(".text", elf::sht_progbits,
-                              elf::shf_alloc | elf::shf_execinstr);
+    SectionId text;
+    switch (object_.format) {
+    case Format::Elf:
+        // The initial .text is code-aligned to 4, as in LLVM MC.
+        text = section(".text", elf::sht_progbits, elf::shf_alloc | elf::shf_execinstr);
+        sections_[text.value].alignment = 4;
+        break;
+    case Format::Coff:
+        // As LLVM MC, every object has .text, .data, and .bss, aligned to 4.
+        text = coff_section(".text", coff::scn_cnt_code | coff::scn_mem_execute |
+                                         coff::scn_mem_read);
+        sections_[text.value].alignment = 4;
+        sections_[coff_section(".data", coff::scn_cnt_initialized_data |
+                                            coff::scn_mem_read | coff::scn_mem_write)
+                      .value].alignment = 4;
+        sections_[coff_section(".bss", coff::scn_cnt_uninitialized_data |
+                                           coff::scn_mem_read | coff::scn_mem_write)
+                      .value].alignment = 4;
+        break;
+    case Format::MachO:
+        text = macho_section("__TEXT", "__text", macho::s_attr_pure_instructions);
+        break;
+    }
     switch_section(text);
     impl_->previous = text;
 }
@@ -448,7 +536,8 @@ SymbolId Assembler::symbol(std::string_view name, SourceLocation location) {
     const SymbolId id{static_cast<std::uint32_t>(symbols_.size())};
     Symbol entry;
     entry.name = std::string(name);
-    entry.temporary = name.starts_with(".L");
+    entry.temporary = object_.format == Format::MachO ? name.starts_with("L")
+                                                      : name.starts_with(".L");
     entry.location = location;
     symbols_.push_back(std::move(entry));
     impl_->resolving.push_back(false);
@@ -474,12 +563,15 @@ void Assembler::define_label(SymbolId id, SourceLocation location) {
     }
     auto& current = section(current_);
     if (current.fragments.empty() ||
-        current.fragments.back().kind != Fragment::Kind::Data) {
+        current.fragments.back().kind != Fragment::Kind::Data ||
+        (object_.format == Format::MachO && !entry.temporary &&
+         !current.fragments.back().bytes.empty())) {
         current.fragments.emplace_back();
     }
     entry.section = current_;
     entry.fragment = static_cast<std::uint32_t>(current.fragments.size() - 1);
     entry.offset = current.fragments.back().bytes.size();
+    entry.definition = ++impl_->definitions;
     if (location.valid()) entry.location = location;
 }
 
@@ -516,17 +608,21 @@ void Assembler::assignment_statement(Statement& statement) {
     assign(symbol(*name, statement.location), *value, statement.location);
 }
 
+namespace {
+
+using SectionKey = std::tuple<std::string, std::uint32_t, std::uint64_t>;
+
+} // namespace
+
 SectionId Assembler::section(std::string_view name, std::uint32_t type,
                              std::uint64_t flags, std::uint64_t entry_size,
                              std::optional<SymbolId> group, bool comdat,
                              std::uint64_t unique) {
-    const auto key = std::tuple{std::string(name),
-                                group ? group->value + 1 : 0U, unique};
+    const SectionKey key{std::string(name), group ? group->value + 1 : 0U, unique};
     if (const auto found = impl_->section_map.find(key);
         found != impl_->section_map.end()) {
         return found->second;
     }
-    const SectionId id{static_cast<std::uint32_t>(sections_.size())};
     Section entry;
     entry.name = std::string(name);
     entry.type = target_.section_type(name, type);
@@ -535,18 +631,47 @@ SectionId Assembler::section(std::string_view name, std::uint32_t type,
     entry.group = group;
     entry.comdat = comdat;
     entry.unique = unique;
-    entry.symbol = SymbolId{static_cast<std::uint32_t>(symbols_.size())};
-    Symbol section_symbol;
-    section_symbol.type = elf::stt_section;
-    section_symbol.binding = Symbol::Binding::Local;
-    section_symbol.section = id;
-    symbols_.push_back(std::move(section_symbol));
-    impl_->resolving.push_back(false);
-    entry.fragments.emplace_back();
-    sections_.push_back(std::move(entry));
-    impl_->relocations.emplace_back();
-    impl_->section_map.emplace(key, id);
-    return id;
+    entry.code = (flags & elf::shf_execinstr) != 0;
+    entry.zero_fill = entry.type == elf::sht_nobits;
+    return impl_->add_section(std::move(entry), key);
+}
+
+SectionId Assembler::coff_section(std::string_view name, std::uint32_t characteristics,
+                                  std::optional<SymbolId> comdat, std::uint8_t selection) {
+    const SectionKey key{std::string(name), comdat ? comdat->value + 1 : 0U, selection};
+    if (const auto found = impl_->section_map.find(key);
+        found != impl_->section_map.end()) {
+        return found->second;
+    }
+    Section entry;
+    entry.name = std::string(name);
+    entry.type = (characteristics & coff::scn_cnt_uninitialized_data) != 0 ? elf::sht_nobits
+                                                                          : elf::sht_progbits;
+    entry.characteristics = characteristics | (comdat ? coff::scn_lnk_comdat : 0);
+    entry.group = comdat;
+    entry.selection = selection;
+    entry.code = (characteristics & coff::scn_cnt_code) != 0;
+    entry.zero_fill = (characteristics & coff::scn_cnt_uninitialized_data) != 0;
+    return impl_->add_section(std::move(entry), key);
+}
+
+SectionId Assembler::macho_section(std::string_view segment, std::string_view name,
+                                   std::uint32_t flags) {
+    const SectionKey key{std::string(segment) + "," + std::string(name), 0U, 0};
+    if (const auto found = impl_->section_map.find(key);
+        found != impl_->section_map.end()) {
+        return found->second;
+    }
+    Section entry;
+    entry.name = std::string(name);
+    entry.segment = std::string(segment);
+    entry.characteristics = flags;
+    const auto type = flags & macho::section_type;
+    entry.zero_fill = type == macho::s_zerofill || type == macho::s_gb_zerofill ||
+                      type == macho::s_thread_local_zerofill;
+    entry.type = entry.zero_fill ? elf::sht_nobits : elf::sht_progbits;
+    entry.code = (flags & (macho::s_attr_pure_instructions | macho::s_attr_some_instructions)) != 0;
+    return impl_->add_section(std::move(entry), key);
 }
 
 void Assembler::switch_section(SectionId id) {
@@ -625,8 +750,51 @@ void Assembler::emit_alignment(std::uint64_t alignment,
     fragment.alignment = alignment;
     fragment.max_skip = max_skip;
     fragment.fill = fill.value_or(0);
-    fragment.code_fill = !fill && (current.flags & elf::shf_execinstr) != 0;
+    fragment.code_fill = !fill && current.code;
     current.fragments.push_back(std::move(fragment));
+}
+
+void Assembler::emit_relaxable(std::vector<std::uint8_t> bytes, std::uint32_t offset,
+                               FixupKind kind, std::vector<std::uint8_t> relaxed,
+                               std::uint32_t relaxed_offset, FixupKind relaxed_kind,
+                               ExpressionId expression, SourceLocation location) {
+    impl_->materialize_row();
+    auto& current = section(current_);
+    Fragment fragment;
+    fragment.kind = Fragment::Kind::Relaxable;
+    const auto index = static_cast<std::uint32_t>(current.fragments.size());
+    fragment.bytes = std::move(bytes);
+    fragment.fixups.push_back({index, offset, kind, expression, location});
+    fragment.relaxed = std::move(relaxed);
+    fragment.relaxed_fixup = {index, relaxed_offset, relaxed_kind, expression, location};
+    fragment.location = location;
+    current.fragments.push_back(std::move(fragment));
+}
+
+void Assembler::begin_instruction() {
+    impl_->materialize_row();
+    sections_[current_.value].has_instructions = true;
+}
+
+std::uint64_t Assembler::section_address(SectionId id) const {
+    return id.value < impl_->section_addresses.size() ? impl_->section_addresses[id.value] : 0;
+}
+
+std::uint64_t Assembler::address(const Symbol& symbol) const {
+    return impl_->address(symbol);
+}
+
+const Symbol* Assembler::base_symbol(const Symbol& symbol) {
+    if (symbol.section || symbol.common) return &symbol;
+    if (!symbol.variable) return nullptr;
+    const auto value = evaluate(*symbol.variable, false);
+    if (!value || !value->add || value->subtract) return nullptr;
+    const auto& base = symbols_[value->add->value];
+    return base.section ? &base : nullptr;
+}
+
+std::optional<SymbolId> Assembler::atom(SymbolId id) const {
+    return impl_->atom(symbols_[id.value]);
 }
 
 // ---------------------------------------------------------------------------
@@ -641,10 +809,12 @@ ExpressionId Assembler::constant(std::int64_t value, SourceLocation location) {
     return {static_cast<std::uint32_t>(expressions_.size() - 1)};
 }
 
-ExpressionId Assembler::symbol_reference(SymbolId id, SourceLocation location) {
+ExpressionId Assembler::symbol_reference(SymbolId id, SourceLocation location,
+                                         std::uint8_t specifier) {
     Expression expression;
     expression.kind = Expression::Kind::Symbol;
     expression.symbol = id;
+    expression.specifier = specifier;
     expression.location = location;
     expressions_.push_back(expression);
     return {static_cast<std::uint32_t>(expressions_.size() - 1)};
@@ -812,7 +982,25 @@ std::optional<ExpressionId> Assembler::parse_expression(Cursor& cursor) {
                 error(location, "unterminated symbol name");
                 return std::nullopt;
             }
-            return symbol_reference(symbol(*name, location), location);
+            std::uint8_t specifier = 0;
+            if (cursor.rest().starts_with("@")) {
+                // A relocation specifier: `sym@PLT`.
+                auto probe = cursor;
+                probe.set_position(probe.position() + 1);
+                const auto spelling_location = probe.location();
+                const auto spelling = probe.identifier();
+                if (spelling) {
+                    const auto number = target_.specifier(*spelling);
+                    if (!number) {
+                        error(spelling_location, "unknown relocation specifier '@" +
+                                                     std::string(*spelling) + "'");
+                        return std::nullopt;
+                    }
+                    specifier = *number;
+                    cursor = probe;
+                }
+            }
+            return symbol_reference(symbol(*name, location), location, specifier);
         }
         error(location, std::string("unexpected '") + c + "' in expression");
         return std::nullopt;
@@ -870,6 +1058,32 @@ std::optional<std::int64_t> Assembler::absolute_now(ExpressionId id) {
     return value->constant;
 }
 
+std::optional<std::int64_t> Assembler::constant_now(ExpressionId id) {
+    const std::function<bool(ExpressionId)> label_free = [&](ExpressionId each) {
+        const auto& expression = expressions_[each.value];
+        switch (expression.kind) {
+        case Expression::Kind::Constant: return true;
+        case Expression::Kind::Symbol: {
+            const auto& entry = symbols_[expression.symbol.value];
+            if (expression.specifier != 0 || !entry.variable ||
+                entry.binding == Symbol::Binding::Weak || impl_->resolving[expression.symbol.value]) {
+                return false;
+            }
+            impl_->resolving[expression.symbol.value] = true;
+            const bool free = label_free(*entry.variable);
+            impl_->resolving[expression.symbol.value] = false;
+            return free;
+        }
+        case Expression::Kind::Unary: return label_free(expression.left);
+        case Expression::Kind::Binary:
+            return label_free(expression.left) && label_free(expression.right);
+        }
+        return false;
+    };
+    if (!label_free(id)) return std::nullopt;
+    return absolute_now(id);
+}
+
 std::optional<std::int64_t> Assembler::parse_absolute(Cursor& cursor) {
     const auto location = cursor.location();
     const auto expression = parse_expression(cursor);
@@ -883,7 +1097,8 @@ std::optional<std::int64_t> Assembler::parse_absolute(Cursor& cursor) {
     return value->constant;
 }
 
-std::optional<Value> Assembler::evaluate(ExpressionId id, bool report, bool keep_aliases) {
+std::optional<Value> Assembler::evaluate(ExpressionId id, bool report, bool keep_aliases,
+                                         bool in_set) {
     const auto& expression = expressions_[id.value];
     const auto fail = [&](std::string_view message) -> std::optional<Value> {
         if (report) error(expression.location, message);
@@ -900,6 +1115,13 @@ std::optional<Value> Assembler::evaluate(ExpressionId id, bool report, bool keep
         const auto& left = symbols_[value.add->value];
         const auto& right = symbols_[value.subtract->value];
         if (!left.section || !right.section || !(*left.section == *right.section)) {
+            return value;
+        }
+        // A COFF function's address is always relocated; a Mach-O label may
+        // move with its atom.
+        if (object_.format == Format::Coff && (left.coff_type >> 4U) == 2) return value;
+        if (object_.format == Format::MachO && !in_set &&
+            !(atom(*value.add) == atom(*value.subtract))) {
             return value;
         }
         if (impl_->layout_known || left.fragment == right.fragment) {
@@ -924,18 +1146,19 @@ std::optional<Value> Assembler::evaluate(ExpressionId id, bool report, bool keep
                 return fail("symbol '" + entry.name + "' is defined in terms of itself");
             }
             impl_->resolving[expression.symbol.value] = true;
-            auto value = evaluate(*entry.variable, report, keep_aliases);
+            auto value = evaluate(*entry.variable, report, keep_aliases, true);
             impl_->resolving[expression.symbol.value] = false;
             if (keep_aliases && value && !value->absolute() &&
                 entry.binding == Symbol::Binding::Global) {
-                return Value{expression.symbol, std::nullopt, 0};
+                return Value{expression.symbol, std::nullopt, 0, expression.specifier};
             }
+            if (value && expression.specifier != 0) value->specifier = expression.specifier;
             return value;
         }
-        return Value{expression.symbol, std::nullopt, 0};
+        return Value{expression.symbol, std::nullopt, 0, expression.specifier};
     }
     case Expression::Kind::Unary: {
-        auto operand = evaluate(expression.left, report, keep_aliases);
+        auto operand = evaluate(expression.left, report, keep_aliases, in_set);
         if (!operand) return std::nullopt;
         if (expression.op == Operator::Negate && operand->add &&
             operand->subtract) {
@@ -956,9 +1179,9 @@ std::optional<Value> Assembler::evaluate(ExpressionId id, bool report, bool keep
         }
     }
     case Expression::Kind::Binary: {
-        auto left = evaluate(expression.left, report, keep_aliases);
+        auto left = evaluate(expression.left, report, keep_aliases, in_set);
         if (!left) return std::nullopt;
-        auto right = evaluate(expression.right, report, keep_aliases);
+        auto right = evaluate(expression.right, report, keep_aliases, in_set);
         if (!right) return std::nullopt;
         if (expression.op == Operator::Add || expression.op == Operator::Subtract) {
             if (expression.op == Operator::Subtract) {
@@ -978,6 +1201,7 @@ std::optional<Value> Assembler::evaluate(ExpressionId id, bool report, bool keep
             }
             result.add = left->add ? left->add : right->add;
             result.subtract = left->subtract ? left->subtract : right->subtract;
+            result.specifier = left->add ? left->specifier : right->specifier;
             return fold(result);
         }
         *left = fold(*left);
@@ -1201,6 +1425,17 @@ void Assembler::Impl::statement(std::string_view text, SourceLocation location,
             cursor.set_position(cursor.position() + 1);
             if (active) {
                 const auto id = as.symbol(*name, label_location);
+                // As in LLVM MC: a Mach-O label the linker sees starts an
+                // atom, which a frame may not span.
+                const auto& entry = as.symbol(id);
+                if (as.object_.format == Format::MachO && open_frame &&
+                    (entry.binding == Symbol::Binding::Global ||
+                     entry.binding == Symbol::Binding::Weak) &&
+                    !entry.alt_entry) {
+                    as.error(label_location,
+                             "non-private labels cannot appear between "
+                             ".cfi_startproc / .cfi_endproc pairs");
+                }
                 as.define_label(id, label_location);
             }
             continue;
@@ -1546,6 +1781,8 @@ void Assembler::Impl::repeat(Statement& statement) {
 void Assembler::Impl::directive(Statement& statement) {
     if (as.target_.directive(as, statement)) return;
     const auto name = lower(statement.name);
+    if (as.object_.format == Format::Coff && coff_directive(name, statement)) return;
+    if (as.object_.format == Format::MachO && macho_directive(name, statement)) return;
     auto& cursor = statement.operands;
     const auto expect_end = [&]() {
         if (!cursor.at_end()) as.error(cursor.location(), "unexpected text after directive");
@@ -1657,6 +1894,505 @@ void Assembler::Impl::directive(Statement& statement) {
         return;
     }
     as.error(statement.location, "unknown directive '" + std::string(statement.name) + "'");
+}
+
+namespace {
+
+std::string trim_text(std::string_view text) {
+    const auto first = text.find_first_not_of(" \t");
+    const auto last = text.find_last_not_of(" \t");
+    return first == std::string_view::npos ? std::string{}
+                                           : std::string(text.substr(first, last - first + 1));
+}
+
+} // namespace
+
+bool Assembler::Impl::coff_directive(std::string_view name, Statement& statement) {
+    auto& cursor = statement.operands;
+    const auto expect_end = [&]() {
+        if (!cursor.at_end()) as.error(cursor.location(), "unexpected text after directive");
+    };
+    if (name == ".text" || name == ".data" || name == ".bss") {
+        expect_end();
+        const auto characteristics =
+            name == ".text"   ? coff::scn_cnt_code | coff::scn_mem_execute | coff::scn_mem_read
+            : name == ".data" ? coff::scn_cnt_initialized_data | coff::scn_mem_read | coff::scn_mem_write
+                              : coff::scn_cnt_uninitialized_data | coff::scn_mem_read | coff::scn_mem_write;
+        as.switch_section(as.coff_section(name, characteristics));
+        return true;
+    }
+    if (name == ".section" || name == ".pushsection") {
+        coff_section_directive(statement, name == ".pushsection");
+        return true;
+    }
+    if (name == ".def") {
+        const auto symbol_name = cursor.symbol_name();
+        if (!symbol_name) {
+            as.error(cursor.location(), "expected a symbol name");
+            return true;
+        }
+        if (coff_definition) as.error(statement.location, "starting a new symbol definition without ending the previous one");
+        coff_definition = as.symbol(*symbol_name, statement.location);
+        expect_end();
+        return true;
+    }
+    if (name == ".scl" || name == ".type") {
+        const auto value = as.parse_absolute(cursor);
+        if (!value) return true;
+        if (!coff_definition) {
+            as.error(statement.location, std::string(name) + " must appear inside a .def/.endef pair");
+            return true;
+        }
+        auto& entry = as.symbol(*coff_definition);
+        if (name == ".scl") {
+            if (*value < 0 || *value > 255) {
+                as.error(statement.location, "storage class value out of range");
+                return true;
+            }
+            entry.storage_class = static_cast<std::uint8_t>(*value);
+        } else {
+            if (*value < 0 || *value > 0xffff) {
+                as.error(statement.location, "type value out of range");
+                return true;
+            }
+            entry.coff_type = static_cast<std::uint16_t>(*value);
+        }
+        expect_end();
+        return true;
+    }
+    if (name == ".endef") {
+        if (!coff_definition) as.error(statement.location, ".endef without .def");
+        coff_definition.reset();
+        expect_end();
+        return true;
+    }
+    if (name == ".secrel32" || name == ".secidx" || name == ".rva") {
+        const auto kind = name == ".secrel32" ? fixup::section_offset4
+                          : name == ".secidx" ? fixup::section_index2
+                                              : fixup::image_offset4;
+        const unsigned size = name == ".secidx" ? 2 : 4;
+        do {
+            const auto location = cursor.location();
+            const auto expression = as.parse_expression(cursor);
+            if (!expression) return true;
+            as.add_fixup(kind, *expression, location);
+            const std::array<std::uint8_t, 4> zero{};
+            as.emit_bytes(std::span(zero.data(), size));
+        } while (cursor.consume(","));
+        expect_end();
+        return true;
+    }
+    if (name == ".local" || name == ".hidden" || name == ".internal" || name == ".protected" ||
+        name == ".size" || name == ".ident") {
+        as.error(statement.location, "directive '" + std::string(statement.name) +
+                                         "' is not supported in COFF objects");
+        return true;
+    }
+    return false;
+}
+
+void Assembler::Impl::coff_section_directive(Statement& statement, bool push) {
+    auto& cursor = statement.operands;
+    cursor.skip_space();
+    std::string name;
+    if (cursor.peek() == '"') {
+        auto quoted = cursor.string_literal(as.diagnostics_);
+        if (!quoted) return;
+        name = *quoted;
+    } else {
+        const auto rest = cursor.rest();
+        std::size_t end = 0;
+        while (end < rest.size() && rest[end] != ',' && !space(rest[end])) ++end;
+        name = std::string(rest.substr(0, end));
+        cursor.set_position(cursor.position() + end);
+    }
+    if (name.empty()) {
+        as.error(statement.location, "expected a section name");
+        return;
+    }
+    std::uint32_t characteristics =
+        coff::scn_cnt_initialized_data | coff::scn_mem_read | coff::scn_mem_write;
+    // The linker-directive section carries no contents and is removed; LLVM
+    // MC gives it LNK_INFO | LNK_REMOVE.
+    if (name == ".drectve") characteristics = coff::scn_lnk_info | coff::scn_lnk_remove;
+    if (cursor.consume(",")) {
+        cursor.skip_space();
+        const auto flag_location = cursor.location();
+        const auto text = cursor.string_literal(as.diagnostics_);
+        if (!text) {
+            as.error(flag_location, "expected a section flags string");
+            return;
+        }
+        // GNU as and LLVM MC flag letters.
+        enum : unsigned {
+            alloc = 1, code = 2, load = 4, init_data = 8, shared = 16, no_load = 32,
+            no_read = 64, no_write = 128, discardable = 256, info = 512,
+        };
+        unsigned flags = 0;
+        bool read_only_removed = false;
+        for (const char c : *text) {
+            switch (c) {
+            case 'a': break;
+            case 'b':
+                flags |= alloc;
+                if ((flags & init_data) != 0) {
+                    as.error(flag_location, "conflicting section flags 'b' and 'd'");
+                    return;
+                }
+                flags &= ~load;
+                break;
+            case 'd':
+                flags |= init_data;
+                if ((flags & alloc) != 0) {
+                    as.error(flag_location, "conflicting section flags 'b' and 'd'");
+                    return;
+                }
+                flags &= ~no_write;
+                if ((flags & no_load) == 0) flags |= load;
+                break;
+            case 'n': flags = (flags | no_load) & ~load; break;
+            case 'D': flags |= discardable; break;
+            case 'r':
+                read_only_removed = false;
+                flags |= no_write;
+                if ((flags & code) == 0) flags |= init_data;
+                if ((flags & no_load) == 0) flags |= load;
+                break;
+            case 's':
+                flags = (flags | shared | init_data) & ~no_write;
+                if ((flags & no_load) == 0) flags |= load;
+                break;
+            case 'w':
+                flags &= ~no_write;
+                read_only_removed = true;
+                break;
+            case 'x':
+                flags |= code;
+                if ((flags & no_load) == 0) flags |= load;
+                if (!read_only_removed) flags |= no_write;
+                break;
+            case 'y': flags |= no_read | no_write; break;
+            case 'i': flags |= info; break;
+            default:
+                as.error(flag_location, std::string("unknown section flag '") + c + "'");
+                return;
+            }
+        }
+        if (flags == 0) flags = init_data;
+        characteristics = 0;
+        if ((flags & code) != 0) characteristics |= coff::scn_cnt_code | coff::scn_mem_execute;
+        if ((flags & init_data) != 0) characteristics |= coff::scn_cnt_initialized_data;
+        if ((flags & alloc) != 0 && (flags & load) == 0) {
+            characteristics |= coff::scn_cnt_uninitialized_data;
+        }
+        if ((flags & no_load) != 0) characteristics |= coff::scn_lnk_remove;
+        if ((flags & discardable) != 0 || name.starts_with(".debug")) {
+            characteristics |= coff::scn_mem_discardable;
+        }
+        if ((flags & no_read) == 0) characteristics |= coff::scn_mem_read;
+        if ((flags & no_write) == 0) characteristics |= coff::scn_mem_write;
+        if ((flags & shared) != 0) characteristics |= coff::scn_mem_shared;
+        if ((flags & info) != 0) characteristics |= coff::scn_lnk_info;
+    }
+    std::optional<SymbolId> comdat;
+    std::uint8_t selection = 0;
+    if (cursor.consume(",")) {
+        const auto type_location = cursor.location();
+        const auto type = cursor.identifier();
+        if (!type) {
+            as.error(type_location, "expected a COMDAT type such as 'discard'");
+            return;
+        }
+        if (*type == "one_only") selection = coff::comdat_select_noduplicates;
+        else if (*type == "discard") selection = coff::comdat_select_any;
+        else if (*type == "same_size") selection = coff::comdat_select_same_size;
+        else if (*type == "same_contents") selection = coff::comdat_select_exact_match;
+        else if (*type == "associative") selection = coff::comdat_select_associative;
+        else if (*type == "largest") selection = coff::comdat_select_largest;
+        else if (*type == "newest") selection = coff::comdat_select_newest;
+        else {
+            as.error(type_location, "unknown COMDAT type '" + std::string(*type) + "'");
+            return;
+        }
+        if (!cursor.consume(",")) {
+            as.error(cursor.location(), "expected ',' before the COMDAT symbol");
+            return;
+        }
+        const auto symbol_name = cursor.symbol_name();
+        if (!symbol_name) {
+            as.error(cursor.location(), "expected the COMDAT symbol");
+            return;
+        }
+        comdat = as.symbol(*symbol_name, statement.location);
+    }
+    if (!cursor.at_end()) {
+        as.error(cursor.location(), "unexpected text after section directive");
+        return;
+    }
+    const auto id = as.coff_section(name, characteristics, comdat, selection);
+    if (push) as.push_section(id);
+    else as.switch_section(id);
+}
+
+namespace {
+
+struct MachOSectionDefault {
+    std::string_view segment;
+    std::string_view name;
+    std::uint32_t flags;
+};
+
+// LLVM MC's predefined Darwin sections, whose flags apply when a directive
+// names the section without a type.
+constexpr MachOSectionDefault macho_defaults[] = {
+    {"__TEXT", "__text", macho::s_attr_pure_instructions},
+    {"__TEXT", "__eh_frame", macho::s_coalesced | macho::s_attr_no_toc |
+                                 macho::s_attr_strip_static_syms | macho::s_attr_live_support},
+    {"__TEXT", "__cstring", macho::s_cstring_literals},
+    {"__TEXT", "__literal4", macho::s_4byte_literals},
+    {"__TEXT", "__literal8", macho::s_8byte_literals},
+    {"__TEXT", "__literal16", macho::s_16byte_literals},
+    {"__TEXT", "__textcoal_nt", macho::s_coalesced | macho::s_attr_pure_instructions},
+    {"__TEXT", "__const_coal", macho::s_coalesced},
+    {"__DATA", "__datacoal_nt", macho::s_coalesced},
+    {"__DATA", "__common", macho::s_zerofill},
+    {"__DATA", "__bss", macho::s_zerofill},
+    {"__DATA", "__thread_data", macho::s_thread_local_regular},
+    {"__DATA", "__thread_bss", macho::s_thread_local_zerofill},
+    {"__DATA", "__thread_vars", macho::s_thread_local_variables},
+    {"__DATA", "__thread_init", macho::s_thread_local_init_function_pointers},
+    {"__DATA", "__la_symbol_ptr", macho::s_lazy_symbol_pointers},
+    {"__DATA", "__nl_symbol_ptr", macho::s_non_lazy_symbol_pointers},
+    {"__DATA", "__thread_ptr", macho::s_thread_local_variable_pointers},
+    {"__DATA", "__mod_init_func", macho::s_mod_init_func_pointers},
+    {"__DATA", "__mod_term_func", macho::s_mod_term_func_pointers},
+    {"__LD", "__compact_unwind", macho::s_attr_debug},
+};
+
+struct NamedFlag {
+    std::string_view name;
+    std::uint32_t value;
+};
+
+constexpr NamedFlag macho_types[] = {
+    {"regular", macho::s_regular},
+    {"zerofill", macho::s_zerofill},
+    {"cstring_literals", macho::s_cstring_literals},
+    {"4byte_literals", macho::s_4byte_literals},
+    {"8byte_literals", macho::s_8byte_literals},
+    {"literal_pointers", macho::s_literal_pointers},
+    {"non_lazy_symbol_pointers", macho::s_non_lazy_symbol_pointers},
+    {"lazy_symbol_pointers", macho::s_lazy_symbol_pointers},
+    {"symbol_stubs", macho::s_symbol_stubs},
+    {"mod_init_funcs", macho::s_mod_init_func_pointers},
+    {"mod_term_funcs", macho::s_mod_term_func_pointers},
+    {"coalesced", macho::s_coalesced},
+    {"interposing", macho::s_interposing},
+    {"16byte_literals", macho::s_16byte_literals},
+    {"lazy_dylib_symbol_pointers", macho::s_lazy_dylib_symbol_pointers},
+    {"thread_local_regular", macho::s_thread_local_regular},
+    {"thread_local_zerofill", macho::s_thread_local_zerofill},
+    {"thread_local_variables", macho::s_thread_local_variables},
+    {"thread_local_variable_pointers", macho::s_thread_local_variable_pointers},
+    {"thread_local_init_function_pointers", macho::s_thread_local_init_function_pointers},
+};
+
+constexpr NamedFlag macho_attributes[] = {
+    {"pure_instructions", macho::s_attr_pure_instructions},
+    {"no_toc", macho::s_attr_no_toc},
+    {"strip_static_syms", macho::s_attr_strip_static_syms},
+    {"no_dead_strip", macho::s_attr_no_dead_strip},
+    {"live_support", macho::s_attr_live_support},
+    {"self_modifying_code", macho::s_attr_self_modifying_code},
+    {"debug", macho::s_attr_debug},
+};
+
+std::uint32_t macho_default_flags(std::string_view segment, std::string_view name) {
+    if (segment == "__DWARF") return macho::s_attr_debug;
+    for (const auto& entry : macho_defaults) {
+        if (entry.segment == segment && entry.name == name) return entry.flags;
+    }
+    return macho::s_regular;
+}
+
+} // namespace
+
+void Assembler::Impl::macho_section_directive(Statement& statement, bool push) {
+    auto& cursor = statement.operands;
+    // `.section segment,section[,type[,attribute+attribute...[,stub size]]]`
+    std::vector<std::string> parts;
+    {
+        std::string current;
+        for (const char c : cursor.rest()) {
+            if (c == ',') {
+                parts.push_back(trim_text(current));
+                current.clear();
+            } else {
+                current.push_back(c);
+            }
+        }
+        parts.push_back(trim_text(current));
+        cursor.set_position(cursor.text().size());
+    }
+    if (parts.size() < 2 || parts[0].empty() || parts[1].empty()) {
+        as.error(statement.location, "expected 'segment,section' in Mach-O section directive");
+        return;
+    }
+    if (parts[0].size() > 16 || parts[1].size() > 16) {
+        as.error(statement.location, "Mach-O segment and section names have at most 16 characters");
+        return;
+    }
+    std::uint32_t flags = macho_default_flags(parts[0], parts[1]);
+    if (parts.size() >= 3) {
+        const auto found = std::find_if(std::begin(macho_types), std::end(macho_types),
+                                        [&](const NamedFlag& entry) { return entry.name == parts[2]; });
+        if (found == std::end(macho_types)) {
+            as.error(statement.location, "unknown Mach-O section type '" + parts[2] + "'");
+            return;
+        }
+        flags = found->value;
+        if (parts.size() >= 4) {
+            std::string_view attributes = parts[3];
+            while (!attributes.empty()) {
+                const auto plus = attributes.find('+');
+                const auto attribute = trim_text(attributes.substr(0, plus));
+                const auto match = std::find_if(std::begin(macho_attributes), std::end(macho_attributes),
+                                                [&](const NamedFlag& entry) { return entry.name == attribute; });
+                if (match == std::end(macho_attributes)) {
+                    as.error(statement.location, "unknown Mach-O section attribute '" + attribute + "'");
+                    return;
+                }
+                flags |= match->value;
+                if (plus == std::string_view::npos) break;
+                attributes.remove_prefix(plus + 1);
+            }
+        }
+    }
+    const auto id = as.macho_section(parts[0], parts[1], flags);
+    if (push) as.push_section(id);
+    else as.switch_section(id);
+}
+
+bool Assembler::Impl::macho_directive(std::string_view name, Statement& statement) {
+    auto& cursor = statement.operands;
+    const auto expect_end = [&]() {
+        if (!cursor.at_end()) as.error(cursor.location(), "unexpected text after directive");
+    };
+    struct Shorthand {
+        std::string_view directive, segment, section;
+    };
+    static constexpr Shorthand shorthands[] = {
+        {".text", "__TEXT", "__text"},         {".data", "__DATA", "__data"},
+        {".bss", "__DATA", "__bss"},           {".const", "__TEXT", "__const"},
+        {".const_data", "__DATA", "__const"},  {".cstring", "__TEXT", "__cstring"},
+        {".literal4", "__TEXT", "__literal4"}, {".literal8", "__TEXT", "__literal8"},
+        {".literal16", "__TEXT", "__literal16"},
+        {".mod_init_func", "__DATA", "__mod_init_func"},
+        {".mod_term_func", "__DATA", "__mod_term_func"},
+        {".static_data", "__DATA", "__static_data"},
+    };
+    for (const auto& entry : shorthands) {
+        if (entry.directive != name) continue;
+        expect_end();
+        as.switch_section(as.macho_section(entry.segment, entry.section,
+                                           macho_default_flags(entry.segment, entry.section)));
+        return true;
+    }
+    if (name == ".section" || name == ".pushsection") {
+        macho_section_directive(statement, name == ".pushsection");
+        return true;
+    }
+    if (name == ".private_extern" || name == ".weak_definition" || name == ".weak_reference" ||
+        name == ".no_dead_strip" || name == ".alt_entry") {
+        do {
+            const auto location = cursor.location();
+            const auto symbol_name = cursor.symbol_name();
+            if (!symbol_name) {
+                as.error(location, "expected a symbol name");
+                return true;
+            }
+            auto& entry = as.symbol(as.symbol(*symbol_name, location));
+            if (name == ".private_extern") {
+                entry.private_extern = true;
+                if (entry.binding == Symbol::Binding::Unset) entry.binding = Symbol::Binding::Global;
+            } else if (name == ".weak_definition") {
+                entry.weak_definition = true;
+            } else if (name == ".weak_reference") {
+                entry.weak_reference = true;
+            } else if (name == ".no_dead_strip") {
+                entry.no_dead_strip = true;
+            } else {
+                entry.alt_entry = true;
+            }
+        } while (cursor.consume(","));
+        expect_end();
+        return true;
+    }
+    if (name == ".subsections_via_symbols") {
+        expect_end();
+        subsections_via_symbols = true;
+        return true;
+    }
+    if (name == ".zerofill") {
+        // `.zerofill segment,section[,symbol,size[,align power]]`
+        const auto segment = cursor.identifier();
+        if (!segment || !cursor.consume(",")) {
+            as.error(cursor.location(), "expected 'segment,section'");
+            return true;
+        }
+        const auto section_name = cursor.identifier();
+        if (!section_name) {
+            as.error(cursor.location(), "expected a section name");
+            return true;
+        }
+        const auto id = as.macho_section(*segment, *section_name, macho::s_zerofill);
+        if (!cursor.consume(",")) {
+            expect_end();
+            return true;
+        }
+        const auto symbol_name = cursor.symbol_name();
+        if (!symbol_name || !cursor.consume(",")) {
+            as.error(cursor.location(), "expected 'symbol, size'");
+            return true;
+        }
+        const auto size_value = as.parse_absolute(cursor);
+        if (!size_value) return true;
+        std::int64_t power = 0;
+        if (cursor.consume(",")) {
+            const auto value = as.parse_absolute(cursor);
+            if (!value) return true;
+            power = *value;
+        }
+        expect_end();
+        if (power < 0 || power > 15) {
+            as.error(statement.location, "alignment power is out of range");
+            return true;
+        }
+        const auto saved = as.current_;
+        const auto saved_previous = previous;
+        as.current_ = id;
+        as.emit_alignment(std::uint64_t{1} << power, std::nullopt, 0);
+        as.define_label(as.symbol(*symbol_name, statement.location), statement.location);
+        auto& bytes = as.section(id).fragments.back().bytes;
+        bytes.insert(bytes.end(), static_cast<std::size_t>(*size_value), 0);
+        as.current_ = saved;
+        previous = saved_previous;
+        return true;
+    }
+    if (name == ".local" || name == ".hidden" || name == ".internal" || name == ".protected" ||
+        name == ".weak" || name == ".size" || name == ".type" || name == ".ident") {
+        as.error(statement.location, "directive '" + std::string(statement.name) +
+                                         "' is not supported in Mach-O objects");
+        return true;
+    }
+    if (name == ".build_version" || name == ".macosx_version_min" || name == ".ios_version_min" ||
+        name == ".tvos_version_min" || name == ".watchos_version_min" || name == ".tbss" ||
+        name == ".tlv" || name == ".indirect_symbol" || name == ".linker_option" ||
+        name == ".lazy_reference" || name == ".reference" || name == ".desc") {
+        as.error(statement.location, "unsupported Mach-O directive '" + std::string(statement.name) + "'");
+        return true;
+    }
+    return false;
 }
 
 void Assembler::Impl::data(Statement& statement, unsigned size) {
@@ -1786,7 +2522,7 @@ void Assembler::Impl::reserve(Statement& statement, bool zero) {
             return;
         }
         auto& current = as.section(as.current_);
-        if (current.type == elf::sht_nobits && fill_byte != 0) {
+        if (current.zero_fill && fill_byte != 0) {
             as.error(location, "a NOBITS section cannot hold nonzero data");
         }
         if (current.fragments.back().kind != Fragment::Kind::Data) current.fragments.emplace_back();
@@ -2239,6 +2975,14 @@ void Assembler::Impl::common(Statement& statement, bool local) {
         const auto value = as.parse_absolute(cursor);
         if (!value) return;
         alignment = *value;
+        // Mach-O alignments are powers of two.
+        if (as.object_.format == Format::MachO) {
+            if (alignment < 0 || alignment > 15) {
+                as.error(statement.location, "alignment power is out of range");
+                return;
+            }
+            alignment = std::int64_t{1} << alignment;
+        }
     }
     if (alignment <= 0 || !std::has_single_bit(static_cast<std::uint64_t>(alignment))) {
         as.error(statement.location, "alignment must be a power of two");
@@ -2248,7 +2992,18 @@ void Assembler::Impl::common(Statement& statement, bool local) {
     if (local) {
         const auto saved = as.current_;
         const auto saved_previous = previous;
-        as.current_ = as.section(".bss", elf::sht_nobits, elf::shf_alloc | elf::shf_write);
+        switch (as.object_.format) {
+        case Format::Elf:
+            as.current_ = as.section(".bss", elf::sht_nobits, elf::shf_alloc | elf::shf_write);
+            break;
+        case Format::Coff:
+            as.current_ = as.coff_section(".bss", coff::scn_cnt_uninitialized_data |
+                                                      coff::scn_mem_read | coff::scn_mem_write);
+            break;
+        case Format::MachO:
+            as.current_ = as.macho_section("__DATA", "__bss", macho::s_zerofill);
+            break;
+        }
         as.emit_alignment(static_cast<std::uint64_t>(alignment), std::nullopt, 0);
         as.define_label(id, statement.location);
         auto& entry = as.symbol(id);
@@ -2662,6 +3417,7 @@ bool Assembler::Impl::layout(bool report) {
                 fragment.address = address;
                 switch (fragment.kind) {
                 case Fragment::Kind::Data:
+                case Fragment::Kind::Relaxable:
                     fragment.size = fragment.bytes.size();
                     break;
                 case Fragment::Kind::Align: {
@@ -2749,11 +3505,88 @@ bool Assembler::Impl::layout(bool report) {
         }
         return {changed, ok};
     };
-    for (unsigned iteration = 0; iteration < 256; ++iteration) {
-        if (!pass(false).first) break;
+    // Relaxes the instructions whose short form cannot reach their target
+    // in the current layout; a relaxed instruction never shrinks back.
+    const auto relax = [&]() {
+        bool changed = false;
+        for (std::size_t index = 0; index < as.sections_.size(); ++index) {
+            for (auto& fragment : as.sections_[index].fragments) {
+                if (fragment.kind != Fragment::Kind::Relaxable) continue;
+                const auto& fixup = fragment.fixups.front();
+                bool grow = true;
+                const auto value = as.evaluate(fixup.expression, false, true);
+                if (value && value->add && !value->subtract && value->specifier == 0 &&
+                    resolves_in_place(*value, index, fixup)) {
+                    const auto displacement =
+                        static_cast<std::int64_t>(address(as.symbols_[value->add->value])) +
+                        value->constant -
+                        static_cast<std::int64_t>(fragment.address + fixup.offset) - 1;
+                    grow = displacement < -128 || displacement > 127;
+                }
+                if (!grow) continue;
+                fragment.kind = Fragment::Kind::Data;
+                fragment.bytes = std::move(fragment.relaxed);
+                fragment.fixups.assign(1, fragment.relaxed_fixup);
+                changed = true;
+            }
+        }
+        return changed;
+    };
+    for (unsigned iteration = 0; iteration < 4096; ++iteration) {
+        const bool sizes_changed = pass(false).first;
+        if (!relax() && !sizes_changed) break;
     }
     if (!report) return true;
     return pass(true).second;
+}
+
+std::optional<SymbolId> Assembler::Impl::atom(const Symbol& symbol) {
+    if (!symbol.section || symbol.type == elf::stt_section) return std::nullopt;
+    const SymbolId id{static_cast<std::uint32_t>(&symbol - as.symbols_.data())};
+    if (!symbol.temporary && !symbol.alt_entry) return id;
+    build_atoms();
+    const auto& list = atoms[symbol.section->value];
+    const auto key = std::tuple{symbol.fragment, symbol.offset, symbol.definition};
+    const auto found = std::lower_bound(list.begin(), list.end(), key, [](const auto& entry, const auto& k) {
+        return std::tuple{std::get<0>(entry), std::get<1>(entry), std::get<2>(entry)} < k;
+    });
+    if (found == list.begin()) return std::nullopt;
+    return std::get<3>(*std::prev(found));
+}
+
+std::optional<SymbolId> Assembler::Impl::atom_at(std::size_t section_index, std::uint32_t fragment,
+                                                 std::uint64_t offset) {
+    build_atoms();
+    const auto& list = atoms[section_index];
+    const auto found = std::upper_bound(list.begin(), list.end(), std::pair{fragment, offset},
+                                        [](const auto& k, const auto& entry) {
+                                            return k < std::pair{std::get<0>(entry), std::get<1>(entry)};
+                                        });
+    if (found == list.begin()) return std::nullopt;
+    return std::get<3>(*std::prev(found));
+}
+
+bool Assembler::Impl::resolves_in_place(const Value& value, std::size_t section_index,
+                                        const Fixup& fixup) {
+    if (!value.add || value.specifier != 0) return false;
+    const auto* target = as.base_symbol(as.symbols_[value.add->value]);
+    if (!target || !target->section || target->section->value != section_index) return false;
+    const auto& symbol = as.symbols_[value.add->value];
+    switch (as.object_.format) {
+    case Format::Elf:
+        // A global symbol may be preempted; an ifunc goes through the PLT.
+        return (symbol.binding == Symbol::Binding::Local ||
+                (symbol.binding == Symbol::Binding::Unset && symbol.defined())) &&
+               symbol.type != elf::stt_gnu_ifunc;
+    case Format::Coff:
+        // Relocations to functions stay for the linker's incremental and
+        // control-flow-guard tables, as in LLVM MC.
+        return (symbol.coff_type >> 4U) != 2 && symbol.binding != Symbol::Binding::Weak;
+    case Format::MachO:
+        // Within one atom only.
+        return atom(*target) == atom_at(section_index, fixup.fragment, fixup.offset);
+    }
+    return false;
 }
 
 namespace {
@@ -2825,11 +3658,40 @@ struct Builder {
 
 } // namespace
 
+SectionId Assembler::Impl::frame_section(bool eh) {
+    switch (as.object_.format) {
+    case Format::Elf:
+        return eh ? as.section(".eh_frame", elf::sht_progbits, elf::shf_alloc)
+                  : as.section(".debug_frame", elf::sht_progbits, 0);
+    case Format::Coff:
+        return eh ? as.coff_section(".eh_frame", coff::scn_cnt_initialized_data | coff::scn_mem_read)
+                  : debug_section(".debug_frame");
+    case Format::MachO:
+        return eh ? as.macho_section("__TEXT", "__eh_frame", macho_default_flags("__TEXT", "__eh_frame"))
+                  : debug_section(".debug_frame");
+    }
+    return {};
+}
+
+SectionId Assembler::Impl::debug_section(std::string_view name) {
+    switch (as.object_.format) {
+    case Format::Elf: return as.section(name, elf::sht_progbits, 0);
+    case Format::Coff:
+        return as.coff_section(name, coff::scn_cnt_initialized_data | coff::scn_mem_discardable |
+                                         coff::scn_mem_read);
+    case Format::MachO:
+        // Mach-O section names have at most 16 characters: `.debug_x`
+        // becomes `__debug_x`.
+        return as.macho_section("__DWARF", ("__" + std::string(name.substr(1))).substr(0, 16),
+                                macho::s_attr_debug);
+    }
+    return {};
+}
+
 void Assembler::Impl::emit_frames(bool eh) {
     const auto facts = as.target_.frame_facts();
     const unsigned address_size = as.object_.elf64 ? 8 : 4;
-    const auto id = as.section(eh ? ".eh_frame" : ".debug_frame", elf::sht_progbits,
-                               eh ? elf::shf_alloc : 0);
+    const auto id = frame_section(eh);
     auto& section = as.sections_[id.value];
     const std::uint64_t base = section.size;
     Builder out;
@@ -2909,12 +3771,14 @@ void Assembler::Impl::emit_frames(bool eh) {
         if (eh) {
             word(out.bytes.size() - cie_offset, 4);
         } else {
-            reference(section.symbol, 4, fixup::data4, static_cast<std::int64_t>(base + cie_offset));
+            reference(section.symbol, 4, fixup::section_offset4,
+                      static_cast<std::int64_t>(base + cie_offset));
         }
         const auto begin = address(as.symbols_[frame.begin.value]);
         const auto end = address(as.symbols_[frame.end->value]);
         if (eh && (pointer_encoding & 0x70) == 0x10) {
-            reference(frame.begin, 4, fixup::data4_pc, 0);
+            reference(frame.begin, pointer_size,
+                      pointer_size == 8 ? fixup::data8_pc : fixup::data4_pc, 0);
         } else {
             reference(frame.begin, pointer_size,
                       FixupKind{static_cast<std::uint16_t>(pointer_size)}, 0);
@@ -3039,7 +3903,7 @@ void Assembler::Impl::emit_line_table() {
     const unsigned version = root_file ? 5 : 4;
     const auto facts = as.target_.frame_facts();
     const unsigned address_size = as.object_.elf64 ? 8 : 4;
-    const auto id = as.section(".debug_line", elf::sht_progbits, 0);
+    const auto id = debug_section(".debug_line");
     std::optional<SectionId> strings_id;
     std::vector<std::uint8_t> string_bytes;
     std::unordered_map<std::string, std::uint32_t> string_offsets;
@@ -3051,8 +3915,10 @@ void Assembler::Impl::emit_line_table() {
     };
     const auto line_string = [&](const std::string& text) {
         if (!strings_id) {
-            strings_id = as.section(".debug_line_str", elf::sht_progbits,
-                                    elf::shf_merge | elf::shf_strings, 1);
+            strings_id = as.object_.format == Format::Elf
+                             ? as.section(".debug_line_str", elf::sht_progbits,
+                                          elf::shf_merge | elf::shf_strings, 1)
+                             : debug_section(".debug_line_str");
         }
         const auto [entry, inserted] =
             string_offsets.try_emplace(text, static_cast<std::uint32_t>(string_bytes.size()));
@@ -3064,7 +3930,7 @@ void Assembler::Impl::emit_line_table() {
         if (entry->second != 0) {
             expression = as.binary(Operator::Add, expression, as.constant(entry->second, {}));
         }
-        out.fixups.push_back({out.bytes.size(), fixup::data4, expression});
+        out.fixups.push_back({out.bytes.size(), fixup::section_offset4, expression});
         word(0, 4);
     };
     const auto c_string = [&](const std::string& text) {
@@ -3216,12 +4082,156 @@ void Assembler::Impl::emit_line_table() {
 // ---------------------------------------------------------------------------
 // Fixups, symbols, and the object file
 
+bool Assembler::Impl::apply(const Fixup& fixup, const FixupInfo& info, std::int64_t number,
+                            std::span<std::uint8_t> bytes, bool relocated) {
+    if (fixup.kind.value < FixupKind::target_base) {
+        // COFF REL32 counts from the end of the field.
+        if (relocated && as.object_.format == Format::Coff && fixup.kind == fixup::data4_pc) {
+            number += 4;
+        }
+        if (!relocated && !fits(number, info.size)) {
+            as.error(fixup.location, "value " + std::to_string(number) + " does not fit in " +
+                                         std::to_string(info.size) + " bytes");
+            return false;
+        }
+        as.write_integer(bytes, static_cast<std::uint64_t>(number));
+        return true;
+    }
+    return as.target_.apply_fixup(as, fixup, number, bytes, relocated);
+}
+
+namespace {
+
+bool local_binding(const Symbol& symbol) {
+    return symbol.binding == Symbol::Binding::Local ||
+           (symbol.binding == Symbol::Binding::Unset && symbol.defined());
+}
+
+} // namespace
+
+bool Assembler::Impl::record_elf(std::size_t section_index, Fragment& fragment, Fixup& fixup,
+                                 FixupInfo& info, Value& value, std::span<std::uint8_t> bytes) {
+    const auto place = fragment.address + fixup.offset;
+    if (fixup.kind == fixup::section_offset4) fixup.kind = fixup::data4;
+    if (value.subtract) {
+        const auto& subtracted = as.symbols_[value.subtract->value];
+        if (value.add && subtracted.section && subtracted.section->value == section_index &&
+            (fixup.kind == fixup::data4 || fixup.kind == fixup::data8)) {
+            value.constant += static_cast<std::int64_t>(place) -
+                              static_cast<std::int64_t>(address(subtracted));
+            value.subtract.reset();
+            fixup.kind = fixup.kind == fixup::data4 ? fixup::data4_pc : fixup::data8_pc;
+            info.pc_relative = true;
+        } else {
+            as.error(fixup.location, "cannot represent a difference of symbols in different sections");
+            return false;
+        }
+    }
+    if (value.absolute()) {
+        if (info.pc_relative) {
+            as.error(fixup.location, "the target of a PC-relative field must be a symbol");
+            return false;
+        }
+        return apply(fixup, info, value.constant, bytes, false);
+    }
+    const auto& target_symbol = as.symbols_[value.add->value];
+    if (info.pc_relative && resolves_in_place(value, section_index, fixup)) {
+        const auto* base = as.base_symbol(target_symbol);
+        return apply(fixup, info,
+                     static_cast<std::int64_t>(address(*base)) + value.constant -
+                         static_cast<std::int64_t>(place),
+                     bytes, false);
+    }
+    if (!target_symbol.defined() && target_symbol.temporary) {
+        as.error(fixup.location, "undefined local symbol '" + target_symbol.name + "'");
+        return false;
+    }
+    const Section* symbol_section =
+        target_symbol.section ? &as.sections_[target_symbol.section->value] : nullptr;
+    const auto choice = as.target_.relocation(as, fixup, value, target_symbol, symbol_section);
+    if (!choice) return false;
+    SymbolId relocated = *value.add;
+    std::int64_t addend = value.constant;
+    if (target_symbol.section && local_binding(target_symbol) &&
+        target_symbol.type != elf::stt_section) {
+        const bool keep = choice->keep_symbol ||
+                          ((symbol_section->flags & elf::shf_merge) != 0 && addend != 0);
+        if (!keep) {
+            relocated = symbol_section->symbol;
+            addend += static_cast<std::int64_t>(address(target_symbol));
+        }
+    }
+    as.symbols_[relocated.value].used_in_relocation = true;
+    if (as.object_.rela) {
+        addend += choice->rela_bias;
+    } else if (!apply(fixup, info, addend, bytes, true)) {
+        return false;
+    }
+    relocations[section_index].push_back({place, choice->type, relocated, addend});
+    return true;
+}
+
+bool Assembler::Impl::record_coff(std::size_t section_index, Fragment& fragment, Fixup& fixup,
+                                  FixupInfo& info, Value& value, std::span<std::uint8_t> bytes) {
+    const auto place = fragment.address + fixup.offset;
+    std::int64_t field = value.constant;
+    if (value.subtract) {
+        // A - B with B in this section: a PC-relative field.
+        const auto& subtracted = as.symbols_[value.subtract->value];
+        if (!value.add || !subtracted.section || subtracted.section->value != section_index ||
+            !(fixup.kind == fixup::data4 || fixup.kind == fixup::data8)) {
+            as.error(fixup.location, "cannot represent this difference of symbols in COFF");
+            return false;
+        }
+        field += static_cast<std::int64_t>(place) - static_cast<std::int64_t>(address(subtracted));
+        value.subtract.reset();
+        fixup.kind = fixup::data4_pc;
+        info.pc_relative = true;
+    }
+    if (value.absolute()) {
+        if (info.pc_relative) {
+            as.error(fixup.location, "the target of a PC-relative field must be a symbol");
+            return false;
+        }
+        if (fixup.kind == fixup::section_offset4 || fixup.kind == fixup::section_index2 ||
+            fixup.kind == fixup::image_offset4) {
+            as.error(fixup.location, "this directive needs a symbol");
+            return false;
+        }
+        return apply(fixup, info, field, bytes, false);
+    }
+    const auto& target_symbol = as.symbols_[value.add->value];
+    if (info.pc_relative && resolves_in_place(value, section_index, fixup)) {
+        const auto* base = as.base_symbol(target_symbol);
+        return apply(fixup, info,
+                     static_cast<std::int64_t>(address(*base)) + field -
+                         static_cast<std::int64_t>(place),
+                     bytes, false);
+    }
+    if (!target_symbol.defined() && target_symbol.temporary) {
+        as.error(fixup.location, "undefined local symbol '" + target_symbol.name + "'");
+        return false;
+    }
+    const auto* base = as.base_symbol(target_symbol);
+    const Section* symbol_section =
+        base && base->section ? &as.sections_[base->section->value] : nullptr;
+    const auto choice = as.target_.relocation(as, fixup, value, target_symbol, symbol_section);
+    if (!choice) return false;
+    SymbolId relocated = *value.add;
+    if (target_symbol.temporary && base && base->section) {
+        // Temporary labels are not in the symbol table: name the section.
+        relocated = symbol_section->symbol;
+        field += static_cast<std::int64_t>(address(*base));
+    }
+    if (fixup.kind == fixup::section_index2) field = 0;
+    as.symbols_[relocated.value].used_in_relocation = true;
+    if (!apply(fixup, info, field, bytes, true)) return false;
+    relocations[section_index].push_back({place, choice->type, relocated, 0});
+    return true;
+}
+
 bool Assembler::Impl::resolve_fixups() {
     bool ok = true;
-    const auto local = [](const Symbol& symbol) {
-        return symbol.binding == Symbol::Binding::Local ||
-               (symbol.binding == Symbol::Binding::Unset && symbol.defined());
-    };
     for (std::size_t section_index = 0; section_index < as.sections_.size(); ++section_index) {
         auto& section = as.sections_[section_index];
         for (auto& fragment : section.fragments) {
@@ -3229,14 +4239,16 @@ bool Assembler::Impl::resolve_fixups() {
                 auto fixup = original;
                 FixupInfo info;
                 if (fixup.kind.value < FixupKind::target_base) {
-                    info.size = fixup.kind == fixup::data4_pc ? 4U : fixup.kind.value;
-                    info.pc_relative = fixup.kind == fixup::data4_pc;
+                    info.pc_relative = fixup.kind == fixup::data4_pc || fixup.kind == fixup::data8_pc;
+                    info.size = fixup.kind == fixup::data8_pc            ? 8U
+                                : fixup.kind == fixup::section_index2    ? 2U
+                                : fixup.kind.value > 8 ? 4U : fixup.kind.value;
                 } else {
                     info = as.target_.fixup_info(fixup.kind);
                 }
                 std::span<std::uint8_t> bytes(fragment.bytes.data() + fixup.offset, info.size);
-                if (section.type == elf::sht_nobits) {
-                    as.error(fixup.location, "a NOBITS section cannot hold relocated data");
+                if (section.zero_fill) {
+                    as.error(fixup.location, "a zero-fill section cannot hold relocated data");
                     ok = false;
                     continue;
                 }
@@ -3245,85 +4257,64 @@ bool Assembler::Impl::resolve_fixups() {
                     ok = false;
                     continue;
                 }
-                const auto place = fragment.address + fixup.offset;
-                if (value->subtract) {
-                    const auto& subtracted = as.symbols_[value->subtract->value];
-                    if (value->add && subtracted.section &&
-                        subtracted.section->value == section_index &&
-                        fixup.kind == fixup::data4) {
-                        value->constant += static_cast<std::int64_t>(place) -
-                                           static_cast<std::int64_t>(address(subtracted));
-                        value->subtract.reset();
-                        fixup.kind = fixup::data4_pc;
-                        info.pc_relative = true;
-                    } else {
-                        as.error(fixup.location,
-                                 "cannot represent a difference of symbols in different sections");
-                        ok = false;
-                        continue;
+                switch (as.object_.format) {
+                case Format::Elf:
+                    if (!record_elf(section_index, fragment, fixup, info, *value, bytes)) ok = false;
+                    break;
+                case Format::Coff:
+                    if (!record_coff(section_index, fragment, fixup, info, *value, bytes)) ok = false;
+                    break;
+                case Format::MachO: {
+                    const auto place = fragment.address + fixup.offset;
+                    if (value->absolute() && !info.pc_relative &&
+                        fixup.kind != fixup::section_offset4) {
+                        if (!apply(fixup, info, value->constant, bytes, false)) ok = false;
+                        break;
                     }
-                }
-                const auto apply = [&](std::int64_t number, bool relocated) {
-                    if (fixup.kind.value < FixupKind::target_base) {
-                        if (!relocated && !fits(number, info.size)) {
-                            as.error(fixup.location, "value " + std::to_string(number) +
-                                                         " does not fit in " +
-                                                         std::to_string(info.size) + " bytes");
+                    if (fixup.kind == fixup::section_offset4 && value->add && !value->subtract) {
+                        // DWARF section offsets are plain numbers in Mach-O.
+                        const auto* base = as.base_symbol(as.symbols_[value->add->value]);
+                        if (!base || !base->section) {
+                            as.error(fixup.location, "a section offset needs a defined symbol");
                             ok = false;
-                            return;
+                            break;
                         }
-                        as.write_integer(bytes, static_cast<std::uint64_t>(number));
-                        return;
+                        if (!apply(fixup, info,
+                                   static_cast<std::int64_t>(address(*base)) + value->constant,
+                                   bytes, false)) {
+                            ok = false;
+                        }
+                        break;
                     }
-                    if (!as.target_.apply_fixup(as, fixup, number, bytes, relocated)) ok = false;
-                };
-                if (value->absolute()) {
-                    if (info.pc_relative) {
-                        as.error(fixup.location, "the target of a PC-relative field must be a symbol");
+                    if (info.pc_relative && !value->subtract &&
+                        resolves_in_place(*value, section_index, fixup)) {
+                        const auto* base = as.base_symbol(as.symbols_[value->add->value]);
+                        if (!apply(fixup, info,
+                                   static_cast<std::int64_t>(address(*base)) + value->constant -
+                                       static_cast<std::int64_t>(place),
+                                   bytes, false)) {
+                            ok = false;
+                        }
+                        break;
+                    }
+                    std::int64_t field = 0;
+                    std::vector<Relocation> records;
+                    const auto field_address =
+                        as.sections_[section_index].size == 0 ? place : place;  // section-relative
+                    if (!as.target_.macho_relocation(as, SectionId{static_cast<std::uint32_t>(section_index)},
+                                                     fixup, place, field_address, *value, field, records)) {
                         ok = false;
-                        continue;
+                        break;
                     }
-                    apply(value->constant, false);
-                    continue;
-                }
-                const auto& target_symbol = as.symbols_[value->add->value];
-                if (info.pc_relative && target_symbol.section &&
-                    target_symbol.section->value == section_index && local(target_symbol)) {
-                    apply(static_cast<std::int64_t>(address(target_symbol)) + value->constant -
-                              static_cast<std::int64_t>(place),
-                          false);
-                    continue;
-                }
-                if (!target_symbol.defined() && target_symbol.temporary) {
-                    as.error(fixup.location, "undefined local symbol '" + target_symbol.name + "'");
-                    ok = false;
-                    continue;
-                }
-                const Section* symbol_section =
-                    target_symbol.section ? &as.sections_[target_symbol.section->value] : nullptr;
-                const auto choice = as.target_.relocation(as, fixup, target_symbol, symbol_section);
-                if (!choice) {
-                    ok = false;
-                    continue;
-                }
-                SymbolId relocated = *value->add;
-                std::int64_t addend = value->constant;
-                if (target_symbol.section && local(target_symbol) &&
-                    target_symbol.type != elf::stt_section) {
-                    const bool keep = choice->keep_symbol ||
-                                      ((symbol_section->flags & elf::shf_merge) != 0 && addend != 0);
-                    if (!keep) {
-                        relocated = symbol_section->symbol;
-                        addend += static_cast<std::int64_t>(address(target_symbol));
+                    // The target computed the field's exact in-place value.
+                    as.write_integer(bytes, static_cast<std::uint64_t>(field));
+                    for (auto& record : records) {
+                        as.symbols_[record.symbol.value].used_in_relocation = true;
+                        relocations[section_index].push_back(record);
                     }
+                    break;
                 }
-                as.symbols_[relocated.value].used_in_relocation = true;
-                if (as.object_.rela) {
-                    addend += choice->rela_bias;
-                } else {
-                    apply(addend, true);
                 }
-                relocations[section_index].push_back({place, choice->type, relocated, addend});
             }
         }
     }
@@ -3332,12 +4323,49 @@ bool Assembler::Impl::resolve_fixups() {
                          [](const Relocation& left, const Relocation& right) {
                              return left.offset < right.offset;
                          });
-        if (!as.object_.rela) as.target_.order_relocations(entries);
+        if (as.object_.format == Format::Elf && !as.object_.rela) {
+            as.target_.order_relocations(entries);
+        }
     }
     return ok;
 }
 
+std::vector<std::uint8_t> Assembler::section_contents(SectionId id) const {
+    const auto& section = sections_[id.value];
+    std::vector<std::uint8_t> data;
+    data.reserve(section.size);
+    for (const auto& fragment : section.fragments) {
+        switch (fragment.kind) {
+        case Fragment::Kind::Data:
+        case Fragment::Kind::Leb:
+        case Fragment::Kind::Relaxable:
+            data.insert(data.end(), fragment.bytes.begin(), fragment.bytes.end());
+            break;
+        case Fragment::Kind::Align:
+        case Fragment::Kind::Fill:
+        case Fragment::Kind::Org: {
+            const auto start = data.size();
+            data.insert(data.end(), fragment.size, fragment.code_fill ? 0 : fragment.fill);
+            if (fragment.code_fill) {
+                target_.code_padding(std::span(data.data() + start, fragment.size));
+            }
+            break;
+        }
+        }
+    }
+    return data;
+}
+
 std::vector<std::uint8_t> Assembler::Impl::write() {
+    switch (as.object_.format) {
+    case Format::Elf: return write_elf_object();
+    case Format::Coff: return write_coff(as, relocations, file_symbols);
+    case Format::MachO: return write_macho(as, relocations, subsections_via_symbols);
+    }
+    return {};
+}
+
+std::vector<std::uint8_t> Assembler::Impl::write_elf_object() {
     const bool wide = as.object_.elf64;
     const bool big = as.object_.big_endian;
     StringTable strings;
@@ -3544,27 +4572,14 @@ std::vector<std::uint8_t> Assembler::Impl::write() {
                 }
             }
         } else {
-            entry.data.reserve(section.size);
-            for (const auto& fragment : section.fragments) {
-                switch (fragment.kind) {
-                case Fragment::Kind::Data:
-                case Fragment::Kind::Leb:
-                    entry.data.insert(entry.data.end(), fragment.bytes.begin(), fragment.bytes.end());
-                    break;
-                case Fragment::Kind::Align:
-                case Fragment::Kind::Fill:
-                case Fragment::Kind::Org:
-                    entry.data.insert(entry.data.end(), fragment.size,
-                                      fragment.code_fill ? 0 : fragment.fill);
-                    break;
-                }
-            }
+            entry.data = as.section_contents(SectionId{static_cast<std::uint32_t>(index)});
         }
         if (relocation_index[index] == 0) continue;
         auto& rel = output[relocation_index[index] - 1];
         rel.name = strings.add((as.object_.rela ? ".rela" : ".rel") + section.name);
         rel.type = as.object_.rela ? elf::sht_rela : elf::sht_rel;
-        rel.flags = elf::shf_info_link | (section.group ? elf::shf_group : 0);
+        // LLVM MC marks a group member's relocations SHF_GROUP only.
+        rel.flags = section.group ? elf::shf_group : elf::shf_info_link;
         rel.alignment = wide ? 8 : 4;
         rel.entry_size = wide ? (as.object_.rela ? 24 : 16) : (as.object_.rela ? 12 : 8);
         rel.link = symtab_index;
@@ -3629,8 +4644,12 @@ std::optional<std::vector<std::uint8_t>> Assembler::run(
         if (impl_->eh_frame) impl_->emit_frames(true);
         if (impl_->debug_frame) impl_->emit_frames(false);
     }
+    target_.finish_tables(*this);
+    if (diagnostics_.errors() != errors) return std::nullopt;
+    if (!impl_->layout(true)) return std::nullopt;
     impl_->emit_line_table();
     if (!impl_->layout(true)) return std::nullopt;
+    if (object_.format == Format::MachO) impl_->section_addresses = macho_section_addresses(*this);
     if (!impl_->resolve_fixups() || diagnostics_.errors() != errors) return std::nullopt;
     auto object = impl_->write();
     if (diagnostics_.errors() != errors) return std::nullopt;

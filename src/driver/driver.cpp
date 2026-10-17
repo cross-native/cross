@@ -10,7 +10,6 @@
 #if CROSS_ENABLE_GCC_GIMPLE_TEXT
 #include "backend/gcc/gimple_ir.hpp"
 #endif
-#include "backend/native/assembler.hpp"
 #include "backend/native/data_emitter.hpp"
 #include "backend/native/debug_info.hpp"
 #include "backend/native/stack_usage.hpp"
@@ -1374,10 +1373,8 @@ int cc_main(int argc, char** argv) {
                 }
             }
         } else {
-            native::AssemblyRequest request{
-                assembly, options.target, subtarget->object_format(), output,
-                options.verbose, options.save_temps};
-            (void)native::assemble_object(request, diagnostics);
+            diagnostics.command_error("target '" + options.target +
+                                      "' has no in-process assembler for object output");
         }
     }
     return diagnostics.errors() == 0 ? 0 : 1;

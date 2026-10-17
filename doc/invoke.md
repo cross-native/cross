@@ -9,9 +9,10 @@ ld [options] file ...
 
 `cc` preprocesses and compiles Cross source (`.x`) to assembly or object
 files. `cpp` only preprocesses, writing Cross to standard output or to `-o`.
-`as` assembles hand-written GNU-syntax MIPS assembly into an object file
-([Assembling](#assembling)), and `ld` links MIPS objects into a static
-executable ([Linking](#linking)). `cc --help`, `cpp --help`, `as --help`, and
+`as` assembles hand-written assembly into an object file
+([Assembling](#assembling)) -- GNU-syntax MIPS or AT&T-syntax x86-64 -- and
+`ld` links MIPS objects into a static executable ([Linking](#linking)).
+`cc --help`, `cpp --help`, `as --help`, and
 `ld --help` list every option. Options of `cc`, `cpp`, and `as` taking a value
 accept it joined or separate (`-oout.s`, `-o out.s`).
 
@@ -29,10 +30,10 @@ accept it joined or separate (`-oout.s`, `-o out.s`).
 `-o FILE` names the output, and `-o -` writes it to standard output, which an
 object file (`-c`) cannot use; files written beside the output, such as those
 of `-fstack-usage` and `-MD`, then take the names they have without `-o`.
-For MIPS targets `-c` assembles the output in process with the assembler of
-`as`; for other targets it runs `llvm-mc` from `PATH`. `-save-temps` keeps the
-assembly beside the object, named like it with `.s`. `cc` never calls a C
-compiler, LLVM's code generator, or a linker.
+`-c` assembles the output in process with the assembler of `as`, for every
+target and object format. `-save-temps` keeps the assembly beside the object,
+named like it with `.s`. `cc` never runs another program: not a C compiler,
+LLVM's code generator, an assembler, or a linker.
 
 `-fstack-usage` writes one line per emitted function, in output order:
 `FILE:LINE:COLUMN:NAME`, a tab, the bytes, a tab, and `static` or `dynamic`.
@@ -178,9 +179,11 @@ fail when a header is deleted.
 
 ## Assembling
 
-`as` reads GNU-syntax assembly, the language of `cc -S` output, and writes one
-ELF relocatable object from all its inputs (`-` reads standard input). It
-assembles MIPS code; other targets are rejected.
+`as` reads the assembly `cc -S` emits, and writes one relocatable object from
+all its inputs (`-` reads standard input). The target selects the syntax and
+object format: GNU-syntax MIPS into ELF, or AT&T-syntax x86-64 into ELF,
+COFF/PE, or Mach-O as the triple names (`x86_64-unknown-linux-gnu`,
+`x86_64-w64-windows-gnu`, `x86_64-apple-darwin`).
 
 | Option | Selects |
 | --- | --- |
@@ -227,6 +230,23 @@ or `.MIPS.options` (ELF64), and `.pdr` for each `.end`. Unlike GNU as:
 - the `div` and `divu` macros, address macros such as `la` and `lw REG,
   symbol`, and PIC code (`-mabicalls`, `.cpload`) are not available: write
   `div $zero, rs, rt` and `%hi`/`%lo` pairs.
+
+For an x86-64 target `as` reads AT&T syntax: operand order source then
+destination, `%` registers, `$` immediates, `disp(base, index, scale)` memory
+with `%rip`-relative and absolute forms, `b`/`w`/`l`/`q` operand-size suffixes,
+and `symbol@PLT`, `@GOTPCREL`, `@GOTTPOFF`, `@TPOFF`, `@tlsgd`, `@SECREL32`,
+and the other relocation specifiers. It encodes the integer, x87, SSE through
+AVX-512 (VEX and EVEX, with `{%k}` masks, `{z}`, `{1toN}` broadcasts, and
+`{rn-sae}` rounding), and BMI instructions the backend selects, choosing the
+same encodings as LLVM MC where several are equivalent, including two-byte VEX
+prefixes, the NOP forms that pad alignment, and the short or near branch a
+layout pass selects. Short branches whose targets move out of reach relax to
+their near forms. Objects carry `.cfi_*` tables (`.eh_frame` and
+`.debug_frame`), `.loc`/`.file` line tables, and the relocations each format
+needs; Win64 `.seh_*` directives produce `.pdata` and `.xdata`, and Mach-O
+objects honor `.subsections_via_symbols`. Only 64-bit AT&T syntax is
+accepted: Intel syntax, `.code16` and `.code32`, the APX and AVX10 encodings,
+and `.reloc` are rejected, and an unknown mnemonic is an error.
 
 ## Linking
 

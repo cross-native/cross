@@ -5,6 +5,7 @@
 #include "common/diagnostic.hpp"
 #include "common/source.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -17,8 +18,9 @@
 namespace cross::assembler {
 
 // GNU-syntax assembler core: statements, expressions, sections, symbols,
-// layout, DWARF line and call-frame tables, and ELF relocatable output.
-// Instruction syntax, encodings, and relocation types belong to a Target.
+// layout, DWARF line and call-frame tables, and ELF, COFF, and Mach-O
+// relocatable output. Instruction syntax, encodings, and relocation types
+// belong to a Target.
 
 struct SymbolId {
     std::uint32_t value{};
@@ -45,9 +47,19 @@ inline constexpr FixupKind data1{1};
 inline constexpr FixupKind data2{2};
 inline constexpr FixupKind data4{4};
 inline constexpr FixupKind data8{8};
-// A four-byte field holding a symbol minus the field's own address.
+// A four- or eight-byte field holding a symbol minus the field's address.
 inline constexpr FixupKind data4_pc{20};
+inline constexpr FixupKind data8_pc{21};
+// A four-byte offset of a symbol from the start of its section (DWARF
+// section offsets, COFF `.secrel32`).
+inline constexpr FixupKind section_offset4{22};
+// COFF: the two-byte section number of a symbol (`.secidx`) and a symbol's
+// four-byte address relative to the image base (`.rva`).
+inline constexpr FixupKind section_index2{23};
+inline constexpr FixupKind image_offset4{24};
 } // namespace fixup
+
+enum class Format : std::uint8_t { Elf, Coff, MachO };
 
 namespace elf {
 inline constexpr std::uint32_t sht_progbits = 1;
@@ -67,6 +79,7 @@ inline constexpr std::uint64_t shf_execinstr = 0x4;
 inline constexpr std::uint64_t shf_merge = 0x10;
 inline constexpr std::uint64_t shf_strings = 0x20;
 inline constexpr std::uint64_t shf_info_link = 0x40;
+inline constexpr std::uint64_t shf_link_order = 0x80;
 inline constexpr std::uint64_t shf_group = 0x200;
 inline constexpr std::uint64_t shf_tls = 0x400;
 inline constexpr std::uint64_t shf_gnu_retain = 0x200000;
@@ -88,6 +101,68 @@ inline constexpr std::uint8_t stv_hidden = 2;
 inline constexpr std::uint8_t stv_protected = 3;
 } // namespace elf
 
+namespace coff {
+inline constexpr std::uint32_t scn_cnt_code = 0x20;
+inline constexpr std::uint32_t scn_cnt_initialized_data = 0x40;
+inline constexpr std::uint32_t scn_cnt_uninitialized_data = 0x80;
+inline constexpr std::uint32_t scn_lnk_info = 0x200;
+inline constexpr std::uint32_t scn_lnk_remove = 0x800;
+inline constexpr std::uint32_t scn_lnk_comdat = 0x1000;
+inline constexpr std::uint32_t scn_align_mask = 0x00f00000;
+inline constexpr std::uint32_t scn_mem_discardable = 0x02000000;
+inline constexpr std::uint32_t scn_mem_shared = 0x10000000;
+inline constexpr std::uint32_t scn_mem_execute = 0x20000000;
+inline constexpr std::uint32_t scn_mem_read = 0x40000000;
+inline constexpr std::uint32_t scn_mem_write = 0x80000000;
+inline constexpr std::uint8_t sym_class_external = 2;
+inline constexpr std::uint8_t sym_class_static = 3;
+inline constexpr std::uint8_t sym_class_label = 6;
+inline constexpr std::uint8_t sym_class_file = 103;
+inline constexpr std::uint8_t sym_class_weak_external = 105;
+inline constexpr std::uint16_t sym_type_function = 0x20;
+inline constexpr std::uint8_t comdat_select_noduplicates = 1;
+inline constexpr std::uint8_t comdat_select_any = 2;
+inline constexpr std::uint8_t comdat_select_same_size = 3;
+inline constexpr std::uint8_t comdat_select_exact_match = 4;
+inline constexpr std::uint8_t comdat_select_associative = 5;
+inline constexpr std::uint8_t comdat_select_largest = 6;
+inline constexpr std::uint8_t comdat_select_newest = 7;
+} // namespace coff
+
+namespace macho {
+inline constexpr std::uint32_t s_regular = 0x0;
+inline constexpr std::uint32_t s_zerofill = 0x1;
+inline constexpr std::uint32_t s_cstring_literals = 0x2;
+inline constexpr std::uint32_t s_4byte_literals = 0x3;
+inline constexpr std::uint32_t s_8byte_literals = 0x4;
+inline constexpr std::uint32_t s_literal_pointers = 0x5;
+inline constexpr std::uint32_t s_non_lazy_symbol_pointers = 0x6;
+inline constexpr std::uint32_t s_lazy_symbol_pointers = 0x7;
+inline constexpr std::uint32_t s_symbol_stubs = 0x8;
+inline constexpr std::uint32_t s_mod_init_func_pointers = 0x9;
+inline constexpr std::uint32_t s_mod_term_func_pointers = 0xa;
+inline constexpr std::uint32_t s_coalesced = 0xb;
+inline constexpr std::uint32_t s_gb_zerofill = 0xc;
+inline constexpr std::uint32_t s_interposing = 0xd;
+inline constexpr std::uint32_t s_16byte_literals = 0xe;
+inline constexpr std::uint32_t s_dtrace_dof = 0xf;
+inline constexpr std::uint32_t s_lazy_dylib_symbol_pointers = 0x10;
+inline constexpr std::uint32_t s_thread_local_regular = 0x11;
+inline constexpr std::uint32_t s_thread_local_zerofill = 0x12;
+inline constexpr std::uint32_t s_thread_local_variables = 0x13;
+inline constexpr std::uint32_t s_thread_local_variable_pointers = 0x14;
+inline constexpr std::uint32_t s_thread_local_init_function_pointers = 0x15;
+inline constexpr std::uint32_t section_type = 0xff;
+inline constexpr std::uint32_t s_attr_pure_instructions = 0x80000000;
+inline constexpr std::uint32_t s_attr_no_toc = 0x40000000;
+inline constexpr std::uint32_t s_attr_strip_static_syms = 0x20000000;
+inline constexpr std::uint32_t s_attr_no_dead_strip = 0x10000000;
+inline constexpr std::uint32_t s_attr_live_support = 0x08000000;
+inline constexpr std::uint32_t s_attr_self_modifying_code = 0x04000000;
+inline constexpr std::uint32_t s_attr_debug = 0x02000000;
+inline constexpr std::uint32_t s_attr_some_instructions = 0x00000400;
+} // namespace macho
+
 enum class Operator : std::uint8_t {
     Negate, Complement, LogicalNot,
     Add, Subtract, Multiply, Divide, Remainder, ShiftLeft, ShiftRight,
@@ -98,6 +173,9 @@ enum class Operator : std::uint8_t {
 struct Expression {
     enum class Kind : std::uint8_t { Constant, Symbol, Unary, Binary } kind{};
     Operator op{};
+    // A Symbol reference's relocation specifier (`sym@PLT`), numbered by
+    // the target; 0 for none.
+    std::uint8_t specifier{};
     std::int64_t value{};
     SymbolId symbol{};
     ExpressionId left{};
@@ -105,11 +183,13 @@ struct Expression {
     SourceLocation location;
 };
 
-// The relocatable form of an evaluated expression: add - subtract + constant.
+// The relocatable form of an evaluated expression: add - subtract + constant,
+// with the specifier of the added symbol.
 struct Value {
     std::optional<SymbolId> add;
     std::optional<SymbolId> subtract;
     std::int64_t constant{};
+    std::uint8_t specifier{};
     [[nodiscard]] bool absolute() const { return !add && !subtract; }
 };
 
@@ -127,13 +207,25 @@ struct Symbol {
     std::uint8_t type{elf::stt_notype};
     std::uint8_t visibility{elf::stv_default};
     std::uint8_t other{};
-    // `.L` names, numeric local labels, and internal labels are omitted
-    // from the symbol table unless a relocation must name them.
+    // `.L` names (`L` in Mach-O), numeric local labels, and internal labels
+    // are omitted from the symbol table unless a relocation must name them.
     bool temporary{};
     bool used_in_relocation{};
     bool common{};
     std::uint64_t common_size{};
     std::uint64_t common_alignment{};
+    // COFF `.def` attributes: storage class (0 when unset) and type.
+    std::uint8_t storage_class{};
+    std::uint16_t coff_type{};
+    // Mach-O attributes.
+    bool private_extern{};
+    bool weak_definition{};
+    bool weak_reference{};
+    bool no_dead_strip{};
+    bool alt_entry{};
+    // The order of label definitions, which places labels that share an
+    // address.
+    std::uint32_t definition{};
     SourceLocation location;
     [[nodiscard]] bool defined() const {
         return section.has_value() || variable.has_value() || common;
@@ -149,7 +241,7 @@ struct Fixup {
 };
 
 struct Fragment {
-    enum class Kind : std::uint8_t { Data, Align, Leb, Fill, Org } kind{};
+    enum class Kind : std::uint8_t { Data, Align, Leb, Fill, Org, Relaxable } kind{};
     std::vector<std::uint8_t> bytes;
     std::vector<Fixup> fixups;
     // Align: boundary, fill byte (or the target's no-op), and skip limit.
@@ -160,6 +252,12 @@ struct Fragment {
     // Leb, Fill (byte count), and Org (target offset) operands.
     ExpressionId expression{};
     bool is_signed{};
+    // Relaxable: one instruction whose short form in `bytes` has one
+    // PC-relative one-byte fixup; layout replaces it with `relaxed` and
+    // `relaxed_fixup` (an offset into `relaxed`) when the value does not
+    // fit or needs a relocation, and the fragment becomes Data.
+    std::vector<std::uint8_t> relaxed;
+    Fixup relaxed_fixup;
     SourceLocation location;
     // Layout results.
     std::uint64_t address{};
@@ -172,9 +270,23 @@ struct Section {
     std::uint64_t flags{};
     std::uint64_t entry_size{};
     std::uint64_t alignment{1};
+    // ELF group signature, or the COFF COMDAT symbol.
     std::optional<SymbolId> group;
     bool comdat{};
     std::uint64_t unique{};
+    // COFF characteristics, or Mach-O section flags (type and attributes).
+    std::uint32_t characteristics{};
+    // Mach-O segment name; `name` is the section name.
+    std::string segment;
+    // COFF COMDAT selection; associative sections name the section of the
+    // COMDAT symbol through `group`.
+    std::uint8_t selection{};
+    // Format-neutral facts: the section holds instructions, or occupies no
+    // file space.
+    bool code{};
+    bool zero_fill{};
+    // An instruction was emitted into the section.
+    bool has_instructions{};
     SymbolId symbol{};
     std::vector<Fragment> fragments;
     std::uint64_t size{};
@@ -224,8 +336,13 @@ struct Statement {
 struct ObjectInfo {
     bool elf64{};
     bool big_endian{};
+    // The ELF e_machine or COFF Machine value.
     std::uint16_t machine{};
     bool rela{};
+    Format format{Format::Elf};
+    // Mach-O CPU type and subtype.
+    std::uint32_t cpu_type{};
+    std::uint32_t cpu_subtype{};
 };
 
 // Call-frame facts of a target, in DWARF register numbers.
@@ -262,6 +379,12 @@ struct Relocation {
     // The complete addend, also for REL relocations whose addend is
     // stored in the section contents.
     std::int64_t addend{};
+    // Mach-O: the field is PC-relative, its size as a power of two, and
+    // the relocation names a symbol rather than a section (whose section
+    // symbol is `symbol`).
+    bool pc_relative{};
+    std::uint8_t length{};
+    bool external{true};
 };
 
 class Assembler;
@@ -283,6 +406,15 @@ public:
     [[nodiscard]] virtual std::optional<unsigned> dwarf_register(
         std::string_view name) const = 0;
     [[nodiscard]] virtual FixupInfo fixup_info(FixupKind kind) const = 0;
+    // The number of a relocation specifier spelled after '@' (`sym@PLT`).
+    [[nodiscard]] virtual std::optional<std::uint8_t> specifier(
+        std::string_view) const {
+        return std::nullopt;
+    }
+    // Fills alignment padding in code sections.
+    virtual void code_padding(std::span<std::uint8_t> bytes) const {
+        std::fill(bytes.begin(), bytes.end(), std::uint8_t{0});
+    }
 
     // Parses and emits one instruction (or target macro) statement.
     virtual void instruction(Assembler& assembler, Statement& statement) = 0;
@@ -291,6 +423,8 @@ public:
     virtual bool directive(Assembler& assembler, Statement& statement) = 0;
     // Runs after the last statement and before layout.
     virtual void finish(Assembler& assembler) = 0;
+    // Runs after layout and the call-frame tables, before the line table.
+    virtual void finish_tables(Assembler&) {}
     // Writes a resolved value, or a REL relocation's in-place addend, into
     // the bytes of a fixup; false after a diagnostic.
     virtual bool apply_fixup(Assembler& assembler, const Fixup& fixup,
@@ -300,10 +434,17 @@ public:
     // The relocation for a fixup that refers to `symbol`; nullopt after a
     // diagnostic.
     virtual std::optional<RelocationChoice> relocation(
-        Assembler& assembler, const Fixup& fixup, const Symbol& symbol,
-        const Section* symbol_section) const = 0;
+        Assembler& assembler, const Fixup& fixup, const Value& value,
+        const Symbol& symbol, const Section* symbol_section) const = 0;
     // Orders one section's relocations, which arrive sorted by offset.
     virtual void order_relocations(std::vector<Relocation>&) const {}
+    // Mach-O: resolves one fixup of `section` into its field value and
+    // relocations; false after a diagnostic.
+    virtual bool macho_relocation(Assembler&, SectionId, const Fixup&, std::uint64_t /*place*/,
+                                  std::uint64_t /*address*/, const Value&, std::int64_t& /*field*/,
+                                  std::vector<Relocation>&) const {
+        return false;
+    }
 };
 
 struct Options {
@@ -317,7 +458,7 @@ struct Options {
     bool compiler_output{};
 };
 
-// Assembles `sources`, in order, into one ELF relocatable object. Returns no
+// Assembles `sources`, in order, into one relocatable object. Returns no
 // object after any error; every diagnostic carries its source position.
 [[nodiscard]] std::optional<std::vector<std::uint8_t>> assemble(
     const std::vector<const SourceFile*>& sources, Target& target,
@@ -335,11 +476,13 @@ public:
     void error(SourceLocation location, std::string_view message);
     void warning(SourceLocation location, std::string_view message);
     [[nodiscard]] const ObjectInfo& object() const { return object_; }
+    [[nodiscard]] const Options& options() const { return options_; }
 
     // Expressions.
     std::optional<ExpressionId> parse_expression(Cursor& cursor);
     ExpressionId constant(std::int64_t value, SourceLocation location);
-    ExpressionId symbol_reference(SymbolId symbol, SourceLocation location);
+    ExpressionId symbol_reference(SymbolId symbol, SourceLocation location,
+                                  std::uint8_t specifier = 0);
     ExpressionId binary(Operator op, ExpressionId left, ExpressionId right);
     [[nodiscard]] const Expression& expression(ExpressionId id) const {
         return expressions_[id.value];
@@ -347,14 +490,19 @@ public:
     // The value now, before layout; nullopt (without a diagnostic) when
     // the expression is not yet absolute.
     [[nodiscard]] std::optional<std::int64_t> absolute_now(ExpressionId id);
+    // The value when it involves no label, as LLVM MC folds an operand while
+    // parsing; nullopt otherwise.
+    [[nodiscard]] std::optional<std::int64_t> constant_now(ExpressionId id);
     // Parses an expression that must be absolute now; nullopt after a
     // diagnostic.
     std::optional<std::int64_t> parse_absolute(Cursor& cursor);
     // The relocatable value of an expression at the current state. With
     // `keep_aliases`, a global symbol assigned a label-relative value stays
     // itself, so a relocation names the alias rather than its target.
+    // `in_set` evaluates the value of an assignment, whose label differences
+    // always fold (Mach-O otherwise folds only differences within an atom).
     std::optional<Value> evaluate(ExpressionId id, bool report,
-                                  bool keep_aliases = false);
+                                  bool keep_aliases = false, bool in_set = false);
 
     // Symbols and sections.
     SymbolId symbol(std::string_view name, SourceLocation location = {});
@@ -363,20 +511,31 @@ public:
     [[nodiscard]] const Symbol& symbol(SymbolId id) const {
         return symbols_[id.value];
     }
+    [[nodiscard]] const std::vector<Symbol>& symbols() const { return symbols_; }
     void define_label(SymbolId id, SourceLocation location);
     void assign(SymbolId id, ExpressionId value, SourceLocation location);
     // `.set NAME, EXPR` and the equivalent directives.
     void assignment_statement(Statement& statement);
+    // An ELF section.
     SectionId section(std::string_view name, std::uint32_t type,
                       std::uint64_t flags, std::uint64_t entry_size = 0,
                       std::optional<SymbolId> group = std::nullopt,
                       bool comdat = false, std::uint64_t unique = 0);
+    // A COFF section with its characteristics and COMDAT symbol.
+    SectionId coff_section(std::string_view name, std::uint32_t characteristics,
+                           std::optional<SymbolId> comdat = std::nullopt,
+                           std::uint8_t selection = 0);
+    // A Mach-O section; flags apply when it is created.
+    SectionId macho_section(std::string_view segment, std::string_view name,
+                            std::uint32_t flags);
     [[nodiscard]] Section& section(SectionId id) {
         return sections_[id.value];
     }
     [[nodiscard]] const Section& section(SectionId id) const {
         return sections_[id.value];
     }
+    [[nodiscard]] const std::vector<Section>& sections() const { return sections_; }
+    [[nodiscard]] SectionId current_section() const { return current_; }
     void switch_section(SectionId id);
     void push_section(SectionId id);
     void pop_section(SourceLocation location);
@@ -392,11 +551,33 @@ public:
                     SourceLocation location);
     void emit_alignment(std::uint64_t alignment, std::optional<std::uint8_t> fill,
                         std::uint64_t max_skip);
+    // Emits an instruction whose short form `bytes` holds a one-byte
+    // PC-relative field at `offset`, and whose long form `relaxed` holds the
+    // same reference with `relaxed_kind` at `relaxed_offset`.
+    void emit_relaxable(std::vector<std::uint8_t> bytes, std::uint32_t offset,
+                        FixupKind kind, std::vector<std::uint8_t> relaxed,
+                        std::uint32_t relaxed_offset, FixupKind relaxed_kind,
+                        ExpressionId expression, SourceLocation location);
+    // Materializes a pending `.loc` row before an instruction and marks the
+    // current section as holding instructions.
+    void begin_instruction();
+    // Mach-O: a section's address within the object, after layout.
+    [[nodiscard]] std::uint64_t section_address(SectionId id) const;
+
+    // The final bytes of a section that occupies file space.
+    [[nodiscard]] std::vector<std::uint8_t> section_contents(SectionId id) const;
 
     // Integers in the object's byte order.
     void write_integer(std::span<std::uint8_t> bytes, std::uint64_t value) const;
     [[nodiscard]] std::uint64_t read_integer(
         std::span<const std::uint8_t> bytes) const;
+
+    // After layout: a label's address within its section, the section of a
+    // symbol (following assignments), and, for Mach-O, the atom of a label:
+    // the latest non-temporary label at or before it in its section.
+    [[nodiscard]] std::uint64_t address(const Symbol& symbol) const;
+    [[nodiscard]] const Symbol* base_symbol(const Symbol& symbol);
+    [[nodiscard]] std::optional<SymbolId> atom(SymbolId id) const;
 
     std::optional<std::vector<std::uint8_t>> run(
         const std::vector<const SourceFile*>& sources);

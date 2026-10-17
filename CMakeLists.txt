@@ -98,7 +98,9 @@ target_compile_definitions(cross_common PRIVATE
 
 add_library(cross_assembler
     src/assembler/assembler.cpp
+    src/assembler/coff_writer.cpp
     src/assembler/elf_writer.cpp
+    src/assembler/macho_writer.cpp
 )
 target_link_libraries(cross_assembler PUBLIC cross_common)
 cross_component(cross_assembler)
@@ -142,8 +144,11 @@ add_library(cross_targets
     src/target/mips/assembler.cpp
     src/target/mips/linker.cpp
     src/target/mips/target.cpp
+    src/target/x86_64/assembler.cpp
+    src/target/x86_64/encodings.cpp
     src/target/x86_64/manual_endpoint.cpp
     src/target/x86_64/target.cpp
+    src/target/x86_64/vector_encodings.cpp
 )
 target_link_libraries(cross_targets PUBLIC cross_common cross_assembler cross_linker)
 cross_component(cross_targets)
@@ -201,7 +206,6 @@ target_link_libraries(cross_raw_backend PUBLIC cross_middle cross_targets
 cross_component(cross_raw_backend)
 
 add_library(cross_native_backend
-    src/backend/native/assembler.cpp
     src/backend/native/data_emitter.cpp
     src/backend/native/frame_cfi.cpp
     src/backend/native/machine_pass.cpp
@@ -1491,7 +1495,7 @@ if(BUILD_TESTING)
     set_tests_properties(cross_frame_runtime PROPERTIES
         LABELS "check.runtime;arch.x86_64;backend.native;feature.frame")
     add_test(NAME cross_hard_register_unwind COMMAND "${CMAKE_COMMAND}"
-        -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+        -DCC=$<TARGET_FILE:cross_cc> -DAS=$<TARGET_FILE:cross_as> -DHOST_CXX=${CMAKE_CXX_COMPILER}
         -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/frame/hard_register_unwind.x
         -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/hard-register-unwind
         -P "${CMAKE_SOURCE_DIR}/test/backend/frame/hard_register_unwind.cmake")
@@ -2875,6 +2879,63 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/backend/native/coff_unwind.cmake")
     set_tests_properties(cross_x86_64_coff_unwind PROPERTIES
         LABELS "check.compile;arch.x86_64;backend.native;feature.object")
+    # The integrated x86-64 assembler: encodings, relaxation, relocations per
+    # object format, Win64 unwind tables, the as tool, and diagnostics.
+    find_program(CROSS_LLVM_MC NAMES llvm-mc)
+    if(CROSS_LLVM_MC)
+        foreach(case encodings relaxation relocations)
+            add_test(NAME cross_x86_64_assembler_${case}
+                COMMAND "${CMAKE_COMMAND}"
+                        -DAS=$<TARGET_FILE:cross_as>
+                        -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/x86_64/assembler/${case}.s
+                        -DTRIPLE=x86_64-unknown-linux-gnu
+                        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/x86-64-assembler/${case}
+                        -P "${CMAKE_SOURCE_DIR}/test/target/x86_64/assembler/differential.cmake")
+            set_tests_properties(cross_x86_64_assembler_${case} PROPERTIES
+                LABELS "feature.assembler;arch.x86_64;check.compile")
+        endforeach()
+        add_test(NAME cross_x86_64_assembler_unwind
+            COMMAND "${CMAKE_COMMAND}"
+                    -DAS=$<TARGET_FILE:cross_as>
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/x86_64/assembler/unwind.s
+                    -DTRIPLE=x86_64-w64-windows-gnu
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/x86-64-assembler/unwind
+                    -P "${CMAKE_SOURCE_DIR}/test/target/x86_64/assembler/differential.cmake")
+        set_tests_properties(cross_x86_64_assembler_unwind PROPERTIES
+            LABELS "feature.assembler;arch.x86_64;check.compile;feature.object")
+        add_test(NAME cross_x86_64_assembler_encodings_coff
+            COMMAND "${CMAKE_COMMAND}"
+                    -DAS=$<TARGET_FILE:cross_as>
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/x86_64/assembler/encodings.s
+                    -DTRIPLE=x86_64-w64-windows-gnu
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/x86-64-assembler/encodings-coff
+                    -P "${CMAKE_SOURCE_DIR}/test/target/x86_64/assembler/differential.cmake")
+        set_tests_properties(cross_x86_64_assembler_encodings_coff PROPERTIES
+            LABELS "feature.assembler;arch.x86_64;check.compile")
+        add_test(NAME cross_x86_64_assembler_encodings_macho
+            COMMAND "${CMAKE_COMMAND}"
+                    -DAS=$<TARGET_FILE:cross_as>
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/x86_64/assembler/encodings.s
+                    -DTRIPLE=x86_64-apple-darwin
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/x86-64-assembler/encodings-macho
+                    -P "${CMAKE_SOURCE_DIR}/test/target/x86_64/assembler/differential.cmake")
+        set_tests_properties(cross_x86_64_assembler_encodings_macho PROPERTIES
+            LABELS "feature.assembler;arch.x86_64;check.compile")
+    endif()
+    add_test(NAME cross_x86_64_assembler_diagnostics
+        COMMAND "${CMAKE_COMMAND}"
+                -DAS=$<TARGET_FILE:cross_as>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/x86-64-assembler-diagnostics
+                -P "${CMAKE_SOURCE_DIR}/test/target/x86_64/assembler/diagnostics.cmake")
+    set_tests_properties(cross_x86_64_assembler_diagnostics PROPERTIES
+        LABELS "feature.assembler;arch.x86_64;diagnostics")
+    add_test(NAME cross_x86_64_assembler_tool
+        COMMAND "${CMAKE_COMMAND}"
+                -DAS=$<TARGET_FILE:cross_as>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/x86-64-assembler-tool
+                -P "${CMAKE_SOURCE_DIR}/test/target/x86_64/assembler/tool.cmake")
+    set_tests_properties(cross_x86_64_assembler_tool PROPERTIES
+        LABELS "feature.assembler;arch.x86_64;check.compile")
     add_test(NAME cross_managed_mir
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

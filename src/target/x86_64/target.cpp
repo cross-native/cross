@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "target/x86_64/target.hpp"
 
+#include "target/x86_64/assembler.hpp"
+
 #include "target/subtarget.hpp"
 #include "target/x86_64/bit_operations.hpp"
 #include "target/x86_64/instructions.hpp"
@@ -955,6 +957,7 @@ std::vector<InstructionCostEntry> declared_instructions() {
 
 TargetInfo with_instruction_costs(TargetInfo info) {
     set_instruction_costs(info, declared_instructions());
+    info.integrated_assembler = &x86_64::assemble;
     return info;
 }
 

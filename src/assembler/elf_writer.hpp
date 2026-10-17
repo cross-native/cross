@@ -51,6 +51,24 @@ private:
     std::unordered_map<std::string, std::uint32_t> offsets_;
 };
 
+// A string table laid out as LLVM's StringTableBuilder does: strings sorted
+// by their reversed text, a string that ends another sharing its bytes.
+class MergedStringTable {
+public:
+    void add(std::string_view text) { strings_.emplace(text, 0); }
+    // Lays the table out after `prefix` leading bytes, padding its size to
+    // `alignment`.
+    void finalize(std::uint32_t prefix, std::uint32_t alignment = 1);
+    [[nodiscard]] std::uint32_t offset(std::string_view text) const;
+    [[nodiscard]] std::uint32_t size() const { return size_; }
+    // The table's bytes after the prefix, as offsets count them.
+    [[nodiscard]] std::vector<std::uint8_t> data(std::uint32_t prefix) const;
+
+private:
+    std::unordered_map<std::string, std::uint32_t> strings_;
+    std::uint32_t size_{};
+};
+
 struct ElfSection {
     std::uint32_t name{};
     std::uint32_t type{};

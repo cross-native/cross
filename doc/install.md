@@ -1,15 +1,15 @@
 # Building Cross
 
 Building produces four executables: `cc`, the compiler, `cpp`, the
-standalone preprocessor, `as`, the MIPS assembler, and `ld`, the MIPS linker.
+standalone preprocessor, `as`, the assembler, and `ld`, the MIPS linker.
 All are self-contained; the shipped compiler models are built into them.
 
 ## Requirements
 
 - CMake 3.20 or later and a build tool it supports, such as Ninja or Make.
 - A C++20 compiler: GCC or Clang.
-- `llvm-mc` on `PATH` to produce x86-64 object files with `cc -c`. MIPS
-  objects and assembly output (`cc -S`) need no other tool.
+- No other tool: `cc`, `cpp`, `as`, and `ld` need nothing on `PATH`. `cc -c`
+  assembles objects in process for every target and object format.
 
 The tested hosts are x86-64 Windows with the MSYS2 MINGW64 environment and
 x86-64 Ubuntu Linux. On Windows:
