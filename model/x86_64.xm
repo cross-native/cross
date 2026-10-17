@@ -1275,10 +1275,10 @@ cpu "core-avx-i" {
 
 cpu "haswell" {
     architecture = "x86-64";
-    features = ["base", "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "aes",
-                "pclmul", "avx", "f16c", "fma", "avx2", "bmi", "bmi2",
-                "lzcnt", "movbe", "rdrnd", "cx16", "xsave", "xsaveopt",
-                "fsgsbase", "rdtscp", "invpcid"];
+    features = ["base", "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt",
+                "pclmul", "avx", "f16c", "fma", "avx2", "bmi", "bmi2", "lzcnt",
+                "movbe", "rdrnd", "cx16", "xsave", "xsaveopt", "fsgsbase",
+                "rdtscp", "invpcid"];
 }
 
 cpu "core-avx2" {
@@ -1299,20 +1299,20 @@ cpu "broadwell" {
 cpu "skylake" {
     architecture = "x86-64";
     features = ["base", "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "aes",
-                "pclmul", "avx", "f16c", "fma", "avx2", "bmi", "bmi2",
-                "lzcnt", "movbe", "adx", "rdrnd", "rdseed", "cx16", "xsave",
-                "xsaveopt", "xsavec", "xsaves", "fsgsbase", "rdtscp", "pku",
-                "clflushopt", "invpcid"];
+                "pclmul", "avx", "f16c", "fma", "avx2", "bmi", "bmi2", "lzcnt",
+                "movbe", "adx", "rdrnd", "rdseed", "cx16", "xsave", "xsaveopt",
+                "xsavec", "xsaves", "fsgsbase", "rdtscp", "clflushopt",
+                "invpcid", "prefetchw"];
 }
 
 cpu "skylake-avx512" {
     architecture = "x86-64";
     features = ["base", "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "aes",
-                "pclmul", "avx", "f16c", "fma", "avx2", "bmi", "bmi2",
-                "lzcnt", "movbe", "adx", "rdrnd", "rdseed", "avx512f",
-                "avx512dq", "avx512cd", "avx512bw", "avx512vl", "cx16",
-                "xsave", "xsaveopt", "xsavec", "xsaves", "fsgsbase", "rdtscp",
-                "pku", "clflushopt", "invpcid"];
+                "pclmul", "avx", "f16c", "fma", "avx2", "bmi", "bmi2", "lzcnt",
+                "movbe", "adx", "rdrnd", "rdseed", "avx512f", "avx512dq",
+                "avx512cd", "avx512bw", "avx512vl", "cx16", "xsave",
+                "xsaveopt", "xsavec", "xsaves", "fsgsbase", "rdtscp", "pku",
+                "clflushopt", "invpcid", "clwb", "prefetchw"];
 }
 
 cpu "skx" {
@@ -1708,29 +1708,29 @@ cpu "bdver4" {
 cpu "znver1" {
     architecture = "x86-64";
     features = ["base", "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "aes",
-                "pclmul", "avx", "f16c", "fma", "avx2", "bmi", "bmi2",
-                "lzcnt", "movbe", "adx", "rdrnd", "rdseed", "sha", "cx16",
-                "xsave", "xsaveopt", "xsavec", "xsaves", "fsgsbase", "rdtscp",
-                "prefetchw", "monitor"];
+                "pclmul", "avx", "f16c", "fma", "avx2", "bmi", "bmi2", "lzcnt",
+                "movbe", "adx", "rdrnd", "rdseed", "sha", "cx16", "xsave",
+                "xsaveopt", "xsavec", "xsaves", "fsgsbase", "rdtscp",
+                "prefetchw", "monitor", "clflushopt"];
 }
 
 cpu "znver2" {
     architecture = "x86-64";
     features = ["base", "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "aes",
-                "pclmul", "avx", "f16c", "fma", "avx2", "bmi", "bmi2",
-                "lzcnt", "movbe", "adx", "rdrnd", "rdseed", "sha", "cx16",
-                "xsave", "xsaveopt", "xsavec", "xsaves", "fsgsbase", "rdtscp",
-                "rdpid", "prefetchw", "monitor", "clwb"];
+                "pclmul", "avx", "f16c", "fma", "avx2", "bmi", "bmi2", "lzcnt",
+                "movbe", "adx", "rdrnd", "rdseed", "sha", "cx16", "xsave",
+                "xsaveopt", "xsavec", "xsaves", "fsgsbase", "rdtscp", "rdpid",
+                "prefetchw", "monitor", "clwb", "clflushopt", "wbnoinvd"];
 }
 
 cpu "znver3" {
     architecture = "x86-64";
     features = ["base", "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "aes",
-                "pclmul", "avx", "f16c", "fma", "avx2", "bmi", "bmi2",
-                "lzcnt", "movbe", "adx", "rdrnd", "rdseed", "sha", "gfni",
-                "vaes", "vpclmulqdq", "cx16", "xsave", "xsaveopt", "xsavec",
-                "xsaves", "fsgsbase", "rdtscp", "rdpid", "prefetchw",
-                "monitor", "clwb"];
+                "pclmul", "avx", "f16c", "fma", "avx2", "bmi", "bmi2", "lzcnt",
+                "movbe", "adx", "rdrnd", "rdseed", "sha", "vaes", "vpclmulqdq",
+                "cx16", "xsave", "xsaveopt", "xsavec", "xsaves", "fsgsbase",
+                "rdtscp", "rdpid", "prefetchw", "monitor", "clwb",
+                "clflushopt", "wbnoinvd", "pku", "invpcid"];
 }
 
 cpu "ext-znver4" {
