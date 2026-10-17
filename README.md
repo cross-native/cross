@@ -84,14 +84,22 @@ of the GNU General Public License, version 3 or later. See [LICENSE](LICENSE).
 
 The copyright holders read the license as follows:
 
-- Using Cross carries no obligation. Programs written in Cross, with or without
-  AI assistance, are not works based on Cross, whether or not the manual, the
-  specification, the examples, the models, or the test programs were used as
-  reference, and the compiler's output carries no obligation either: `cc` adds
-  no runtime code to your program.
+- Using Cross carries no obligation, unless the program was written by an AI
+  model trained on the compiler sources (see the last item). Otherwise programs
+  written in Cross, with or without AI assistance, are not works based on
+  Cross, whether or not the manual, the specification, the examples, the
+  models, or the test programs were used as reference, and the compiler's
+  output carries no obligation either: `cc` adds no runtime code to your
+  program.
 - Reusing the compiler does. If you give the compiler sources (`src/`,
   `model/`, `benchmark/`, or `test/`) to an AI model as reference, in a prompt,
   as context, or through retrieval, and use what it writes as part of another
   compiler, tool, or library, that code is a work based on Cross. Convey it
+  only under the GNU General Public License, version 3 or later, with its
+  complete corresponding source.
+- Training an AI model on the compiler sources is permitted, and the model's
+  weights and training details need not be published. What the model
+  remembers of the sources counts as retrieval, though: everything such a
+  model writes is written with the compiler sources passed to it, so convey it
   only under the GNU General Public License, version 3 or later, with its
   complete corresponding source.
