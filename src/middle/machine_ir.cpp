@@ -254,6 +254,11 @@ bool verify_instruction(const Instruction& instruction, const Function& function
                   "machine input projection requires one equally wide "
                   "target definition");
     }
+    if (instruction.memory && !instruction.may_load &&
+        !instruction.may_store) {
+        ok = fail(diagnostics, instruction.location,
+                  "machine memory access facts require a load or store");
+    }
     if (instruction.result_extension != ExtensionKind::None &&
         (instruction.kind != InstructionKind::Return ||
          instruction.uses.size() != 1)) {
@@ -262,14 +267,12 @@ bool verify_instruction(const Instruction& instruction, const Function& function
     }
     if (instruction.result_composition != ResultComposition::None &&
         (instruction.kind != InstructionKind::Return ||
-         instruction.uses.size() != 2 ||
-         instruction.uses[0].mode.bits <=
-             instruction.uses[1].mode.bits ||
+         instruction.uses.size() < 2 ||
          instruction.result_extension != ExtensionKind::None)) {
         ok = fail(
             diagnostics, instruction.location,
-            "machine result composition requires two differently wide "
-            "return values and no result extension");
+            "machine result composition requires a return of several "
+            "pieces and no result extension");
     }
     if (instruction.patch) {
         if (instruction.kind != InstructionKind::Target ||

@@ -31,6 +31,7 @@
 #include <initializer_list>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <optional>
 #include <span>
 #include <sstream>
@@ -77,6 +78,8 @@ enum class LoweringPass : std::uint16_t {
     PropagateCopies,
     FoldBoundaryProjections,
     SelectIntegerImmediates,
+    SplitBoundaryResults,
+    NarrowBitRanges,
     FoldBooleanExtensions,
     FoldNarrowExtensions,
     FoldPointerOffsets,
@@ -276,6 +279,35 @@ bool has_dynamic_stack(const machine::Function& function) {
 
 bool phi_instruction(const machine::Instruction& instruction) {
     return instruction.opcode == Opcode::Phi;
+}
+
+// The cycles a preserved register costs a call: its save and its restore.
+constexpr std::uint64_t preserved_register_cycles = 2;
+
+// A load or store of one scalar.
+bool scalar_memory_access(const machine::Instruction& value) {
+    if (value.kind != machine::InstructionKind::Target) return false;
+    switch (decode_opcode(value.opcode)) {
+    case Opcode::LoadSigned:
+    case Opcode::LoadUnsigned:
+    case Opcode::Fload:
+    case Opcode::Store:
+    case Opcode::Fstore:
+    case Opcode::PointerLoadSigned:
+    case Opcode::PointerLoadUnsigned:
+    case Opcode::FpointerLoad:
+    case Opcode::PointerStore:
+    case Opcode::FpointerStore:
+    case Opcode::IndexedLoadSigned:
+    case Opcode::IndexedLoadUnsigned:
+    case Opcode::FindexedLoad:
+    case Opcode::GlobalLoadSigned:
+    case Opcode::GlobalLoadUnsigned:
+    case Opcode::FglobalLoad:
+    case Opcode::GlobalStore:
+    case Opcode::FglobalStore: return true;
+    default: return false;
+    }
 }
 
 // A floating operation whose only side effect is that it may raise a
@@ -888,89 +920,6 @@ public:
     }
 
 private:
-    bool lower_xor_zero_extend_return(
-        mir::ValueId returned_id, machine::Instruction& result) const {
-        if (!options_.machine_combine ||
-            !subtarget_.has_feature(Feature::Mips3) || !source_ ||
-            returned_id.value >= source_->values.size()) {
-            return false;
-        }
-        const auto& returned = source_->values[returned_id.value];
-        if (returned.kind != mir::ValueKind::Binary ||
-            returned.binary != mir::BinaryOperation::BitXor ||
-            returned.operands.size() != 2 ||
-            type_bits(hir_, returned.type) != 64) {
-            return false;
-        }
-
-        std::optional<mir::ValueId> wide;
-        std::optional<mir::ValueId> narrow;
-        for (unsigned index = 0; index < 2; ++index) {
-            const auto candidate = returned.operands[index];
-            if (candidate.value >= source_->values.size()) return false;
-            const auto& extension = source_->values[candidate.value];
-            if (extension.kind != mir::ValueKind::Cast ||
-                extension.cast != mir::CastOperation::ZeroExtend ||
-                extension.operands.size() != 1 ||
-                type_bits(hir_, extension.type) != 64 ||
-                extension.operands.front().value >=
-                    source_->values.size() ||
-                type_bits(hir_, source_->values[
-                                    extension.operands.front().value]
-                                    .type) != 32) {
-                continue;
-            }
-            const auto other = returned.operands[1U - index];
-            if (other.value >= source_->values.size() ||
-                type_bits(hir_, source_->values[other.value].type) != 64) {
-                return false;
-            }
-            wide = other;
-            narrow = extension.operands.front();
-            break;
-        }
-        if (!wide || !narrow) return false;
-
-        const auto& entity = hir_.function(source_->source);
-        const auto* abi = managed_abi_model(hir_, entity, subtarget_, options_);
-        const auto signature = abi
-            ? classify_function_interface(entity, *abi)
-            : std::optional<SignatureLayout>{};
-        if (!signature || signature->results.size() != 1) return false;
-        const auto& assignment = signature->results.front();
-        if (assignment.indirect || assignment.pieces.size() != 2) {
-            return false;
-        }
-        bool low = false;
-        bool high = false;
-        std::string_view first_register;
-        for (const auto& piece : assignment.pieces) {
-            if (piece.location.kind != LocationKind::Register ||
-                piece.value_bits != 32 || piece.carrier_bits != 32 ||
-                piece.location.reg.empty() ||
-                piece.location.reg == first_register) {
-                return false;
-            }
-            if (first_register.empty()) first_register = piece.location.reg;
-            const auto offset = effective_piece_offset(
-                piece, 64,
-                subtarget_.target().data_layout.byte_order);
-            if (offset == 0) low = true;
-            else if (offset == 32) high = true;
-            else return false;
-        }
-        if (!low || !high) return false;
-
-        const auto wide_register = reg(*wide);
-        const auto narrow_register = reg(*narrow);
-        result.operands = {register_operand(wide_register),
-                           register_operand(narrow_register)};
-        result.uses = {wide_register, narrow_register};
-        result.result_composition =
-            machine::ResultComposition::XorZeroExtend;
-        return true;
-    }
-
     bool has_result(const mir::ManagedValue& value) const {
         if (is_void(hir_, value.type)) return false;
         return value.kind != mir::ValueKind::LifetimeStart &&
@@ -2061,7 +2010,6 @@ private:
             result.kind = machine::InstructionKind::Return;
             if (terminator.value) {
                 auto source_id = *terminator.value;
-                if (lower_xor_zero_extend_return(source_id, result)) break;
                 const auto& returned = source_->values[source_id.value];
                 if (returned.kind == mir::ValueKind::Cast &&
                     returned.operands.size() == 1 &&
@@ -2127,6 +2075,7 @@ private:
     }
 
     void lower_blocks(const mir::ManagedFunction& source) {
+        const mir::AccessAnalysis accesses(source, hir_, subtarget_.target());
         for (const auto& block : source.blocks) {
             machine::Block target;
             target.id = {block.id.value};
@@ -2150,6 +2099,12 @@ private:
                     continue;
                 }
                 auto instruction = lower_value(managed_value);
+                // A one-instruction scalar access keeps what MIR knows of
+                // the bytes it touches.
+                if ((instruction.may_load || instruction.may_store) &&
+                    scalar_memory_access(instruction)) {
+                    instruction.memory = accesses.access(managed_value);
+                }
                 // A floating operation that may raise a trapped exception
                 // stays where the source runs it, even when unused.
                 if (mir::may_trap_floating(managed_value, source, hir_,
@@ -2779,6 +2734,17 @@ private:
                 if (result.indirect) append_endpoints(result.pieces);
             }
         }
+        std::unordered_set<std::uint32_t> phi_values;
+        for (const auto& block : function.blocks) {
+            for (const auto& instruction : block.instructions) {
+                if (instruction.opcode == Opcode::Phi &&
+                    instruction.defs.size() == 1) {
+                    if (const auto id = virtual_id(instruction.defs.front())) {
+                        phi_values.insert(*id);
+                    }
+                }
+            }
+        }
         for (const auto& block : function.blocks) {
             for (const auto& instruction : block.instructions) {
                 if ((instruction.opcode == Opcode::Parameter ||
@@ -2889,6 +2855,34 @@ private:
                 }
                 if (instruction.kind == machine::InstructionKind::Return) {
                     if (!function_abi) continue;
+                    if (instruction.result_composition ==
+                            machine::ResultComposition::Pieces &&
+                        function_layout &&
+                        function_layout->results.size() == 1 &&
+                        function_layout->results.front().pieces.size() ==
+                            instruction.uses.size()) {
+                        // Each piece's value prefers its result register,
+                        // except a loop-carried PHI, whose color follows its
+                        // incoming values; the parallel copy at the return
+                        // resolves overlap.
+                        const auto& pieces =
+                            function_layout->results.front().pieces;
+                        for (std::size_t index = 0;
+                             index < instruction.uses.size(); ++index) {
+                            const auto id = virtual_id(instruction.uses[index]);
+                            const auto physical =
+                                pieces[index].location.kind ==
+                                        LocationKind::Register
+                                    ? physical_register_id(
+                                          pieces[index].location.reg)
+                                    : std::nullopt;
+                            if (id && physical && !phi_values.contains(*id)) {
+                                preferred_physical_colors[*id].push_back(
+                                    *physical);
+                            }
+                        }
+                        continue;
+                    }
                     for (const auto& use : instruction.uses) {
                         const auto id = virtual_id(use);
                         if (!id) continue;
@@ -3658,6 +3652,8 @@ private:
                         }
                     } else if (instruction.kind ==
                                    machine::InstructionKind::Return &&
+                               instruction.result_composition ==
+                                   machine::ResultComposition::None &&
                                function_layout &&
                                function_layout->results.size() == 1 &&
                                !instruction.uses.empty()) {
@@ -3961,7 +3957,12 @@ private:
         return value;
     }
 
-    bool share_index_scales(machine::Function& function) {
+    // Indexed operations of a block that scale one index by one power of
+    // two share one shift once `minimum_uses` of them do; a shared or lone
+    // shift is a separate operation that scheduling and delay slots place
+    // on its own, and the operations add the shifted index unscaled.
+    bool share_index_scales(machine::Function& function,
+                            unsigned minimum_uses = 2) {
         struct Group {
             machine::Register index;
             std::uint64_t scale{};
@@ -4013,8 +4014,8 @@ private:
                     ++found->uses;
                 }
             }
-            std::erase_if(groups, [](const Group& group) {
-                return group.uses < 2;
+            std::erase_if(groups, [&](const Group& group) {
+                return group.uses < minimum_uses;
             });
             if (groups.empty()) continue;
 
@@ -4539,6 +4540,988 @@ private:
                             machine::RegisterKind::Virtual &&
                         removed_truncations.contains(
                             instruction.defs.front().id);
+                });
+        }
+        return true;
+    }
+
+    // The ABI assignment of the integer `in` parameter that `value` captures
+    // whole, when the ABI carries it in several pieces.
+    const ArgumentAssignment* piece_parameter(
+        const machine::Function& function, const SignatureLayout& layout,
+        const machine::Instruction& value) const {
+        if (value.opcode != Opcode::Parameter || value.input_projection ||
+            value.operands.empty() || value.defs.size() != 1) {
+            return nullptr;
+        }
+        const auto& entity = hir_.function(function.source);
+        const auto* index =
+            std::get_if<machine::ImmediateOperand>(&value.operands[0]);
+        if (!index || index->value >= entity.parameters.size() ||
+            index->value >= layout.call.arguments.size()) {
+            return nullptr;
+        }
+        const auto& parameter = entity.parameters[index->value];
+        const auto& assignment = layout.call.arguments[index->value];
+        if (parameter.mode != ParameterMode::In ||
+            is_aggregate(hir_, parameter.type) ||
+            is_floating(hir_, parameter.type) || assignment.indirect ||
+            assignment.pieces.size() < 2 ||
+            type_bits(hir_, parameter.type) != value.defs.front().mode.bits) {
+            return nullptr;
+        }
+        return &assignment;
+    }
+
+    // The function's own ABI interface, when its model classifies it.
+    std::optional<SignatureLayout> own_interface_layout(
+        const machine::Function& function) const {
+        const auto& entity = hir_.function(function.source);
+        const auto* abi =
+            managed_abi_model(hir_, entity, subtarget_, options_);
+        return abi ? classify_function_interface(entity, *abi)
+                   : std::optional<SignatureLayout>{};
+    }
+
+    // A scalar integer result that its ABI carries in several register
+    // pieces, while one register holds the whole value, returns piece by
+    // piece: one truncation per piece of the bits the piece carries, which
+    // narrow_bit_ranges may then take from narrower values.
+    bool split_boundary_results(machine::Function& function) {
+        const auto& entity = hir_.function(function.source);
+        if (naked_ || is_void(hir_, entity.result_type) ||
+            is_floating(hir_, entity.result_type) ||
+            is_aggregate(hir_, entity.result_type) ||
+            is_vector(hir_, entity.result_type)) {
+            return false;
+        }
+        const auto layout = own_interface_layout(function);
+        if (!layout || layout->results.size() != 1) return false;
+        const auto& result = layout->results.front();
+        const auto bits = type_bits(hir_, entity.result_type);
+        const auto order = subtarget_.target().data_layout.byte_order;
+        const unsigned register_bits =
+            subtarget_.has_feature(Feature::Mips3) ? 64U : 32U;
+        if (result.indirect || result.pieces.size() < 2 ||
+            bits > register_bits ||
+            std::any_of(result.pieces.begin(), result.pieces.end(),
+                        [&](const ValuePiece& piece) {
+                            return piece.location.kind !=
+                                       LocationKind::Register ||
+                                !gpr_id(piece.location.reg) ||
+                                piece.value_bits == 0 ||
+                                piece.value_bits >= bits ||
+                                effective_piece_offset(piece, bits, order) +
+                                        piece.value_bits > bits;
+                        })) {
+            return false;
+        }
+        const machine::IntegerMode mode{static_cast<std::uint16_t>(bits)};
+        bool changed = false;
+        for (auto& block : function.blocks) {
+            if (block.instructions.empty()) continue;
+            auto returned = block.instructions.back();
+            if (returned.kind != machine::InstructionKind::Return ||
+                returned.uses.size() != 1 ||
+                returned.result_composition !=
+                    machine::ResultComposition::None) {
+                continue;
+            }
+            auto source = returned.uses.front();
+            if (source.kind != machine::RegisterKind::Virtual ||
+                source.id >= function.virtual_register_classes.size() ||
+                function.virtual_register_classes[source.id] !=
+                    machine::VirtualRegisterClass::Integer) {
+                continue;
+            }
+            // A call's result returned as is may leave as a tail call.
+            if (block.instructions.size() >= 2) {
+                const auto& previous =
+                    block.instructions[block.instructions.size() - 2];
+                if (previous.kind == machine::InstructionKind::Call &&
+                    previous.defs.size() == 1 &&
+                    previous.defs.front() == source) {
+                    continue;
+                }
+            }
+            std::vector<machine::Instruction> added;
+            const auto add = [&](Opcode opcode, machine::Register input,
+                                 machine::IntegerMode output_mode,
+                                 std::optional<std::uint64_t> amount) {
+                const auto output = create_integer_temporary(
+                    function, output_mode, returned.location, "result.piece");
+                auto value = target_instruction(opcode, returned.location);
+                value.inline_site = returned.inline_site;
+                value.operands = {register_operand(input)};
+                if (amount) {
+                    value.operands.push_back(
+                        immediate_operand(*amount, 0, machine::i32));
+                }
+                value.uses = {input};
+                value.defs = {output};
+                added.push_back(std::move(value));
+                return output;
+            };
+            if (returned.result_extension != machine::ExtensionKind::None) {
+                source = add(returned.result_extension ==
+                                     machine::ExtensionKind::Zero
+                                 ? Opcode::Zext
+                                 : Opcode::Sext,
+                             source, mode, std::nullopt);
+            }
+            if (source.mode != mode) continue;
+            std::vector<machine::Register> pieces;
+            for (const auto& piece : result.pieces) {
+                const auto offset = effective_piece_offset(piece, bits, order);
+                const auto from = offset == 0
+                    ? source
+                    : add(Opcode::ShrU, source, mode, offset);
+                pieces.push_back(add(Opcode::Trunc, from,
+                                     {piece.value_bits}, std::nullopt));
+            }
+            returned.uses = pieces;
+            returned.operands.clear();
+            for (const auto piece : pieces) {
+                returned.operands.push_back(register_operand(piece));
+            }
+            returned.result_extension = machine::ExtensionKind::None;
+            returned.result_composition = machine::ResultComposition::Pieces;
+            block.instructions.pop_back();
+            for (auto& value : added) {
+                block.instructions.push_back(std::move(value));
+            }
+            block.instructions.push_back(std::move(returned));
+            changed = true;
+        }
+        return changed;
+    }
+
+    // Bits [offset, offset + width) of an integer value, constant bits, or,
+    // with `sign`, copies of the top bit of `value`.
+    struct BitSource {
+        std::optional<std::uint64_t> constant;
+        machine::Register value;
+        unsigned offset{};
+        bool sign{};
+    };
+
+    // A truncation reads a range of its source's bits: [c, c + w) when it
+    // truncates a right shift by a constant c. The register that holds that
+    // range may be a narrower value: the operand of an extension or of a
+    // constant shift, the side of a bitwise operation whose other side is
+    // zero there, a constant, or the ABI piece of a parameter that its ABI
+    // carries in pieces. The truncation then reads that value. A truncation
+    // of a bitwise operation that only it reads, one side of which is such
+    // a value or a constant, operates at the narrow width instead.
+    bool narrow_bit_ranges(machine::Function& function) {
+        if (!options_.machine_combine || naked_) return false;
+        const auto count = function.virtual_registers.size();
+        const bool mips3 = subtarget_.has_feature(Feature::Mips3);
+        const unsigned register_bits = mips3 ? 64U : 32U;
+        std::vector<const machine::Instruction*> definitions(count);
+        std::vector<unsigned> uses(count);
+        std::vector<std::vector<const machine::Instruction*>> readers(count);
+        for (const auto& block : function.blocks) {
+            for (const auto& instruction : block.instructions) {
+                for (const auto definition : instruction.defs) {
+                    if (definition.kind == machine::RegisterKind::Virtual &&
+                        definition.id < count) {
+                        definitions[definition.id] = &instruction;
+                    }
+                }
+                for (const auto use : instruction.uses) {
+                    if (use.kind == machine::RegisterKind::Virtual &&
+                        use.id < count) {
+                        ++uses[use.id];
+                        readers[use.id].push_back(&instruction);
+                    }
+                }
+                for (const auto live : instruction.live_across_call) {
+                    if (live.kind == machine::RegisterKind::Virtual &&
+                        live.id < count) {
+                        ++uses[live.id];
+                    }
+                }
+            }
+        }
+        const auto integer = [&](machine::Register value) {
+            return value.kind == machine::RegisterKind::Virtual &&
+                value.id < count && value.mode.bits <= 64 &&
+                function.virtual_register_classes[value.id] ==
+                    machine::VirtualRegisterClass::Integer;
+        };
+        const auto low_mask = [](unsigned width) {
+            return width >= 64 ? ~std::uint64_t{0}
+                               : (std::uint64_t{1} << width) - 1U;
+        };
+        const auto definition_of = [&](machine::Register value)
+            -> const machine::Instruction* {
+            if (!integer(value)) return nullptr;
+            const auto* found = definitions[value.id];
+            return found && found->kind == machine::InstructionKind::Target &&
+                    found->defs.size() == 1 && !found->patch
+                ? found : nullptr;
+        };
+        const auto amount_of = [](const machine::Instruction& value)
+            -> std::optional<unsigned> {
+            const auto* amount = value.operands.size() == 2
+                ? std::get_if<machine::ImmediateOperand>(&value.operands[1])
+                : nullptr;
+            if (!amount || value.uses.size() != 1 || amount->high != 0 ||
+                amount->value >= 64) {
+                return std::nullopt;
+            }
+            return static_cast<unsigned>(amount->value);
+        };
+        const auto constant_of = [&](machine::Register value)
+            -> std::optional<std::uint64_t> {
+            const auto* definition = definition_of(value);
+            if (!definition || definition->opcode != Opcode::Constant ||
+                definition->operands.empty()) {
+                return std::nullopt;
+            }
+            const auto* immediate = std::get_if<machine::ImmediateOperand>(
+                &definition->operands.front());
+            if (!immediate) return std::nullopt;
+            return immediate->value & low_mask(value.mode.bits);
+        };
+        // The bits of a bitwise operation's immediate right operand.
+        const auto right_constant = [](const machine::Instruction& value)
+            -> std::optional<std::uint64_t> {
+            const auto* immediate = value.operands.size() == 2
+                ? std::get_if<machine::ImmediateOperand>(&value.operands[1])
+                : nullptr;
+            if (!immediate || value.uses.size() != 1) return std::nullopt;
+            return immediate->value;
+        };
+
+        // Whether bits [offset, offset + width) of `value` are zero.
+        std::function<bool(machine::Register, unsigned, unsigned, unsigned)>
+            zero;
+        zero = [&](machine::Register value, unsigned offset, unsigned width,
+                   unsigned depth) -> bool {
+            if (const auto bits = constant_of(value)) {
+                return ((*bits >> offset) & low_mask(width)) == 0;
+            }
+            const auto* definition = definition_of(value);
+            if (!definition || depth > 8) return false;
+            if (known_extension(*definition, definitions).zero <= offset) {
+                return true;
+            }
+            const auto bits = value.mode.bits;
+            const auto source = definition->uses.empty()
+                ? machine::Register{} : definition->uses.front();
+            switch (decode_opcode(definition->opcode)) {
+            case Opcode::Reinterpret:
+                return integer(source) && source.mode.bits == bits &&
+                    zero(source, offset, width, depth + 1);
+            case Opcode::Zext:
+                if (!integer(source)) return false;
+                if (offset >= source.mode.bits) return true;
+                return offset + width <= source.mode.bits &&
+                    zero(source, offset, width, depth + 1);
+            case Opcode::Shl:
+                if (const auto amount = amount_of(*definition)) {
+                    if (offset + width <= *amount) return true;
+                    return offset >= *amount &&
+                        zero(source, offset - *amount, width, depth + 1);
+                }
+                return false;
+            case Opcode::ShrU:
+                if (const auto amount = amount_of(*definition)) {
+                    if (offset + *amount >= bits) return true;
+                    return offset + *amount + width <= bits &&
+                        zero(source, offset + *amount, width, depth + 1);
+                }
+                return false;
+            case Opcode::And:
+                if (const auto mask = right_constant(*definition)) {
+                    return ((*mask >> offset) & low_mask(width)) == 0 ||
+                        zero(source, offset, width, depth + 1);
+                }
+                return definition->uses.size() == 2 &&
+                    (zero(definition->uses[0], offset, width, depth + 1) ||
+                     zero(definition->uses[1], offset, width, depth + 1));
+            case Opcode::Or:
+            case Opcode::Xor:
+                if (const auto right = right_constant(*definition)) {
+                    return ((*right >> offset) & low_mask(width)) == 0 &&
+                        zero(source, offset, width, depth + 1);
+                }
+                return definition->uses.size() == 2 &&
+                    zero(definition->uses[0], offset, width, depth + 1) &&
+                    zero(definition->uses[1], offset, width, depth + 1);
+            default: return false;
+            }
+        };
+
+        // Parameters that their ABI carries in pieces, whose whole capture
+        // may give way to one capture per piece.
+        const auto layout = own_interface_layout(function);
+        const auto order = subtarget_.target().data_layout.byte_order;
+        const auto pieces_of = [&](const machine::Instruction& value) {
+            return layout ? piece_parameter(function, *layout, value)
+                          : nullptr;
+        };
+        std::map<std::pair<std::uint64_t, std::size_t>, machine::Register>
+            piece_captures;
+        std::vector<machine::Instruction> new_captures;
+        std::unordered_set<std::uint32_t> split_captures;
+
+        // Where bits [offset, offset + width) of `value` come from.
+        std::function<BitSource(machine::Register, unsigned, unsigned,
+                                unsigned)>
+            resolve;
+        resolve = [&](machine::Register value, unsigned offset,
+                      unsigned width, unsigned depth) -> BitSource {
+            const BitSource unresolved{std::nullopt, value, offset};
+            if (const auto bits = constant_of(value)) {
+                return {(*bits >> offset) & low_mask(width), {}, 0};
+            }
+            const BitSource none{std::uint64_t{0}, {}, 0};
+            if (zero(value, offset, width, 0)) return none;
+            const auto* definition = definition_of(value);
+            if (!definition || depth > 8) return unresolved;
+            const auto bits = value.mode.bits;
+            const auto source = definition->uses.empty()
+                ? machine::Register{} : definition->uses.front();
+            switch (decode_opcode(definition->opcode)) {
+            case Opcode::Reinterpret:
+                if (integer(source) && source.mode.bits == bits) {
+                    return resolve(source, offset, width, depth + 1);
+                }
+                break;
+            case Opcode::Zext:
+            case Opcode::Sext:
+                if (!integer(source)) break;
+                if (offset + width <= source.mode.bits) {
+                    return resolve(source, offset, width, depth + 1);
+                }
+                if (definition->opcode == Opcode::Zext &&
+                    offset >= source.mode.bits) {
+                    return none;
+                }
+                if (definition->opcode == Opcode::Sext &&
+                    offset >= source.mode.bits &&
+                    source.mode.bits == width) {
+                    return {std::nullopt, source, 0, true};
+                }
+                break;
+            case Opcode::Shl:
+                if (const auto amount = amount_of(*definition)) {
+                    if (offset >= *amount) {
+                        return resolve(source, offset - *amount, width,
+                                       depth + 1);
+                    }
+                    if (offset + width <= *amount) return none;
+                }
+                break;
+            case Opcode::ShrU:
+            case Opcode::ShrS:
+                if (const auto amount = amount_of(*definition);
+                    amount && offset + *amount + width <= bits) {
+                    return resolve(source, offset + *amount, width,
+                                   depth + 1);
+                }
+                break;
+            case Opcode::Or:
+            case Opcode::Xor:
+                if (const auto right = right_constant(*definition)) {
+                    if (((*right >> offset) & low_mask(width)) == 0) {
+                        return resolve(source, offset, width, depth + 1);
+                    }
+                } else if (definition->uses.size() == 2) {
+                    if (zero(definition->uses[1], offset, width, 0)) {
+                        return resolve(definition->uses[0], offset, width,
+                                       depth + 1);
+                    }
+                    if (zero(definition->uses[0], offset, width, 0)) {
+                        return resolve(definition->uses[1], offset, width,
+                                       depth + 1);
+                    }
+                }
+                break;
+            case Opcode::And:
+                if (const auto mask = right_constant(*definition)) {
+                    const auto kept = (*mask >> offset) & low_mask(width);
+                    if (kept == low_mask(width)) {
+                        return resolve(source, offset, width, depth + 1);
+                    }
+                    if (kept == 0) return none;
+                } else if (definition->uses.size() == 2) {
+                    const auto left = definition->uses[0];
+                    const auto right = definition->uses[1];
+                    if (zero(left, offset, width, 0) ||
+                        zero(right, offset, width, 0)) {
+                        return none;
+                    }
+                    const auto all = [&](machine::Register mask) {
+                        const auto bits_of = constant_of(mask);
+                        return bits_of && ((*bits_of >> offset) &
+                                           low_mask(width)) == low_mask(width);
+                    };
+                    if (all(right)) {
+                        return resolve(left, offset, width, depth + 1);
+                    }
+                    if (all(left)) {
+                        return resolve(right, offset, width, depth + 1);
+                    }
+                }
+                break;
+            case Opcode::Parameter: {
+                const auto* assignment = options_.cprop_registers
+                    ? pieces_of(*definition) : nullptr;
+                if (!assignment) break;
+                const auto index = std::get<machine::ImmediateOperand>(
+                    definition->operands[0]).value;
+                for (std::size_t piece = 0;
+                     piece < assignment->pieces.size(); ++piece) {
+                    const auto& transport = assignment->pieces[piece];
+                    const auto begin =
+                        effective_piece_offset(transport, bits, order);
+                    if (offset < begin ||
+                        offset + width > begin + transport.value_bits) {
+                        continue;
+                    }
+                    auto& capture = piece_captures[{index, piece}];
+                    if (capture.mode.bits == 0) {
+                        capture = create_integer_temporary(
+                            function, {transport.value_bits},
+                            definition->location, "parameter.piece");
+                        auto added = *definition;
+                        added.defs = {capture};
+                        added.input_projection = machine::ValueProjection{
+                            static_cast<std::uint16_t>(begin),
+                            transport.value_bits};
+                        new_captures.push_back(std::move(added));
+                    }
+                    split_captures.insert(definition->defs.front().id);
+                    return {std::nullopt, capture, offset - begin};
+                }
+                break;
+            }
+            default: break;
+            }
+            return unresolved;
+        };
+        const auto exact = [](const BitSource& source, unsigned width) {
+            return !source.constant && !source.sign && source.offset == 0 &&
+                source.value.mode.bits == width;
+        };
+
+        // Rewrites are decided against the unchanged function, keeping use
+        // counts current: a value whose last reader goes away releases the
+        // values it reads in turn.
+        struct Rewrite {
+            std::vector<machine::Instruction> before;
+            machine::Instruction replacement;
+        };
+        std::vector<std::unordered_map<std::size_t, Rewrite>> rewrites(
+            function.blocks.size());
+        std::unordered_map<const machine::Instruction*,
+                           std::vector<machine::Register>> current_uses;
+        std::unordered_set<const machine::Instruction*> dead;
+        std::unordered_set<const machine::Instruction*> arithmetic;
+        const auto release = [&](machine::Register value) {
+            std::vector<machine::Register> pending{value};
+            while (!pending.empty()) {
+                const auto released = pending.back();
+                pending.pop_back();
+                if (!integer(released) || uses[released.id] == 0 ||
+                    --uses[released.id] != 0) {
+                    continue;
+                }
+                const auto* definition = definitions[released.id];
+                if (!definition ||
+                    definition->kind != machine::InstructionKind::Target ||
+                    definition->defs.size() != 1 || definition->may_load ||
+                    definition->may_store || definition->has_side_effects ||
+                    definition->patch ||
+                    definition->opcode == Opcode::Parameter ||
+                    definition->opcode == Opcode::Fparameter) {
+                    continue;
+                }
+                dead.insert(definition);
+                const auto found = current_uses.find(definition);
+                const auto& inputs = found != current_uses.end()
+                    ? found->second : definition->uses;
+                pending.insert(pending.end(), inputs.begin(), inputs.end());
+            }
+        };
+        const auto acquire = [&](machine::Register value) {
+            if (integer(value)) ++uses[value.id];
+        };
+        // Instructions that compute a source's bits as a `width`-bit value.
+        const auto materialize = [&](const BitSource& source, unsigned width,
+                                     const machine::Instruction& like,
+                                     std::vector<machine::Instruction>& added)
+            -> machine::Register {
+            const machine::IntegerMode mode{static_cast<std::uint16_t>(width)};
+            const auto make = [&](Opcode opcode, machine::IntegerMode output,
+                                  std::vector<machine::Operand> operands,
+                                  std::vector<machine::Register> inputs) {
+                const auto result = create_integer_temporary(
+                    function, output, like.location, "narrow");
+                for (const auto input : inputs) acquire(input);
+                auto value = target_instruction(opcode, like.location);
+                value.inline_site = like.inline_site;
+                value.operands = std::move(operands);
+                value.uses = std::move(inputs);
+                value.defs = {result};
+                added.push_back(std::move(value));
+                return result;
+            };
+            if (source.constant) {
+                return make(Opcode::Constant, mode,
+                            {immediate_operand(*source.constant, 0, mode)},
+                            {});
+            }
+            if (source.sign) {
+                return make(Opcode::ShrS, mode,
+                            {register_operand(source.value),
+                             immediate_operand(width - 1U, 0, machine::i32)},
+                            {source.value});
+            }
+            if (exact(source, width)) {
+                acquire(source.value);
+                return source.value;
+            }
+            auto from = source.value;
+            if (source.offset != 0) {
+                // The top word of a doubleword shifts arithmetically, so
+                // the word is sign-canonical without a truncation.
+                const bool sign = mips3 && width == 32 &&
+                    source.offset + width == from.mode.bits;
+                from = make(sign ? Opcode::ShrS : Opcode::ShrU, from.mode,
+                            {register_operand(from),
+                             immediate_operand(source.offset, 0,
+                                               machine::i32)},
+                            {from});
+            }
+            return make(Opcode::Trunc, mode, {register_operand(from)},
+                        {from});
+        };
+
+        // Whether a bitwise operation that one reader reads computes bits
+        // [offset, offset + width) at that width from its operands' bits,
+        // one of which is cheap there: a constant, a value of that width,
+        // copies of a sign, or such an operation.
+        std::function<bool(machine::Register, unsigned, unsigned, unsigned)>
+            narrowable;
+        narrowable = [&](machine::Register value, unsigned offset,
+                         unsigned width, unsigned depth) -> bool {
+            if (depth > 4 || !integer(value) ||
+                value.mode.bits > register_bits || uses[value.id] != 1) {
+                return false;
+            }
+            const auto* operation = definition_of(value);
+            const auto opcode = operation
+                ? decode_opcode(operation->opcode) : Opcode::Invalid;
+            if (opcode != Opcode::And && opcode != Opcode::Or &&
+                opcode != Opcode::Xor) {
+                return false;
+            }
+            const auto cheap = [&](machine::Register side) {
+                if (!integer(side)) return false;
+                const auto source = resolve(side, offset, width, 0);
+                if (source.constant || source.sign || exact(source, width)) {
+                    return true;
+                }
+                return source.value == side && source.offset == offset &&
+                    narrowable(side, offset, width, depth + 1);
+            };
+            if (operation->uses.size() == 1) {
+                return right_constant(*operation).has_value() &&
+                    cheap(operation->uses[0]);
+            }
+            return operation->uses.size() == 2 &&
+                (cheap(operation->uses[0]) || cheap(operation->uses[1]));
+        };
+        // A `width`-bit register holding bits [offset, offset + width) of
+        // `value`, computed at that width where narrowable() allows.
+        std::function<machine::Register(machine::Register, unsigned,
+                                        unsigned, const machine::Instruction&,
+                                        std::vector<machine::Instruction>&)>
+            narrow;
+        narrow = [&](machine::Register value, unsigned offset, unsigned width,
+                     const machine::Instruction& like,
+                     std::vector<machine::Instruction>& added)
+            -> machine::Register {
+            const auto source = resolve(value, offset, width, 0);
+            if (source.constant || source.sign || source.value != value ||
+                source.offset != offset ||
+                !narrowable(value, offset, width, 0)) {
+                return materialize(source, width, like, added);
+            }
+            const auto& operation = *definition_of(value);
+            const machine::IntegerMode mode{static_cast<std::uint16_t>(width)};
+            std::vector<machine::Register> inputs{
+                narrow(operation.uses[0], offset, width, like, added)};
+            std::vector<machine::Operand> operands{
+                register_operand(inputs.front())};
+            if (const auto right = right_constant(operation)) {
+                operands.push_back(immediate_operand(
+                    (*right >> offset) & low_mask(width), 0, mode));
+            } else {
+                inputs.push_back(
+                    narrow(operation.uses[1], offset, width, like, added));
+                operands.push_back(register_operand(inputs.back()));
+            }
+            const auto result = create_integer_temporary(
+                function, mode, like.location, "narrow");
+            auto computed = target_instruction(operation.opcode,
+                                               like.location);
+            computed.inline_site = like.inline_site;
+            computed.operands = std::move(operands);
+            computed.uses = std::move(inputs);
+            computed.defs = {result};
+            added.push_back(std::move(computed));
+            return result;
+        };
+
+        // The low bits of `value` that its readers use: a mask or a
+        // truncation reads fewer than all.
+        const auto demanded_bits = [&](machine::Register value) {
+            unsigned demanded = 0;
+            for (const auto* reader : readers[value.id]) {
+                if (dead.contains(reader)) continue;
+                if (const auto rewritten = current_uses.find(reader);
+                    rewritten != current_uses.end() &&
+                    std::find(rewritten->second.begin(),
+                              rewritten->second.end(),
+                              value) == rewritten->second.end()) {
+                    continue;
+                }
+                unsigned bits = value.mode.bits;
+                if (reader->kind == machine::InstructionKind::Target &&
+                    reader->uses.size() == 1 && reader->uses.front() == value &&
+                    reader->defs.size() == 1) {
+                    if (reader->opcode == Opcode::And) {
+                        if (const auto mask = right_constant(*reader)) {
+                            bits = static_cast<unsigned>(std::bit_width(
+                                *mask & low_mask(value.mode.bits)));
+                        }
+                    } else if (reader->opcode == Opcode::Trunc) {
+                        bits = std::min(bits,
+                                        unsigned{reader->defs.front()
+                                                     .mode.bits});
+                    }
+                }
+                demanded = std::max(demanded, bits);
+            }
+            return demanded;
+        };
+
+        bool changed = false;
+        // A rewrite may leave a truncation the only reader of a value,
+        // so truncations are visited again until nothing changes.
+        for (bool progress = true; progress;) {
+            progress = false;
+            for (std::size_t block = 0; block < function.blocks.size();
+                 ++block) {
+                const auto& instructions = function.blocks[block].instructions;
+                for (std::size_t index = 0; index < instructions.size();
+                     ++index) {
+                    const auto& instruction = instructions[index];
+                    if (instruction.kind != machine::InstructionKind::Target ||
+                        instruction.opcode != Opcode::Trunc ||
+                        instruction.uses.size() != 1 ||
+                        instruction.defs.size() != 1 || instruction.patch ||
+                        !integer(instruction.uses.front()) ||
+                        !integer(instruction.defs.front()) ||
+                        dead.contains(&instruction) ||
+                        rewrites[block].contains(index)) {
+                        continue;
+                    }
+                    const auto width = instruction.defs.front().mode.bits;
+                    const auto truncated = instruction.uses.front();
+                    auto read = truncated;
+                    unsigned offset = 0;
+                    // A truncated right shift reads its operand's bits from the
+                    // shift amount up.
+                    const auto* shift = definition_of(read);
+                    if (shift && (shift->opcode == Opcode::ShrU ||
+                                  shift->opcode == Opcode::ShrS)) {
+                        const auto amount = amount_of(*shift);
+                        if (amount && *amount + width <= read.mode.bits &&
+                            integer(shift->uses.front())) {
+                            read = shift->uses.front();
+                            offset = *amount;
+                        } else {
+                            shift = nullptr;
+                        }
+                    } else {
+                        shift = nullptr;
+                    }
+                    // The shift goes away with this truncation when only it
+                    // reads the shift.
+                    const bool own_shift = shift && uses[truncated.id] == 1;
+                    const auto found = resolve(read, offset, width, 0);
+                    Rewrite rewrite;
+                    rewrite.replacement = instruction;
+                    auto& replacement = rewrite.replacement;
+                    if (!found.constant && found.value == read &&
+                        found.offset == offset) {
+                        // Nothing narrower holds the bits. A bitwise operation
+                        // that only this truncation reads may operate at the
+                        // narrow width instead.
+                        if ((!shift || own_shift) &&
+                            narrowable(read, offset, width, 0)) {
+                            const auto& operation = *definition_of(read);
+                            const machine::IntegerMode mode{
+                                static_cast<std::uint16_t>(width)};
+                            std::vector<machine::Register> inputs{
+                                narrow(operation.uses[0], offset, width,
+                                       instruction, rewrite.before)};
+                            std::vector<machine::Operand> operands{
+                                register_operand(inputs.front())};
+                            if (const auto right = right_constant(operation)) {
+                                operands.push_back(immediate_operand(
+                                    (*right >> offset) & low_mask(width), 0,
+                                    mode));
+                            } else {
+                                inputs.push_back(
+                                    narrow(operation.uses[1], offset, width,
+                                           instruction, rewrite.before));
+                                operands.push_back(
+                                    register_operand(inputs.back()));
+                            }
+                            replacement.opcode = operation.opcode;
+                            replacement.operands = std::move(operands);
+                            replacement.uses = std::move(inputs);
+                            current_uses[&instruction] = replacement.uses;
+                            release(truncated);
+                            rewrites[block].emplace(index, std::move(rewrite));
+                            changed = true;
+                            progress = true;
+                            continue;
+                        }
+                        // Readers that use only the low bits may take them
+                        // from a register that holds just those.
+                        const auto demanded =
+                            demanded_bits(instruction.defs.front());
+                        const auto partial = demanded != 0 &&
+                                demanded < width
+                            ? resolve(read, offset, demanded, 0)
+                            : found;
+                        if (!partial.sign &&
+                            (partial.constant ||
+                             ((partial.value != read ||
+                               partial.offset != offset) &&
+                              partial.value.mode.bits >= width &&
+                              partial.value.mode.bits <= register_bits &&
+                              (partial.offset == 0 || own_shift ||
+                               partial.value.mode.bits == width)))) {
+                            if (partial.constant) {
+                                replacement.opcode = Opcode::Constant;
+                                replacement.operands = {immediate_operand(
+                                    *partial.constant, 0,
+                                    instruction.defs.front().mode)};
+                                replacement.uses.clear();
+                            } else {
+                                auto from = partial.value;
+                                acquire(from);
+                                if (partial.offset != 0 &&
+                                    from.mode.bits == width) {
+                                    replacement.opcode = Opcode::ShrU;
+                                    replacement.operands = {
+                                        register_operand(from),
+                                        immediate_operand(partial.offset, 0,
+                                                          machine::i32)};
+                                    replacement.uses = {from};
+                                } else {
+                                    if (partial.offset != 0) {
+                                        const auto shifted =
+                                            create_integer_temporary(
+                                                function, from.mode,
+                                                instruction.location,
+                                                "narrow");
+                                        auto value = target_instruction(
+                                            Opcode::ShrU,
+                                            instruction.location);
+                                        value.inline_site =
+                                            instruction.inline_site;
+                                        value.operands = {
+                                            register_operand(from),
+                                            immediate_operand(
+                                                partial.offset, 0,
+                                                machine::i32)};
+                                        value.uses = {from};
+                                        value.defs = {shifted};
+                                        rewrite.before.push_back(
+                                            std::move(value));
+                                        from = shifted;
+                                    }
+                                    replacement.opcode =
+                                        from.mode.bits == width
+                                        ? Opcode::Reinterpret
+                                        : Opcode::Trunc;
+                                    replacement.operands = {
+                                        register_operand(from)};
+                                    replacement.uses = {from};
+                                }
+                            }
+                            current_uses[&instruction] = replacement.uses;
+                            release(truncated);
+                            rewrites[block].emplace(index,
+                                                    std::move(rewrite));
+                            changed = true;
+                            progress = true;
+                            continue;
+                        }
+                        if (mips3 && width == 32 && own_shift &&
+                            offset + width == read.mode.bits &&
+                            shift->opcode == Opcode::ShrU) {
+                            arithmetic.insert(shift);
+                            changed = true;
+                        }
+                        continue;
+                    }
+                    const bool narrow_source = found.constant.has_value() ||
+                        found.sign || exact(found, width);
+                    // A range of another register costs a shift unless this
+                    // replaces one, and pairs take no new shifts.
+                    if (!narrow_source &&
+                        ((found.offset != 0 && !own_shift) ||
+                         found.value.mode.bits > register_bits)) {
+                        continue;
+                    }
+                    if (found.constant) {
+                        replacement.opcode = Opcode::Constant;
+                        replacement.operands = {immediate_operand(
+                            *found.constant, 0, instruction.defs.front().mode)};
+                        replacement.uses.clear();
+                    } else if (found.sign) {
+                        acquire(found.value);
+                        replacement.opcode = Opcode::ShrS;
+                        replacement.operands = {
+                            register_operand(found.value),
+                            immediate_operand(width - 1U, 0, machine::i32)};
+                        replacement.uses = {found.value};
+                    } else if (exact(found, width)) {
+                        acquire(found.value);
+                        replacement.opcode = Opcode::Reinterpret;
+                        replacement.operands = {register_operand(found.value)};
+                        replacement.uses = {found.value};
+                    } else {
+                        auto from = found.value;
+                        acquire(from);
+                        if (found.offset != 0) {
+                            const auto shifted = create_integer_temporary(
+                                function, from.mode, instruction.location,
+                                "narrow");
+                            const bool sign = mips3 && width == 32 &&
+                                found.offset + width == from.mode.bits;
+                            auto value = target_instruction(
+                                sign ? Opcode::ShrS : Opcode::ShrU,
+                                instruction.location);
+                            value.inline_site = instruction.inline_site;
+                            value.operands = {
+                                register_operand(from),
+                                immediate_operand(found.offset, 0,
+                                                  machine::i32)};
+                            value.uses = {from};
+                            value.defs = {shifted};
+                            rewrite.before.push_back(std::move(value));
+                            from = shifted;
+                        }
+                        replacement.operands = {register_operand(from)};
+                        replacement.uses = {from};
+                    }
+                    current_uses[&instruction] = replacement.uses;
+                    release(truncated);
+                    rewrites[block].emplace(index, std::move(rewrite));
+                    changed = true;
+                    progress = true;
+                }
+            }
+        }
+        if (!changed) return false;
+
+        // Resolution may have named piece captures that no rewrite kept.
+        std::unordered_set<std::uint32_t> read_captures;
+        const auto note_reads = [&](const machine::Instruction& value) {
+            for (const auto use : value.uses) {
+                if (use.kind == machine::RegisterKind::Virtual &&
+                    use.id >= count) {
+                    read_captures.insert(use.id);
+                }
+            }
+        };
+        for (std::size_t block = 0; block < function.blocks.size(); ++block) {
+            for (const auto& [index, rewrite] : rewrites[block]) {
+                if (dead.contains(
+                        &function.blocks[block].instructions[index])) {
+                    continue;
+                }
+                for (const auto& value : rewrite.before) note_reads(value);
+                note_reads(rewrite.replacement);
+            }
+        }
+
+        for (std::size_t block = 0; block < function.blocks.size(); ++block) {
+            auto& instructions = function.blocks[block].instructions;
+            std::vector<machine::Instruction> rebuilt;
+            rebuilt.reserve(instructions.size());
+            for (std::size_t index = 0; index < instructions.size(); ++index) {
+                auto& instruction = instructions[index];
+                if (dead.contains(&instruction)) continue;
+                if (arithmetic.contains(&instruction)) {
+                    instruction.opcode = Opcode::ShrS;
+                }
+                const bool whole = instruction.opcode == Opcode::Parameter &&
+                    !instruction.input_projection &&
+                    instruction.defs.size() == 1 &&
+                    split_captures.contains(instruction.defs.front().id);
+                if (whole) {
+                    // The piece captures that something reads join the
+                    // whole capture, which goes away once nothing reads it.
+                    for (auto& capture : new_captures) {
+                        if (capture.operands == instruction.operands &&
+                            read_captures.contains(
+                                capture.defs.front().id)) {
+                            rebuilt.push_back(std::move(capture));
+                        }
+                    }
+                    if (uses[instruction.defs.front().id] == 0) continue;
+                }
+                const auto found = rewrites[block].find(index);
+                if (found == rewrites[block].end()) {
+                    rebuilt.push_back(std::move(instruction));
+                    continue;
+                }
+                for (auto& value : found->second.before) {
+                    rebuilt.push_back(std::move(value));
+                }
+                rebuilt.push_back(std::move(found->second.replacement));
+            }
+            instructions = std::move(rebuilt);
+        }
+        // A PHI's copy of a parameter's capture remains, so that a loop
+        // value starting from a parameter is not drawn into the parameter's
+        // ABI register; other copies go away.
+        if (options_.cprop_registers) {
+            std::unordered_set<std::uint32_t> captures;
+            std::unordered_set<std::uint32_t> phi_inputs;
+            for (const auto& block : function.blocks) {
+                for (const auto& instruction : block.instructions) {
+                    if (instruction.opcode == Opcode::Parameter &&
+                        instruction.defs.size() == 1) {
+                        captures.insert(instruction.defs.front().id);
+                    }
+                    if (instruction.opcode == Opcode::Phi) {
+                        for (const auto use : instruction.uses) {
+                            phi_inputs.insert(use.id);
+                        }
+                    }
+                }
+            }
+            (void)native::propagate_virtual_register_copies(
+                function, [&](const machine::Instruction& value) {
+                    return value.opcode == Opcode::Reinterpret &&
+                        value.uses.size() == 1 && value.defs.size() == 1 &&
+                        !(captures.contains(value.uses.front().id) &&
+                          phi_inputs.contains(value.defs.front().id));
                 });
         }
         return true;
@@ -5572,13 +6555,20 @@ private:
         // may trap follows the previous one and every load since, and a
         // load follows the previous operation that may trap; earlier ones
         // precede those transitively. A store follows the previous store,
-        // every load since, and the previous operation that may trap, and
-        // loads and operations that may trap follow it: memory keeps its
-        // order, while other operations move past stores.
+        // every earlier load whose bytes it may overlap, and the previous
+        // operation that may trap; a load follows the last store whose
+        // bytes it may overlap, and an operation that may trap follows the
+        // last store. Accesses overlap unless their MIR access facts keep
+        // them apart; other operations move past stores.
         std::optional<std::size_t> last_trapping;
         std::vector<std::size_t> loads_since;
-        std::optional<std::size_t> last_store;
-        std::vector<std::size_t> loads_since_store;
+        std::vector<std::size_t> stores;
+        std::vector<std::size_t> loads;
+        const auto overlap = [&](std::size_t left, std::size_t right) {
+            const auto& first = instructions[begin + left].memory;
+            const auto& second = instructions[begin + right].memory;
+            return !first || !second || mir::may_alias(*first, *second);
+        };
         for (std::size_t index = 0; index < count; ++index) {
             std::unordered_set<std::size_t> dependencies;
             for (const auto& value : instructions[begin + index].uses) {
@@ -5598,16 +6588,22 @@ private:
             if ((trapping || current.may_load || store) && last_trapping) {
                 dependencies.insert(*last_trapping);
             }
-            if ((trapping || current.may_load || store) && last_store) {
-                dependencies.insert(*last_store);
-            }
             if (store) {
-                dependencies.insert(loads_since_store.begin(),
-                                    loads_since_store.end());
-                loads_since_store.clear();
-                last_store = index;
+                if (!stores.empty()) dependencies.insert(stores.back());
+                for (const auto load : loads) {
+                    if (overlap(load, index)) dependencies.insert(load);
+                }
+                stores.push_back(index);
             } else if (current.may_load) {
-                loads_since_store.push_back(index);
+                const auto last = std::find_if(
+                    stores.rbegin(), stores.rend(),
+                    [&](std::size_t earlier) {
+                        return overlap(earlier, index);
+                    });
+                if (last != stores.rend()) dependencies.insert(*last);
+                loads.push_back(index);
+            } else if (trapping && !stores.empty()) {
+                dependencies.insert(stores.back());
             }
             if (trapping) {
                 dependencies.insert(loads_since.begin(), loads_since.end());
@@ -6253,18 +7249,49 @@ private:
         // further preserved register: with the values live through the
         // region, no bank's peak passes both the region's and the bank's
         // volatile colors, less the colors that loop PHIs and emitter
-        // staging take (as for loop constants).
+        // staging take (as for loop constants). An order that loads before
+        // a store, which only MIR's access facts allow, may take one
+        // register more where the region runs often enough that its saved
+        // cycles outweigh a preserved register's save and restore; register
+        // allocation then weighs those cycles against the further saves.
         if (latency_schedules_) {
             // Candidates that avoid waits, weighting pressure lightly and as
             // the plain schedule does; the one that finishes soonest wins.
             std::optional<std::vector<std::size_t>> best;
-            unsigned best_cycles = estimated_cycles(original);
+            const auto original_cycles = estimated_cycles(original);
+            unsigned best_cycles = original_cycles;
+            bool best_repaid = false;
+            // Whether an order loads before a store that precedes the load
+            // in the region: what MIR's access facts allow and the first
+            // pass, whose regions end at stores, cannot reach.
+            const auto loads_before_store =
+                [&](const std::vector<std::size_t>& plan) {
+                    std::vector<std::size_t> position(count);
+                    for (std::size_t at = 0; at < plan.size(); ++at) {
+                        position[plan[at]] = at;
+                    }
+                    for (std::size_t store = 0; store < count; ++store) {
+                        if (!instructions[begin + store].may_store) continue;
+                        for (auto load = store + 1; load < count; ++load) {
+                            const auto& value = instructions[begin + load];
+                            if (value.may_load && !value.may_store &&
+                                position[load] < position[store]) {
+                                return true;
+                            }
+                        }
+                    }
+                    return false;
+                };
             for (const bool light : {true, false}) {
                 const auto alternative = greedy(light, true);
                 if (!alternative || *alternative == original) continue;
                 const auto peak = measure_pressure(*alternative).peak;
                 bool fits = true;
+                unsigned added{};
                 for (std::size_t bank = 0; bank < peak.size(); ++bank) {
+                    if (peak[bank] > original_pressure.peak[bank]) {
+                        added += peak[bank] - original_pressure.peak[bank];
+                    }
                     const auto through = region_pressure.through[bank];
                     const auto headroom =
                         bank == static_cast<std::size_t>(
@@ -6277,15 +7304,24 @@ private:
                                      colors > headroom ? colors - headroom : 0U);
                 }
                 const auto cycles = estimated_cycles(*alternative);
-                if (fits &&
+                const bool repaid = added <= 1 && cycles < original_cycles &&
+                    region_weight_ * (original_cycles - cycles) >
+                        preserved_register_cycles &&
+                    loads_before_store(*alternative);
+                if ((fits || repaid) &&
                     transfer_nops(*alternative) <= transfer_nops(original) &&
                     hilo_stalls(*alternative) <= hilo_stalls(original) &&
                     cycles < best_cycles) {
                     best = alternative;
                     best_cycles = cycles;
+                    best_repaid = !fits;
                 }
             }
             if (!best) return false;
+            if (best_repaid) {
+                latency_gain_ +=
+                    region_weight_ * (original_cycles - best_cycles);
+            }
             std::vector<machine::Instruction> scheduled;
             scheduled.reserve(count);
             for (const auto index : *best) {
@@ -6491,12 +7527,23 @@ private:
         schedule_fallback_.reset();
         ordered_stores_ = false;
         latency_schedules_ = false;
-        if (options_.optimize_for != OptimizationGoal::Speed ||
-            !options_.register_allocation) {
+        if (!options_.register_allocation) {
             return schedule_regions(function) || changed;
         }
         changed = schedule_regions(function) || changed;
         auto fallback = function;
+        // Lone scaled indices split into a shift and an add, which delay
+        // slots and the latency schedules may place apart; allocation
+        // weighs the split's pressure.
+        const bool split = !naked_ && options_.combine_addresses &&
+            share_index_scales(function, 1);
+        if (options_.optimize_for != OptimizationGoal::Speed) {
+            if (split) {
+                (void)schedule_regions(function);
+                schedule_fallback_ = std::move(fallback);
+            }
+            return changed || split;
+        }
         // A store's pending data-cache write is a registry form's hazard
         // event, which the hazard model times from the store's position.
         ordered_stores_ = std::none_of(
@@ -6509,11 +7556,12 @@ private:
                     });
             });
         latency_schedules_ = true;
+        latency_gain_ = 0;
         const bool latency = schedule_regions(function);
         ordered_stores_ = false;
         latency_schedules_ = false;
-        if (latency) schedule_fallback_ = std::move(fallback);
-        return changed || latency;
+        if (latency || split) schedule_fallback_ = std::move(fallback);
+        return changed || latency || split;
     }
 
     // Values that allocation left without a color.
@@ -6589,14 +7637,19 @@ private:
         (void)split_entry_parameters(fallback);
         const bool changed = allocate_with_scratch_colors(function);
         (void)allocate_with_scratch_colors(fallback);
-        // The latency schedules stay when they need no further preserved
-        // register, uncolored value, or move.
+        // The latency schedules stay when they need no further uncolored
+        // value or move, and no further preserved register beyond what the
+        // cycles saved by orders that load before a store repay, weighted
+        // by how often their blocks run.
         const auto moves = weighted_moves(function);
         const auto fallback_moves = weighted_moves(fallback);
-        if (function.callee_saved_registers.size() >
-                fallback.callee_saved_registers.size() ||
-            uncolored_values(function) > uncolored_values(fallback) ||
-            moves > fallback_moves) {
+        const auto saves = [](const machine::Function& value) {
+            return preserved_register_cycles *
+                value.callee_saved_registers.size();
+        };
+        if (uncolored_values(function) > uncolored_values(fallback) ||
+            moves > fallback_moves ||
+            saves(function) > saves(fallback) + latency_gain_) {
             function = std::move(fallback);
         }
         return changed;
@@ -6605,6 +7658,7 @@ private:
     bool schedule_regions(machine::Function& function) {
         bool changed = false;
         const auto live_out = virtual_live_out(function);
+        const auto weights = block_weights(function);
         // Only speed goals read the pressure of values live through a region.
         RegionPressure pressure;
         if (const auto* abi = managed_abi_model(
@@ -6688,6 +7742,8 @@ private:
                 }
                 if (latency_schedules_) region_pressure[region].live_after = live;
             }
+            region_weight_ = block.id.value < weights.size()
+                ? weights[block.id.value] : 1U;
             for (std::size_t region = 0; region < regions.size(); ++region) {
                 changed = schedule_region(block.instructions,
                                           regions[region].first,
@@ -6900,6 +7956,18 @@ private:
                 return select_integer_immediates(function);
             });
         passes.add(
+            {{LoweringPass::SplitBoundaryResults}, Stage::Legalization,
+             "split-boundary-results"},
+            [this](machine::Function& function) {
+                return split_boundary_results(function);
+            });
+        passes.add(
+            {{LoweringPass::NarrowBitRanges}, Stage::InstructionCombining,
+             "narrow-bit-ranges"},
+            [this](machine::Function& function) {
+                return narrow_bit_ranges(function);
+            });
+        passes.add(
             {{LoweringPass::FoldBooleanExtensions},
              Stage::InstructionCombining, "fold-boolean-extensions"},
             [this](machine::Function& function) {
@@ -7016,13 +8084,20 @@ private:
              "eliminate-dead-machine-values"},
             [this](machine::Function& function) {
                 if (!options_.machine_dce && !naked_) return false;
+                // A parameter that its ABI carries in pieces is assembled
+                // only where something reads it whole.
+                const auto layout = naked_
+                    ? std::optional<SignatureLayout>{}
+                    : own_interface_layout(function);
                 std::vector<bool> implicit_parameter_storage(
                     function.virtual_registers.size());
                 for (const auto& block : function.blocks) {
                     for (const auto& value : block.instructions) {
                         const auto opcode = decode_opcode(value.opcode);
-                        if (opcode != Opcode::Parameter &&
-                            opcode != Opcode::Fparameter) {
+                        if ((opcode != Opcode::Parameter &&
+                             opcode != Opcode::Fparameter) ||
+                            (layout &&
+                             piece_parameter(function, *layout, value))) {
                             continue;
                         }
                         for (const auto& definition : value.defs) {
@@ -7447,6 +8522,10 @@ private:
     bool latency_schedules_{};
     bool ordered_stores_{};
     std::optional<machine::Function> schedule_fallback_;
+    // How often the block being scheduled runs, and the cycles the latency
+    // schedules save, weighted by how often their blocks run.
+    std::uint64_t region_weight_{1};
+    std::uint64_t latency_gain_{};
     std::unordered_map<std::uint32_t, machine::PhysicalRegisterId>
         hard_slots_;
 };
@@ -9027,8 +10106,10 @@ private:
         return "$abi.in." + std::string(reg);
     }
 
-    std::optional<machine::Register> parameter_target(
+    // The values that capture a parameter: one, or one per projected piece.
+    std::vector<machine::Register> parameter_targets(
         const machine::Function& function, std::size_t parameter) const {
+        std::vector<machine::Register> targets;
         for (const auto& block : function.blocks) {
             for (const auto& instruction : block.instructions) {
                 if ((instruction.opcode != Opcode::Parameter &&
@@ -9041,11 +10122,11 @@ private:
                     std::get_if<machine::ImmediateOperand>(
                         &instruction.operands.front());
                 if (index && index->value == parameter) {
-                    return instruction.defs.front();
+                    targets.push_back(instruction.defs.front());
                 }
             }
         }
-        return std::nullopt;
+        return targets;
     }
 
     bool individually_direct_parameter_capture(
@@ -9060,15 +10141,21 @@ private:
         const bool pointer = entity.parameters[index].mode != ParameterMode::In;
         const auto& assignment =
             active_signature_->layout.call.arguments[index];
-        const auto target = parameter_target(function, index);
-        if (!target) return false;
+        // Nothing reads a parameter without a capture.
+        const auto targets = parameter_targets(function, index);
+        if (targets.empty()) return true;
         if (!pointer && is_floating(hir_, entity.parameters[index].type)) {
             return assignment.pieces.size() == 1 &&
                 assignment.pieces.front().location.kind ==
                     LocationKind::Register &&
-                assigned_fpr(function, *target).has_value();
+                targets.size() == 1 &&
+                assigned_fpr(function, targets.front()).has_value();
         }
-        if (!assigned_gpr(function, *target) || assignment.pieces.empty() ||
+        if (std::any_of(targets.begin(), targets.end(),
+                        [&](machine::Register target) {
+                            return !assigned_gpr(function, target);
+                        }) ||
+            assignment.pieces.empty() ||
             std::any_of(assignment.pieces.begin(), assignment.pieces.end(),
                         [](const ValuePiece& piece) {
                             return piece.location.kind !=
@@ -9870,6 +10957,12 @@ private:
         normalize_integer(target, source, bits, sign);
     }
 
+    // A word that LW loads from a stack piece is sign-canonical on MIPS III.
+    bool canonical_stack_word(const ValuePiece& piece, unsigned bits) const {
+        return piece.location.kind == LocationKind::Stack && bits == 32 &&
+            piece.carrier_bits == 32 && subtarget_.has_feature(Feature::Mips3);
+    }
+
     bool abi_supplies_canonical_word(const ValuePiece& piece,
                                      unsigned bits) const {
         return bits == 32 && piece.carrier_bits == 32 &&
@@ -10647,18 +11740,27 @@ private:
                 }
                 return;
             }
+            // A stack piece loads straight into its value's register.
+            const auto assigned = selected->location.kind ==
+                    LocationKind::Stack
+                ? assigned_gpr(function, target)
+                : std::nullopt;
+            const std::string_view work = assigned ? *assigned : "t0";
             load_abi_piece(function, *selected, *active_signature_->abi,
-                           "t0", true);
+                           work, true);
             if (shift != 0) {
                 instruction(selected->carrier_bits > 32 ? "dsrl" : "srl",
-                            "$t0,$t0," + std::to_string(shift));
+                            reg_name(work) + "," + reg_name(work) + "," +
+                                std::to_string(shift));
             }
             if (!abi_supplies_canonical_word(
-                    *selected, target.mode.bits)) {
+                    *selected, target.mode.bits) &&
+                !(shift == 0 && canonical_stack_word(*selected,
+                                                     target.mode.bits))) {
                 canonicalize_integer_value(
-                    "t0", target.mode.bits, false);
+                    work, target.mode.bits, false);
             }
-            store_vreg(function, target, "t0", value.location);
+            store_vreg(function, target, work, value.location);
             return;
         }
         if (direct_parameter_capture(function, index)) {
@@ -10712,15 +11814,8 @@ private:
                     if (input.value_bits == 32 && offset == 32) high = &input;
                 }
                 if (low && high) {
-                    instruction("dsll32", reg_name(*destination) + "," +
-                                              reg_name(high->location.reg) +
-                                              ",0");
-                    instruction("dsll32", "$at," +
-                                              reg_name(low->location.reg) +
-                                              ",0");
-                    instruction("dsrl32", "$at,$at,0");
-                    instruction("or", reg_name(*destination) + "," +
-                                          reg_name(*destination) + ",$at");
+                    compose_doubleword(*destination, low->location.reg,
+                                       high->location.reg);
                     return;
                 }
             }
@@ -10816,6 +11911,31 @@ private:
                                 value.location);
             }
         } else {
+            // A stack piece that holds the whole integer loads straight into
+            // its value's register.
+            const auto& pieces = assignment.pieces;
+            const auto assigned = !is_floating(hir_, parameter.type) &&
+                    pieces.size() == 1 &&
+                    pieces.front().location.kind == LocationKind::Stack &&
+                    effective_piece_offset(
+                        pieces.front(), bits,
+                        subtarget_.target().data_layout.byte_order) == 0 &&
+                    pieces.front().value_bits >= bits
+                ? assigned_gpr(function, target)
+                : std::nullopt;
+            if (assigned) {
+                const auto& piece = pieces.front();
+                load_abi_piece(function, piece, *active_signature_->abi,
+                               *assigned, true);
+                if (!abi_supplies_canonical_word(piece, bits) &&
+                    !canonical_stack_word(piece, bits)) {
+                    canonicalize_integer_value(
+                        *assigned, bits,
+                        is_signed_integer(hir_, parameter.type) ||
+                            is_address_value(hir_, parameter.type));
+                }
+                return;
+            }
             assemble_incoming_integer(
                 function, assignment.pieces, *active_signature_->abi, bits,
                 is_signed_integer(hir_, parameter.type) ||
@@ -11058,6 +12178,26 @@ private:
         return true;
     }
 
+    // A doubleword from its two word pieces: the high word shifted up and
+    // the low word zero-extended through $at, reading each piece before
+    // writing the destination over it.
+    void compose_doubleword(std::string_view destination,
+                            std::string_view low, std::string_view high) {
+        if (destination == low) {
+            instruction("dsll32", "$at," + reg_name(low) + ",0");
+            instruction("dsrl32", "$at,$at,0");
+            instruction("dsll32", reg_name(destination) + "," +
+                                      reg_name(high) + ",0");
+        } else {
+            instruction("dsll32", reg_name(destination) + "," +
+                                      reg_name(high) + ",0");
+            instruction("dsll32", "$at," + reg_name(low) + ",0");
+            instruction("dsrl32", "$at,$at,0");
+        }
+        instruction("or", reg_name(destination) + "," +
+                              reg_name(destination) + ",$at");
+    }
+
     void capture_call_result(const machine::Function& function,
                              const machine::Instruction& call,
                              const ActiveSignature& signature) {
@@ -11118,6 +12258,30 @@ private:
                         assignment.pieces.front().location.reg,
                         call.location);
             return;
+        }
+        // Two word pieces of a doubleword form it in its register.
+        if (bits == 64 && subtarget_.has_feature(Feature::Mips3) &&
+            !is_floating(hir_, callee.result_type) &&
+            assignment.pieces.size() == 2) {
+            const ValuePiece* low = nullptr;
+            const ValuePiece* high = nullptr;
+            for (const auto& piece : assignment.pieces) {
+                if (piece.location.kind != LocationKind::Register ||
+                    piece.value_bits != 32) {
+                    continue;
+                }
+                const auto offset = effective_piece_offset(
+                    piece, bits, subtarget_.target().data_layout.byte_order);
+                if (offset == 0) low = &piece;
+                if (offset == 32) high = &piece;
+            }
+            const auto destination = assigned_gpr(function, target);
+            if (low && high && destination &&
+                low->location.reg != high->location.reg) {
+                compose_doubleword(*destination, low->location.reg,
+                                   high->location.reg);
+                return;
+            }
         }
         if (bits > 32 && !subtarget_.has_feature(Feature::Mips3)) {
             assemble_incoming_pair(function, assignment.pieces,
@@ -11610,146 +12774,6 @@ private:
         output_ << done << ":\n";
     }
 
-    bool place_composed_return(
-        const machine::Function& function,
-        const machine::Instruction& value,
-        const ReturnAssignment& result,
-        bool fallthrough_epilogue) {
-        if (value.result_composition !=
-                machine::ResultComposition::XorZeroExtend) {
-            return false;
-        }
-        if (!subtarget_.has_feature(Feature::Mips3) ||
-            value.uses.size() != 2 || value.uses[0].mode.bits != 64 ||
-            value.uses[1].mode.bits != 32 || result.indirect ||
-            result.pieces.size() != 2) {
-            diagnostics_.error(
-                value.location,
-                "invalid MIPS mixed-width result composition");
-            return true;
-        }
-
-        const ValuePiece* low = nullptr;
-        const ValuePiece* high = nullptr;
-        for (const auto& piece : result.pieces) {
-            if (piece.location.kind != LocationKind::Register ||
-                piece.value_bits != 32 || piece.carrier_bits != 32) {
-                diagnostics_.error(
-                    value.location,
-                    "MIPS mixed-width result requires two 32-bit register pieces");
-                return true;
-            }
-            const auto offset = effective_piece_offset(
-                piece, 64,
-                subtarget_.target().data_layout.byte_order);
-            if (offset == 0) low = &piece;
-            else if (offset == 32) high = &piece;
-        }
-        if (!low || !high || low->location.reg == high->location.reg) {
-            diagnostics_.error(
-                value.location,
-                "MIPS mixed-width result has an invalid ABI piece map");
-            return true;
-        }
-
-        const auto wide_assignment = assigned_gpr(function, value.uses[0]);
-        const auto narrow_assignment = assigned_gpr(function, value.uses[1]);
-        const auto scratch = [&](std::initializer_list<std::string_view>
-                                     unavailable)
-            -> std::optional<std::string_view> {
-            static constexpr std::array<std::string_view, 11> candidates{
-                "t0", "t1", "t2", "t3", "t4", "t5",
-                "t6", "t7", "t8", "t9", "at"};
-            const auto found = std::find_if(
-                candidates.begin(), candidates.end(),
-                [&](std::string_view candidate) {
-                    return std::find(unavailable.begin(), unavailable.end(),
-                                     candidate) == unavailable.end();
-                });
-            return found == candidates.end()
-                ? std::nullopt
-                : std::optional<std::string_view>{*found};
-        };
-
-        std::string_view wide;
-        std::string_view narrow;
-        if (wide_assignment) {
-            wide = *wide_assignment;
-        } else {
-            const auto selected = scratch(
-                {low->location.reg, high->location.reg,
-                 narrow_assignment.value_or(std::string_view{})});
-            if (!selected) {
-                diagnostics_.error(value.location,
-                                   "MIPS return has no wide-value scratch register");
-                return true;
-            }
-            wide = *selected;
-            load_vreg(function, value.uses[0], wide, value.location);
-        }
-        if (narrow_assignment) {
-            narrow = *narrow_assignment;
-        } else {
-            const auto selected = scratch(
-                {low->location.reg, high->location.reg, wide});
-            if (!selected) {
-                diagnostics_.error(
-                    value.location,
-                    "MIPS return has no narrow-value scratch register");
-                return true;
-            }
-            narrow = *selected;
-            load_vreg(function, value.uses[1], narrow, value.location);
-        }
-        if (wide == narrow || wide == low->location.reg ||
-            wide == high->location.reg || narrow == low->location.reg ||
-            narrow == high->location.reg) {
-            diagnostics_.error(
-                value.location,
-                "MIPS allocator overlapped a composed return source and result");
-            return true;
-        }
-
-        instruction("xor", reg_name(low->location.reg) + "," +
-                               reg_name(wide) + "," + reg_name(narrow));
-        instruction("dsrl32", reg_name(high->location.reg) + "," +
-                                  reg_name(wide) + ",0");
-        if (high->extension == AbiExtensionKind::Sign) {
-            instruction("sll", reg_name(high->location.reg) + "," +
-                                   reg_name(high->location.reg) + ",0");
-        }
-
-        // Keep the final low-word normalization in the control-transfer
-        // delay slot whenever this block owns that transfer.
-        std::string delay_opcode = "nop";
-        std::string delay_operands;
-        if (low->extension == AbiExtensionKind::Sign) {
-            delay_opcode = "sll";
-            delay_operands = reg_name(low->location.reg) + "," +
-                reg_name(low->location.reg) + ",0";
-        } else if (low->extension == AbiExtensionKind::Zero) {
-            instruction("dsll32", reg_name(low->location.reg) + "," +
-                                      reg_name(low->location.reg) + ",0");
-            delay_opcode = "dsrl32";
-            delay_operands = reg_name(low->location.reg) + "," +
-                reg_name(low->location.reg) + ",0";
-        }
-        const auto emit_delay = [&] {
-            if (delay_opcode == "nop") instruction("nop");
-            else instruction(delay_opcode, delay_operands);
-        };
-        if (direct_return()) {
-            instruction("jr", "$ra");
-            emit_delay();
-        } else if (!fallthrough_epilogue) {
-            instruction("b", epilogue_label_);
-            emit_delay();
-        } else if (delay_opcode != "nop") {
-            instruction(delay_opcode, delay_operands);
-        }
-        return true;
-    }
-
     // The registers of a scalar result that one move places in its ABI
     // register, or none when the value already is there.
     struct ResultMove {
@@ -11765,6 +12789,19 @@ private:
         const machine::Function& function,
         const machine::Instruction& value) const {
         if (value.uses.empty()) return std::optional<ResultMove>{};
+        if (value.result_composition == machine::ResultComposition::Pieces) {
+            auto moves = piece_result_moves(value);
+            if (!moves) return std::nullopt;
+            std::erase_if(*moves, [&](const ArgumentMove& move) {
+                return argument_location(function, move) == move.target;
+            });
+            if (moves->empty()) return std::optional<ResultMove>{};
+            const auto assigned =
+                assigned_gpr(function, moves->front().source);
+            if (moves->size() != 1 || !assigned) return std::nullopt;
+            return std::optional<ResultMove>{
+                ResultMove{moves->front().target, *assigned, false}};
+        }
         const auto& entity = hir_.function(function.source);
         if (!active_signature_ || value.uses.size() != 1 ||
             active_signature_->layout.results.size() != 1 ||
@@ -11928,6 +12965,68 @@ private:
         }
     }
 
+    // The moves that place a piecewise return's values in their ABI result
+    // registers, when every piece is a register.
+    std::optional<std::vector<ArgumentMove>> piece_result_moves(
+        const machine::Instruction& value) const {
+        if (value.result_composition != machine::ResultComposition::Pieces ||
+            !active_signature_ ||
+            active_signature_->layout.results.size() != 1) {
+            return std::nullopt;
+        }
+        const auto& result = active_signature_->layout.results.front();
+        if (result.indirect || result.pieces.size() != value.uses.size()) {
+            return std::nullopt;
+        }
+        std::vector<ArgumentMove> moves;
+        for (std::size_t index = 0; index < value.uses.size(); ++index) {
+            const auto& piece = result.pieces[index];
+            const auto source = value.uses[index];
+            if (piece.location.kind != LocationKind::Register ||
+                !gpr_id(piece.location.reg) ||
+                source.mode.bits != piece.value_bits ||
+                legalizes_to_pair(source) ||
+                !internal_value_matches_extension(piece, piece.value_bits)) {
+                return std::nullopt;
+            }
+            moves.push_back({source, piece.location.reg, false, false});
+        }
+        return moves;
+    }
+
+    // A piecewise return places each piece in its register as one parallel
+    // copy; the last step fills the transfer's delay slot when it is a
+    // register move.
+    void place_piece_return(const machine::Function& function,
+                            const machine::Instruction& value,
+                            bool fallthrough_epilogue) {
+        const auto moves = piece_result_moves(value);
+        if (!moves) {
+            diagnostics_.error(value.location,
+                               "MIPS piecewise return does not match its ABI "
+                               "result pieces");
+            return;
+        }
+        auto steps = argument_copy_steps(function, *moves);
+        const bool transfers = direct_return() || !fallthrough_epilogue;
+        std::optional<ArgumentStep> delayed;
+        if (transfers && options_.schedule_insns2 && !steps.empty() &&
+            !steps.back().save &&
+            (steps.back().move.temporary ||
+             assigned_gpr(function, steps.back().move.source))) {
+            delayed = steps.back();
+            steps.pop_back();
+        }
+        for (const auto& step : steps) {
+            emit_argument_step(function, step, value.location);
+        }
+        if (!transfers) return;
+        if (direct_return()) instruction("jr", "$ra");
+        else instruction("b", epilogue_label_);
+        if (delayed) emit_argument_step(function, *delayed, value.location);
+        else instruction("nop");
+    }
+
     void emit_result_move(const ResultMove& move, machine::Register value) {
         instruction(move.floating ? (value.mode.bits == 32 ? "mov.s" : "mov.d")
                                   : "move",
@@ -12014,8 +13113,9 @@ private:
                     diagnostics_.error(
                         value.location,
                         "MIPS indirect function results are not implemented yet");
-                } else if (place_composed_return(function, value, result,
-                                                 fallthrough_epilogue)) {
+                } else if (value.result_composition ==
+                           machine::ResultComposition::Pieces) {
+                    place_piece_return(function, value, fallthrough_epilogue);
                     return;
                 } else {
                     const auto source = value.uses.front();
@@ -12281,6 +13381,25 @@ private:
         if (opcode == Opcode::GlobalHigh || opcode == Opcode::StackAddress ||
             (opcode == Opcode::GlobalAddress && data_base)) {
             return true;
+        }
+        // An unscaled indexed address is one add.
+        if (opcode == Opcode::IndexedAddress) {
+            const auto* scale = candidate.operands.empty()
+                ? nullptr
+                : std::get_if<machine::ImmediateOperand>(
+                      &candidate.operands.back());
+            return scale && scale->value == 1 && candidate.uses.size() == 2;
+        }
+        // An integer copy between two registers is one move.
+        if (opcode == Opcode::Reinterpret) {
+            return candidate.uses.size() == 1 &&
+                candidate.defs.front().mode == candidate.uses.front().mode &&
+                function.virtual_register_classes[candidate.defs.front().id] ==
+                    machine::VirtualRegisterClass::Integer &&
+                function.virtual_register_classes[candidate.uses.front().id] ==
+                    machine::VirtualRegisterClass::Integer &&
+                !same_physical_assignment(function, candidate.defs.front(),
+                                          candidate.uses.front());
         }
         if (opcode == Opcode::PointerOffset) {
             const auto* offset = candidate.operands.size() >= 2
@@ -12657,6 +13776,17 @@ private:
                         continue;
                     }
                 }
+                // An integer copy that allocation made a no-op emits
+                // nothing.
+                if (crossed.kind == machine::InstructionKind::Target &&
+                    crossed.opcode == Opcode::Reinterpret &&
+                    crossed.defs.size() == 1 && crossed.uses.size() == 1 &&
+                    crossed.defs.front().mode == crossed.uses.front().mode &&
+                    assigned_gpr(function, crossed.defs.front()) &&
+                    same_physical_assignment(function, crossed.defs.front(),
+                                             crossed.uses.front())) {
+                    continue;
+                }
                 legal = !barrier(crossed) && !(store && crossed.may_load) &&
                     std::none_of(candidate.defs.begin(), candidate.defs.end(),
                                  [&](machine::Register definition) {
@@ -12972,6 +14102,11 @@ private:
         case Opcode::StackAddress:
         case Opcode::GlobalAddress:
         case Opcode::PointerOffset:
+        case Opcode::IndexedAddress:
+        case Opcode::Reinterpret:
+        // A multiply writes only HI and LO, which no block reads before its
+        // own multiply writes them.
+        case Opcode::MulStart:
         case Opcode::Neg:
         case Opcode::Not:
         case Opcode::Iszero:
@@ -13047,6 +14182,8 @@ private:
             if (index + 1 >= fallthrough->instructions.size()) continue;
             const auto& candidate = fallthrough->instructions[index];
             if (!speculative_delay_instruction(function, candidate) ||
+                (decode_opcode(candidate.opcode) == Opcode::MulStart &&
+                 !hilo_writer_fits_slot(function, block.id)) ||
                 (physical_registers(function, candidate.defs.front()) &
                  live_on_edge(function, block.id, taken)).any()) {
                 continue;
@@ -13321,75 +14458,95 @@ private:
         }
     }
 
+    // A non-interlocked MIPS I--III core forbids a HI/LO writer in the two
+    // instructions following MFHI/MFLO.  The branch itself pays one slot, so
+    // a MulStart moved into the slot of `source`'s branch is safe when at
+    // least one emitted instruction follows the most recent MFHI/MFLO, which
+    // MoveFromLo and the operations that read HI or LO last emit.  Only an
+    // unconditional branch to the next layout block can cross a block
+    // boundary without emitting a branch and delay slot; walk exactly that
+    // fallthrough chain.  Every other incoming edge clears the
+    // two-instruction exclusion window by construction.
+    bool hilo_writer_fits_slot(const machine::Function& function,
+                               machine::BlockId source) const {
+        if (subtarget_.has_feature(Feature::HiloInterlocks)) return true;
+        const auto reads_hilo_last = [](const machine::Instruction& value) {
+            switch (decode_opcode(value.opcode)) {
+            case Opcode::MoveFromLo:
+            case Opcode::Mul:
+            case Opcode::Mulhs:
+            case Opcode::Mulhu:
+            case Opcode::Sdiv:
+            case Opcode::Udiv:
+            case Opcode::Srem:
+            case Opcode::Urem:
+            case Opcode::Sdivrem:
+            case Opcode::Udivrem: return true;
+            default: return false;
+            }
+        };
+        std::unordered_set<std::uint32_t> visited;
+        auto current = source;
+        while (visited.insert(current.value).second) {
+            const auto block = std::find_if(
+                function.blocks.begin(), function.blocks.end(),
+                [&](const machine::Block& candidate) {
+                    return candidate.id == current;
+                });
+            if (block == function.blocks.end() ||
+                block->instructions.empty()) {
+                return true;
+            }
+            auto end = block->instructions.size();
+            if (block->instructions.back().kind !=
+                machine::InstructionKind::Target) {
+                --end;
+            }
+            while (end != 0) {
+                const auto& value = block->instructions[--end];
+                if (no_output_prefix(value)) continue;
+                if (value.kind != machine::InstructionKind::Target) {
+                    return true;
+                }
+                return !reads_hilo_last(value);
+            }
+
+            const auto previous_layout = layout_predecessor(function, current);
+            if (!previous_layout) return true;
+            const auto previous_id = *previous_layout;
+            const auto previous = std::find_if(
+                function.blocks.begin(), function.blocks.end(),
+                [&](const machine::Block& candidate) {
+                    return candidate.id == previous_id;
+                });
+            if (previous == function.blocks.end() ||
+                previous->instructions.empty()) {
+                return true;
+            }
+            const auto& terminator = previous->instructions.back();
+            if (terminator.kind != machine::InstructionKind::Branch ||
+                terminator.operands.empty()) {
+                return true;
+            }
+            const auto* target = std::get_if<machine::BlockOperand>(
+                &terminator.operands.front());
+            if (!target || target->target != current ||
+                layout_successor(function, previous_id) != current) {
+                return true;
+            }
+            current = previous_id;
+        }
+        return false;
+    }
+
     void plan_successor_delay_slots(const machine::Function& function) {
         edge_delay_entries_.clear();
         successor_delay_entries_.clear();
         forwarded_blocks_.clear();
         if (!options_.schedule_insns2) return;
 
-        // A non-interlocked MIPS I--III core forbids a HI/LO writer in the
-        // two instructions following MFHI/MFLO.  The branch itself pays one
-        // slot, so a moved MulStart is safe when at least one emitted
-        // instruction follows the most recent MoveFromLo.  Only an
-        // unconditional branch to the next layout block can cross a block
-        // boundary without emitting a branch and delay slot; walk exactly
-        // that fallthrough chain.  Every other incoming edge clears the
-        // two-instruction exclusion window by construction.
         const auto hilo_delay_safe = [&](machine::BlockId source) {
-            if (subtarget_.has_feature(Feature::HiloInterlocks)) return true;
-            std::unordered_set<std::uint32_t> visited;
-            auto current = source;
-            while (visited.insert(current.value).second) {
-                const auto block = std::find_if(
-                    function.blocks.begin(), function.blocks.end(),
-                    [&](const machine::Block& candidate) {
-                        return candidate.id == current;
-                    });
-                if (block == function.blocks.end() ||
-                    block->instructions.empty()) {
-                    return true;
-                }
-                auto end = block->instructions.size();
-                if (block->instructions.back().kind !=
-                    machine::InstructionKind::Target) {
-                    --end;
-                }
-                while (end != 0) {
-                    const auto& value = block->instructions[--end];
-                    if (no_output_prefix(value)) continue;
-                    if (value.kind != machine::InstructionKind::Target) {
-                        return true;
-                    }
-                    return decode_opcode(value.opcode) != Opcode::MoveFromLo;
-                }
-
-                const auto previous_layout =
-                    layout_predecessor(function, current);
-                if (!previous_layout) return true;
-                const auto previous_id = *previous_layout;
-                const auto previous = std::find_if(
-                    function.blocks.begin(), function.blocks.end(),
-                    [&](const machine::Block& candidate) {
-                        return candidate.id == previous_id;
-                    });
-                if (previous == function.blocks.end() ||
-                    previous->instructions.empty()) {
-                    return true;
-                }
-                const auto& terminator = previous->instructions.back();
-                if (terminator.kind != machine::InstructionKind::Branch ||
-                    terminator.operands.empty()) {
-                    return true;
-                }
-                const auto* target = std::get_if<machine::BlockOperand>(
-                    &terminator.operands.front());
-                if (!target || target->target != current ||
-                    layout_successor(function, previous_id) != current) {
-                    return true;
-                }
-                current = previous_id;
-            }
-            return false;
+            return hilo_writer_fits_slot(function, source);
         };
         const auto plan_edge = [&](const machine::Block& source,
                                    machine::BlockId target,
@@ -13430,6 +14587,8 @@ private:
                 if (speculative_against) {
                     if (candidate.kind == machine::InstructionKind::Target &&
                         speculative_delay_instruction(function, candidate) &&
+                        (decode_opcode(candidate.opcode) != Opcode::MulStart ||
+                         hilo_delay_safe(source.id)) &&
                         !(physical_registers(function,
                                              candidate.defs.front()) &
                           live_on_edge(function, source.id,

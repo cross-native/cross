@@ -9,6 +9,7 @@
 #include "common/diagnostic.hpp"
 #include "middle/hir.hpp"
 #include "middle/mir.hpp"
+#include "middle/mir_analysis.hpp"
 
 #include <cstdint>
 #include <limits>
@@ -255,14 +256,11 @@ enum class InstructionKind {
 // the complete logical result width.
 enum class ExtensionKind : std::uint8_t { None, Zero, Sign };
 
-// A target may preserve a simple mixed-width result expression through
-// instruction selection so ABI piece placement can compute only the pieces
-// that actually change.  XorZeroExtend denotes:
-//
-//   uses[0] ^ zero_extend(uses[1])
-//
-// where uses[0] has the complete result width and uses[1] is narrower.
-enum class ResultComposition : std::uint8_t { None, XorZeroExtend };
+// A result that its ABI carries in several pieces may be returned piece by
+// piece, so that each piece comes from the cheapest value that holds its
+// bits.  Pieces means that uses[i] holds the value bits of the i-th piece of
+// the function's result layout, in a register as wide as those bits.
+enum class ResultComposition : std::uint8_t { None, Pieces };
 
 // A selected boundary value may consume only a contiguous bit range of its
 // logical ABI value.  Keeping this projection separate from the target opcode
@@ -314,6 +312,10 @@ struct Instruction {
     // to the function's ABI model and never appears in the operand stream.
     AbiStateId variadic_state;
     std::optional<ValueProjection> input_projection;
+    // The bytes a load or store accesses, as the source function's access
+    // analysis names them; absent when unknown. Scheduling within a block
+    // lets accesses that mir::may_alias() keeps apart pass each other.
+    std::optional<mir::MemoryAccess> memory;
     ExtensionKind result_extension{ExtensionKind::None};
     ResultComposition result_composition{ResultComposition::None};
     bool may_load{};

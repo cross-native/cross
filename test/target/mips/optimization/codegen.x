@@ -196,9 +196,9 @@ global u32 mips_projected_parameter(in u64 value) {
 }
 
 [[abi("o32"), noinline]]
-global u64 mips_shared_zero_extension(in u64 wide,
-                                      in u32 first, in u32 second) {
-    return wide ^ first ^ second;
+global void mips_shared_zero_extension(in u64 *result, in u64 wide,
+                                       in u32 first, in u32 second) {
+    *result = wide ^ first ^ second;
 }
 
 [[abi("o32"), noinline]]
@@ -211,6 +211,62 @@ global u64 mips_mixed_xor_return(in u64 wide, in u32 narrow) {
 global u64 mips_mixed_xor_return_commuted(in u64 wide, in u32 narrow) {
     u64 extended = narrow;
     return extended ^ wide;
+}
+
+// The halves of an o32 u64 parameter come from its two endpoints, and a
+// result built from halves, copies of a sign, or a constant high word
+// returns piece by piece.
+[[abi("o32"), noinline]]
+global u32 mips_parameter_halves(in u64 value) {
+    return (u32)(value >> 32) ^ (u32)value;
+}
+
+[[abi("o32"), noinline]]
+global u32 mips_parameter_middle(in u64 value) {
+    return (u32)(value >> 16) & 65535u32;
+}
+
+[[abi("o32"), noinline]]
+global u64 mips_result_halves(in u32 high, in u32 low) {
+    return ((u64)high << 32) | (u64)low;
+}
+
+[[abi("o32"), noinline]]
+global u64 mips_result_widened(in i32 value) {
+    return (u64)(i64)value;
+}
+
+// A doubleword call result forms in one register from its two pieces.
+[[abi("o32"), noinline]]
+global u64 mips_call_result(in u32 high, in u32 low) {
+    return mips_result_halves(high, low) * 3u64;
+}
+
+// A doubleword result that a call returns as is leaves as a tail call.
+[[abi("o32"), noinline]]
+global u64 mips_tail_doubleword(in u64 x) {
+    return mips_result_halves((u32)x, (u32)(x >> 32));
+}
+
+// The slot of a loop's top test starts the multiply of the next pass,
+// which the exit, reading no HI or LO, does not mind.
+[[abi("o32"), noinline]]
+global u32 mips_lcg_count(in u32 seed, in u32 count) {
+    u32 hits = 0u32;
+    for (u32 n = 0u32; n < count; ++n) {
+        seed = seed * 1664525u32 + 1013904223u32;
+        if (((seed >> 16) & 3u32) != 0u32) hits = hits + 1u32;
+    }
+    return hits ^ seed;
+}
+
+// The shift of a scaled index leaves its add for the loop branch's slot.
+[[abi("o32"), noinline]]
+global u32 mips_chase(in const u32 *next, in u32 start, in u32 count,
+                      in u32 mask) {
+    u32 slot = start;
+    for (u32 n = 0u32; n < count; ++n) slot = next[slot] & mask;
+    return slot;
 }
 
 [[abi("o32"), noinline]]
@@ -647,8 +703,8 @@ global void mips_matrix_rows(in const i32 *matrix, in i32 *sums,
 
 // A low-word mask and a shifted run of ones start from ADDIU -1.
 [[abi("o32"), noinline]]
-global u64 mips_wide_masks(in u64 x) {
-    return (x & 0x00000000ffffffffu64) ^ (x + 0x0fffffffff000000u64);
+global void mips_wide_masks(in u64 *result, in u64 x) {
+    *result = (x & 0x00000000ffffffffu64) ^ (x + 0x0fffffffff000000u64);
 }
 
 // The inner loop's exit test, which heads it, moves to its latch, where a
@@ -957,6 +1013,17 @@ global u32 release_slot(in u32 pick, in u32 live) {
         mips_release_bits[slot >> 5] & ~(1u32 << (slot & 31u32));
     const u32 rest = live - 1u32;
     mips_release_live[pick & 127u32] = mips_release_live[rest & 127u32];
+    return rest * 8u32 + (slot << 3);
+}
+
+// Through pointers that may address the same bytes, the second load keeps
+// its place after the store.
+global u32 release_slot_shared(in u16 *cells, in u32 *bits, in u32 pick,
+                               in u32 live) {
+    const u32 slot = (u32)cells[pick & 127u32];
+    bits[slot >> 5] = bits[slot >> 5] & ~(1u32 << (slot & 31u32));
+    const u32 rest = live - 1u32;
+    cells[pick & 127u32] = cells[rest & 127u32];
     return rest * 8u32 + (slot << 3);
 }
 

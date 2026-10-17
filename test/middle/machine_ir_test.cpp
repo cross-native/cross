@@ -189,11 +189,18 @@ int main() {
             cross::machine::Register::virtual_register(
                 {1}, cross::machine::i32)};
         result.result_composition =
-            cross::machine::ResultComposition::XorZeroExtend;
+            cross::machine::ResultComposition::Pieces;
         std::ostringstream text;
         cross::Diagnostics diagnostics(text);
         ok = expect(cross::machine::verify(function, diagnostics),
                     "well-formed result composition was rejected") &&
+             ok;
+
+        auto single = function;
+        single.blocks.front().instructions.back().uses.pop_back();
+        ok = expect(rejected(std::move(single),
+                             "result composition requires"),
+                    "result composition of one piece was accepted") &&
              ok;
 
         result.result_extension = cross::machine::ExtensionKind::Zero;

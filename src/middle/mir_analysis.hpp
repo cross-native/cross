@@ -26,6 +26,69 @@ bool may_trap_floating(const ManagedValue& value,
                        const hir::Module& hir_module,
                        const floating::Environment& environment);
 
+// The bytes an ordinary load or store accesses: a base, a constant byte
+// displacement, at most one scaled variable index, and a size. Slot and
+// object bases are distinct storage; a value base is any other pointer.
+// `addressed` marks a slot whose address a pointer may hold.
+struct MemoryAddress {
+    enum class Base : std::uint8_t { Slot, Object, Value };
+    Base base{Base::Value};
+    std::uint32_t id{};
+    std::optional<ValueId> index;
+    std::uint64_t scale{};
+    std::int64_t offset{};
+    bool addressed{};
+    friend bool operator==(const MemoryAddress&, const MemoryAddress&) = default;
+};
+
+struct MemoryAccess {
+    MemoryAddress address;
+    std::uint64_t size{};
+    friend bool operator==(const MemoryAccess&, const MemoryAccess&) = default;
+};
+
+// Whether two accesses of one function can touch a common byte. Distinct
+// slots and objects never overlap, and no pointer reaches a slot whose
+// address is never taken. Equal bases with equal variable parts compare
+// their constant displacements; a value is the same value only within one
+// execution of a block.
+[[nodiscard]] bool may_alias(const MemoryAccess& left,
+                             const MemoryAccess& right);
+
+// What the ordinary, non-volatile loads and stores of a function access.
+class AccessAnalysis {
+public:
+    AccessAnalysis(const ManagedFunction& function, const hir::Module& module,
+                   const TargetInfo& target);
+    [[nodiscard]] std::optional<MemoryAccess> access(
+        const ManagedValue& value) const;
+    [[nodiscard]] bool may_alias(const MemoryAccess& left,
+                                 const MemoryAccess& right) const {
+        return mir::may_alias(left, right);
+    }
+
+private:
+    // An object that no other declared object shares storage with.
+    static bool distinct(const hir::Object& object);
+    std::optional<MemoryAccess> sized(MemoryAddress address,
+                                      hir::TypeId type) const;
+    // The address stride of a pointer's pointee, as the targets scale an
+    // indexed address.
+    std::uint64_t stride(hir::TypeId pointer) const;
+    // A constant address index, sign-extended from its width.
+    std::optional<std::int64_t> constant_index(ValueId id) const;
+    // Adds `index` units of `scale` bytes to the address when the index is
+    // constant or the address has no variable part yet.
+    bool displace(MemoryAddress& address, ValueId index,
+                  std::uint64_t scale) const;
+    MemoryAddress decompose(ValueId id) const;
+
+    const ManagedFunction& function_;
+    const hir::Module& module_;
+    const TargetInfo& target_;
+    std::vector<bool> addressed_;
+};
+
 struct LocalAddress {
     SlotId slot;
     // Missing displacement means some part of this cell, not a proven write.

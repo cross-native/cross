@@ -102,6 +102,9 @@ compile_variant(no_reorder -fno-reorder-blocks)
 compile_variant(no_extent_bounds -fno-loop-bounds-from-extents)
 compile_size_variant(size)
 compile_size_variant(size_no_machine_combine -fno-machine-combine)
+compile_size_variant(size_no_address_combine -fno-combine-addresses)
+compile_size_variant(size_no_delay -fno-schedule-insns2)
+compile_size_variant(size_r3000 -march=r3000 -mtune=r3000)
 compile_size_variant(size_no_licm -fno-move-loop-invariants)
 compile_reassociation_variant(reassoc_risc 0)
 compile_reassociation_variant(reassoc_risc_off 0 -fno-tree-reassoc)
@@ -551,8 +554,8 @@ string(REGEX MATCHALL "dsll32" separate_left_shifts
        "${separate_extensions}")
 list(LENGTH factored_left_shifts factored_extension_count)
 list(LENGTH separate_left_shifts separate_extension_count)
-if(NOT factored_extension_count EQUAL 2 OR
-   NOT separate_extension_count EQUAL 3)
+if(NOT factored_extension_count EQUAL 3 OR
+   NOT separate_extension_count EQUAL 4)
     message(FATAL_ERROR
         "MIR bitwise factoring did not share a zero extension or honor "
         "-fno-tree-bit-ccp\n"
@@ -568,20 +571,22 @@ function_body("${OUTPUT}.little.s"
               mips_mixed_xor_return mixed_return_little)
 function_body("${OUTPUT}.no_machine_combine.s"
               mips_mixed_xor_return ordinary_mixed_return)
+# Each o32 result piece comes from the piece of the parameter that holds
+# its bits; neither the parameter nor the result is assembled in one
+# doubleword.
 foreach(body mixed_return mixed_return_commuted)
-    if(NOT ${body} MATCHES "[\t ]xor[\t ]+\\$v1," OR
-       NOT ${body} MATCHES "[\t ]dsrl32[\t ]+\\$v0," OR
-       NOT ${body} MATCHES
-           "[\t ]jr[\t ]+\\$ra\n[\t ]+sll[\t ]+\\$v1,\\$v1,0")
+    if(NOT ${body} MATCHES
+           "[\t ]xor[\t ]+\\$v1,(\\$a1,\\$a2|\\$a2,\\$a1)\n" OR
+       NOT ${body} MATCHES "[\t ]move[\t ]+\\$v0,\\$a0\n" OR
+       ${body} MATCHES "[\t ](d?s[lr]l(32)?|or)[\t ]")
         message(FATAL_ERROR
-            "MIPS mixed-width return was not decomposed for big-endian o32\n"
-            "${${body}}")
+            "MIPS mixed-width return was not placed piece by piece for "
+            "big-endian o32\n${${body}}")
     endif()
 endforeach()
-if(NOT mixed_return_little MATCHES "[\t ]xor[\t ]+\\$v0," OR
-   NOT mixed_return_little MATCHES "[\t ]dsrl32[\t ]+\\$v1," OR
-   NOT mixed_return_little MATCHES
-       "[\t ]jr[\t ]+\\$ra\n[\t ]+sll[\t ]+\\$v0,\\$v0,0")
+if(NOT mixed_return_little MATCHES "[\t ]xor[\t ]+\\$v0,\\$a0,\\$a2\n" OR
+   NOT mixed_return_little MATCHES "[\t ]move[\t ]+\\$v1,\\$a1\n" OR
+   mixed_return_little MATCHES "[\t ](d?s[lr]l(32)?|or)[\t ]")
     message(FATAL_ERROR
         "MIPS mixed-width return lost little-endian o32 piece order\n"
         "${mixed_return_little}")
@@ -593,12 +598,81 @@ string(REGEX MATCHALL "dsll32" ordinary_mixed_return_left_shifts
 list(LENGTH mixed_return_left_shifts mixed_return_extension_count)
 list(LENGTH ordinary_mixed_return_left_shifts
      ordinary_mixed_return_extension_count)
-if(NOT mixed_return_extension_count EQUAL 2 OR
+if(NOT mixed_return_extension_count EQUAL 0 OR
    NOT ordinary_mixed_return_extension_count EQUAL 3)
     message(FATAL_ERROR
         "-fno-machine-combine did not preserve the materialized mixed-width "
         "return\ncombined:\n${mixed_return}\n"
         "ordinary:\n${ordinary_mixed_return}")
+endif()
+
+# u64 boundaries: parameter halves and middle bits come from one o32
+# endpoint, results return piece by piece in both byte orders, and a call's
+# doubleword result forms in its register from the two result words.
+function_body("${OUTPUT}.enabled.s" mips_parameter_halves parameter_halves)
+function_body("${OUTPUT}.no_cprop.s" mips_parameter_halves
+              parameter_halves_whole)
+function_body("${OUTPUT}.enabled.s" mips_parameter_middle parameter_middle)
+function_body("${OUTPUT}.little.s" mips_parameter_middle
+              parameter_middle_little)
+function_body("${OUTPUT}.enabled.s" mips_result_halves result_halves)
+function_body("${OUTPUT}.little.s" mips_result_halves result_halves_little)
+function_body("${OUTPUT}.no_machine_combine.s" mips_result_halves
+              result_halves_whole)
+function_body("${OUTPUT}.enabled.s" mips_result_widened result_widened)
+function_body("${OUTPUT}.enabled.s" mips_call_result call_result)
+function_body("${OUTPUT}.enabled.s" mips_tail_doubleword tail_doubleword)
+if(NOT parameter_halves MATCHES "[\t ]xor[\t ]+\\$v0,(\\$a0,\\$a1|\\$a1,\\$a0)\n" OR
+   parameter_halves MATCHES "[\t ](d?s[lr]l(32)?|or)[\t ]" OR
+   NOT parameter_halves_whole MATCHES "[\t ]or[\t ]" OR
+   NOT parameter_middle MATCHES "[\t ]srl[\t ]+\\$v0,\\$a1,16\n" OR
+   parameter_middle MATCHES "[\t ](andi|dsll32|dsrl)[\t ]" OR
+   NOT parameter_middle_little MATCHES "[\t ]srl[\t ]+\\$v0,\\$a0,16\n" OR
+   NOT result_halves MATCHES "[\t ]move[\t ]+\\$v0,\\$a0\n" OR
+   NOT result_halves MATCHES "[\t ]move[\t ]+\\$v1,\\$a1\n" OR
+   result_halves MATCHES "[\t ](d?s[lr]l(32)?|or)[\t ]" OR
+   NOT result_halves_little MATCHES "[\t ]move[\t ]+\\$v0,\\$a1\n" OR
+   NOT result_halves_little MATCHES "[\t ]move[\t ]+\\$v1,\\$a0\n" OR
+   NOT result_halves_whole MATCHES "[\t ]dsll32[\t ]" OR
+   NOT result_widened MATCHES "[\t ]sra[\t ]+\\$v0,\\$a0,31\n" OR
+   NOT result_widened MATCHES "[\t ]move[\t ]+\\$v1,\\$a0\n" OR
+   NOT call_result MATCHES
+       "[\t ]jal[\t ]+mips_result_halves\n[^\n]*\n[\t ]+dsll32[\t ]+(\\$[a-z0-9]+),\\$v0,0\n[\t ]+dsll32[\t ]+\\$at,\\$v1,0\n[\t ]+dsrl32[\t ]+\\$at,\\$at,0\n[\t ]+or[\t ]+" OR
+   NOT tail_doubleword MATCHES "[\t ]j[\t ]+mips_result_halves\n" OR
+   tail_doubleword MATCHES "[\t ]jal[\t ]")
+    message(FATAL_ERROR
+        "MIPS u64 boundary pieces regressed or -fno-cprop-registers or "
+        "-fno-machine-combine was ignored\n"
+        "halves:\n${parameter_halves}\nwhole:\n${parameter_halves_whole}\n"
+        "middle:\n${parameter_middle}\n${parameter_middle_little}\n"
+        "result:\n${result_halves}\n${result_halves_little}\n"
+        "${result_halves_whole}\nwidened:\n${result_widened}\n"
+        "call:\n${call_result}\ntail:\n${tail_doubleword}")
+endif()
+# A loop's top test runs the next pass's multiply in its slot, on MIPS I
+# too, and -fno-schedule-insns2 keeps the slot empty.
+function_body("${OUTPUT}.size.s" mips_lcg_count lcg_count)
+function_body("${OUTPUT}.size_r3000.s" mips_lcg_count lcg_count_r3000)
+function_body("${OUTPUT}.size_no_delay.s" mips_lcg_count lcg_count_empty)
+if(NOT lcg_count MATCHES "[\t ]beq[\t ][^\n]*\n[\t ]+mult[\t ]" OR
+   NOT lcg_count_r3000 MATCHES "[\t ]beq[\t ][^\n]*\n[\t ]+mult[\t ]" OR
+   lcg_count_empty MATCHES "[\t ]beq[\t ][^\n]*\n[\t ]+mult[\t ]")
+    message(FATAL_ERROR
+        "a loop test's slot did not start the next multiply, or "
+        "-fno-schedule-insns2 was ignored\n"
+        "Oz:\n${lcg_count}\nR3000:\n${lcg_count_r3000}\n"
+        "without:\n${lcg_count_empty}")
+endif()
+# A scaled index splits into a shift that the loop branch's slot runs and an
+# unscaled add; -fno-combine-addresses keeps the scaled form.
+function_body("${OUTPUT}.size.s" mips_chase chase)
+function_body("${OUTPUT}.size_no_address_combine.s" mips_chase chase_fused)
+if(NOT chase MATCHES "[\t ]bnel[\t ][^\n]*\n[\t ]+sll[\t ][^\n]*,2\n" OR
+   NOT chase_fused MATCHES "[\t ]bne[\t ][^\n]*\n[\t ]+nop\n")
+    message(FATAL_ERROR
+        "a scaled index's shift did not fill the loop branch's slot, or "
+        "-fno-combine-addresses was ignored\n"
+        "split:\n${chase}\nfused:\n${chase_fused}")
 endif()
 
 function_body("${OUTPUT}.enabled.s" mips_affine_exit unit_exit)
@@ -1233,12 +1307,14 @@ if(NOT ring_step_r3000 MATCHES "[\t ]bne[\t ][^\n]*\n[\t ]+addiu[\t ][^\n]*,-1\n
         "-fno-schedule-insns2 was ignored\n"
         "r3000:\n${ring_step_r3000}\nwithout:\n${ring_step_unfilled}")
 endif()
-# A speed goal's load-latency schedule moves arithmetic past a store, which
-# keeps its place among the loads; size goals and -fno-schedule-insns keep
-# the store a scheduling barrier.
+# A speed goal's load-latency schedule moves arithmetic past a store, and a
+# load of another object too, while a load through a pointer that may
+# address the stored bytes keeps its place after the store; size goals and
+# -fno-schedule-insns keep the store a scheduling barrier.
 function_body("${OUTPUT}.enabled.s" release_slot latency_release)
 function_body("${OUTPUT}.no_schedule.s" release_slot latency_release_plain)
 function_body("${OUTPUT}.size.s" release_slot latency_release_size)
+function_body("${OUTPUT}.enabled.s" release_slot_shared latency_release_shared)
 foreach(variant latency_release latency_release_plain latency_release_size)
     string(FIND "${${variant}}" "\tsw\t" ${variant}_store)
     string(REGEX MATCH "\taddiu\t[^\n]*,-1\n" ${variant}_decrement "${${variant}}")
@@ -1248,12 +1324,17 @@ if(latency_release_store EQUAL -1 OR latency_release_decrement STREQUAL "" OR
    NOT latency_release_decrement_at LESS latency_release_store OR
    NOT latency_release_plain_store LESS latency_release_plain_decrement_at OR
    NOT latency_release_size_store LESS latency_release_size_decrement_at OR
-   NOT latency_release MATCHES "\tsw\t[^\n]*\n(\t[^\n]*\n)*\tlhu\t")
+   NOT latency_release MATCHES
+       "\tlhu\t[^\n]*\n(\t[^\n]*\n)*\tlhu\t[^\n]*\n(\t[^\n]*\n)*\tsw\t" OR
+   NOT latency_release_plain MATCHES "\tsw\t[^\n]*\n(\t[^\n]*\n)*\tlhu\t" OR
+   NOT latency_release_size MATCHES "\tsw\t[^\n]*\n(\t[^\n]*\n)*\tlhu\t" OR
+   NOT latency_release_shared MATCHES "\tsw\t[^\n]*\n(\t[^\n]*\n)*\tlhu\t")
     message(FATAL_ERROR
-        "the speed schedule did not move arithmetic past a store, moved a "
-        "load before it, or a size goal or -fno-schedule-insns moved it\n"
+        "the speed schedule did not move arithmetic and a disjoint load past "
+        "a store, moved a load that may overlap it, or a size goal or "
+        "-fno-schedule-insns moved them\n"
         "O2:\n${latency_release}\nno schedule:\n${latency_release_plain}\n"
-        "Oz:\n${latency_release_size}")
+        "Oz:\n${latency_release_size}\nshared:\n${latency_release_shared}")
 endif()
 # Size goals rotate a loop whose first test folds; -Os spends its growth
 # on a pointer for the table, -fsize-loop-growth=0 does not.

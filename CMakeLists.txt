@@ -2532,6 +2532,66 @@ if(BUILD_TESTING)
         set_tests_properties(cross_mips_differential_quality_${quality_name} PROPERTIES
             LABELS "check.runtime;arch.mips;backend.native;feature.optimization;isa.${quality_isa};endian.${quality_endian_label};opt.${quality_level_label}")
     endforeach()
+    # u64 parameters and results at o32, cross32, and n64 boundaries in both
+    # byte orders, with and without the boundary narrowing. Each entry:
+    # name|ISA|endian|address model|QEMU CPU|optimization|flags.
+    foreach(boundary_case
+            "o32_o0|vr4300|BE|32|R4000|-O0|-mprofile=vr4300-o32"
+            "o32_o2|vr4300|BE|32|R4000|-O2|-mprofile=vr4300-o32"
+            "o32_oz|vr4300|BE|32|R4000|-Oz|-mprofile=vr4300-o32"
+            "o32_le_o0|vr4300|LE|32|R4000|-O0|-target mipsel-unknown-elf -mabi=o32 -march=vr4300"
+            "o32_le_o2|vr4300|LE|32|R4000|-O2|-target mipsel-unknown-elf -mabi=o32 -march=vr4300"
+            "console_o3|vr4300|BE|32|R4000|-O3|-mprofile=n64"
+            "cross32_o0|vr4300|BE|32|R4000|-O0|-target mips-unknown-elf -march=vr4300"
+            "cross32_o2|vr4300|BE|32|R4000|-O2|-target mips-unknown-elf -march=vr4300"
+            "cross32_le_o0|vr4300|LE|32|R4000|-O0|-target mipsel-unknown-elf -march=vr4300"
+            "cross32_le_o2|vr4300|LE|32|R4000|-O2|-target mipsel-unknown-elf -march=vr4300"
+            "r3000_o2|r3000|BE|32|R4000|-O2|-mprofile=r3000-o32"
+            "n64_o0|mips64|BE|64|MIPS64R2-generic|-O0|-mprofile=mips64-n64 -mabi=n64"
+            "n64_o2|mips64|BE|64|MIPS64R2-generic|-O2|-mprofile=mips64-n64 -mabi=n64"
+            "n64_le_o0|mips64|LE|64|MIPS64R2-generic|-O0|-mprofile=mips64el-n64 -mabi=n64"
+            "n64_le_o2|mips64|LE|64|MIPS64R2-generic|-O2|-mprofile=mips64el-n64 -mabi=n64")
+        string(REPLACE "|" ";" boundary_fields "${boundary_case}")
+        list(GET boundary_fields 0 boundary_name)
+        list(GET boundary_fields 1 boundary_isa)
+        list(GET boundary_fields 2 boundary_endian)
+        list(GET boundary_fields 3 boundary_address)
+        list(GET boundary_fields 4 boundary_cpu)
+        list(GET boundary_fields 5 boundary_level)
+        list(GET boundary_fields 6 boundary_flags)
+        string(SUBSTRING "${boundary_level}" 1 -1 boundary_level_label)
+        if(boundary_address STREQUAL "64")
+            set(boundary_startup start_boundary_n64.s)
+            set(boundary_linker bare-n64.ld)
+        else()
+            set(boundary_startup start_boundary.s)
+            set(boundary_linker bare.ld)
+        endif()
+        if(boundary_endian STREQUAL "LE")
+            set(boundary_endian_label little)
+        else()
+            set(boundary_endian_label big)
+        endif()
+        add_test(NAME cross_mips_differential_boundary_${boundary_name}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DTEMPLATE=${CMAKE_SOURCE_DIR}/test/target/mips/differential/boundary_kernels.x.in
+                    -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/differential/${boundary_startup}
+                    -DHOST_MAIN=${CMAKE_SOURCE_DIR}/test/target/mips/differential/main_boundary.cpp
+                    -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/${boundary_linker}
+                    -DWRAPPER_TEMPLATE=${CMAKE_SOURCE_DIR}/test/target/mips/runtime64.s.in
+                    -DWRAPPER_LINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare64.ld
+                    "-DTARGET_FLAGS=${boundary_flags}"
+                    -DENDIAN=${boundary_endian}
+                    -DADDRESS_MODEL=${boundary_address}
+                    -DQEMU_CPU=${boundary_cpu}
+                    -DOPT_LEVEL=${boundary_level}
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-differential-boundary-${boundary_name}
+                    -P "${CMAKE_SOURCE_DIR}/test/target/mips/differential/differential.cmake")
+        set_tests_properties(cross_mips_differential_boundary_${boundary_name} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;feature.abi;feature.optimization;isa.${boundary_isa};endian.${boundary_endian_label};opt.${boundary_level_label}")
+    endforeach()
     add_test(NAME cross_model_system
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

@@ -1,0 +1,143 @@
+// Copyright (C) 2026 Cross contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// u64 values crossing ABI boundaries: helpers carry no abi attribute, so they
+// use the compilation's ABI (o32 or cross32, which carry a u64 in two 32-bit
+// pieces, n64 in one register, the host's own ABI on x86-64). Their bodies
+// use parameters as halves, as shifted ranges, and whole, and build results
+// from halves, extensions, constants, and whole values, so that both a
+// boundary's pieces and its whole value are checked in both byte orders.
+
+[[noinline]]
+global u64 b_pass(in u64 x) {
+    return x;
+}
+
+[[noinline]]
+global u64 b_swap(in u64 x) {
+    return (x << 32) | (x >> 32);
+}
+
+[[noinline]]
+global u64 b_halves(in u64 x, in u32 y) {
+    return ((u64)((u32)(x >> 32) + y) << 32) | (u64)((u32)x ^ y);
+}
+
+[[noinline]]
+global u64 b_xor_extended(in u64 x, in u32 y) {
+    return x ^ (u64)y;
+}
+
+[[noinline]]
+global u64 b_widen(in i32 y) {
+    return (u64)(i64)y;
+}
+
+[[noinline]]
+global u64 b_high(in u64 x) {
+    return x >> 32;
+}
+
+[[noinline]]
+global u64 b_middle(in u64 x) {
+    return (u64)((u32)(x >> 16) & 65535u32) | ((u64)(u32)(x >> 40) << 48);
+}
+
+[[noinline]]
+global u64 b_constant_high(in u32 y) {
+    return 1311768464867721216u64 | (u64)y;
+}
+
+[[noinline]]
+global u64 b_whole(in u64 x, in u64 y) {
+    return x * 3u64 + (y >> 7) + ((u64)(u32)x << 32);
+}
+
+[[noinline]]
+global u32 b_fold(in u64 x) {
+    return (u32)(x >> 32) ^ (u32)x;
+}
+
+[[noinline]]
+global u64 b_stacked(in u32 p1, in u32 p2, in u32 p3, in u32 p4, in u64 x,
+                     in u64 y) {
+    return ((u64)((u32)(y >> 32) - p1) << 32) |
+           (u64)((u32)x + p2 + p3 * p4);
+}
+
+[[noinline]]
+global u64 b_mask(in u64 x, in u64 y) {
+    return (x & 4294967295u64) ^ (y & 18446744069414584320u64);
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_b_pass(in u32 a, in u32 b, in u32 c) {
+    const u64 r = b_pass(((u64)a << 32) | (u64)(b ^ c));
+    return (u32)(r >> 32) * 3u32 + (u32)r;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_b_swap(in u32 a, in u32 b, in u32 c) {
+    const u64 r = b_swap(((u64)(a + c) << 32) | (u64)b);
+    return (u32)(r >> 32) - (u32)r * 5u32;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_b_halves(in u32 a, in u32 b, in u32 c) {
+    const u64 r = b_halves(((u64)a << 32) | (u64)b, c);
+    return (u32)(r >> 32) ^ ((u32)r << 1);
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_b_xor_extended(in u32 a, in u32 b, in u32 c) {
+    const u64 r = b_xor_extended(((u64)b << 32) | (u64)a, c);
+    return (u32)(r >> 32) + (u32)r * 7u32;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_b_widen(in u32 a, in u32 b, in u32 c) {
+    const u64 r = b_widen((i32)(a ^ c)) + (u64)b;
+    return (u32)(r >> 32) ^ (u32)r;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_b_high(in u32 a, in u32 b, in u32 c) {
+    const u64 r = b_high(((u64)(a * 3u32) << 32) | (u64)c);
+    return (u32)(r >> 32) * 11u32 + (u32)r + b;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_b_middle(in u32 a, in u32 b, in u32 c) {
+    const u64 r = b_middle(((u64)(a + b) << 32) | (u64)(c ^ b));
+    return (u32)(r >> 32) ^ ((u32)r * 13u32);
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_b_constant_high(in u32 a, in u32 b, in u32 c) {
+    const u64 r = b_constant_high(a ^ (b + c));
+    return (u32)(r >> 32) + (u32)r;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_b_whole(in u32 a, in u32 b, in u32 c) {
+    const u64 r = b_whole(((u64)a << 32) | (u64)b, ((u64)c << 33) | (u64)a);
+    return (u32)(r >> 32) ^ (u32)r;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_b_fold(in u32 a, in u32 b, in u32 c) {
+    return b_fold(((u64)(a ^ c) << 32) | (u64)b) + c;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_b_stacked(in u32 a, in u32 b, in u32 c) {
+    const u64 r = b_stacked(a, b, c, a ^ b, ((u64)c << 32) | (u64)a,
+                            ((u64)b << 32) | (u64)c);
+    return (u32)(r >> 32) * 17u32 ^ (u32)r;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_b_mask(in u32 a, in u32 b, in u32 c) {
+    const u64 r = b_mask(((u64)a << 32) | (u64)b, ((u64)c << 32) | (u64)a);
+    return (u32)(r >> 32) + (u32)r * 19u32;
+}
