@@ -7062,9 +7062,14 @@ private:
                 if (switches_.back().has_default) error(node.location, "duplicate default label in switch");
                 switches_.back().has_default = true;
             }
+            if (!switches_.empty() && variable_arrays_.size() > switches_.back().variable_arrays)
+                error(node.location, std::string(node.kind == Statement::Kind::Case ? "case" : "default") +
+                    " label would enter the scope of variable-length array '" +
+                    variable_arrays_[switches_.back().variable_arrays]->name + "'");
         }
         if (!valid_) co_return;
         const auto saved = types_.local_types.size();
+        const auto saved_arrays = variable_arrays_.size();
         const bool scoped = node.kind == Statement::Kind::Compound || node.kind == Statement::Kind::For;
         if (node.kind == Statement::Kind::For && node.first) co_await statement(*node.first);
         if (node.declaration) {
@@ -7154,6 +7159,8 @@ private:
                         "goto target does not name a visible label or label-valued expression");
             }
         }
+        if (node.declaration && node.declaration->dynamic_array_bound)
+            variable_arrays_.push_back(node.declaration.get());
         if (node.kind == Statement::Kind::Case) co_await case_label(node);
         if (node.kind == Statement::Kind::StaticAssert && node.expression) {
             const auto condition = type(*node.expression);
@@ -7192,14 +7199,17 @@ private:
         if (node.kind == Statement::Kind::Switch) {
             const auto selector = node.condition ? type(*node.condition) : TypePtr{};
             switches_.push_back({selector ? promote_integer(evaluation_integer_type(selector, program_.address_bits))
-                                         : IntegerType{}, false, {}});
+                                         : IntegerType{}, false, {}, variable_arrays_.size()});
         }
         for (const auto& child : node.statements) co_await statement(*child);
         if (node.first && node.kind != Statement::Kind::For) co_await statement(*node.first);
         if (node.second) co_await statement(*node.second);
         if (node.kind == Statement::Kind::Switch) switches_.pop_back();
         if (loop) --loop_depth_;
-        if (scoped) types_.local_types.resize(saved);
+        if (scoped) {
+            types_.local_types.resize(saved);
+            variable_arrays_.resize(saved_arrays);
+        }
         forget_types();
     }
 
@@ -7221,8 +7231,12 @@ private:
         IntegerType type;
         bool has_default{};
         std::vector<UInt128> values;
+        // The variable-length arrays in scope at the switch statement.
+        std::size_t variable_arrays{};
     };
     std::vector<Switch> switches_;
+    // The variable-length arrays in scope, in declaration order.
+    std::vector<const VariableDecl*> variable_arrays_;
     bool valid_{true};
     SourceValidationPhase phase_;
 };

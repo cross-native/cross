@@ -8,10 +8,12 @@ foreach(required CC SOURCE OUTPUT_DIR)
 endforeach()
 file(MAKE_DIRECTORY "${OUTPUT_DIR}")
 get_filename_component(SWITCH_DIR "${CMAKE_CURRENT_LIST_DIR}" ABSOLUTE)
-set(cases errors duplicate_default outside_case bad_selector vla_entry vla_default)
+set(cases errors duplicate_default outside_case bad_selector vla_entry vla_default
+    vla_eval)
 set(patterns "case" "default" "case|switch" "integer|scalar|switch"
     "case label would enter the scope of variable-length array .buffer."
-    "default label would enter the scope of variable-length array .skipped.")
+    "default label would enter the scope of variable-length array .skipped."
+    "vla_eval.x:9:5: error: case label would enter the scope of variable-length array .buffer.")
 list(LENGTH cases count)
 math(EXPR last "${count}-1")
 foreach(index RANGE ${last})
