@@ -70,3 +70,23 @@ foreach(label mips-Oz mips-Os mips-no-thread)
 endforeach()
 compile(mips-limit -O2 -fthread-jumps-limit=64 ${mips})
 expect_count(mips-limit loaded "\tlw\t" 3)
+
+# The copies hold only the operations the limit counts, not the decided
+# conditions, so a copy-free thread adds no instruction.
+function(instructions label function variable)
+    file(READ "${OUTPUT}/${label}.s" assembly)
+    string(FIND "${assembly}" "\n${function}:\n" start)
+    string(FIND "${assembly}" "\n.end ${function}" end)
+    math(EXPR length "${end} - ${start}")
+    string(SUBSTRING "${assembly}" ${start} ${length} text)
+    string(REGEX MATCHALL "\n\t[a-z]" matches "${text}")
+    list(LENGTH matches count)
+    set(${variable} ${count} PARENT_SCOPE)
+endfunction()
+compile(mips-Oz-no-thread -Oz -fno-thread-jumps ${mips})
+instructions(mips-Oz release threaded)
+instructions(mips-Oz-no-thread release unthreaded)
+if(threaded GREATER unthreaded)
+    message(FATAL_ERROR
+        "a copy-free thread grew release from ${unthreaded} to ${threaded} instructions")
+endif()

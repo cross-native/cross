@@ -985,7 +985,7 @@ public:
             const UseLists uses(function_);
             const auto path = find(dominators, loops, uses);
             if (!path) break;
-            apply(*path);
+            apply(*path, uses);
             prune_unreachable_blocks(function_);
             changed = true;
         }
@@ -1114,13 +1114,18 @@ private:
                            });
     }
 
-    // What the thread costs: the operations that copies of the path's
-    // blocks keep, which are stores and the operations whose values a later
-    // block, a phi there, or another kept operation reads, and the values
-    // read after the path, which the original blocks and the copies then
-    // pass in new phis. The conditions of the decided branches, and what
-    // only they read, are not copied, and constants count nothing.
-    unsigned thread_cost(const ThreadPath& path, const UseLists& uses) const {
+    struct KeptValues {
+        std::unordered_set<std::uint32_t> values;
+        // The values read after the path, which the original blocks and the
+        // copies then pass in new phis.
+        unsigned merged{};
+    };
+
+    // The operations that copies of the path's blocks keep: stores and the
+    // operations whose values a later block, a phi of the target, or another
+    // kept operation reads. The conditions of the decided branches, and what
+    // only they read, are not copied.
+    KeptValues kept_values(const ThreadPath& path, const UseLists& uses) const {
         std::unordered_set<std::uint32_t> blocks;
         for (const auto block : path.blocks) blocks.insert(block.value);
         const auto on_path = [&](ValueId id) {
@@ -1162,6 +1167,17 @@ private:
                 }
             }
         }
+        // The target's phis take what they take from the last block from
+        // the last copy as well.
+        for (const auto id : function_.blocks[path.target.value].values) {
+            const auto& value = function_.values[id.value];
+            if (value.kind != ValueKind::Phi) continue;
+            for (const auto& incoming : value.incoming) {
+                if (incoming.predecessor == path.blocks.back()) {
+                    keep(incoming.value);
+                }
+            }
+        }
         while (!pending.empty()) {
             const auto id = pending.back();
             pending.pop_back();
@@ -1175,8 +1191,15 @@ private:
             }
             for (const auto operand : value.operands) keep(operand);
         }
-        unsigned count = merged;
-        for (const auto id : kept) {
+        return {std::move(kept), merged};
+    }
+
+    // What the thread costs: the operations its copies keep, constants
+    // aside, and the values read after the path.
+    unsigned thread_cost(const ThreadPath& path, const UseLists& uses) const {
+        const auto kept = kept_values(path, uses);
+        unsigned count = kept.merged;
+        for (const auto id : kept.values) {
             const auto kind = function_.values[id].kind;
             if (kind != ValueKind::Phi && kind != ValueKind::ConstantInteger &&
                 kind != ValueKind::ConstantFloating) {
@@ -1304,7 +1327,8 @@ private:
         return id;
     }
 
-    void apply(const ThreadPath& path) {
+    void apply(const ThreadPath& path, const UseLists& uses) {
+        const auto kept = kept_values(path, uses).values;
         std::unordered_map<std::uint32_t, ValueId> copies;
         const auto copied = [&](ValueId id) {
             const auto found = copies.find(id.value);
@@ -1339,6 +1363,7 @@ private:
                     }
                     continue;
                 }
+                if (!kept.contains(id.value)) continue;
                 for (auto& operand : value.operands) operand = copied(operand);
                 if (value.effect_input) {
                     value.effect_input = effects.at(value.effect_input->value);
