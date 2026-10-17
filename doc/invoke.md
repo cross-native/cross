@@ -334,7 +334,7 @@ below, and runs no other program.
 | Option | Selects |
 | --- | --- |
 | `-o FILE` | The executable (default `a.out`). |
-| `-T FILE`, `--script=FILE` | The linker script. |
+| `-T FILE`, `--script=FILE` | The linker script. Files its `INPUT` and `GROUP` commands name are linked where `-T` stands among the inputs. |
 | `-e SYMBOL`, `--entry=SYMBOL` | The entry point, a symbol or an address. Without it, `ENTRY` in the script, then `_start`, then the start of `.text` (with a warning). |
 | `-L DIR`, `-l NAME` | `-l NAME` links `libNAME.a` (`-l:NAME` links `NAME`) from the `-L` directories and the script's `SEARCH_DIR`s. |
 | `-R FILE`, `--just-symbols=FILE` | The addresses of the global symbols that the ELF file FILE defines, without its contents. |
@@ -343,13 +343,17 @@ below, and runs no other program.
 | `--defsym SYMBOL=EXPRESSION` | Define SYMBOL with a script expression. |
 | `-Ttext=ADDRESS`, `-Tdata=ADDRESS`, `-Tbss=ADDRESS`, `--section-start=NAME=ADDRESS` | Place an output section at ADDRESS, read as hexadecimal. |
 | `-r`, `--relocatable` | Write a relocatable object instead of an executable. |
-| `--gc-sections`, `--print-gc-sections` | Remove the allocated sections that nothing reaches, and report each one removed. |
+| `-d`, `-dc`, `-dp` | Allocate common symbols with `-r` too. |
+| `--gc-sections`, `--print-gc-sections` | Remove the sections that nothing reaches, and report each one removed. With `-r`, `-e` or `-u` must name a defined symbol, or `--gc-keep-exported` must be given. |
+| `--gc-keep-exported` | Keep the sections that define global symbols of default or protected visibility. |
+| `--eh-frame-hdr`, `--no-eh-frame-hdr` | Write, or do not write (the default), an `.eh_frame_hdr` search table and its `PT_GNU_EH_FRAME` header. |
 | `-Map FILE`, `-M` | Write a link map to FILE, or to standard output. |
 | `-m EMULATION`, `--oformat=FORMAT`, `-EB`, `-EL` | The output class and byte order instead of the first object's: the emulations `elf32btsmip`, `elf32ltsmip`, `elf32ebmip`, `elf32elmip`, `elf64btsmip`, and `elf64ltsmip`, or the formats `elf32-bigmips`, `elf32-littlemips`, `elf32-tradbigmips`, `elf32-tradlittlemips`, and their `elf64-` counterparts. |
 | `-z max-page-size=SIZE` | The alignment of loadable segments in the file: by default 64 KiB for ELF64 and for the `ts` emulations and `trad` formats, otherwise 4 KiB. |
 | `-s`, `--strip-all` | Omit the symbol table. |
 | `--fatal-warnings` | Treat warnings as errors. |
 | `--start-group`, `--end-group` | Accepted; archives are searched in any order. |
+| `-nostdlib` | Accepted; there are no default library directories. |
 
 **Symbols.** A symbol has at most one strong definition. A strong definition
 replaces weak and common ones, a common symbol replaces a weak definition,
@@ -363,46 +367,104 @@ archive on the command line that defines the symbol provides it, and weak
 references link no member. A linker-script assignment defines its symbol
 even when an object also defines it.
 
-**Linker scripts.** The accepted commands are `SECTIONS`, `MEMORY`, `PHDRS`,
-`ENTRY`, `INCLUDE` (searched in the current directory, the `-L` and
-`SEARCH_DIR` directories, and the including script's directory),
-`SEARCH_DIR`, `EXTERN`, `ASSERT`, `OUTPUT_ARCH`, `OUTPUT_FORMAT` (both
-ignored), and assignments, also inside `PROVIDE`, `HIDDEN`, and
-`PROVIDE_HIDDEN`. An output section
-description may give an address, `(NOLOAD)`, `AT(...)`, `ALIGN(...)`,
-`>REGION`, `AT>REGION`, `:PHDR`, and `=FILL` (a 32-bit big-endian pattern);
+**Linker scripts.** The accepted commands are `SECTIONS`, `MEMORY` (with
+region attributes `R`, `W`, `X`, `A`, `I`, `L`, and `!`), `PHDRS`, `ENTRY`,
+`INCLUDE` (searched in the current directory, the `-L` and `SEARCH_DIR`
+directories, and the including script's directory; also inside output
+section descriptions), `INPUT` and `GROUP` (files, `-lNAME` libraries, and
+`AS_NEEDED` lists, searched in the current directory and the library
+directories), `SEARCH_DIR`, `EXTERN`, `INSERT AFTER` and `INSERT BEFORE`,
+`REGION_ALIAS`, `NOCROSSREFS`, `NOCROSSREFS_TO`, `ASSERT`, `OUTPUT_ARCH`,
+`OUTPUT_FORMAT` (both ignored), and assignments, also inside `PROVIDE`,
+`HIDDEN`, and `PROVIDE_HIDDEN`. An input file that is neither an object nor
+an archive is an implicit linker script, which adds to the main one; files
+its `INPUT` names are searched in its own directory first. A script with
+`INSERT` adds to the default layout instead of replacing it: the statements
+before each `INSERT` move after (or before) the named output section.
+
+An output section description may give an address, a type (`NOLOAD`;
+`DSECT`, `COPY`, `INFO`, or `OVERLAY` for a section without memory;
+`READONLY`; `TYPE = SHT_PROGBITS` and the other GNU ld type names or a
+number), `AT(...)`, `ALIGN(...)`, `ALIGN_WITH_INPUT`, `SUBALIGN(...)`,
+`ONLY_IF_RO` or `ONLY_IF_RW`, `>REGION`, `AT>REGION`, `:PHDR`, and `=FILL`;
 its contents are input section descriptions, `BYTE`, `SHORT`, `LONG`, `QUAD`,
-`SQUAD`, assignments to symbols and to `.`, and `ASSERT`. An input section
-description is `FILE(SECTION ...)` with the wildcards `*`, `?`, and `[...]`,
-optionally in `KEEP(...)`, with `EXCLUDE_FILE(...)`, `SORT`, `SORT_BY_NAME`,
-`SORT_BY_ALIGNMENT`, `SORT_NONE`, and `ARCHIVE:MEMBER` file patterns; a file
-pattern matches the path as written, and an archive member matches its
-archive's path. `COMMON` names the common symbols and `/DISCARD/` drops what
-it matches. Expressions have C's operators and the functions `ABSOLUTE`,
-`ADDR`, `ALIGN`, `ALIGNOF`, `BLOCK`, `CONSTANT`, `DEFINED`, `LENGTH`,
-`LOADADDR`, `LOG2CEIL`, `MAX`, `MIN`, `NEXT`, `ORIGIN`, `SEGMENT_START`,
-`SIZEOF`, and `SIZEOF_HEADERS`. Other commands, such as `OVERLAY`, `INSERT`,
-`INPUT`, `GROUP`, `STARTUP`, `NOCROSSREFS`, `REGION_ALIAS`, `SUBALIGN`,
-`ONLY_IF_RO`, `FILL`, output section types other than `NOLOAD`, and the
-`DATA_SEGMENT_*` functions, are diagnosed.
+`SQUAD`, `FILL(...)`, `CONSTRUCTORS` and `LINKER_VERSION` (which place
+nothing), assignments to
+symbols and to `.`, and `ASSERT`. `OVERLAY` gives its sections one address
+and consecutive load addresses, defines `__load_start_NAME` and
+`__load_stop_NAME` for each (NAME being the section name without characters
+other than letters, digits, and `_`), and moves `.` past the largest. An input
+section description is `FILE(SECTION ...)` with the wildcards `*`, `?`, and
+`[...]`, optionally in `KEEP(...)`, with `EXCLUDE_FILE(...)`, `SORT`,
+`SORT_BY_NAME`, `SORT_BY_ALIGNMENT`, `SORT_BY_INIT_PRIORITY`, `SORT_NONE`, and
+`ARCHIVE:MEMBER` file patterns; a file pattern matches the path as written,
+and an archive member matches its archive's path. `COMMON` names the common
+symbols and `/DISCARD/` drops what it matches. Expressions have C's operators
+and the functions `ABSOLUTE`, `ADDR`, `ALIGN`, `ALIGNOF`, `BLOCK`, `CONSTANT`,
+`DATA_SEGMENT_ALIGN`, `DATA_SEGMENT_END`, `DATA_SEGMENT_RELRO_END`, `DEFINED`,
+`LENGTH`, `LOADADDR`, `LOG2CEIL`, `MAX`, `MIN`, `NEXT`, `ORIGIN`,
+`SEGMENT_START`, `SIZEOF`, and `SIZEOF_HEADERS`; `NEXT_SECTION` names the next
+output section. Other commands, such as `STARTUP`, `OUTPUT`, `TARGET`,
+`INPUT_SECTION_FLAGS`, `CREATE_OBJECT_SYMBOLS`, and the `SPECIAL` constraint,
+are diagnosed.
 
 **Layout.** Addresses, load addresses, empty sections, and the location
-counter follow GNU ld: an output section without contents is omitted (its
-address still counts when it defines symbols); a section without an address
-follows the location counter, or with `>REGION` that region, at its
-alignment; a plain number assigned to `.` inside an output section is an
-offset from the section's start. A section without `AT` or `AT>` keeps the
-difference between load and virtual address of the previous section in its
-region, and one without them that follows a section with `AT>` in the same
-region also loads in that section's load region. Sections without `>REGION`
-follow the location counter even when `MEMORY` defines regions. An input
-section that no rule matches keeps its name and follows the last output
-section of its kind (code, read-only data, data, or zero-filled data), or of
-an earlier kind; non-allocated ones come last, and `COMMON` goes to `.bss`.
+counter follow GNU ld. An output section that is empty before `.eh_frame`
+and `.pdr` editing is left out unless a `KEEP` input section or an
+assignment to `.` keeps it (`. = 0`, `. = . + 0`, and
+`. = ALIGN(. != 0 ? EXPRESSION : 1)` do not); a left-out section's address
+still counts when it defines symbols, which move to a nearby section. A
+section of assignments alone becomes zero-filled space once `.` advances in
+it and is otherwise not allocated. An address given to a section sets `.`
+even when the section is left out; a section without an address follows the
+location counter, or its region with `>REGION`, at its alignment. When
+`MEMORY` defines regions, an allocated section without `>REGION` goes to the
+first region whose attributes match its contents (read-only data counts as
+both `R` and `W`, as in GNU ld), and one that no region takes is an error;
+an `AT>REGION` without `>REGION` or an address also gives the run-time
+region; a section that names an undeclared region gets a warning and a
+region at address 0. A section without `AT` or `AT>` keeps the difference
+between load and virtual address of the last section of its region that had
+one, a later section of an `OVERLAY` loads after the previous one, and a
+section without them that follows a section with `AT>` in the same region
+also loads in that region.
+
+Expression values are plain numbers, absolute addresses, or addresses
+relative to an output section, as in GNU ld. Inside an output section, a
+plain number assigned to a symbol or to `.` is an offset from the section's
+start, and an absolute symbol counts as a plain number. An operator on a
+relative value and a plain number works on the offset in the section and
+keeps the section, so inside a section `. != 0` tells whether it has
+contents so far and `. = MAX(., 16)` makes it at least 16 bytes long; values
+of two different sections are made absolute first; arithmetic on two values
+of one section, or on two absolute values, gives a plain number inside
+output sections and an absolute value outside them; comparisons give plain
+numbers. `ALIGN(EXPRESSION, ALIGNMENT)`, `MAX`, and `MIN` keep the section
+of a relative result. A symbol assigned from `.` outside output sections
+belongs to the previous allocated section, or after an assignment to `.` to
+the next one (but past `_end` to the previous). A non-allocated script
+section without an address gets the location counter as its address and
+moves `.` past its end, as in GNU ld, so debugging sections need the
+address 0. `ONLY_IF_RO` and `ONLY_IF_RW`
+sections whose input sections are not all read-only (or all writable) are
+dropped, leaving their input sections to later statements. `SUBALIGN`
+replaces the alignment of the section and of its input sections. A fill
+pattern fills each gap from its start: a hexadecimal literal gives all its
+digits as the pattern, any other value its low four bytes, big-endian.
+`DATA_SEGMENT_ALIGN(MAXPAGESIZE, COMMONPAGESIZE)` gives the next page at the
+same offset, or the form that saves a common page when the data's partial
+first and last pages fit in one; `DATA_SEGMENT_RELRO_END` gives its second
+operand. An input section that no rule matches keeps its name and follows the
+last output section of its kind (code, read-only data, data, or zero-filled
+data), or of an earlier kind, in that section's regions; non-allocated ones
+follow `.comment` (or come last) at address 0, and `COMMON` goes to `.bss`.
 Without `-T` the layout is a subset of GNU ld's default for MIPS: the ABI
-sections and code at 0x400000 (0x120000000 for ELF64), the data on the next
-page at the same page offset, `_gp` 32 KiB past the start of the small data,
-and `_etext`, `_edata`, `__bss_start`, and `_end`.
+sections and code at 0x400000 (0x120000000 for ELF64), `.eh_frame_hdr`,
+`.eh_frame`, and `.gcc_except_table` after the read-only data (or, when
+writable, before the data), the data placed by `DATA_SEGMENT_ALIGN`, `_gp`
+32 KiB past the start of the small data, `_etext`, `_edata`, `__bss_start`,
+and `_end`, then `.comment`, the debugging sections, and `.gnu.attributes`
+at address 0.
 
 **Segments.** Without `PHDRS`, allocated sections share a loadable segment
 unless a section's load and virtual addresses differ by another amount, it
@@ -412,8 +474,31 @@ sections and on another page. With `PHDRS`, a section without `:PHDR` takes
 the program headers of the previous section unless it is `NOLOAD`. The file
 and program headers join the first loadable segment when there is room for
 them below its first section in that page, without `PHDRS` or when the
-segment's entry has `FILEHDR` or `PHDRS`. A `.MIPS.abiflags` or `.reginfo`
-output section also gets a `PT_MIPS_ABIFLAGS` or `PT_MIPS_REGINFO` header.
+segment's entry has `FILEHDR` or `PHDRS`. A loadable segment is aligned to
+the page size or to its most aligned section; one without file contents gets
+an offset within the first page. A `.MIPS.abiflags` or `.reginfo` output
+section also gets a `PT_MIPS_ABIFLAGS` or `PT_MIPS_REGINFO` header, and the
+output section holding `.eh_frame_hdr` a `PT_GNU_EH_FRAME` header. Once an
+input has a `.note.GNU-stack` section, a `PT_GNU_STACK` header tells whether
+the stack is executable: it is when an input's note asks for it or an input
+has no note.
+
+**Unwind tables.** The input sections of the `.eh_frame` output section are
+edited as GNU ld edits them: an FDE whose function is in a removed section
+(a duplicate COMDAT copy, a `/DISCARD/` match, or a section `--gc-sections`
+collects) or whose address range is empty is dropped, CIEs that no remaining
+FDE uses go, identical CIEs (equal but for their personality pointer's bytes,
+with the same personality symbol) share the first copy, trailing
+`DW_CFA_nop` padding is trimmed, entries realign (FDEs to their address
+size), and only the last input section keeps a zero terminator. Live code
+keeps the LSDAs its FDEs refer to and the personality routines of their
+CIEs. With `--eh-frame-hdr`, `.eh_frame_hdr` is an input section of the first
+input with unwind entries, placed by `*(.eh_frame_hdr)` or as an orphan, with
+a hidden local symbol `__GNU_EH_FRAME_HDR`; its table lists every FDE's
+initial location and address relative to the header, sorted, and FDEs that
+overlap are an error. An `.eh_frame` section the linker cannot read stays
+whole, with a warning, and the header then omits its table. `-r` edits
+unwind tables the same way, without sharing CIEs.
 
 **MIPS.** `ld` applies `R_MIPS_16`, `_32`, `_64`, `_26`, `_HI16`, `_LO16`,
 `_GPREL16`, `_GPREL32`, `_LITERAL`, `_PC16`, `_PC32`, `_HIGHER`, and
@@ -430,14 +515,24 @@ the gp value an object's `.reginfo` or `.MIPS.options` records. `R_MIPS_16`
 fills the 16-bit field at its offset, where GNU ld fills the low half of the
 32-bit word there. The header flags of the objects must agree on the ABI, the
 NaN encoding, and FP64, and their ISAs must extend one another; the output
-takes the newest ISA. `.reginfo` and `.MIPS.options` merge into one register
-mask with the final `_gp`, and `.MIPS.abiflags` into the largest ISA and
-register sizes with the floating-point ABI that all objects accept (the
-objects' `.MIPS.abiflags`, where GNU ld takes it from `.gnu.attributes`;
-objects with incompatible floating-point ABIs get a warning, as in GNU ld).
-A `.pdr` record whose function a file does not contribute, such as a
-duplicate COMDAT copy, is dropped, and `.gnu.attributes` sections are not
-copied to the output.
+takes the newest ISA. The output's `.reginfo` is the first object's, as in
+GNU ld, with the final `_gp`; `.MIPS.options` merge into one register-usage
+option with the union of the masks and the final `_gp`; `.gnu.attributes`
+merge as in GNU ld: the first
+object's attributes, with the floating-point and MSA ABIs of all objects
+merged (an object without a floating-point attribute contributes the one in
+its `.MIPS.abiflags`; incompatible ones get a warning) and
+`Tag_compatibility` agreeing; and `.MIPS.abiflags` into the largest ISA and
+register sizes with the merged floating-point ABI. A `.pdr` record whose
+function a file does not contribute, such as a duplicate COMDAT copy, is
+dropped. Output sections take GNU ld's MIPS types and flags by name:
+`.reginfo`, `.MIPS.options`, `.MIPS.abiflags`, `.mdebug`, and the debugging
+sections their MIPS section types; `.sdata`, `.sbss`, `.srdata`, `.lit4`,
+`.lit8`, and `.got` the gp-relative flag; and `.MIPS.options`, and in the
+IRIX-compatible formats (all but the `ts` emulations and `trad` formats)
+`.debug_frame`, the no-strip flag. In the IRIX-compatible formats
+`.reginfo` has an entry size of 1, and in their ELF32 forms the symbol
+table's `sh_info` counts only the section symbols.
 
 **Other rules.** Relocation-free `SHF_MERGE` sections of one output section
 are merged as GNU ld merges them: one copy of each string or constant, and
@@ -445,18 +540,30 @@ strings that end other strings share their tails. `--gc-sections` keeps the
 entry, `-u`, `EXTERN`, and script symbols, `KEEP` sections, sections whose
 symbols those reach through relocations, COMDAT groups as wholes, note, init
 and fini array sections, `.ctors`, `.dtors`, OS- and processor-specific
-sections, and `.eh_frame` whole (relocations in it that refer to removed code
-resolve to zero, as they do in non-allocated sections). The symbol table
-keeps local symbols except assembler-local labels in mergeable sections,
-makes the symbols a script defines with `HIDDEN` or `PROVIDE_HIDDEN` local,
-keeps the binding and visibility objects give their symbols, and leaves out
-undefined weak symbols. The map lists discarded input sections, then each output section
-with its input sections, the files they come from, their symbols, and the
-script's assignments, in a format like GNU ld's. With `-r`, input sections
-of one name share an output section, except that the members of a section
-group keep their own and the group stays; relocations remain, against output
-section symbols with their addends adjusted, and common symbols stay common;
-`-r` takes `--defsym` but no linker script.
+sections, and `.eh_frame`; of a file with a live allocated section, it keeps
+the debugging sections and the non-allocated sections without relocations
+(so MIPS `.pdr` goes), and of other files none. An undefined symbol that no
+remaining relocation refers to leaves the symbol table. The symbol table
+starts with a symbol for each output section, then each file's local
+symbols (of the files that place a section in an output section with
+contents, including those of an `.eh_frame` input section that editing
+emptied) after a FILE symbol, named after the file when it has none, then
+the symbols a script defines with `HIDDEN` or `PROVIDE_HIDDEN`, made local
+after an unnamed FILE symbol, then the global symbols, with the binding and
+visibility objects give them; assembler-local labels in mergeable sections
+and undefined weak symbols are left out. The map lists discarded input
+sections, then each output section (also those left out of the output) with
+its input sections, the files they come from, their symbols, and the
+script's assignments, in a format like GNU ld's, with addresses of the
+output's width. With `-r`, output sections follow
+GNU ld's relocatable layout for the target (`.text`, `.rodata`, `.data`,
+`.sdata`, `.sbss`, `.bss`, and the like collect input sections of exactly
+that name, in that order), then other input sections of one name share an
+output section in the order they first appear, except that the members of a
+section group keep their own and the group stays; relocations remain,
+against output section symbols with their addends adjusted, and common
+symbols stay common unless `-d` makes them `.bss` (MIPS small commons
+`.scommon`) space; `-r` takes `--defsym` but no linker script.
 
 ## Inspecting the compiler
 

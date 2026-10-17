@@ -46,6 +46,13 @@ private:
     Diagnostics& diagnostics_;
 };
 
+// The name GNU ld gives the FILE symbol of an input without one.
+std::string file_basename(const InputFile& file) {
+    const auto& name = file.member.empty() ? file.path : file.member;
+    const auto slash = name.find_last_of('/');
+    return slash == std::string::npos ? name : name.substr(slash + 1);
+}
+
 std::string padded_hex(std::uint64_t value, int digits) {
     char buffer[32];
     std::snprintf(buffer, sizeof buffer, "0x%0*llx", digits, static_cast<unsigned long long>(value));
@@ -60,6 +67,16 @@ std::string size_field(std::uint64_t value) {
 
 } // namespace
 
+bool Link::contributes(const InputFile& file) const {
+    // GNU ld writes the local symbols of a file that has a section in an
+    // output section with contents, including one a target merged.
+    return std::any_of(file.sections.begin(), file.sections.end(), [](const auto& section) {
+        const auto* placed = section && section->combined ? section->combined : section.get();
+        return placed && placed->included() && placed->output && placed->output->index != 0 &&
+               !placed->output->nobits();
+    });
+}
+
 bool Link::write_contents() {
     const auto pointer = gp();
     for (const auto& step : steps_) {
@@ -68,21 +85,19 @@ bool Link::write_contents() {
         auto& output = *placement->output;
         if (output.nobits()) continue;
         output.data.assign(output.size, 0);
-        if (placement->statement && placement->statement->fill) {
-            final_ = true;
-            if (const auto value = evaluate(*placement->statement->fill)) {
-                for (std::size_t index = 0; index < output.data.size(); ++index) {
-                    output.data[index] = static_cast<std::uint8_t>(value->value >> (24 - 8 * (index % 4)));
-                }
-                for (const auto* section : output.sections) {
-                    std::fill_n(output.data.begin() + static_cast<std::ptrdiff_t>(section->offset),
-                                section->size, 0);
-                }
+        // Each gap repeats its fill pattern from the gap's start.
+        final_ = true;
+        for (const auto& gap : placement->padding) {
+            if (!gap.fill) continue;
+            const auto pattern = fill_pattern(*gap.fill);
+            if (!pattern || pattern->empty()) continue;
+            for (std::uint64_t index = 0; index < gap.size; ++index) {
+                output.data[gap.offset + index] = (*pattern)[index % pattern->size()];
             }
         }
         for (const auto& item : placement->items) {
             for (const auto* section : item.sections) {
-                if (section->nobits()) continue;
+                if (section->nobits() || !section->included()) continue;
                 std::copy(section->data.begin(), section->data.end(),
                           output.data.begin() + static_cast<std::ptrdiff_t>(section->offset));
             }
@@ -95,6 +110,7 @@ bool Link::write_contents() {
                 }
             }
         }
+        if (output.name == ".eh_frame") patch_frame_pointers(output);
         for (const auto* section : output.sections) {
             if (section->relocations.empty() || section->nobits()) continue;
             const SectionContext context(*this, *section, pointer, diagnostics_);
@@ -102,6 +118,8 @@ bool Link::write_contents() {
                                                                                   section->size));
         }
     }
+    // The .eh_frame_hdr table reads the relocated FDEs.
+    if (auto* frames = output_named(".eh_frame"); frames && frame_header_) write_frame_header(*frames);
     return diagnostics_.errors() == 0;
 }
 
@@ -143,7 +161,9 @@ bool Link::write_executable() {
         section.flags = output->flags;
         section.alignment = output->alignment;
         section.entry_size = output->entry_size;
-        section.address = output->alloc() ? output->address : 0;
+        target_->finish_output_section(output->name, options_.format, section.type, section.flags,
+                                       section.entry_size);
+        section.address = output->address;
         section.offset = output->offset;
         if (output->nobits()) {
             section.size = output->size;
@@ -183,8 +203,19 @@ bool Link::write_executable() {
     if (!options_.strip_all) {
         add_symbol("", 0, 0, 0, 0, 0);
         ++count;
+        // GNU ld's order: a symbol for each output section, each file's
+        // local symbols after a FILE symbol (its name when the file has
+        // none), then the symbols the script makes local after an unnamed
+        // FILE symbol, then the global symbols.
+        for (const auto* output : emitted) {
+            add_symbol("", output->address, 0, info(elf::stb_local, elf::stt_section), 0,
+                       static_cast<std::uint16_t>(output->index));
+            ++count;
+        }
+        bool file_symbols = false;
         for (const auto& file : files_) {
-            if (file->just_symbols) continue;
+            if (file->just_symbols || !contributes(*file)) continue;
+            bool named = false;
             for (std::size_t index = 1; index < file->symbols.size(); ++index) {
                 const auto& entry = file->symbols[index];
                 if (entry.binding != elf::stb_local || entry.type == elf::stt_section ||
@@ -195,11 +226,10 @@ bool Link::write_executable() {
                 std::uint64_t value = entry.value;
                 if (entry.type != elf::stt_file && entry.shndx != shn_abs) {
                     if (entry.shndx == 0 || entry.shndx >= file->sections.size()) continue;
+                    // A symbol of a section that .eh_frame editing excluded
+                    // stays at the section's place (GNU ld).
                     const auto* section = file->sections[entry.shndx].get();
-                    if (!section || !section->included() || !section->output ||
-                        section->output->index == 0) {
-                        continue;
-                    }
+                    if (!section || !section->output || section->output->index == 0) continue;
                     // GNU ld drops assembler-local labels in mergeable data.
                     if ((section->flags & elf::shf_merge) != 0 &&
                         (entry.name.starts_with(".L") || entry.name.starts_with("..") ||
@@ -209,17 +239,29 @@ bool Link::write_executable() {
                     shndx = static_cast<std::uint16_t>(section->output->index);
                     value = section_address(*section, entry.value);
                 }
+                if (entry.type == elf::stt_file) {
+                    named = true;
+                } else if (!named) {
+                    add_symbol(file_basename(*file), 0, 0, info(elf::stb_local, elf::stt_file), 0, shn_abs);
+                    ++count;
+                    named = true;
+                }
+                file_symbols = true;
                 add_symbol(entry.name, value, entry.size, info(elf::stb_local, entry.type),
                            entry.other, shndx);
                 ++count;
             }
         }
+        bool script_locals = false;
         for (const int pass : {0, 1}) {
             if (pass == 1) first_global = count;
             for (const auto& entry : symbols_) {
                 // Undefined symbols that an object refers to stay, except
                 // weak ones, which GNU ld drops from executables.
-                if (!entry.defined() && (!entry.referenced || !entry.file || entry.weak)) continue;
+                if (!entry.defined() && (!entry.referenced || !entry.file || entry.weak ||
+                                         (options_.gc_sections && !live_references_.contains(&entry)))) {
+                    continue;
+                }
                 // Script HIDDEN symbols are local; object symbols keep their
                 // binding and visibility, as in GNU ld.
                 const bool local = entry.hidden;
@@ -227,23 +269,31 @@ bool Link::write_executable() {
                 std::uint16_t shndx = 0;
                 std::uint64_t value = 0;
                 if (entry.defined()) {
+                    // A symbol of an output section that was left out moves
+                    // to a nearby one (GNU ld).
+                    const auto home = [&](const OutputSection* output, std::uint64_t address) {
+                        if (output && output->index == 0) output = nearby_section(*output, address);
+                        return output && output->index != 0 ? static_cast<std::uint16_t>(output->index) : shn_abs;
+                    };
                     if (entry.section) {
-                        if (!entry.section->included() || !entry.section->output ||
-                            entry.section->output->index == 0) {
-                            continue;
-                        }
-                        shndx = static_cast<std::uint16_t>(entry.section->output->index);
+                        if (!entry.section->included() || !entry.section->output) continue;
                         value = section_address(*entry.section, entry.value);
+                        shndx = home(entry.section->output, value);
                     } else {
-                        shndx = entry.output && entry.output->index != 0
-                                    ? static_cast<std::uint16_t>(entry.output->index)
-                                    : shn_abs;
                         value = entry.value;
+                        shndx = entry.output ? home(entry.output, value) : shn_abs;
                     }
                 }
+                if (local && !script_locals && file_symbols) {
+                    add_symbol("", 0, 0, info(elf::stb_local, elf::stt_file), 0, shn_abs);
+                    ++count;
+                }
+                script_locals = script_locals || local;
                 const auto binding = local ? elf::stb_local
                                            : (entry.weak ? elf::stb_weak : elf::stb_global);
-                add_symbol(entry.name, value, entry.size, info(binding, entry.type), entry.other, shndx);
+                // A symbol made local loses its visibility (GNU ld).
+                const auto other = local ? static_cast<std::uint8_t>(entry.other & ~3U) : entry.other;
+                add_symbol(entry.name, value, entry.size, info(binding, entry.type), other, shndx);
                 ++count;
             }
         }
@@ -255,7 +305,9 @@ bool Link::write_executable() {
         table.alignment = wide ? 8 : 4;
         table.entry_size = wide ? 24 : 16;
         table.link = static_cast<std::uint32_t>(sections.size() + 2);
-        table.info = first_global;
+        table.info = target_->sections_end_locals(options_.format)
+                         ? static_cast<std::uint32_t>(emitted.size() + 1)
+                         : first_global;
         table.data = std::move(symtab.data());
         sections.push_back(std::move(table));
         ElfSection string_table;
@@ -305,6 +357,8 @@ bool Link::write_executable() {
 
 void Link::write_map() const {
     std::ostringstream out;
+    // Addresses take the target's width, as in GNU ld's map.
+    const int width = object_.elf64 ? 16 : 8;
     out << "Discarded input sections\n\n";
     for (const auto& file : files_) {
         for (const auto& section : file->sections) {
@@ -315,7 +369,7 @@ void Link::write_map() const {
             } else {
                 out << std::string(15 - section->name.size(), ' ');
             }
-            out << padded_hex(0, 16) << ' ' << size_field(section->size) << ' ' << file->name()
+            out << padded_hex(0, width) << ' ' << size_field(section->size) << ' ' << file->name()
                 << '\n';
         }
     }
@@ -334,7 +388,7 @@ void Link::write_map() const {
             const auto* target = find(assignment.symbol);
             if (!target || !target->script) return;
         }
-        out << std::string(16, ' ') << padded_hex(value, 16) << std::string(16, ' ')
+        out << std::string(16, ' ') << padded_hex(value, width) << std::string(16, ' ')
             << assignment.symbol << '\n';
     };
     for (const auto& step : steps_) {
@@ -344,17 +398,18 @@ void Link::write_map() const {
             }
             continue;
         }
+        // Sections left out of the output are listed too (GNU ld).
         const auto* output = step.placement->output;
-        if (!output || !step.placement->emitted) continue;
+        if (!output || (!step.placement->emitted && !step.placement->created)) continue;
         out << '\n' << output->name;
         if (output->name.size() >= 16) {
             out << '\n' << std::string(16, ' ');
         } else {
             out << std::string(16 - output->name.size(), ' ');
         }
-        out << padded_hex(output->address, 16) << ' ' << size_field(output->size);
+        out << padded_hex(output->address, width) << ' ' << size_field(output->size);
         if (output->load_address != output->address) {
-            out << " load address " << padded_hex(output->load_address, 16);
+            out << " load address " << padded_hex(output->load_address, width);
         }
         out << '\n';
         for (const auto& item : step.placement->items) {
@@ -366,7 +421,7 @@ void Link::write_map() const {
                 if (const auto* data = std::get_if<script::Data>(item.item)) {
                     static constexpr const char* names[] = {"", "BYTE", "SHORT", "", "LONG",
                                                             "", "", "", "QUAD"};
-                    out << ' ' << std::string(15, ' ') << padded_hex(output->address + item.offset, 16)
+                    out << ' ' << std::string(15, ' ') << padded_hex(output->address + item.offset, width)
                         << ' ' << size_field(data->size) << ' ' << names[data->size] << ' '
                         << padded_hex(item.value, 1) << '\n';
                     continue;
@@ -379,11 +434,11 @@ void Link::write_map() const {
                 } else {
                     out << std::string(15 - section->name.size(), ' ');
                 }
-                out << padded_hex(address(*section), 16) << ' ' << size_field(section->size) << ' '
+                out << padded_hex(address(*section), width) << ' ' << size_field(section->size) << ' '
                     << section->file->name() << '\n';
                 for (const auto* entry : defined) {
                     if (entry->section != section) continue;
-                    out << std::string(16, ' ') << padded_hex(section_address(*section, entry->value), 16)
+                    out << std::string(16, ' ') << padded_hex(section_address(*section, entry->value), width)
                         << std::string(16, ' ') << entry->name << '\n';
                 }
             }

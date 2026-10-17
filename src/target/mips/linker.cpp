@@ -9,6 +9,7 @@
 #include <array>
 #include <cstdio>
 #include <functional>
+#include <map>
 #include <string>
 
 namespace cross::mips {
@@ -110,16 +111,18 @@ std::string fp_name(std::uint8_t abi) {
     }
 }
 
-// Positive when an object with floating-point ABI `a` may join objects with
-// `b` and the result takes `a` (LLD's rule).
-int compare_fp(std::uint8_t a, std::uint8_t b) {
-    if (a == b) return 0;
-    if (b == fp_any) return 1;
-    if (b == fp_64a && a == fp_64) return 1;
-    if (b != fp_xx) return -1;
-    if (a == fp_double || a == fp_64 || a == fp_64a) return 1;
-    return -1;
-}
+// GNU object attributes of the "gnu" vendor for the whole file: each tag's
+// integer and string (Tag_compatibility has both, other odd tags a string,
+// even tags an integer).
+struct Attribute {
+    std::uint64_t number{};
+    std::string text;
+};
+using Attributes = std::map<std::uint64_t, Attribute>;
+constexpr std::uint64_t tag_file = 1;
+constexpr std::uint64_t tag_mips_abi_fp = 4;
+constexpr std::uint64_t tag_mips_abi_msa = 8;
+constexpr std::uint64_t tag_compatibility = 32;
 
 std::string relocation_name(std::uint32_t type) {
     switch (type) {
@@ -175,15 +178,15 @@ public:
 
     bool add_object(const InputFile& file, Diagnostics& diagnostics) override {
         if (file.raw) return true;
+        bool ok = merge_attributes(file, diagnostics);
         const auto flags = file.flags;
         if (!first_) {
             first_ = file.name();
             flags_ = flags & ~(ef_mips_pic | ef_mips_cpic | ef_mips_arch | ef_mips_mach);
             pic_ = flags & (ef_mips_pic | ef_mips_cpic);
             arch_ = flags & (ef_mips_arch | ef_mips_mach);
-            return true;
+            return ok;
         }
-        bool ok = true;
         const auto abi = flags & (ef_mips_abi | ef_mips_abi2);
         const auto merged_abi = flags_ & (ef_mips_abi | ef_mips_abi2);
         if (abi != merged_abi) {
@@ -292,14 +295,17 @@ public:
                     fail("invalid register information");
                     continue;
                 }
-                for (unsigned index = 0; index < 5; ++index) {
-                    masks[index] |= static_cast<std::uint32_t>(read(data, 4 * index, 4));
-                }
                 section->file->gp0 = sign_extend(read(data, 20, 4), 32);
+                // GNU ld links only the first .reginfo (a link-once section),
+                // so its masks are the output's.
                 if (!reginfo_) {
                     reginfo_ = section;
+                    for (unsigned index = 0; index < 5; ++index) {
+                        reginfo_masks_[index] = static_cast<std::uint32_t>(read(data, 4 * index, 4));
+                    }
                 } else {
                     section->discarded = true;
+                    section->combined = reginfo_;
                 }
             } else if (section->type == sht_mips_options) {
                 for (std::size_t at = 0; at + 8 <= data.size();) {
@@ -327,6 +333,7 @@ public:
                     options_ = section;
                 } else {
                     section->discarded = true;
+                    section->combined = options_;
                 }
             } else if (section->type == sht_mips_abiflags) {
                 if (data.size() < 24 || read(data, 0, 2) != 0) {
@@ -337,36 +344,39 @@ public:
                     std::copy(data.begin(), data.begin() + 24, abiflags.begin());
                     have_abiflags = true;
                     abiflags_ = section;
-                    abiflags_file_ = section->file->name();
                     continue;
                 }
                 section->discarded = true;
+                section->combined = abiflags_;
                 for (const std::size_t at : {2U, 3U, 4U, 5U, 6U}) {
                     abiflags[at] = std::max(abiflags[at], data[at]);
                 }
-                std::array<std::uint8_t, 24> merged = abiflags;
-                if (read(data, 8, 4) > read(merged, 8, 4)) write_bytes(merged, 8, read(data, 8, 4), 4);
+                if (read(data, 8, 4) > read(abiflags, 8, 4)) write_bytes(abiflags, 8, read(data, 8, 4), 4);
                 for (const std::size_t at : {12U, 16U, 20U}) {
-                    write_bytes(merged, at, read(merged, at, 4) | read(data, at, 4), 4);
+                    write_bytes(abiflags, at, read(abiflags, at, 4) | read(data, at, 4), 4);
                 }
-                // An incompatible floating-point ABI is a warning, as GNU ld
-                // reports it; the earlier objects' ABI stays.
-                const auto old_fp = abiflags[7];
-                const auto new_fp = data[7];
-                if (compare_fp(new_fp, old_fp) >= 0) {
-                    merged[7] = new_fp;
-                } else if (compare_fp(old_fp, new_fp) < 0) {
-                    diagnostics.warning({}, section->file->name() + ": floating-point ABI '" +
-                                                fp_name(new_fp) + "' is incompatible with '" +
-                                                fp_name(old_fp) + "' of " + abiflags_file_);
+            } else if (section->type == elf::sht_gnu_attributes) {
+                if (!gnu_attributes_) {
+                    gnu_attributes_ = section;
+                } else {
+                    section->discarded = true;
+                    section->combined = gnu_attributes_;
                 }
-                abiflags = merged;
             }
+        }
+        // The floating-point ABI is the objects' merged attribute (GNU ld).
+        if (attributes_initialized_) {
+            const auto fp = attributes_.find(tag_mips_abi_fp);
+            abiflags[7] = static_cast<std::uint8_t>(fp == attributes_.end() ? 0 : fp->second.number);
+        }
+        if (gnu_attributes_) {
+            gnu_attributes_->data = serialize_attributes();
+            gnu_attributes_->size = gnu_attributes_->data.size();
         }
         if (reginfo_) {
             auto& data = reginfo_->data;
             data.assign(24, 0);
-            for (unsigned index = 0; index < 5; ++index) write_bytes(data, 4 * index, masks[index], 4);
+            for (unsigned index = 0; index < 5; ++index) write_bytes(data, 4 * index, reginfo_masks_[index], 4);
         }
         if (options_) {
             auto& data = options_->data;
@@ -416,10 +426,109 @@ public:
     void relocate(const linker::RelocationContext& context,
                   std::span<std::uint8_t> bytes) const override;
 
-    [[nodiscard]] std::string default_script() const override {
+    [[nodiscard]] bool sections_end_locals(const linker::OutputFormat& format) const override {
+        // IRIX 5 compatible ELF32 counts only section symbols as local.
+        return !format.traditional && !output_.elf64;
+    }
+
+    void finish_output_section(std::string_view name, const linker::OutputFormat& format, std::uint32_t& type,
+                               std::uint64_t& flags, std::uint64_t& entry_size) const override {
+        // GNU ld's MIPS output section conventions by name; the IRIX-
+        // compatible formats (all but the traditional ones) differ.
+        const bool irix = !format.traditional;
+        if (name == ".reginfo") {
+            type = sht_mips_reginfo;
+            entry_size = irix ? 1 : 24;
+        } else if (name == ".mdebug") {
+            type = sht_mips_debug;
+            entry_size = 1;
+        } else if (name == ".got" || name == ".srdata" || name == ".sdata" || name == ".sbss" ||
+                   name == ".lit4" || name == ".lit8") {
+            flags |= shf_mips_gprel;
+        } else if (name == ".MIPS.options" || name == ".options") {
+            type = sht_mips_options;
+            entry_size = 1;
+            flags |= shf_mips_nostrip;
+        } else if (name.starts_with(".MIPS.abiflags")) {
+            type = sht_mips_abiflags;
+            entry_size = 24;
+        } else if (name.starts_with(".debug_") || name.starts_with(".gnu.debuglto_.debug_") ||
+                   name.starts_with(".zdebug_") || name.starts_with(".gnu.debuglto_.zdebug_")) {
+            type = sht_mips_dwarf;
+            if (irix && name.starts_with(".debug_frame")) flags |= shf_mips_nostrip;
+        }
+    }
+
+    [[nodiscard]] std::string default_script(bool relocatable) const override {
+        if (relocatable) {
+            // GNU ld's relocatable layout for the MIPS emulations.
+            return "SECTIONS\n{\n"
+                   "  .MIPS.abiflags : { *(.MIPS.abiflags) }\n"
+                   "  .reginfo : { *(.reginfo) }\n"
+                   "  .init : { *(.init) }\n"
+                   "  .text : { *(.text .stub) *(.gnu.warning) }\n"
+                   "  .fini : { *(.fini) }\n"
+                   "  .rodata : { *(.rodata) }\n"
+                   "  .rodata1 : { *(.rodata1) }\n"
+                   "  .sdata2 : { *(.sdata2) }\n"
+                   "  .sbss2 : { *(.sbss2) }\n"
+                   "  .eh_frame_hdr : { *(.eh_frame_hdr) }\n"
+                   "  .eh_frame : { *(.eh_frame) }\n"
+                   "  .gcc_except_table : { *(.gcc_except_table) }\n"
+                   "  .tdata : { *(.tdata) }\n"
+                   "  .tbss : { *(.tbss) }\n"
+                   "  .jcr : { *(.jcr) }\n"
+                   "  .data : { *(.data) }\n"
+                   "  .data1 : { *(.data1) }\n"
+                   "  .got.plt : { *(.got.plt) }\n"
+                   "  .got : { *(.got) }\n"
+                   "  .sdata : { *(.sdata) }\n"
+                   "  .lit8 : { *(.lit8) }\n"
+                   "  .lit4 : { *(.lit4) }\n"
+                   "  .sbss : { *(.sbss) }\n"
+                   "  .bss : { *(.bss) }\n"
+                   "  .stab : { *(.stab) }\n"
+                   "  .stabstr : { *(.stabstr) }\n"
+                   "  .comment : { *(.comment) }\n"
+                   "  .debug : { *(.debug) }\n"
+                   "  .line : { *(.line) }\n"
+                   "  .debug_srcinfo : { *(.debug_srcinfo) }\n"
+                   "  .debug_sfnames : { *(.debug_sfnames) }\n"
+                   "  .debug_aranges : { *(.debug_aranges) }\n"
+                   "  .debug_pubnames : { *(.debug_pubnames) }\n"
+                   "  .debug_info : { *(.debug_info) }\n"
+                   "  .debug_abbrev : { *(.debug_abbrev) }\n"
+                   "  .debug_line : { *(.debug_line) }\n"
+                   "  .debug_frame : { *(.debug_frame) }\n"
+                   "  .debug_str : { *(.debug_str) }\n"
+                   "  .debug_loc : { *(.debug_loc) }\n"
+                   "  .debug_macinfo : { *(.debug_macinfo) }\n"
+                   "  .debug_pubtypes : { *(.debug_pubtypes) }\n"
+                   "  .debug_ranges : { *(.debug_ranges) }\n"
+                   "  .debug_addr : { *(.debug_addr) }\n"
+                   "  .debug_line_str : { *(.debug_line_str) }\n"
+                   "  .debug_loclists : { *(.debug_loclists) }\n"
+                   "  .debug_macro : { *(.debug_macro) }\n"
+                   "  .debug_names : { *(.debug_names) }\n"
+                   "  .debug_rnglists : { *(.debug_rnglists) }\n"
+                   "  .debug_str_offsets : { *(.debug_str_offsets) }\n"
+                   "  .debug_sup : { *(.debug_sup) }\n"
+                   "  .gnu.attributes : { *(.gnu.attributes) }\n"
+                   "  .gptab.sdata : { *(.gptab.sdata) }\n"
+                   "  .gptab.sbss : { *(.gptab.sbss) }\n"
+                   "  .mdebug.abi32 : { *(.mdebug.abi32) }\n"
+                   "  .mdebug.abiN32 : { *(.mdebug.abiN32) }\n"
+                   "  .mdebug.abi64 : { *(.mdebug.abi64) }\n"
+                   "  .mdebug.abiO64 : { *(.mdebug.abiO64) }\n"
+                   "  .mdebug.eabi32 : { *(.mdebug.eabi32) }\n"
+                   "  .mdebug.eabi64 : { *(.mdebug.eabi64) }\n"
+                   "  .gcc_compiled_long32 : { *(.gcc_compiled_long32) }\n"
+                   "  .gcc_compiled_long64 : { *(.gcc_compiled_long64) }\n"
+                   "}\n";
+        }
         // A subset of GNU ld's script for the emulation: ABI sections first,
-        // data on the next page at the same page offset, and _gp 32 KiB into
-        // the small data.
+        // data placed by DATA_SEGMENT_ALIGN, and _gp 32 KiB into the small
+        // data.
         return std::string("SECTIONS\n{\n  . = ") + (output_.elf64 ? "0x120000000" : "0x400000") +
                ";\n"
                "  .MIPS.abiflags : { *(.MIPS.abiflags) }\n"
@@ -430,8 +539,12 @@ public:
                "  PROVIDE (_etext = .);\n"
                "  PROVIDE (etext = .);\n"
                "  .rodata : { *(.rodata .rodata.*) }\n"
-               "  .eh_frame : { KEEP (*(.eh_frame)) }\n"
-               "  . = ALIGN(CONSTANT(MAXPAGESIZE)) + (. & (CONSTANT(MAXPAGESIZE) - 1));\n"
+               "  .eh_frame_hdr : { *(.eh_frame_hdr) }\n"
+               "  .eh_frame : ONLY_IF_RO { KEEP (*(.eh_frame)) }\n"
+               "  .gcc_except_table : ONLY_IF_RO { *(.gcc_except_table .gcc_except_table.*) }\n"
+               "  . = DATA_SEGMENT_ALIGN (CONSTANT (MAXPAGESIZE), CONSTANT (COMMONPAGESIZE));\n"
+               "  .eh_frame : ONLY_IF_RW { KEEP (*(.eh_frame)) }\n"
+               "  .gcc_except_table : ONLY_IF_RW { *(.gcc_except_table .gcc_except_table.*) }\n"
                "  .data : { _fdata = .; *(.data .data.*) }\n"
                "  HIDDEN (_gp = ALIGN(16) + 0x7ff0);\n"
                "  .sdata : { *(.sdata .sdata.*) }\n"
@@ -445,6 +558,37 @@ public:
                "  .bss : { *(.bss .bss.*) *(COMMON) }\n"
                "  _end = .;\n"
                "  PROVIDE (end = .);\n"
+               "  . = DATA_SEGMENT_END (.);\n"
+               "  .stab 0 : { *(.stab) }\n"
+               "  .stabstr 0 : { *(.stabstr) }\n"
+               "  .comment 0 (INFO) : { *(.comment) }\n"
+               "  .debug 0 : { *(.debug) }\n"
+               "  .line 0 : { *(.line) }\n"
+               "  .debug_srcinfo 0 : { *(.debug_srcinfo) }\n"
+               "  .debug_sfnames 0 : { *(.debug_sfnames) }\n"
+               "  .debug_aranges 0 : { *(.debug_aranges) }\n"
+               "  .debug_pubnames 0 : { *(.debug_pubnames) }\n"
+               "  .debug_info 0 : { *(.debug_info .gnu.linkonce.wi.*) }\n"
+               "  .debug_abbrev 0 : { *(.debug_abbrev) }\n"
+               "  .debug_line 0 : { *(.debug_line .debug_line.* .debug_line_end) }\n"
+               "  .debug_frame 0 : { *(.debug_frame) }\n"
+               "  .debug_str 0 : { *(.debug_str) }\n"
+               "  .debug_loc 0 : { *(.debug_loc) }\n"
+               "  .debug_macinfo 0 : { *(.debug_macinfo) }\n"
+               "  .debug_pubtypes 0 : { *(.debug_pubtypes) }\n"
+               "  .debug_ranges 0 : { *(.debug_ranges) }\n"
+               "  .debug_addr 0 : { *(.debug_addr) }\n"
+               "  .debug_line_str 0 : { *(.debug_line_str) }\n"
+               "  .debug_loclists 0 : { *(.debug_loclists) }\n"
+               "  .debug_macro 0 : { *(.debug_macro) }\n"
+               "  .debug_names 0 : { *(.debug_names) }\n"
+               "  .debug_rnglists 0 : { *(.debug_rnglists) }\n"
+               "  .debug_str_offsets 0 : { *(.debug_str_offsets) }\n"
+               "  .debug_sup 0 : { *(.debug_sup) }\n"
+               "  .gnu.attributes 0 : { KEEP (*(.gnu.attributes)) }\n"
+               "  .mdebug.abi32 0 : { KEEP (*(.mdebug.abi32)) }\n"
+               "  .mdebug.abi64 0 : { KEEP (*(.mdebug.abi64)) }\n"
+               "  .mdebug.eabi32 0 : { KEEP (*(.mdebug.eabi32)) }\n"
                "}\n";
     }
 
@@ -506,6 +650,162 @@ public:
     }
 
 private:
+    // The "gnu" Tag_File attributes of an attributes section.
+    [[nodiscard]] Attributes parse_attributes(const std::vector<std::uint8_t>& data) const {
+        Attributes result;
+        if (data.empty() || data[0] != 'A') return result;
+        std::size_t at = 1;
+        const auto uleb = [&](std::size_t& position, std::size_t end) {
+            std::uint64_t value = 0;
+            unsigned shift = 0;
+            while (position < end) {
+                const auto byte = data[position++];
+                if (shift < 64) value |= std::uint64_t{byte & 0x7fU} << shift;
+                shift += 7;
+                if ((byte & 0x80) == 0) break;
+            }
+            return value;
+        };
+        while (at + 4 <= data.size()) {
+            const auto length = read(data, at, 4);
+            if (length < 4 || length > data.size() - at) break;
+            const auto end = at + length;
+            std::size_t position = at + 4;
+            std::string vendor;
+            while (position < end && data[position] != 0) vendor += static_cast<char>(data[position++]);
+            ++position;
+            while (vendor == "gnu" && position + 5 <= end) {
+                const auto start = position;
+                const auto tag = uleb(position, end);
+                if (position + 4 > end) break;
+                const auto size = read(data, position, 4);
+                position += 4;
+                const auto stop = start + size;
+                if (size < 5 || stop > end) break;
+                while (tag == tag_file && position < stop) {
+                    const auto attribute = uleb(position, stop);
+                    auto& value = result[attribute];
+                    if (attribute == tag_compatibility || (attribute & 1) == 0) value.number = uleb(position, stop);
+                    if (attribute == tag_compatibility || (attribute & 1) != 0) {
+                        while (position < stop && data[position] != 0) value.text += static_cast<char>(data[position++]);
+                        ++position;
+                    }
+                }
+                position = stop;
+            }
+            at = end;
+        }
+        return result;
+    }
+
+    [[nodiscard]] std::vector<std::uint8_t> serialize_attributes() const {
+        std::vector<std::uint8_t> body;
+        const auto uleb = [&](std::uint64_t value) {
+            do {
+                std::uint8_t byte = value & 0x7fU;
+                value >>= 7;
+                if (value != 0) byte |= 0x80U;
+                body.push_back(byte);
+            } while (value != 0);
+        };
+        for (const auto& [tag, value] : attributes_) {
+            if (value.number == 0 && value.text.empty()) continue;
+            uleb(tag);
+            if (tag == tag_compatibility || (tag & 1) == 0) uleb(value.number);
+            if (tag == tag_compatibility || (tag & 1) != 0) {
+                body.insert(body.end(), value.text.begin(), value.text.end());
+                body.push_back(0);
+            }
+        }
+        if (body.empty()) return {};
+        std::vector<std::uint8_t> data{'A', 0, 0, 0, 0, 'g', 'n', 'u', 0, static_cast<std::uint8_t>(tag_file), 0, 0, 0, 0};
+        write_bytes(data, 1, 13 + body.size(), 4);
+        write_bytes(data, 10, 5 + body.size(), 4);
+        data.insert(data.end(), body.begin(), body.end());
+        return data;
+    }
+
+    // GNU ld's merge of object attributes: the first object's are copied,
+    // then the floating-point and MSA ABIs merge and Tag_compatibility must
+    // agree. An object without a floating-point attribute takes the one in
+    // its .MIPS.abiflags; objects with nothing but empty .text, .data, and
+    // .bss sections take no part.
+    bool merge_attributes(const InputFile& file, Diagnostics& diagnostics) {
+        const InputSection* attributes = nullptr;
+        const InputSection* abiflags = nullptr;
+        bool empty = true;
+        for (const auto& section : file.sections) {
+            if (!section) continue;
+            if (section->type == elf::sht_gnu_attributes && !attributes) attributes = section.get();
+            if (section->type == sht_mips_abiflags && !abiflags) abiflags = section.get();
+            const auto& name = section->name;
+            if (name != ".reginfo" && name != ".mdebug" &&
+                (section->size != 0 || (name != ".text" && name != ".data" && name != ".bss"))) {
+                empty = false;
+            }
+        }
+        if (empty) return true;
+        auto in = attributes ? parse_attributes(attributes->data) : Attributes{};
+        if (abiflags && abiflags->data.size() >= 24 && in[tag_mips_abi_fp].number == fp_any) {
+            in[tag_mips_abi_fp].number = abiflags->data[7];
+        }
+        const auto in_fp = static_cast<std::uint8_t>(in[tag_mips_abi_fp].number);
+        if (!attributes_initialized_) {
+            attributes_ = std::move(in);
+            attributes_initialized_ = true;
+            if (in_fp != fp_any) fp_file_ = file.name();
+            return true;
+        }
+        if (fp_file_.empty() && in_fp != fp_any) fp_file_ = file.name();
+        auto& out = attributes_[tag_mips_abi_fp].number;
+        const auto out_fp = static_cast<std::uint8_t>(out);
+        if (in_fp != out_fp) {
+            const auto set = [&] {
+                out = in_fp;
+                fp_file_ = file.name();
+            };
+            const auto hard = [](std::uint8_t fp) { return fp == fp_double || fp == fp_64 || fp == fp_64a; };
+            if (out_fp == fp_any) {
+                out = in_fp;
+            } else if (out_fp == fp_xx && hard(in_fp)) {
+                set();
+            } else if (in_fp == fp_xx && hard(out_fp)) {
+            } else if (out_fp == fp_64a && in_fp == fp_64) {
+                set();
+            } else if (in_fp == fp_64a && out_fp == fp_64) {
+            } else if (in_fp != fp_any) {
+                diagnostics.warning({}, file.name() + ": floating-point ABI '" + fp_name(in_fp) +
+                                            "' is incompatible with '" + fp_name(out_fp) + "' of " + fp_file_);
+            }
+        }
+        auto& out_msa = attributes_[tag_mips_abi_msa].number;
+        const auto in_msa = in[tag_mips_abi_msa].number;
+        if (in_msa != out_msa) {
+            if (out_msa == 0) {
+                out_msa = in_msa;
+            } else if (in_msa != 0) {
+                diagnostics.warning({}, file.name() + ": MSA ABI " + std::to_string(in_msa) +
+                                            " is incompatible with MSA ABI " + std::to_string(out_msa));
+            }
+        }
+        const auto& in_compatibility = in[tag_compatibility];
+        const auto& out_compatibility = attributes_[tag_compatibility];
+        if (in_compatibility.number != 0 && in_compatibility.text != "gnu") {
+            diagnostics.command_error(file.name() + ": object has vendor-specific contents that must be "
+                                                    "processed by the '" + in_compatibility.text + "' toolchain");
+            return false;
+        }
+        if (in_compatibility.number != out_compatibility.number ||
+            (in_compatibility.number != 0 && in_compatibility.text != out_compatibility.text)) {
+            diagnostics.command_error(file.name() + ": object tag '" + std::to_string(in_compatibility.number) +
+                                      ", " + in_compatibility.text + "' is incompatible with tag '" +
+                                      std::to_string(out_compatibility.number) + ", " + out_compatibility.text +
+                                      "'");
+            return false;
+        }
+        return true;
+    }
+
     struct InPlace {
         std::int64_t value{};
         bool paired{true};
@@ -578,9 +878,14 @@ private:
     std::uint32_t pic_{};
     std::uint32_t arch_{};
     InputSection* reginfo_{};
+    std::array<std::uint32_t, 5> reginfo_masks_{};
     InputSection* options_{};
     InputSection* abiflags_{};
-    std::string abiflags_file_;
+    InputSection* gnu_attributes_{};
+    Attributes attributes_;
+    bool attributes_initialized_{};
+    // The object that set the floating-point ABI.
+    std::string fp_file_;
 };
 
 void MipsLinker::relocate(const linker::RelocationContext& context,

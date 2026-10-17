@@ -32,6 +32,7 @@ inline constexpr std::uint32_t r_mips_pc32 = 248;
 
 inline constexpr std::uint32_t sht_mips_reginfo = 0x70000006;
 inline constexpr std::uint32_t sht_mips_options = 0x7000000d;
+inline constexpr std::uint32_t sht_mips_debug = 0x70000005;
 inline constexpr std::uint32_t sht_mips_dwarf = 0x7000001e;
 inline constexpr std::uint32_t sht_mips_abiflags = 0x7000002a;
 inline constexpr std::uint64_t shf_mips_gprel = 0x10000000;

@@ -117,10 +117,10 @@ endfunction()
 failing_script(assert "SECTIONS {\n  .text : { *(.text*) }\n  ASSERT(SIZEOF(.text) < 4, \"text too big\")\n}\n"
                "assert[.]ld:3:3: error: text too big")
 failing_script(syntax "SECTIONS {\n  .text { *(.text) }\n}\n" "syntax[.]ld:2:9: error: expected ':'")
-failing_script(overlay "SECTIONS {\n  OVERLAY : { .a { *(.a) } }\n}\n"
-               "overlay[.]ld:2:3: error: OVERLAY is not supported")
-failing_script(subalign "SECTIONS {\n  .text : SUBALIGN(16) { *(.text*) }\n}\n"
-               "subalign[.]ld:2:11: error: unsupported output section attribute")
+failing_script(special "SECTIONS {\n  .text : SPECIAL { *(.text*) }\n}\n"
+               "special[.]ld:2:11: error: unsupported output section attribute")
+failing_script(section_command "SECTIONS {\n  .text : { CREATE_OBJECT_SYMBOLS *(.text*) }\n}\n"
+               "section_command[.]ld:2:13: error: unsupported output section command")
 failing_script(command "STARTUP(crt0.o)\n" "command[.]ld:1:1: error: unsupported linker script command 'STARTUP'")
 failing_script(undefined "SECTIONS {\n  .text : { *(.text*) }\n  x = missing + 1;\n}\n"
                "undefined[.]ld:3:7: error: undefined symbol 'missing' referenced in expression")

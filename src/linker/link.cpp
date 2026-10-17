@@ -69,7 +69,8 @@ void each_expression(const script::Script& script, Visit visit) {
         } else if (const auto* section = std::get_if<script::OutputSection>(&command)) {
             for (const auto* expression :
                  {section->address.get(), section->load_address.get(), section->alignment.get(),
-                  section->fill.get()}) {
+                  section->subalign.get(), section->update_dot.get(),
+                  section->fill ? section->fill->value.get() : nullptr}) {
                 if (expression) visit(*expression);
             }
             for (const auto& item : section->items) {
@@ -79,10 +80,20 @@ void each_expression(const script::Script& script, Visit visit) {
                     visit(*data->value);
                 } else if (const auto* check = std::get_if<script::Assert>(&item)) {
                     visit(*check->condition);
+                } else if (const auto* fill = std::get_if<script::Fill>(&item)) {
+                    visit(*fill->value);
                 }
             }
         }
     }
+}
+
+// Sections GNU ld treats as debugging information by name.
+bool debugging_section(std::string_view name) {
+    return name.starts_with(".debug") || name.starts_with(".gnu.debuglto_.debug_") ||
+           name.starts_with(".gnu.linkonce.wi.") || name.starts_with(".zdebug") ||
+           name.starts_with(".line") || name.starts_with(".stab") || name == ".gdb_index" ||
+           name.starts_with(".mdebug");
 }
 
 bool reserved_section(const InputSection& section) {
@@ -378,20 +389,76 @@ bool Link::open_input(const Input& input, std::vector<std::uint8_t> bytes, const
     return file && add_file(std::move(file));
 }
 
+std::optional<std::string> Link::find_script_input(const script::ScriptInput& input) {
+    // GNU ld's search for a file INPUT or GROUP names: the naming script's
+    // directory, the current directory, then the library directories.
+    if (input.library) return find_library(input.name);
+    std::vector<std::filesystem::path> candidates;
+    const std::filesystem::path name(input.name);
+    if (name.is_relative() && !input.directory.empty()) candidates.push_back(input.directory / name);
+    candidates.push_back(name);
+    if (name.is_relative()) {
+        for (const auto& directory : options_.library_paths) candidates.push_back(directory / name);
+        for (const auto& directory : script_.search_directories) candidates.push_back(directory / name);
+    }
+    for (const auto& candidate : candidates) {
+        std::error_code code;
+        if (std::filesystem::is_regular_file(candidate, code)) return candidate.string();
+    }
+    return std::nullopt;
+}
+
+void Link::require(const std::string& name) {
+    auto& target = symbol(name);
+    if (!target.defined()) reference(target, false, nullptr);
+}
+
 bool Link::read_inputs() {
+    struct Request {
+        Input input;
+        // A file a script names, searched for as GNU ld does.
+        std::optional<script::ScriptInput> named;
+    };
     struct Loaded {
-        const Input* input;
+        Input input;
         std::string path;
         std::vector<std::uint8_t> bytes;
     };
+    // The command line, with the main script's INPUT and GROUP files at the
+    // script's position and each implicit script's files after it.
+    std::vector<Request> requests;
+    for (const auto& input : options_.inputs) requests.push_back({input, std::nullopt});
+    // Only an implicit script's own directory is searched first (GNU ld).
+    const auto script_inputs = [&](std::size_t first, std::size_t position, bool implicit) {
+        std::vector<Request> named;
+        for (std::size_t index = first; index < script_.inputs.size(); ++index) {
+            auto input = script_.inputs[index];
+            if (!implicit) input.directory.clear();
+            named.push_back({{input.library ? Input::Kind::Library : Input::Kind::File, input.name}, input});
+        }
+        requests.insert(requests.begin() + static_cast<std::ptrdiff_t>(std::min(position, requests.size())),
+                        named.begin(), named.end());
+    };
+    script_inputs(0, options_.script_position, false);
     std::vector<Loaded> loaded;
     bool ok = true;
-    for (const auto& input : options_.inputs) {
-        std::string path = input.name;
-        if (input.kind == Input::Kind::Library) {
-            const auto found = find_library(input.name);
+    for (std::size_t index = 0; index < requests.size(); ++index) {
+        const auto request = requests[index];
+        std::string path = request.input.name;
+        if (request.named) {
+            const auto found = find_script_input(*request.named);
             if (!found) {
-                diagnostics_.command_error("cannot find -l" + input.name);
+                diagnostics_.error(request.named->location,
+                                   "cannot find " + std::string(request.named->library ? "-l" : "") +
+                                       request.named->name);
+                ok = false;
+                continue;
+            }
+            path = *found;
+        } else if (request.input.kind == Input::Kind::Library) {
+            const auto found = find_library(request.input.name);
+            if (!found) {
+                diagnostics_.command_error("cannot find -l" + request.input.name);
                 ok = false;
                 continue;
             }
@@ -402,7 +469,25 @@ bool Link::read_inputs() {
             ok = false;
             continue;
         }
-        loaded.push_back({&input, std::move(path), std::move(*bytes)});
+        if ((request.input.kind == Input::Kind::File || request.input.kind == Input::Kind::Library) &&
+            !is_elf(*bytes) && !is_archive(*bytes)) {
+            // A file that is neither an object nor an archive is an
+            // implicit linker script, which augments the main one.
+            std::string text(bytes->begin(), bytes->end());
+            const auto* source = sources_.add(path, std::move(text));
+            const auto first_input = script_.inputs.size();
+            const auto first_extern = script_.externs.size();
+            if (!script::parse(*source, script_, options_.library_paths, sources_, diagnostics_)) {
+                ok = false;
+                continue;
+            }
+            for (std::size_t other = first_extern; other < script_.externs.size(); ++other) {
+                require(script_.externs[other]);
+            }
+            script_inputs(first_input, index + 1, true);
+            continue;
+        }
+        loaded.push_back({request.input, std::move(path), std::move(*bytes)});
     }
     if (!ok) return false;
 
@@ -410,7 +495,7 @@ bool Link::read_inputs() {
     // command line leaves open.
     std::optional<assembler::ObjectInfo> first;
     for (const auto& item : loaded) {
-        if (item.input->kind == Input::Kind::Binary) continue;
+        if (item.input.kind == Input::Kind::Binary) continue;
         std::span<const std::uint8_t> bytes = item.bytes;
         if (is_archive(bytes)) {
             auto archive = read_archive(item.bytes, item.path, diagnostics_);
@@ -452,7 +537,7 @@ bool Link::read_inputs() {
     page_size_ = options_.page_size.value_or(target_->page_size());
 
     for (auto& item : loaded) {
-        if (!open_input(*item.input, std::move(item.bytes), item.path)) ok = false;
+        if (!open_input(item.input, std::move(item.bytes), item.path)) ok = false;
     }
     return ok && diagnostics_.errors() == 0;
 }
@@ -531,17 +616,13 @@ void Link::collect_garbage() {
     };
     for (const auto& file : files_) {
         for (const auto& section : file->sections) {
-            if (section && section->alloc()) section->live = false;
+            if (section) section->live = false;
         }
     }
     for (const auto& file : files_) {
         for (const auto& section : file->sections) {
             if (!section || section->discarded) continue;
-            if (!section->alloc()) {
-                section->live = true;
-            } else if (section->keep || reserved_section(*section)) {
-                mark(section.get());
-            }
+            if (section->keep || reserved_section(*section)) mark(section.get());
         }
     }
     const auto mark_symbol = [&](const std::string& name) {
@@ -551,6 +632,16 @@ void Link::collect_garbage() {
     for (const auto& name : options_.undefined) mark_symbol(name);
     for (const auto& name : script_.externs) mark_symbol(name);
     for (const auto& name : script_references_) mark_symbol(name);
+    // --gc-keep-exported: global symbols that other modules could use.
+    if (options_.keep_exported) {
+        for (const auto& entry : symbols_) {
+            const auto visibility = entry.other & 3U;
+            if (entry.defined() && !entry.script && entry.section &&
+                visibility != elf::stv_hidden && visibility != elf::stv_internal) {
+                mark(entry.section);
+            }
+        }
+    }
     while (!work.empty()) {
         auto* section = work.back();
         work.pop_back();
@@ -561,10 +652,40 @@ void Link::collect_garbage() {
                 }
             }
         }
-        // Unwind tables do not keep the code they describe.
+        // Unwind tables do not keep the code they describe; the FDEs of
+        // live code keep their LSDAs and personality routines.
         if (!section->alloc() || section->name == ".eh_frame") continue;
         for (const auto& relocation : section->relocations) {
             mark(defining_section(*section->file, relocation.symbol.value));
+        }
+        mark_frames(*section, mark);
+    }
+    // Non-allocated sections stay with a file that keeps an allocated
+    // section: its debugging sections and those without relocations (so
+    // MIPS .pdr goes), as in GNU ld.
+    for (const auto& file : files_) {
+        const bool kept = std::any_of(file->sections.begin(), file->sections.end(), [](const auto& section) {
+            return section && section->live && section->alloc() && section->type != elf::sht_note;
+        });
+        if (!kept) continue;
+        for (const auto& section : file->sections) {
+            if (section && !section->alloc() && !section->group &&
+                (debugging_section(section->name) || section->relocations.empty())) {
+                mark(section.get());
+            }
+        }
+    }
+    // Undefined symbols that no live section refers to leave the symbol
+    // table, as GNU ld hides them.
+    for (const auto& file : files_) {
+        for (const auto& section : file->sections) {
+            if (!section || !section->included() || (!section->alloc() && !options_.relocatable)) continue;
+            for (const auto& relocation : section->relocations) {
+                const auto index = relocation.symbol.value;
+                if (index < file->symbols.size() && file->symbols[index].global) {
+                    live_references_.insert(file->symbols[index].global);
+                }
+            }
         }
     }
     for (const auto& file : files_) {
@@ -577,6 +698,15 @@ void Link::collect_garbage() {
             }
         }
     }
+}
+
+bool Link::gc_root_defined() const {
+    std::vector<std::string> roots = options_.undefined;
+    roots.push_back(options_.entry.value_or("_start"));
+    return std::any_of(roots.begin(), roots.end(), [&](const std::string& name) {
+        const auto* target = find(name);
+        return target && target->defined() && target->section;
+    });
 }
 
 bool Link::check_undefined() {
@@ -685,6 +815,41 @@ std::optional<std::uint64_t> Link::gp() const {
     return target->value;
 }
 
+bool Link::check_cross_references() {
+    // NOCROSSREFS: no relocation in one of the listed output sections may
+    // refer to a symbol in another (with NOCROSSREFS_TO, in the first).
+    if (script_.cross_references.empty()) return true;
+    const auto listed = [](const script::CrossReferences& list, const OutputSection* section) {
+        return section &&
+               std::find(list.sections.begin(), list.sections.end(), section->name) != list.sections.end();
+    };
+    bool ok = true;
+    for (const auto& file : files_) {
+        for (const auto& section : file->sections) {
+            if (!section || !section->included() || !section->output) continue;
+            for (const auto& relocation : section->relocations) {
+                const auto* target = defining_section(*file, relocation.symbol.value);
+                if (!target || !target->included() || target->output == section->output) continue;
+                for (const auto& list : script_.cross_references) {
+                    const bool prohibited =
+                        list.to ? (target->output->name == list.sections.front() &&
+                                   std::find(list.sections.begin() + 1, list.sections.end(),
+                                             section->output->name) != list.sections.end())
+                                : (listed(list, section->output) && listed(list, target->output));
+                    if (!prohibited) continue;
+                    const auto& name = file->symbols[relocation.symbol.value].name;
+                    diagnostics_.command_error(section->location(relocation.offset) +
+                                               ": prohibited cross reference from " + section->output->name +
+                                               " to '" + name + "' in " + target->output->name);
+                    ok = false;
+                    break;
+                }
+            }
+        }
+    }
+    return ok;
+}
+
 bool Link::run() {
     if (options_.script && options_.relocatable) {
         diagnostics_.command_error("-r does not take a linker script");
@@ -711,37 +876,57 @@ bool Link::run() {
     // Symbols the script defines need no archive member; the entry, -u, and
     // EXTERN symbols and the symbols the script reads may pull one in.
     define_script_symbols();
-    const auto require = [&](const std::string& name) {
-        auto& target = symbol(name);
-        if (!target.defined()) reference(target, false, nullptr);
-    };
     for (const auto& name : options_.undefined) require(name);
     for (const auto& name : script_.externs) require(name);
     if (options_.entry || script_.entry) require(options_.entry.value_or(script_.entry.value_or("")));
     for (const auto& name : script_references_) require(name);
     if (!read_inputs()) return false;
-    if (!options_.script && !options_.relocatable) {
-        const auto* source = sources_.add("<default script>", target_->default_script());
+    // A script with INSERT augments the default script instead of
+    // replacing it.
+    if (!options_.relocatable && (!options_.script || script_.has_insert)) {
+        const auto* source = sources_.add("<default script>", target_->default_script(false));
         if (!script::parse(*source, script_, {}, sources_, diagnostics_)) return false;
-        each_expression(script_, [&](const script::Expression& expression) {
-            collect_references(expression, script_references_);
-        });
     }
+    each_expression(script_, [&](const script::Expression& expression) {
+        collect_references(expression, script_references_);
+    });
     define_script_symbols();
     target_->merge_sections(included_sections(), diagnostics_);
     if (diagnostics_.errors() != 0) return false;
-    // A relocatable link keeps common symbols common.
-    if (options_.relocatable) return write_relocatable();
+    if (options_.relocatable) {
+        // A relocatable link keeps common symbols common unless -d.
+        if (options_.define_common) allocate_commons();
+        parse_frames();
+        if (options_.gc_sections) {
+            if (!options_.keep_exported && !gc_root_defined()) {
+                diagnostics_.command_error("--gc-sections requires a defined symbol root specified by -e or -u");
+                return false;
+            }
+            collect_garbage();
+        }
+        edit_frames(true);
+        return write_relocatable();
+    }
     allocate_commons();
+    parse_frames();
+    if (options_.eh_frame_header) create_frame_header();
     if (!place_sections()) return false;
     if (options_.gc_sections) collect_garbage();
     for (auto& placement : placements_) {
         for (auto& item : placement->items) {
             std::erase_if(item.sections, [](const InputSection* section) { return !section->included(); });
+            // GNU ld leaves out empty output sections before it edits
+            // .eh_frame and .pdr, so editing does not remove a section.
+            for (const auto* section : item.sections) {
+                if (section->size != 0) placement->keep = true;
+            }
         }
     }
     if (!check_undefined()) return false;
     prune_records();
+    // Editing .eh_frame may exclude trailing input sections, which keep
+    // their place without contents (GNU ld's SEC_EXCLUDE).
+    edit_frames(false);
     merge_sections();
     // SIZEOF_HEADERS counts the program headers, which the layout decides.
     for (int attempt = 0;; ++attempt) {
@@ -749,6 +934,7 @@ bool Link::run() {
         if (!uses_headers_size_ || segments_.size() == segment_estimate_ || attempt == 4) break;
         segment_estimate_ = segments_.size();
     }
+    if (!check_cross_references()) return false;
     target_->finish_sections(gp());
     assign_offsets();
     if (!write_contents()) return false;

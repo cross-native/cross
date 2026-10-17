@@ -107,6 +107,7 @@ target_link_libraries(cross_assembler PUBLIC cross_common)
 cross_component(cross_assembler)
 
 add_library(cross_linker
+    src/linker/eh_frame.cpp
     src/linker/input.cpp
     src/linker/layout.cpp
     src/linker/link.cpp
@@ -1794,9 +1795,12 @@ if(BUILD_TESTING)
     set_tests_properties(cross_mips_assembler_linkers PROPERTIES
         LABELS "feature.assembler;arch.mips;backend.native;check.compile;endian.big;endian.little")
     # The Cross ld: relocations, the --just-symbols KSEG0 case, linker
-    # scripts, archives, options and diagnostics, relocatable output, and
-    # images that GNU ld links the same.
-    foreach(linker_test relocations just_symbols scripts archives tool relocatable)
+    # scripts (overlays, memory regions, fills and section types, inputs
+    # and INSERT, expressions and empty sections), archives, options and
+    # diagnostics, relocatable output, and images that GNU ld links the
+    # same.
+    foreach(linker_test relocations just_symbols scripts overlays regions fills inputs expressions
+            archives tool relocatable)
         add_test(NAME cross_mips_linker_${linker_test}
             COMMAND "${CMAKE_COMMAND}"
                     -DAS=$<TARGET_FILE:cross_as>
@@ -1815,6 +1819,16 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/target/mips/linker/gnu_ld.cmake")
     set_tests_properties(cross_mips_linker_gnu_ld PROPERTIES
         LABELS "feature.linker;arch.mips;backend.native;check.compile;endian.big;endian.little")
+    # .eh_frame editing and .eh_frame_hdr, with objects from cc -funwind-tables.
+    add_test(NAME cross_mips_linker_eh_frame
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DAS=$<TARGET_FILE:cross_as>
+                -DLD=$<TARGET_FILE:cross_ld>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-linker/eh-frame
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/linker/eh_frame.cmake")
+    set_tests_properties(cross_mips_linker_eh_frame PROPERTIES
+        LABELS "feature.linker;arch.mips;backend.native;check.compile;endian.big")
     add_test(NAME cross_mips_allegrex
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

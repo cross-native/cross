@@ -21,19 +21,24 @@ struct Format {
     bool elf64;
     bool big_endian;
     std::uint64_t page_size;
+    bool traditional;
 };
 
 // GNU ld's MIPS emulations and output formats.
 constexpr std::array emulations{
-    Format{"elf32btsmip", false, true, 0x10000}, Format{"elf32ltsmip", false, false, 0x10000},
-    Format{"elf32ebmip", false, true, 0x1000},   Format{"elf32elmip", false, false, 0x1000},
-    Format{"elf64btsmip", true, true, 0x10000},  Format{"elf64ltsmip", true, false, 0x10000},
+    Format{"elf32btsmip", false, true, 0x10000, true}, Format{"elf32ltsmip", false, false, 0x10000, true},
+    Format{"elf32ebmip", false, true, 0x1000, false},  Format{"elf32elmip", false, false, 0x1000, false},
+    Format{"elf64btsmip", true, true, 0x10000, true},  Format{"elf64ltsmip", true, false, 0x10000, true},
 };
 constexpr std::array output_formats{
-    Format{"elf32-tradbigmips", false, true, 0x10000}, Format{"elf32-tradlittlemips", false, false, 0x10000},
-    Format{"elf32-bigmips", false, true, 0x1000},      Format{"elf32-littlemips", false, false, 0x1000},
-    Format{"elf64-tradbigmips", true, true, 0x10000},  Format{"elf64-tradlittlemips", true, false, 0x10000},
-    Format{"elf64-bigmips", true, true, 0x10000},      Format{"elf64-littlemips", true, false, 0x10000},
+    Format{"elf32-tradbigmips", false, true, 0x10000, true},
+    Format{"elf32-tradlittlemips", false, false, 0x10000, true},
+    Format{"elf32-bigmips", false, true, 0x1000, false},
+    Format{"elf32-littlemips", false, false, 0x1000, false},
+    Format{"elf64-tradbigmips", true, true, 0x10000, true},
+    Format{"elf64-tradlittlemips", true, false, 0x10000, true},
+    Format{"elf64-bigmips", true, true, 0x10000, false},
+    Format{"elf64-littlemips", true, false, 0x10000, false},
 };
 
 void print_help() {
@@ -54,6 +59,12 @@ void print_help() {
                           place an output section at ADDR
   --gc-sections           remove unreferenced sections
   --print-gc-sections     list the sections --gc-sections removes
+  --gc-keep-exported      keep sections with global symbols of default or
+                          protected visibility (with -r, the roots)
+  -d, -dc, -dp            allocate common symbols even with -r
+  --eh-frame-hdr          write .eh_frame_hdr and PT_GNU_EH_FRAME
+  --no-eh-frame-hdr       do not (the default)
+  -nostdlib               accepted; there are no default library directories
   -Map FILE, -M           write a link map to FILE, or to standard output
   -m EMULATION            select the output: elf32btsmip, elf32ltsmip,
                           elf32ebmip, elf32elmip, elf64btsmip, elf64ltsmip
@@ -114,6 +125,16 @@ public:
                 options.gc_sections = false;
             } else if (argument == "--print-gc-sections") {
                 options.print_gc_sections = true;
+            } else if (argument == "--gc-keep-exported") {
+                options.keep_exported = true;
+            } else if (argument == "-d" || argument == "-dc" || argument == "-dp") {
+                options.define_common = true;
+            } else if (argument == "--eh-frame-hdr") {
+                options.eh_frame_header = true;
+            } else if (argument == "--no-eh-frame-hdr") {
+                options.eh_frame_header = false;
+            } else if (argument == "-nostdlib") {
+                // There are no default library directories to drop.
             } else if (argument == "--fatal-warnings") {
                 options.fatal_warnings = true;
             } else if (argument == "--start-group" || argument == "--end-group" || argument == "-(" ||
@@ -154,6 +175,7 @@ public:
                 options.output = *value;
             } else if ((value = take(argument, "--script", "-T", true))) {
                 options.script = *value;
+                options.script_position = options.inputs.size();
             } else if ((value = take(argument, "--entry", "-e", true))) {
                 options.entry = *value;
             } else if ((value = take(argument, "--library-path", "-L", true))) {
@@ -229,6 +251,7 @@ private:
             options.elf64 = entry.elf64;
             if (!options.big_endian) options.big_endian = entry.big_endian;
             if (!options.page_size) options.page_size = entry.page_size;
+            options.format.traditional = entry.traditional;
             return true;
         }
         diagnostics_.command_error("unsupported " + std::string(what) + " '" + std::string(name) + "'");

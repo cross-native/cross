@@ -30,26 +30,73 @@ bool Link::write_relocatable() {
     }
     if (diagnostics_.errors() != 0) return false;
     prune_records();
-    // Input sections of one name share an output section, except members of
-    // a section group, which keep their own so that the group survives.
-    std::unordered_map<std::string, OutputSection*> by_name;
-    std::vector<OutputSection*> order;
-    std::vector<std::pair<const InputFile*, std::size_t>> groups;
+    // GNU ld's relocatable layout: the target's output sections first, each
+    // collecting the input sections its patterns name, then the others by
+    // name in order of appearance; members of a section group keep their own
+    // output sections so that the group survives.
+    std::vector<std::pair<std::string, std::vector<InputSection*>>> layout;
+    std::unordered_set<const InputSection*> assigned;
+    script::Script relocatable;
+    const auto* layout_script = sources_.add("<relocatable script>", target_->default_script(true));
+    if (!script::parse(*layout_script, relocatable, {}, sources_, diagnostics_)) return false;
+    for (const auto& command : relocatable.commands) {
+        const auto* statement = std::get_if<script::OutputSection>(&command);
+        if (!statement) continue;
+        std::vector<InputSection*> sections;
+        for (const auto& item : statement->items) {
+            const auto* pattern = std::get_if<script::InputPattern>(&item);
+            if (!pattern) continue;
+            for (const auto& file : files_) {
+                for (const auto& section : file->sections) {
+                    if (!section || !section->included() || section->group || assigned.contains(section.get()) ||
+                        !matches(*pattern, *section)) {
+                        continue;
+                    }
+                    assigned.insert(section.get());
+                    sections.push_back(section.get());
+                }
+            }
+        }
+        if (!sections.empty()) layout.emplace_back(statement->name, std::move(sections));
+    }
+    std::unordered_map<std::string, std::size_t> by_name;
+    for (std::size_t index = 0; index < layout.size(); ++index) by_name.emplace(layout[index].first, index);
     for (const auto& file : files_) {
         for (const auto& section : file->sections) {
-            if (!section || !section->included()) continue;
-            OutputSection* output = section->group ? nullptr : by_name[section->name];
-            const bool fresh = output == nullptr;
-            if (fresh) {
-                auto created = std::make_unique<OutputSection>();
-                created->name = section->name;
-                created->type = section->type;
-                created->flags = section->flags;
-                created->entry_size = section->entry_size;
-                output = created.get();
-                outputs_.push_back(std::move(created));
-                order.push_back(output);
-                if (!section->group) by_name[section->name] = output;
+            if (!section || !section->included() || assigned.contains(section.get())) continue;
+            // Allocated common symbols (-d) join .bss, which they create
+            // here if no other input did (GNU ld).
+            if (section->name == "COMMON") {
+                if (const auto found = by_name.find(".bss"); found != by_name.end()) {
+                    layout[found->second].second.push_back(section.get());
+                } else {
+                    by_name[".bss"] = layout.size();
+                    layout.emplace_back(".bss", std::vector<InputSection*>{section.get()});
+                }
+                continue;
+            }
+            if (!section->group) {
+                if (const auto found = by_name.find(section->name); found != by_name.end()) {
+                    layout[found->second].second.push_back(section.get());
+                    continue;
+                }
+                by_name[section->name] = layout.size();
+            }
+            layout.emplace_back(section->name, std::vector<InputSection*>{section.get()});
+        }
+    }
+    std::vector<OutputSection*> order;
+    for (const auto& [name, sections] : layout) {
+        auto created = std::make_unique<OutputSection>();
+        auto* output = created.get();
+        output->name = name;
+        outputs_.push_back(std::move(created));
+        order.push_back(output);
+        for (auto* section : sections) {
+            if (output->sections.empty()) {
+                output->type = section->type;
+                output->flags = section->flags;
+                output->entry_size = section->entry_size;
             } else {
                 constexpr auto merge = elf::shf_merge | elf::shf_strings;
                 if ((output->flags & merge) != (section->flags & merge) ||
@@ -67,8 +114,11 @@ bool Link::write_relocatable() {
             section->offset = align_up(output->size, section->alignment);
             output->size = section->offset + section->size;
             output->alignment = std::max(output->alignment, section->alignment);
-            output->sections.push_back(section.get());
+            output->sections.push_back(section);
         }
+    }
+    std::vector<std::pair<const InputFile*, std::size_t>> groups;
+    for (const auto& file : files_) {
         for (std::size_t index = 0; index < file->groups.size(); ++index) {
             const auto& members = file->groups[index].members;
             if (std::any_of(members.begin(), members.end(), [&](std::uint32_t member) {
@@ -136,7 +186,10 @@ bool Link::write_relocatable() {
     }
     std::map<std::pair<const InputFile*, std::uint32_t>, std::uint32_t> local_index;
     for (const auto& file : files_) {
-        if (file->just_symbols) continue;
+        if (file->just_symbols || !contributes(*file)) continue;
+        // A file's local symbols follow a FILE symbol, named after the file
+        // when it has none (GNU ld).
+        bool named = false;
         for (std::uint32_t index = 1; index < file->symbols.size(); ++index) {
             const auto& entry = file->symbols[index];
             if (entry.binding != elf::stb_local || entry.type == elf::stt_section) continue;
@@ -148,6 +201,15 @@ bool Link::write_relocatable() {
                 if (!section || !section->included()) continue;
                 shndx = section->output->index;
                 value += section->offset;
+            }
+            if (entry.type == elf::stt_file) {
+                named = true;
+            } else if (!named) {
+                const auto& name = file->member.empty() ? file->path : file->member;
+                const auto slash = name.find_last_of('/');
+                add_symbol(slash == std::string::npos ? name : name.substr(slash + 1), 0, 0, elf::stb_local,
+                           elf::stt_file, 0, shn_abs);
+                named = true;
             }
             local_index[{file.get(), index}] =
                 add_symbol(entry.name, value, entry.size, elf::stb_local, entry.type, entry.other, shndx);
@@ -171,7 +233,8 @@ bool Link::write_relocatable() {
                 shndx = shn_abs;
                 value = entry.value;
             }
-        } else if (!entry.referenced || !entry.file) {
+        } else if (!entry.referenced || !entry.file ||
+                   (options_.gc_sections && !live_references_.contains(&entry))) {
             continue;
         } else {
             size = 0;
@@ -306,6 +369,8 @@ bool Link::write_relocatable() {
         header.flags = output->flags;
         header.alignment = output->alignment;
         header.entry_size = output->entry_size;
+        target_->finish_output_section(output->name, options_.format, header.type, header.flags,
+                                       header.entry_size);
         if (output->nobits()) {
             header.size = output->size;
         } else {
@@ -330,7 +395,8 @@ bool Link::write_relocatable() {
     table.alignment = wide ? 8 : 4;
     table.entry_size = wide ? 24 : 16;
     table.link = symtab_index + 1;
-    table.info = first_global;
+    table.info = target_->sections_end_locals(options_.format) ? static_cast<std::uint32_t>(order.size() + 1)
+                                                                : first_global;
     table.data = std::move(symtab.data());
     sections.push_back(std::move(table));
     assembler::ElfSection string_table;

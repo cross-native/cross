@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
 # The ld tool: help and version, the default output and layout, -e, -Ttext,
-# --defsym, -Map and -M, --gc-sections with --print-gc-sections, -s,
-# --fatal-warnings, and diagnostics that name files, sections, and symbols:
+# --defsym, -Map and -M, --gc-sections with --print-gc-sections, -s, the
+# options of a two-step static build (-d, -nostdlib, --no-eh-frame-hdr,
+# --gc-keep-exported), --fatal-warnings, and diagnostics that name files,
+# sections, and symbols:
 # undefined and duplicate symbols, relocation overflow, unpaired %hi,
 # unsupported relocations, references into discarded sections, and objects
 # whose ABI, floating-point ABI, class, or byte order disagree.
@@ -56,10 +58,10 @@ if(NOT extra STREQUAL "1234")
     message(FATAL_ERROR "--defsym gave ${extra}")
 endif()
 file(READ "${OUTPUT}/main.map" map)
-expect("map" "${map}" "\n[.]text +0x0+80010000 +0x1c\n"
-       "\n [.]text +0x0+80010000 +0x8 [^\n]*main[.]o\n"
-       "\n [.]text[.]helper +0x0+80010010 +0xc [^\n]*main[.]o\n"
-       "\n +0x0+80010010 +helper\n" "\n +0x0+00001234 +extra\n")
+expect("map" "${map}" "\n[.]text +0x0*80010000 +0x1c\n"
+       "\n [.]text +0x0*80010000 +0x8 [^\n]*main[.]o\n"
+       "\n [.]text[.]helper +0x0*80010010 +0xc [^\n]*main[.]o\n"
+       "\n +0x0*80010010 +helper\n" "\n +0x0*1234 +extra\n")
 run_checked("-M" "${LD}" -Ttext=0x80010000 -M "${OUTPUT}/main.o" -o "${OUTPUT}/m.elf")
 expect("-M" "${run_stdout}" "Linker script and memory map")
 
@@ -75,6 +77,11 @@ run_checked("strip sections" "${LLVM_READELF}" -S "${OUTPUT}/strip.elf")
 if(run_stdout MATCHES "[.]symtab")
     message(FATAL_ERROR "-s kept the symbol table")
 endif()
+# The options of a GNU ld build that links static images in two steps.
+run_checked("two steps -r" "${LD}" -r -d -dc -dp -nostdlib --no-eh-frame-hdr --gc-sections --gc-keep-exported
+            "${OUTPUT}/main.o" -o "${OUTPUT}/step.o")
+run_checked("two steps" "${LD}" -s -nostdlib --eh-frame-hdr --no-eh-frame-hdr --gc-sections -Ttext=0x80010000
+            "${OUTPUT}/step.o" -o "${OUTPUT}/step.elf")
 run_failing("fatal warnings" "${LD}" --fatal-warnings -e nowhere "${OUTPUT}/main.o" -o "${OUTPUT}/w.elf")
 expect("fatal warnings" "${run_stderr}" "ld: warning: cannot find entry symbol nowhere; defaulting to 0x")
 

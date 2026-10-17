@@ -28,6 +28,12 @@ struct InputFile;
 struct OutputSection;
 struct Symbol;
 
+// Output format choices beyond the class and byte order: GNU ld's
+// "traditional" formats (the `ts` emulations and `trad` formats).
+struct OutputFormat {
+    bool traditional{};
+};
+
 struct InputSection {
     InputFile* file{};
     std::string name;
@@ -53,6 +59,8 @@ struct InputSection {
     // A merged SHF_MERGE section: the group's first section, which holds
     // the merged contents, and each piece's input offset and offset there.
     InputSection* merged{};
+    // A discarded section whose contents a target merged into this one.
+    InputSection* combined{};
     std::vector<std::pair<std::uint64_t, std::uint64_t>> pieces;
 
     [[nodiscard]] bool nobits() const { return type == elf::sht_nobits; }
@@ -97,6 +105,10 @@ struct InputFile {
     // for its symbol addresses.
     bool raw{};
     bool just_symbols{};
+    // The file's .note.GNU-stack, and whether it asks for an executable
+    // stack.
+    bool stack_note{};
+    bool executable_stack{};
     // MIPS: the gp value the object was assembled with.
     std::int64_t gp0{};
     [[nodiscard]] std::string name() const {
@@ -114,7 +126,11 @@ struct Symbol {
     InputSection* section{};
     // A linker-script definition inside an output section: `value` is then
     // the absolute address and `output` gives the symbol's section index.
+    // With `absolute`, the value counts as absolute in expressions and
+    // `output` only gives the index (a symbol assigned from `.` outside
+    // output sections).
     OutputSection* output{};
+    bool absolute{};
     std::uint64_t value{};
     std::uint64_t size{};
     std::uint64_t common_alignment{};
@@ -216,8 +232,17 @@ public:
     // Applies a section's relocations to `bytes`, its copy in the output.
     virtual void relocate(const RelocationContext& context,
                           std::span<std::uint8_t> bytes) const = 0;
-    // The layout without a linker script, as script text.
-    [[nodiscard]] virtual std::string default_script() const = 0;
+    // Whether the symbol table's sh_info counts the section symbols only,
+    // not all local symbols (IRIX 5 conventions).
+    [[nodiscard]] virtual bool sections_end_locals(const OutputFormat& format) const = 0;
+    // Adjusts an output section's type, flags, and entry size to the
+    // target's conventions for its name in the output format.
+    virtual void finish_output_section(std::string_view name, const OutputFormat& format, std::uint32_t& type,
+                                       std::uint64_t& flags, std::uint64_t& entry_size) const = 0;
+    // The layout without a linker script, as script text; for a
+    // relocatable link, the output sections that collect input sections
+    // of given names, in order (the rest follow by name).
+    [[nodiscard]] virtual std::string default_script(bool relocatable) const = 0;
     // Whether a local symbol's name marks an assembler label, which the
     // symbol table drops in mergeable sections, beyond `.L` and `..`.
     [[nodiscard]] virtual bool local_label(std::string_view name) const = 0;
@@ -242,6 +267,8 @@ struct Options {
     std::vector<Input> inputs;
     std::vector<std::filesystem::path> library_paths;
     std::optional<std::filesystem::path> script;
+    // How many inputs precede the script, where its INPUT and GROUP files go.
+    std::size_t script_position{};
     std::filesystem::path output{"a.out"};
     std::optional<std::string> entry;
     std::optional<std::filesystem::path> map;
@@ -255,9 +282,17 @@ struct Options {
     // object decides what these leave open.
     std::optional<bool> elf64;
     std::optional<bool> big_endian;
+    OutputFormat format;
     bool gc_sections{};
     bool print_gc_sections{};
+    // `--gc-keep-exported`: global symbols of default or protected
+    // visibility keep their sections.
+    bool keep_exported{};
     bool relocatable{};
+    // `-d`: allocate common symbols in a relocatable link too.
+    bool define_common{};
+    // `--eh-frame-hdr`: a .eh_frame_hdr section and PT_GNU_EH_FRAME.
+    bool eh_frame_header{};
     bool strip_all{};
     bool fatal_warnings{};
 };

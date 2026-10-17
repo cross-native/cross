@@ -12,7 +12,6 @@ namespace {
 
 constexpr std::uint16_t em_mips = 8;
 constexpr std::uint32_t sht_symtab_shndx = 18;
-constexpr std::uint32_t sht_gnu_attributes = 0x6ffffff5;
 constexpr std::uint32_t sht_llvm_addrsig = 0x6fff4c03;
 constexpr std::uint32_t grp_comdat = 1;
 
@@ -226,7 +225,6 @@ std::unique_ptr<InputFile> read_object(std::span<const std::uint8_t> bytes, std:
         case elf::sht_strtab:
         case elf::sht_rel:
         case elf::sht_rela:
-        case sht_gnu_attributes:
         case sht_llvm_addrsig:
             continue;
         case elf::sht_group: {
@@ -248,7 +246,12 @@ std::unique_ptr<InputFile> read_object(std::span<const std::uint8_t> bytes, std:
         }
         auto name = section_name(header);
         // Executable-stack notes and excluded sections never reach an image.
-        if (name == ".note.GNU-stack" || (header.flags & elf::shf_exclude) != 0) continue;
+        if (name == ".note.GNU-stack") {
+            file->stack_note = true;
+            file->executable_stack = (header.flags & elf::shf_execinstr) != 0;
+            continue;
+        }
+        if ((header.flags & elf::shf_exclude) != 0) continue;
         auto section = std::make_unique<InputSection>();
         section->file = file.get();
         section->name = std::move(name);
