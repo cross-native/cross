@@ -48,6 +48,7 @@ enum : std::uint16_t {
 };
 constexpr std::uint16_t I1 = 0x1ff;
 constexpr std::uint16_t I2 = I1 & ~isa_mips1;
+constexpr std::uint16_t I12 = isa_mips1 | isa_mips2;
 constexpr std::uint16_t I3 = isa_mips3 | isa_mips4 | isa_mips5 | isa_mips64 | isa_mips64r2;
 constexpr std::uint16_t I4 = isa_mips4 | isa_mips5 | isa_mips64 | isa_mips64r2;
 constexpr std::uint16_t I32 = isa_mips32 | isa_mips32r2 | isa_mips64 | isa_mips64r2;
@@ -322,11 +323,14 @@ Model model_for(const Subtarget& subtarget, bool compiler_output) {
         model.cpr1_size = 2;
         model.fr1 = true;
         model.fp_abi = 6;
-    } else if (has(Feature::Fpxx) || (has(Feature::Fp32) && doubleword_fpu_memory(subtarget))) {
+    } else if (has(Feature::Fpxx) ||
+               (has(Feature::Fp32) && doubleword_fpu_memory(subtarget) &&
+                !has(Feature::OddSpreg))) {
         // Compiled code keeps to the FPXX subset of the paired-register
-        // convention, so it links with either FPU. Without ldc1 and sdc1,
-        // as on MIPS I, f64 halves travel through odd single registers and
-        // the code stays FP32.
+        // convention, so it links with either FPU. An FPU with odd single
+        // registers colors them under -mfp32, and without ldc1 and sdc1, as
+        // on MIPS I, f64 halves travel through odd single registers: such
+        // code stays FP32.
         model.fp_abi = 5;
         model.odd_spreg = false;
     }

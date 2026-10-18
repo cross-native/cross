@@ -76,6 +76,15 @@ expect(r3000-O2 quotient_508 ".end" "\tdivu?\t" FALSE)
 expect(r3000-O2 quotient_508 ".end" "\tmultu\t[^\n]*\n\tmfhi\t" TRUE)
 expect(r3000-O2 quotient_609 ".end" "\tmult\t[^\n]*\n\tmfhi\t" TRUE)
 expect(r3000-O2 remainder_613 ".end" "\tdivu?\t" FALSE)
+# 64-bit quotients multiply the words of their pairs instead of running the
+# shift-and-subtract loop, which a size goal keeps.
+set(pair_loop "\tli\t[$]t6,64\n")
+foreach(function quotient_707 remainder_707 quotient_810 remainder_811)
+    expect(r3000-O2 ${function} ".end" "${pair_loop}" FALSE)
+    expect(r3000-O2 ${function} ".end" "\tmultu\t" TRUE)
+endforeach()
+compile(r3000-Os ${r3000} -Os)
+expect(r3000-Os quotient_707 ".end" "${pair_loop}" TRUE)
 
 set(vr4300 -target mips-unknown-elf -march=vr4300 -mabi=o32)
 compile(vr4300-O2 ${vr4300} -O2)

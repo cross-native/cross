@@ -121,6 +121,13 @@ InstructionOperandEntry address_operand() {
     return result;
 }
 
+InstructionOperandEntry label_operand() {
+    InstructionOperandEntry result;
+    result.allow_label = true;
+    result.label_scope = InstructionLabelScope::SameFunction;
+    return result;
+}
+
 // Coprocessor 0 register numbers.
 constexpr unsigned cp0_index = 0;
 constexpr unsigned cp0_random = 1;
@@ -179,23 +186,33 @@ std::vector<InstructionEntry> target_instructions() {
 
     add("$::_nop", "mips", "nop", {}, {}, {});
 
-    // Coprocessor 0 moves. Reads are volatile: Count, Random, Cause, EPC,
-    // and BadVAddr change without a program write.
-    for (const auto& [move_from, move_to, feature, bits] :
+    // Coprocessor 0 moves, and from MIPS32 and MIPS64 on the forms with a
+    // register select. Reads are volatile: Count, Random, Cause, EPC, and
+    // BadVAddr change without a program write.
+    for (const auto& [move_from, move_to, feature, bits, select] :
          {std::tuple{std::string_view{"mfc0"}, std::string_view{"mtc0"},
-                     std::string_view{"mips"}, 32U},
+                     std::string_view{"mips"}, 32U, false},
           std::tuple{std::string_view{"dmfc0"}, std::string_view{"dmtc0"},
-                     std::string_view{"mips3"}, 64U}}) {
+                     std::string_view{"mips3"}, 64U, false},
+          std::tuple{std::string_view{"mfc0"}, std::string_view{"mtc0"},
+                     std::string_view{"mips32"}, 32U, true},
+          std::tuple{std::string_view{"dmfc0"}, std::string_view{"dmtc0"},
+                     std::string_view{"mips64"}, 64U, true}}) {
+        std::vector<InstructionOperandEntry> read_operands{
+            gpr_operand(Role::Output, bits), immediate_field(5, true)};
+        std::vector<InstructionOperandEntry> write_operands{
+            gpr_operand(Role::Input, bits), immediate_field(5, true)};
+        if (select) {
+            read_operands.push_back(immediate_field(3));
+            write_operands.push_back(immediate_field(3));
+        }
         auto& read = system(add(
             move_from == "mfc0" ? "$::_mfc0" : "$::_dmfc0", feature,
-            move_from,
-            {gpr_operand(Role::Output, bits), immediate_field(5, true)},
-            {"cp0"}, {}));
+            move_from, std::move(read_operands), {"cp0"}, {}));
         read.hazard_uses = {{"cp0", 4, 1}};
         auto& write = system(add(
             move_to == "mtc0" ? "$::_mtc0" : "$::_dmtc0", feature, move_to,
-            {gpr_operand(Role::Input, bits), immediate_field(5, true)},
-            {}, {"cp0"}));
+            std::move(write_operands), {}, {"cp0"}));
         write.hazard_writes = {{"cp0", 7, 1}};
     }
 
@@ -256,6 +273,22 @@ std::vector<InstructionEntry> target_instructions() {
                         {"memory"});
     barrier.volatile_effect = true;
 
+    // Exceptions that resume at the next instruction, with an optional code,
+    // and the MIPS32 wait for an interrupt.
+    for (const bool coded : {false, true}) {
+        auto& call = add("$::_syscall", "mips", "syscall",
+                         coded ? std::vector{immediate_field(20)}
+                               : std::vector<InstructionOperandEntry>{},
+                         {"memory"}, {"memory"});
+        call.volatile_effect = true;
+        auto& stop = add("$::_break", "mips", "break",
+                         coded ? std::vector{immediate_field(10)}
+                               : std::vector<InstructionOperandEntry>{},
+                         {"memory"}, {"memory"});
+        stop.volatile_effect = true;
+    }
+    system(add("$::_wait", "mips32", "wait", {}, {"memory"}, {"memory"}));
+
     // Floating-point control and status.
     auto& control_read = add(
         "$::_cfc1", "hard-float", "cfc1",
@@ -292,12 +325,53 @@ std::vector<InstructionEntry> target_instructions() {
         }
     }
 
-    // Control transfers that leave a naked function.
+    // Control transfers that leave a naked function. Before MIPS III an
+    // exception handler returns with RFE in the delay slot of its jump,
+    // which restores the status stack as the jump leaves.
     for (const auto& [feature, bits] :
          {std::pair{std::string_view{"mips"}, 32U},
           std::pair{std::string_view{"mips3"}, 64U}}) {
         add("$::_jr", feature, "jr", {gpr_operand(Role::Input, bits)}, {},
             {}, Control::RawReturn);
+    }
+    auto& restore = system(add("$::_rfe", "mips", "jr",
+                               {gpr_operand(Role::Input, 32)}, {"cp0"},
+                               {"cp0"}, Control::RawReturn));
+    restore.forbidden_features = {"mips3", "mips32"};
+
+    // Branches within a naked function: to a label, and on a comparison of
+    // two general registers or of one with zero. The compiler fills their
+    // delay slots.
+    add("$::_b", "mips", "b", {label_operand()}, {}, {},
+        Control::UnconditionalBranch);
+    using Condition = InstructionBranchCondition;
+    for (const auto& [name, mnemonic, condition, registers] :
+         {std::tuple{std::string_view{"$::_beq"}, std::string_view{"beq"},
+                     Condition::Equal, 2U},
+          std::tuple{std::string_view{"$::_bne"}, std::string_view{"bne"},
+                     Condition::NotEqual, 2U},
+          std::tuple{std::string_view{"$::_beqz"}, std::string_view{"beqz"},
+                     Condition::Equal, 1U},
+          std::tuple{std::string_view{"$::_bnez"}, std::string_view{"bnez"},
+                     Condition::NotEqual, 1U},
+          std::tuple{std::string_view{"$::_bltz"}, std::string_view{"bltz"},
+                     Condition::LessThanZero, 1U},
+          std::tuple{std::string_view{"$::_bgez"}, std::string_view{"bgez"},
+                     Condition::GreaterEqualZero, 1U},
+          std::tuple{std::string_view{"$::_blez"}, std::string_view{"blez"},
+                     Condition::LessEqualZero, 1U},
+          std::tuple{std::string_view{"$::_bgtz"}, std::string_view{"bgtz"},
+                     Condition::GreaterThanZero, 1U}}) {
+        for (const auto& [feature, bits] :
+             {std::pair{std::string_view{"mips"}, 32U},
+              std::pair{std::string_view{"mips3"}, 64U}}) {
+            std::vector<InstructionOperandEntry> operands(
+                registers, gpr_operand(Role::Input, bits));
+            operands.push_back(label_operand());
+            auto& branch = add(name, feature, mnemonic, std::move(operands),
+                               {}, {}, Control::ConditionalBranch);
+            branch.branch_condition = condition;
+        }
     }
     return result;
 }
@@ -387,7 +461,14 @@ std::vector<InstructionCostId> integer_operation_instructions(
     const IntegerOperationCostQuery& query) {
     using mips::Instruction;
     const bool wide = query.bits == 64;
-    if (wide && !subtarget.has_feature(mips::Feature::Mips3)) return {};
+    // Before MIPS III a 64-bit multiply-high combines the four products of
+    // the words; the other doubleword operations are software loops.
+    if (wide && !subtarget.has_feature(mips::Feature::Mips3)) {
+        if (operation != CostedIntegerOperation::MultiplyHigh) return {};
+        return {Instruction::Multu, Instruction::Mfhi, Instruction::Multu,
+                Instruction::Mflo, Instruction::Multu, Instruction::Mflo,
+                Instruction::Multu, Instruction::Mflo};
+    }
     switch (operation) {
     case CostedIntegerOperation::Multiply:
         if (query.bits > 64) return {};

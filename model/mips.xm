@@ -564,6 +564,9 @@ abi "o32" {
 # cursor.  Carriers are 64 bits wide and narrower integers arrive sign
 # extended, which is the SImode-canonical form the backend already keeps.
 # There is no caller home area; unnamed floating arguments use integer slots.
+# A variadic definition stores its unnamed argument registers in its own
+# frame directly below the stack arguments, so arg_area, like GCC's va_list,
+# walks the registers and then the stack.
 abi "n64" {
     architecture = "mips";
     address_bits = 64;
@@ -581,8 +584,9 @@ abi "n64" {
     return_address_bytes = 0;
     stack_order = ["arguments"];
     variadic_supported = true;
-    variadic_save_banks = ["integer"];
-    variadic_save_alignment = 8;
+    variadic_home_bank = "integer";
+    variadic_home_base = -64;
+    variadic_home_stride = 8;
     variadic_va_list_bytes = 8;
     variadic_va_list_alignment = 8;
     call_clobbers = [
@@ -614,6 +618,15 @@ abi "n64" {
         results = ["f0", "f2"];
     }
 
+    variadic_state "arg_area" {
+        type = "void*";
+        kind = "cursor_address";
+        cursor = "argument";
+        base = -64;
+        stride = 8;
+        llvm_va_list_offset = 0;
+    }
+
     variadic_state "overflow_arg_area" {
         type = "void*";
         kind = "stack_address";
@@ -621,8 +634,9 @@ abi "n64" {
 
     variadic_state "gp_arg_area" {
         type = "u64*";
-        kind = "register_save_address";
+        kind = "cursor_address";
         cursor = "argument";
+        base = -64;
         stride = 8;
     }
 
@@ -726,7 +740,11 @@ abi "n64" {
 # MIPS EABI32 keeps integer and floating argument allocation independent.
 # This is the ABI used by the PSPDEV Allegrex toolchain.  Feature-dependent
 # rules also describe ordinary double-float EABI targets without giving the
-# common ABI interpreter any CPU or platform names.
+# common ABI interpreter any CPU or platform names.  A variadic definition
+# stores its unnamed integer argument registers directly below the stack
+# arguments, as GCC does: arg_area is GCC's va_list without double-precision
+# floating registers, and the five states overflow_arg_area, gpr_top,
+# fpr_top, gpr_offset, and fpr_offset fill GCC's va_list record with them.
 abi "eabi32" {
     architecture = "mips";
     address_bits = 32;
@@ -745,8 +763,11 @@ abi "eabi32" {
     return_address_bytes = 0;
     stack_order = ["arguments"];
     variadic_supported = true;
-    variadic_save_banks = ["integer"];
-    variadic_save_alignment = 4;
+    variadic_home_bank = "integer";
+    variadic_home_base = -32;
+    variadic_home_stride = 4;
+    variadic_save_banks = ["floating-varargs"];
+    variadic_save_alignment = 8;
     variadic_va_list_bytes = 4;
     variadic_va_list_alignment = 4;
     call_clobbers = [
@@ -788,9 +809,56 @@ abi "eabi32" {
         results = ["f0"];
     }
 
+    # The doubles a variadic definition saves for fpr_top: no rule passes
+    # values in this bank.
+    bank "floating-varargs" {
+        class = "floating";
+        cursor = "floating";
+        register_bits = 64;
+        arguments = ["f12", "f14", "f16", "f18"];
+    }
+
     variadic_state "arg_area" {
         type = "void*";
+        kind = "cursor_address";
+        cursor = "integer";
+        base = -32;
+        stride = 4;
+        llvm_va_list_offset = 0;
+    }
+
+    variadic_state "overflow_arg_area" {
+        type = "void*";
         kind = "stack_address";
+    }
+
+    variadic_state "gpr_top" {
+        type = "void*";
+        kind = "cursor_address";
+    }
+
+    variadic_state "fpr_top" {
+        type = "void*";
+        kind = "register_save_address";
+        base = 32;
+    }
+
+    variadic_state "gpr_offset" {
+        type = "u8";
+        kind = "cursor_offset";
+        cursor = "integer";
+        base = 32;
+        stride = -4;
+        limit = 8;
+    }
+
+    variadic_state "fpr_offset" {
+        type = "u8";
+        kind = "cursor_offset";
+        cursor = "floating";
+        base = 32;
+        stride = -4;
+        limit = 8;
     }
 
     rule "zero" {

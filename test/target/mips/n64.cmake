@@ -81,7 +81,7 @@ foreach(pattern
         "[\t ]daddiu[\t ][$][0-9]+,[$][0-9]+,%lo[(]"
         "[\t ]ld[\t ][$][0-9]+,0[(][$]29[)]"
         "[\t ]ld[\t ][$][0-9]+,8[(][$]29[)]"
-        "[\t ]mov\.d[\t ][^\n]*[$]f13"
+        "[\t ][a-z]+\.d[\t ][^\n]*[$]f13"
         "[\t ](mov\.s|cvt\.d\.s)[\t ][^\n]*[$]f14"
         "\n\t\.quad n64_object\n"
         "\\.quad \\.Lcross\\.patch\\.value\\.[0-9]+\\.end-8")

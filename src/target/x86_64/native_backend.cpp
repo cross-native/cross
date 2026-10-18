@@ -19786,7 +19786,14 @@ private:
         }
         std::string address;
         if (resolved.base == VariadicStateBase::IncomingArguments) {
-            address = incoming_memory(resolved.offset);
+            if (resolved.offset < 0) {
+                diagnostics_.error(value.location,
+                                   "x86-64 frames reserve no variadic home "
+                                   "area below the incoming arguments");
+                return;
+            }
+            address = incoming_memory(
+                static_cast<std::size_t>(resolved.offset));
         } else {
             const auto save = named_slot_offset(function, "$variadic.save");
             if (!save) {
@@ -19808,12 +19815,18 @@ private:
         const auto* abi = abi_model(entity.abi);
         if (!abi) return;
         if (!abi->variadic_home_bank.empty()) {
+            if (abi->variadic_home_base < 0) {
+                diagnostics_.error(entity.location,
+                                   "x86-64 frames reserve no variadic home "
+                                   "area below the incoming arguments");
+                return;
+            }
             if (const auto* bank =
                     abi_bank(*abi, abi->variadic_home_bank)) {
                 for (std::size_t index = 0;
                      index < bank->arguments.size(); ++index) {
                     const auto incoming = incoming_memory(
-                        abi->variadic_home_base +
+                        static_cast<std::size_t>(abi->variadic_home_base) +
                         index * abi->variadic_home_stride);
                     instruction(
                         "movq",

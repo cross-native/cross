@@ -400,3 +400,87 @@ if(status EQUAL 0 OR
    NOT stderr MATCHES "^cpp: error: cannot find Cross model file")
     message(FATAL_ERROR "cpp errors do not name cpp\n${stderr}")
 endif()
+
+# Integers are unsigned except where a property allows a sign: variadic home
+# bases and state offsets.
+expect_rejected(negative-unsigned 4 "model property 'stack_alignment' must be an unsigned integer" [=[
+abi "a" {
+    architecture = "x86-64";
+    address_bits = 64;
+    stack_alignment = -16;
+    stack_slot_bytes = 8;
+    bank "integer" { class = "integer"; register_bits = 64; arguments = ["rdi"]; results = ["rax"]; }
+    rule "integer" { match = ["integer"]; action = "direct"; bank = "integer"; }
+}
+]=])
+expect_rejected(negative-option 2 "compiler option property 'f[.]inline-limit' cannot be negative" [=[
+profile "p" {
+    f.inline-limit = -3;
+}
+]=])
+expect_rejected(state-stride-without-cursor 8 "ABI variadic state with a cursor requires a nonzero stride, and one without a cursor no stride" [=[
+abi "a" {
+    architecture = "x86-64";
+    address_bits = 64;
+    stack_alignment = 16;
+    stack_slot_bytes = 8;
+    variadic_supported = true;
+    bank "integer" { class = "integer"; register_bits = 64; arguments = ["rdi"]; results = ["rax"]; }
+    variadic_state "top" { type = "void*"; kind = "cursor_address"; stride = 8; }
+    rule "integer" { match = ["integer"]; action = "direct"; bank = "integer"; }
+}
+]=])
+expect_rejected(state-limit-without-cursor 8 "ABI variadic state limit requires a cursor" [=[
+abi "a" {
+    architecture = "x86-64";
+    address_bits = 64;
+    stack_alignment = 16;
+    stack_slot_bytes = 8;
+    variadic_supported = true;
+    bank "integer" { class = "integer"; register_bits = 64; arguments = ["rdi"]; results = ["rax"]; }
+    variadic_state "offset" { type = "u32"; kind = "cursor_offset"; base = 8; limit = 1; }
+    rule "integer" { match = ["integer"]; action = "direct"; bank = "integer"; }
+}
+]=])
+expect_rejected(home-base-without-bank 1 "a negative variadic_home_base requires a home bank" [=[
+abi "a" {
+    architecture = "x86-64";
+    address_bits = 64;
+    stack_alignment = 16;
+    stack_slot_bytes = 8;
+    variadic_supported = true;
+    variadic_home_base = -16;
+    bank "integer" { class = "integer"; register_bits = 64; arguments = ["rdi", "rsi"]; results = ["rax"]; }
+    rule "integer" { match = ["integer"]; action = "direct"; bank = "integer"; }
+}
+]=])
+expect_rejected(home-straddling 8 "ABI model 'a' places variadic home slots on both sides of the incoming arguments" [=[
+abi "a" {
+    architecture = "x86-64";
+    address_bits = 64;
+    stack_alignment = 16;
+    stack_slot_bytes = 8;
+    variadic_supported = true;
+    variadic_home_bank = "integer";
+    variadic_home_base = -8;
+    variadic_home_stride = 8;
+    bank "integer" { class = "integer"; register_bits = 64; arguments = ["rdi", "rsi"]; results = ["rax"]; }
+    rule "integer" { match = ["integer"]; action = "direct"; bank = "integer"; }
+}
+]=])
+expect_accepted(signed-variadic-offsets [=[
+abi "a" {
+    architecture = "x86-64";
+    address_bits = 64;
+    stack_alignment = 16;
+    stack_slot_bytes = 8;
+    variadic_supported = true;
+    variadic_home_bank = "integer";
+    variadic_home_base = -16;
+    variadic_home_stride = 8;
+    bank "integer" { class = "integer"; register_bits = 64; arguments = ["rdi", "rsi"]; results = ["rax"]; }
+    variadic_state "remaining" { type = "u32"; kind = "cursor_offset"; cursor = "integer"; base = 16; stride = -8; limit = 2; }
+    variadic_state "top" { type = "void*"; kind = "cursor_address"; }
+    rule "integer" { match = ["integer"]; action = "direct"; bank = "integer"; }
+}
+]=])

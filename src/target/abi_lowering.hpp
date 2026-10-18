@@ -254,7 +254,7 @@ std::size_t variadic_save_area_size(const AbiEntry& abi);
 enum class VariadicStateBase {
     // The value itself (`cursor_offset`).
     None,
-    // An offset into the incoming stack arguments, measured like a caller
+    // An offset from the incoming stack arguments, measured like a caller
     // stack Location.
     IncomingArguments,
     // An offset into the area of `variadic_save_banks`.
@@ -263,7 +263,8 @@ enum class VariadicStateBase {
 
 struct VariadicStateValue {
     VariadicStateBase base{VariadicStateBase::None};
-    std::size_t offset{};
+    // Negative below the incoming arguments (a callee home area).
+    std::int64_t offset{};
 };
 
 // Resolves a `variadic_state` of a definition from the classification of

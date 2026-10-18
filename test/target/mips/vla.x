@@ -120,6 +120,57 @@ static u32 initialized_vla(in u32 count) {
     return 1u32;
 }
 
+// Frames that realign for a local aligned beyond the ABI stack alignment and
+// also allocate on the stack: register saves and incoming arguments stay at
+// the fixed frame bottom, which an anchor register holds.
+[[runtime_only, noinline]]
+static u32 realigned_vla(in u32 count) {
+    [[aligned(64)]] u8 line[64];
+    u32 values[count];
+    if (((uptr)line & 63uptr) != 0uptr) return 0u32;
+    line[0] = 5u8;
+    line[63] = 6u8;
+    values[0] = 1u32;
+    values[count - 1u32] = 2u32;
+    // A call with stack arguments below the live array; values live across
+    // it.
+    u32 kept = count * 3u32;
+    u32 sum = ten(1u32, 2u32, 3u32, 4u32, 5u32, 6u32, 7u32, 8u32, 9u32, 10u32);
+    if (((uptr)line & 63uptr) != 0uptr) return 0u32;
+    return sum + kept - count * 3u32 + values[0] + values[count - 1u32] +
+           line[0] + line[63];
+}
+
+// Incoming stack arguments of a realigned frame that allocates.
+[[runtime_only, noinline]]
+static u32 realigned_vla_arguments(in u32 a, in u32 b, in u32 c, in u32 d,
+                                   in u32 e, in u32 f, in u32 g, in u32 h,
+                                   in u32 i, in u32 count) {
+    [[aligned(32)]] u64 cell[2];
+    u8 bytes[count];
+    cell[0] = (u64)a;
+    cell[1] = (u64)i;
+    bytes[count - 1u32] = (u8)h;
+    if (((uptr)cell & 31uptr) != 0uptr) return 0u32;
+    return (u32)cell[0] + b + c + d + e + f + g + bytes[count - 1u32] +
+           (u32)cell[1] + count;
+}
+
+[[always_inline]] static u32 fill_values(in u32 count) {
+    u32 values[count];
+    for (u32 index = 0u32; index < count; index += 1u32) values[index] = index;
+    return values[count - 1u32];
+}
+
+// An always_inline callee allocates in a realigned frame.
+[[runtime_only, noinline]]
+static u32 realigned_inline(in u32 count) {
+    [[aligned(64)]] u8 buffer[64];
+    buffer[0] = (u8)count;
+    if (((uptr)buffer & 63uptr) != 0uptr) return 0u32;
+    return fill_values(count) + buffer[0];
+}
+
 global u32 vla_entry(in u32 count) {
     bound_calls = 0u32;
     u8 exact[4] = "abc";
@@ -133,5 +184,9 @@ global u32 vla_entry(in u32 count) {
            sizeof(inferred) == 3uptr && inferred[1] == 121u8 &&
            inferred[2] == 0u8 && padded[0] == 122u8 &&
            padded[1] == 0u8 && padded[23] == 0u8 &&
-           goto_cleanup(count) == 19u32;
+           goto_cleanup(count) == 19u32 &&
+           realigned_vla(count) == 69u32 &&
+           realigned_vla_arguments(1u32, 2u32, 3u32, 4u32, 5u32, 6u32, 7u32,
+                                   8u32, 9u32, count) == 45u32 + count &&
+           realigned_inline(count) == count - 1u32 + (count & 255u32);
 }

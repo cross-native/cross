@@ -33,6 +33,7 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <set>
 #include <span>
 #include <sstream>
 #include <string>
@@ -175,12 +176,21 @@ bool colorable_floating(const Subtarget& subtarget, unsigned bits) {
             (bits <= 64 && !subtarget.has_feature(Feature::SingleFloat)));
 }
 
-// A single-precision FPU has 32 independent registers. An FR=0 FPU with
-// doubles uses only even ones: MIPS I-IV have no odd single-precision
-// arithmetic, and the FPXX objects of MIPS32 do not name odd registers.
-bool odd_fpr_colors(const Subtarget& subtarget) {
-    return subtarget.has_feature(Feature::SingleFloat) &&
-           subtarget.has_feature(Feature::OddSpreg);
+// Whether code may name odd single-precision registers: the FPU has them
+// (`odd-spreg`, which MIPS I-IV lack) and the FPU register model is not
+// FPXX, whose objects keep to even registers.
+bool odd_single_fprs(const Subtarget& subtarget) {
+    return subtarget.has_feature(Feature::HardFloat) &&
+           subtarget.has_feature(Feature::OddSpreg) &&
+           !subtarget.has_feature(Feature::Fpxx);
+}
+
+// Whether the FPRs of an FR=0 FPU with doubles pair up, so that an f64 in
+// an even register also occupies the odd one.
+bool paired_fprs(const Subtarget& subtarget) {
+    return subtarget.has_feature(Feature::HardFloat) &&
+           !subtarget.has_feature(Feature::SingleFloat) &&
+           !subtarget.has_feature(Feature::Fp64);
 }
 
 // Whether an FPR value of `bits` holds an even register and the odd one
@@ -276,6 +286,15 @@ bool has_dynamic_stack(const machine::Function& function) {
         }
     }
     return false;
+}
+
+// The largest slot alignment beyond the ABI stack alignment, or zero.
+std::uint32_t frame_realignment(const machine::Function& function) {
+    const auto stack = std::max(8U, function.frame.stack_alignment);
+    std::uint32_t result = 0;
+    for (const auto& slot : function.stack_slots)
+        if (!slot.elided && slot.alignment > stack) result = std::max(result, slot.alignment);
+    return result;
 }
 
 bool phi_instruction(const machine::Instruction& instruction) {
@@ -517,6 +536,21 @@ bool binds_variadic_state(const hir::Function& entity) {
     return entity.variadic && !entity.variadic_bindings.empty();
 }
 
+// Whether a definition binds a state of `kind`: the home bank serves cursor
+// addresses and the save area register-save addresses.
+bool binds_variadic_kind(const hir::Function& entity, const AbiEntry& abi,
+                         AbiVariadicStateKind kind) {
+    return binds_variadic_state(entity) &&
+           std::any_of(entity.variadic_bindings.begin(),
+                       entity.variadic_bindings.end(),
+                       [&](const hir::VariadicBinding& binding) {
+                           return binding.state.value <
+                                      abi.variadic_states.size() &&
+                                  abi.variadic_states[binding.state.value]
+                                          .kind == kind;
+                       });
+}
+
 std::optional<SignatureLayout> classify_managed_interface(
     const hir::Module& module, const hir::Function& entity,
     const Subtarget& subtarget, const AbiEntry& abi) {
@@ -573,9 +607,9 @@ const AbiEntry* managed_abi_model(const hir::Module& module,
     return abi_model(function.abi);
 }
 
-// The layout of a signature under `abi`, with the call's actual argument
-// types when given (a variadic call classifies its whole list).
-std::optional<SignatureLayout> classify_signature_layout(
+// The classification of a signature under `abi`, with the call's actual
+// argument types when given (a variadic call classifies its whole list).
+SignatureClassificationResult classify_signature_layout(
     const hir::Module& module, const Subtarget& subtarget,
     const hir::FunctionSignature& entity, const AbiEntry& abi,
     std::span<const hir::TypeId> actual_types = {}) {
@@ -600,14 +634,67 @@ std::optional<SignatureLayout> classify_signature_layout(
         results.push_back(abi_value_for(module, entity.result_type,
                                         subtarget.target(), abi));
     }
-    auto classified = entity.variadic
+    return entity.variadic
         ? classify_variadic_signature(abi, arguments, results,
                                       entity.parameters.size(),
                                       subtarget.enabled_features())
         : classify_signature(abi, arguments, results,
                              subtarget.enabled_features());
-    if (!classified) return std::nullopt;
-    return std::move(classified.layout);
+}
+
+// A naked function's interface: each parameter, which is `in`, and the
+// result in the register its manual location names. Nothing travels on the
+// stack, and the function keeps every register outside its interface and
+// clobber contract.
+std::optional<SignatureLayout> naked_signature_layout(
+    const hir::Module& module, const Subtarget& subtarget,
+    const AbiEntry& abi, const hir::FunctionSignature& signature) {
+    const auto piece = [&](hir::TypeId type, std::string_view location)
+        -> std::optional<ValuePiece> {
+        const auto id = physical_register_id(location);
+        const auto bits = module.type(type).kind == hir::Type::Kind::Pointer
+                              ? module.address_bits
+                              : type_bits(module, type);
+        if (!id || id->value == 0 || bits == 0 || bits > 64) {
+            return std::nullopt;
+        }
+        const bool floating = id->value >= fpr_physical_base;
+        ValuePiece result;
+        result.location.reg =
+            std::string(floating ? fpr_name(*id) : gpr_name(*id));
+        result.value_bits = static_cast<std::uint16_t>(bits);
+        result.carrier_bits =
+            static_cast<std::uint16_t>(floating ? bits : bits > 32 ? 64 : 32);
+        return result;
+    };
+    SignatureLayout layout;
+    for (std::size_t index = 0; index < signature.parameters.size(); ++index) {
+        const auto& parameter = signature.parameters[index];
+        if (parameter.mode != ParameterMode::In ||
+            !parameter.physical_location) {
+            return std::nullopt;
+        }
+        auto value = piece(parameter.type, *parameter.physical_location);
+        if (!value) return std::nullopt;
+        ArgumentAssignment assignment;
+        assignment.argument_index = index;
+        assignment.value =
+            abi_value_for(module, parameter.type, subtarget.target(), abi);
+        assignment.pieces.push_back(std::move(*value));
+        layout.call.arguments.push_back(std::move(assignment));
+    }
+    if (!is_void(module, signature.result_type)) {
+        if (!signature.result_location) return std::nullopt;
+        auto value = piece(signature.result_type, *signature.result_location);
+        if (!value) return std::nullopt;
+        ReturnAssignment result;
+        result.value =
+            abi_value_for(module, signature.result_type, subtarget.target(), abi);
+        result.mode = result.value.mode;
+        result.pieces.push_back(std::move(*value));
+        layout.results.push_back(std::move(result));
+    }
+    return layout;
 }
 
 // The ABI and layout a call site uses: the callee's managed ABI for a direct
@@ -622,16 +709,22 @@ classify_call_site(const hir::Module& module, const Subtarget& subtarget,
         const auto& entity = module.function(*call.direct_callee);
         abi = managed_abi_model(module, entity, subtarget, options);
         signature = hir::call_signature(module, entity.id, std::nullopt);
+        if (entity.naked && abi && signature) {
+            auto layout =
+                naked_signature_layout(module, subtarget, *abi, *signature);
+            if (!layout) return std::nullopt;
+            return std::pair{abi, std::move(*layout)};
+        }
     } else {
         signature =
             hir::call_signature(module, std::nullopt, call.call_signature);
         if (signature) abi = abi_model(signature->abi);
     }
     if (!abi || !signature) return std::nullopt;
-    auto layout = classify_signature_layout(module, subtarget, *signature,
-                                            *abi, call.call_argument_types);
-    if (!layout) return std::nullopt;
-    return std::pair{abi, std::move(*layout)};
+    auto classified = classify_signature_layout(
+        module, subtarget, *signature, *abi, call.call_argument_types);
+    if (!classified) return std::nullopt;
+    return std::pair{abi, std::move(classified.layout)};
 }
 
 unsigned effective_piece_offset(const ValuePiece& piece,
@@ -954,6 +1047,43 @@ private:
         return result;
     }
 
+    // Loads a scalar cell into a new virtual register, before the
+    // instruction being selected.
+    machine::Register load_cell(mir::SlotId cell, hir::TypeId type,
+                                SourceLocation location) {
+        const auto mode = mode_for(hir_, type);
+        const bool floating = is_floating(hir_, type);
+        const machine::VirtualRegisterId id{
+            static_cast<std::uint32_t>(current_.virtual_registers.size())};
+        current_.virtual_registers.push_back(mode);
+        current_.virtual_register_assignments.push_back(std::nullopt);
+        current_.rematerialized_immediates.push_back(std::nullopt);
+        current_.virtual_register_classes.push_back(
+            floating ? machine::VirtualRegisterClass::Floating
+                     : machine::VirtualRegisterClass::Integer);
+        machine::StackSlot spill;
+        spill.id = {static_cast<std::uint32_t>(current_.stack_slots.size())};
+        spill.kind = machine::StackSlotKind::Spill;
+        spill.size = floating ? std::max(4U, (mode.bits + 7U) / 8U)
+                     : mode.bits > 32 ? 8U
+                                      : 4U;
+        spill.alignment = spill.size >= 8 ? 8U : 4U;
+        spill.location = location;
+        spill.name = "$v" + std::to_string(id.value);
+        spill.spill_for = id;
+        current_.stack_slots.push_back(std::move(spill));
+        const auto target = machine::Register::virtual_register(id, mode);
+        auto load = target_instruction(
+            load_opcode(type, Opcode::LoadSigned, Opcode::LoadUnsigned,
+                        Opcode::Fload),
+            location);
+        load.operands.push_back(stack_operand({cell.value}, mode));
+        load.defs.push_back(target);
+        load.may_load = true;
+        prelude_.push_back(std::move(load));
+        return target;
+    }
+
     void unsupported(const mir::ManagedValue& value,
                      std::string_view feature) {
         diagnostics_.error(value.location,
@@ -1109,8 +1239,9 @@ private:
 
         const auto& entity = hir_.function(source.source);
         const auto* abi = abi_model(entity.abi);
-        if (binds_variadic_state(entity) && abi &&
-            variadic_save_area_size(*abi) != 0) {
+        if (abi && variadic_save_area_size(*abi) != 0 &&
+            binds_variadic_kind(entity, *abi,
+                                AbiVariadicStateKind::RegisterSaveAddress)) {
             machine::StackSlot save;
             save.id = {static_cast<std::uint32_t>(current_.stack_slots.size())};
             save.kind = machine::StackSlotKind::Local;
@@ -1611,12 +1742,21 @@ private:
                 result.operands.push_back(register_operand(target));
                 result.uses.push_back(target);
             }
+            // A naked callee takes the value of each `in` argument, which
+            // MIR keeps in a cell for its manual location, in a register.
+            const bool naked_callee =
+                value.callee && hir_.function(*value.callee).naked;
             for (const auto& argument : value.call_arguments) {
                 result.call_argument_types.push_back(argument.type);
                 if (argument.value) {
                     const auto source = reg(*argument.value);
                     result.operands.push_back(register_operand(source));
                     result.uses.push_back(source);
+                } else if (naked_callee) {
+                    const auto loaded = load_cell(*argument.cell, argument.type,
+                                                  value.location);
+                    result.operands.push_back(register_operand(loaded));
+                    result.uses.push_back(loaded);
                 } else {
                     result.operands.push_back(stack_operand(
                         {argument.cell->value},
@@ -1667,7 +1807,17 @@ private:
                 };
             const auto* entity =
                 value.callee ? &hir_.function(*value.callee) : nullptr;
-            if (const auto* abi =
+            if (entity && entity->naked) {
+                // A naked callee writes its clobbers and its interface.
+                for (const auto& parameter : callee.parameters) {
+                    if (parameter.physical_location) {
+                        append_clobbers({*parameter.physical_location});
+                    }
+                }
+                if (callee.result_location) {
+                    append_clobbers({*callee.result_location});
+                }
+            } else if (const auto* abi =
                     entity ? managed_abi_model(hir_, *entity, subtarget_, options_)
                            : abi_model(callee.abi)) {
                 const auto exact =
@@ -2100,6 +2250,11 @@ private:
                     continue;
                 }
                 auto instruction = lower_value(managed_value);
+                for (auto& before : prelude_) {
+                    before.inline_site = managed_value.inline_site;
+                    target.instructions.push_back(std::move(before));
+                }
+                prelude_.clear();
                 // A one-instruction scalar access keeps what MIR knows of
                 // the bytes it touches.
                 if ((instruction.may_load || instruction.may_store) &&
@@ -2377,6 +2532,10 @@ private:
             }
         }
         for (std::uint32_t id = 16; id <= 23; ++id) {
+            if (function.frame.cfa_anchor_register &&
+                function.frame.cfa_anchor_register->value == id) {
+                continue;
+            }
             integer_colors.push_back({id});
         }
         return integer_colors;
@@ -2384,23 +2543,79 @@ private:
 
     // F0/F2/F4 remain reserved for conversion, comparison, and ABI
     // staging. Even registers hold FR=0 doubles and the singles of FPUs
-    // without odd single-precision registers; a single-precision FPU
-    // also colors the odd ones. Volatile registers come first.
+    // without odd single-precision registers; odd ones hold values in the
+    // functions that odd_fpr_colors_ permits, except that the odd halves
+    // of the FR=0 staging pairs stay free. Volatile registers come first.
     std::vector<machine::PhysicalRegisterId> allocatable_fprs() const {
         std::vector<machine::PhysicalRegisterId> floating_colors;
-        const bool odd_colors = odd_fpr_colors(subtarget_);
         const auto add_colors = [&](unsigned first, unsigned last,
                                     unsigned step) {
             for (unsigned number = first; number <= last; number += step) {
-                if (number % 2U == 0 || odd_colors) {
+                if (number % 2U == 0 || odd_fpr_colors_) {
                     floating_colors.push_back({fpr_physical_base + number});
                 }
             }
         };
         add_colors(6, 19, 1);
-        add_colors(1, 5, 2);
+        if (!paired_fprs(subtarget_)) add_colors(1, 5, 2);
         add_colors(20, 31, 1);
         return floating_colors;
+    }
+
+    // Odd FPRs take values where the FPU register model names odd single
+    // registers: on single-precision and 64-bit-FPR FPUs everywhere, and on
+    // an FR=0 FPU with doubles in a function without FR=0 pairs, whose
+    // halves would overlap them: no f64 value and no f64 in an FPR at its
+    // own or a call's boundary.
+    bool permits_odd_fpr_colors(const machine::Function& function) const {
+        if (!odd_single_fprs(subtarget_)) return false;
+        if (!paired_fprs(subtarget_)) return true;
+        for (std::size_t id = 0; id < function.virtual_registers.size();
+             ++id) {
+            if (function.virtual_register_classes[id] ==
+                    machine::VirtualRegisterClass::Floating &&
+                function.virtual_registers[id].bits > 32) {
+                return false;
+            }
+        }
+        const auto pairs = [](const SignatureLayout& layout) {
+            const auto wide = [](const std::vector<ValuePiece>& pieces) {
+                return std::any_of(
+                    pieces.begin(), pieces.end(), [](const ValuePiece& piece) {
+                        return piece.location.kind == LocationKind::Register &&
+                               fpr_id(piece.location.reg) &&
+                               piece.carrier_bits > 32;
+                    });
+            };
+            return std::any_of(layout.call.arguments.begin(),
+                               layout.call.arguments.end(),
+                               [&](const ArgumentAssignment& assignment) {
+                                   return wide(assignment.pieces) ||
+                                          wide(assignment.shadows);
+                               }) ||
+                   std::any_of(layout.results.begin(), layout.results.end(),
+                               [&](const ReturnAssignment& result) {
+                                   return wide(result.pieces);
+                               });
+        };
+        const auto& entity = hir_.function(function.source);
+        if (const auto* abi =
+                managed_abi_model(hir_, entity, subtarget_, options_)) {
+            const auto layout =
+                classify_managed_interface(hir_, entity, subtarget_, *abi);
+            if (!layout || pairs(*layout)) return false;
+        }
+        for (const auto& block : function.blocks) {
+            for (const auto& instruction : block.instructions) {
+                if (instruction.kind != machine::InstructionKind::Call) {
+                    continue;
+                }
+                const auto site =
+                    classify_call_site(hir_, subtarget_, options_, instruction);
+                if (!site || pairs(site->second)) return false;
+            }
+        }
+        return true;
     }
 
     // Whether the expansion of `value` may write t2 or t3 when every value
@@ -3350,7 +3565,7 @@ private:
         }
         auto integer_colors = allocatable_gprs(function);
         auto floating_colors = allocatable_fprs();
-        const bool odd_colors = odd_fpr_colors(subtarget_);
+        const bool odd_colors = odd_fpr_colors_;
         if (naked_) {
             coalesce_hard_registers(function, live_in, live_out, interference,
                                     eligible);
@@ -8492,8 +8707,9 @@ private:
         return changed;
     }
 
+    // A naked body fuses always: its raw branches name no register.
     bool fuse_compare_branches(machine::Function& function) {
-        if (!options_.compare_branch_fusion) return false;
+        if (!options_.compare_branch_fusion && !naked_) return false;
         std::vector<unsigned> uses(function.virtual_registers.size());
         for (const auto& block : function.blocks) {
             for (const auto& instruction : block.instructions) {
@@ -9180,9 +9396,82 @@ private:
         for (const auto& label : source.labels) {
             current_.labels.push_back({label.label, {label.block.value}});
         }
+        select_frame_anchor(entity);
+        odd_fpr_colors_ = permits_odd_fpr_colors(current_);
         optimize_machine_function();
         record_private_clobbers(current_);
         return std::move(current_);
+    }
+
+    // A frame that realigns and also allocates on the stack reaches its
+    // register saves and incoming arguments through an anchor: a register
+    // the function's ABI preserves that holds the fixed frame bottom, which
+    // neither the moving $sp nor the realigned $fp keeps. The anchor is any
+    // of s7 down to s0 that no interface, call, or instruction uses.
+    void select_frame_anchor(const hir::Function& entity) {
+        if (naked_ || !has_dynamic_stack(current_) ||
+            frame_realignment(current_) == 0) {
+            return;
+        }
+        const auto* abi = managed_abi_model(hir_, entity, subtarget_, options_);
+        std::unordered_set<std::uint32_t> unavailable;
+        const auto exclude = [&](const std::vector<ValuePiece>& pieces) {
+            for (const auto& piece : pieces) {
+                if (piece.location.kind != LocationKind::Register) continue;
+                if (const auto id = physical_register_id(piece.location.reg)) {
+                    unavailable.insert(id->value);
+                }
+            }
+        };
+        const auto exclude_layout = [&](const SignatureLayout& layout) {
+            for (const auto& assignment : layout.call.arguments) {
+                exclude(assignment.pieces);
+                exclude(assignment.shadows);
+            }
+            for (const auto& result : layout.results) exclude(result.pieces);
+        };
+        if (abi) {
+            if (const auto layout = classify_managed_interface(
+                    hir_, entity, subtarget_, *abi)) {
+                exclude_layout(*layout);
+            }
+        }
+        for (const auto& block : current_.blocks) {
+            for (const auto& instruction : block.instructions) {
+                for (const auto* registers :
+                     {&instruction.defs, &instruction.uses,
+                      &instruction.clobbers}) {
+                    for (const auto& value : *registers) {
+                        if (value.kind == machine::RegisterKind::Physical) {
+                            unavailable.insert(value.id);
+                        }
+                    }
+                }
+                if (instruction.kind != machine::InstructionKind::Call) {
+                    continue;
+                }
+                if (const auto site = classify_call_site(
+                        hir_, subtarget_, options_, instruction)) {
+                    exclude_layout(site->second);
+                }
+            }
+        }
+        const auto clobbered = [&](std::string_view name) {
+            const auto contains = [&](const std::vector<std::string>& names) {
+                return std::find(names.begin(), names.end(), name) !=
+                       names.end();
+            };
+            return (abi && contains(abi->call_clobbers)) ||
+                   contains(entity.clobbers);
+        };
+        for (std::uint32_t id = 23; id >= 16; --id) {
+            if (unavailable.contains(id) || clobbered(gpr_name({id}))) continue;
+            current_.frame.cfa_anchor_register = machine::PhysicalRegisterId{id};
+            return;
+        }
+        diagnostics_.error(current_.location,
+                           "MIPS has no preserved register to anchor a frame "
+                           "that realigns and allocates on the stack");
     }
 
     const mir::ManagedModule& managed_;
@@ -9203,6 +9492,10 @@ private:
     // The allocation may color t2 and t3, which the instructions whose
     // expansions use them as scratches clobber.
     bool scratch_colors_{};
+    // The function's values may take odd FPRs (permits_odd_fpr_colors).
+    bool odd_fpr_colors_{};
+    // Instructions that the instruction being selected needs before it.
+    std::vector<machine::Instruction> prelude_;
     // Speed-goal load-latency schedules; see schedule_instructions.
     bool latency_schedules_{};
     bool ordered_stores_{};
@@ -9293,7 +9586,8 @@ public:
                 hir_.function(function.source).naked) {
                 continue;
             }
-            active_signature_ = classify_entity(hir_.function(function.source), function.location);
+            active_signature_ = classify_entity(
+                hir_.function(function.source), function.location, {}, true);
             if (!active_signature_) continue;
             prepare_parameter_homes(function);
             if (!finalize_frame(function)) continue;
@@ -9803,10 +10097,11 @@ private:
         hazard_form_ = &form;
         hazard_immediates_ = std::move(immediates);
         instruction(form.assembly_mnemonic, operands);
-        // A raw jump has a delay slot; ERET does not.
+        // A raw jump has a delay slot, which RFE fills in the exception
+        // return of MIPS I and II; ERET has none.
         if (form.control != InstructionControlEffect::None &&
             form.assembly_mnemonic != "eret") {
-            instruction("nop");
+            instruction(form.name == "$::_rfe" ? "rfe" : "nop");
         }
         if (output && output->kind == machine::RegisterKind::Virtual) {
             if (floating_output) {
@@ -10439,9 +10734,16 @@ private:
     }
 
     // Register saves and incoming arguments keep a fixed distance from the
-    // caller's stack pointer, which only $sp preserves in a realigned frame.
+    // caller's stack pointer, which only $sp preserves in a realigned frame,
+    // or its anchor when the frame also allocates on the stack.
+    std::string_view fixed_base() const {
+        return !realignment_ ? frame_base()
+               : anchor_.empty() ? std::string_view{"sp"}
+                                 : anchor_;
+    }
+
     std::string save_memory(std::int64_t offset) const {
-        return realignment_ ? memory(offset, "sp") : memory(offset);
+        return memory(offset, fixed_base());
     }
 
     std::string label_prefix(const machine::Function& function) const {
@@ -10745,13 +11047,30 @@ private:
         return *slot->frame_offset;
     }
 
+    // A definition's interface (`definition`) names the parameter its ABI
+    // cannot place; a call names the argument.
     std::optional<ActiveSignature> classify_entity(
         const hir::Function& entity, SourceLocation location,
-        std::span<const hir::TypeId> actual_types = {}) {
+        std::span<const hir::TypeId> actual_types = {},
+        bool definition = false) {
         const auto* abi = managed_abi_model(hir_, entity, subtarget_, options_);
-        return classify_interface(
-            *hir::call_signature(hir_, entity.id, std::nullopt), abi, location,
-            actual_types);
+        const auto signature =
+            *hir::call_signature(hir_, entity.id, std::nullopt);
+        // A call to a naked function uses its register interface, which a
+        // naked body reaches through its bound registers instead.
+        if (entity.naked && abi && !definition) {
+            auto layout =
+                naked_signature_layout(hir_, subtarget_, *abi, signature);
+            if (!layout) {
+                diagnostics_.error(location,
+                                   "MIPS naked function has an interface "
+                                   "outside registers");
+                return std::nullopt;
+            }
+            return ActiveSignature{abi, std::move(*layout)};
+        }
+        return classify_interface(signature, abi, location, actual_types,
+                                  definition);
     }
 
     std::optional<ActiveSignature>
@@ -10774,21 +11093,42 @@ private:
     std::optional<ActiveSignature>
     classify_interface(const hir::FunctionSignature& entity,
                        const AbiEntry* abi, SourceLocation location,
-                       std::span<const hir::TypeId> actual_types) {
+                       std::span<const hir::TypeId> actual_types,
+                       bool definition = false) {
         if (!abi) {
             diagnostics_.error(location,
                                "MIPS function has no registered ABI model");
             return std::nullopt;
         }
-        auto layout = classify_signature_layout(hir_, subtarget_, entity,
-                                                *abi, actual_types);
-        if (!layout) {
-            diagnostics_.error(
-                location,
-                "MIPS ABI model could not classify function interface");
+        auto classified = classify_signature_layout(hir_, subtarget_, entity,
+                                                    *abi, actual_types);
+        if (!classified) {
+            // The first value no rule of the entry places, as x86-64 names it.
+            std::string value = "the result";
+            auto type = entity.result_type;
+            const auto index = classified.error_value;
+            if (!classified.error_in_results) {
+                type = index < actual_types.size()
+                           ? actual_types[index]
+                           : entity.parameters[index].type;
+                if (definition && index < entity.parameters.size()) {
+                    location = entity.parameters[index].location;
+                    value = "parameter '" + entity.parameters[index].name + "'";
+                } else {
+                    value = "argument " + std::to_string(index + 1);
+                }
+            }
+            // Frame layout and emission classify a call again.
+            if (unplaceable_.insert({location.file, location.offset}).second) {
+                diagnostics_.error(location, "ABI '" + abi->canonical_name +
+                                                 "' cannot place " + value +
+                                                 " of type '" +
+                                                 hir::type_name(hir_, type) +
+                                                 "'");
+            }
             return std::nullopt;
         }
-        return ActiveSignature{abi, std::move(*layout)};
+        return ActiveSignature{abi, std::move(classified.layout)};
     }
 
     static std::string parameter_home_name(std::string_view reg) {
@@ -11029,11 +11369,32 @@ private:
         }
     }
 
-    // Caller-relative offsets into the incoming stack arguments.
-    std::int64_t incoming_offset(std::size_t offset) const {
-        return static_cast<std::int64_t>(
-            frame_size_ + active_signature_->abi->return_address_bytes +
-            offset);
+    // Caller-relative offsets into the incoming stack arguments; negative
+    // ones reach a callee home area below them.
+    std::int64_t incoming_offset(std::int64_t offset) const {
+        return static_cast<std::int64_t>(frame_size_) +
+               active_signature_->abi->return_address_bytes + offset;
+    }
+
+    // The bytes directly below the incoming arguments that a negative
+    // variadic_home_base reserves for a definition's unnamed home slots.
+    std::uint32_t variadic_home_reserve(
+        const machine::Function& function) const {
+        if (!active_signature_ ||
+            !binds_variadic_kind(hir_.function(function.source),
+                                 *active_signature_->abi,
+                                 AbiVariadicStateKind::CursorAddress)) {
+            return 0;
+        }
+        const auto& abi = *active_signature_->abi;
+        const auto* bank = abi_bank(abi, abi.variadic_home_bank);
+        if (!bank || abi.variadic_home_base >= 0) return 0;
+        const auto first =
+            abi.variadic_home_base +
+            static_cast<std::int64_t>(abi_cursor_count(
+                active_signature_->layout.call.named_cursors, bank->cursor)) *
+                abi.variadic_home_stride;
+        return first < 0 ? static_cast<std::uint32_t>(-first) : 0U;
     }
 
     void store_variadic_register(const AbiRegisterBank& bank,
@@ -11055,22 +11416,37 @@ private:
 
     // A definition that binds variadic state stores the incoming argument
     // registers its ABI model names before any body code runs: the home bank
-    // into the caller's area and the save banks into $variadic.save.
+    // into the caller's area, or for a negative base the unnamed ones into
+    // the area below the incoming arguments, and the save banks into
+    // $variadic.save.
     void emit_variadic_prologue(const machine::Function& function) {
         const auto& entity = hir_.function(function.source);
         if (!binds_variadic_state(entity)) return;
         const auto& abi = *active_signature_->abi;
-        if (const auto* bank = abi_bank(abi, abi.variadic_home_bank)) {
-            for (std::size_t index = 0; index < bank->arguments.size();
+        const auto* home = abi_bank(abi, abi.variadic_home_bank);
+        if (home && binds_variadic_kind(entity, abi,
+                                        AbiVariadicStateKind::CursorAddress)) {
+            const auto first =
+                abi.variadic_home_base < 0
+                    ? abi_cursor_count(
+                          active_signature_->layout.call.named_cursors,
+                          home->cursor)
+                    : 0U;
+            for (std::size_t index = first; index < home->arguments.size();
                  ++index) {
                 store_variadic_register(
-                    *bank, bank->arguments[index],
+                    *home, home->arguments[index],
                     save_memory(incoming_offset(
                         abi.variadic_home_base +
-                        index * abi.variadic_home_stride)));
+                        static_cast<std::int64_t>(index) *
+                            abi.variadic_home_stride)));
             }
         }
-        if (abi.variadic_save_banks.empty()) return;
+        if (abi.variadic_save_banks.empty() ||
+            !binds_variadic_kind(entity, abi,
+                                 AbiVariadicStateKind::RegisterSaveAddress)) {
+            return;
+        }
         const auto* save = named_slot(function, "$variadic.save");
         if (!save || !save->frame_offset) {
             diagnostics_.error(function.location,
@@ -11122,9 +11498,7 @@ private:
             std::string_view base = frame_base();
             std::int64_t offset{};
             if (resolved.base == VariadicStateBase::IncomingArguments) {
-                // Incoming arguments keep their distance from $sp in a
-                // realigned frame.
-                if (realignment_) base = "sp";
+                base = fixed_base();
                 offset = incoming_offset(resolved.offset);
             } else {
                 const auto* save = named_slot(function, "$variadic.save");
@@ -11134,8 +11508,7 @@ private:
                         "MIPS variadic register-save area has no frame slot");
                     return;
                 }
-                offset = *save->frame_offset +
-                         static_cast<std::int64_t>(resolved.offset);
+                offset = *save->frame_offset + resolved.offset;
             }
             instruction(address_add_immediate(),
                         reg_name(destination) + "," + reg_name(base) + "," +
@@ -11347,8 +11720,10 @@ private:
     // Reloads a late frame's registers before its final stack release. The
     // CFA moves from $fp to $sp before $fp is reloaded.
     void emit_late_frame_restores(const machine::Function& function) {
-        // $ra reloads first where $sp already addresses its save.
-        const bool moves_sp = function.frame.has_frame_pointer && !realignment_;
+        // $ra reloads first where $sp already addresses its save; an anchor
+        // returns $sp to the frame bottom and reloads last.
+        const bool moves_sp = function.frame.has_frame_pointer &&
+                              (!realignment_ || !anchor_.empty());
         const auto restore_ra = [&] {
             instruction(address_load(), "$ra," + memory(saved_ra_offset_, "sp"));
             if (cfi_) output_ << ".cfi_restore 31\n";
@@ -11356,13 +11731,23 @@ private:
         if (saves_ra_ && !moves_sp) restore_ra();
         emit_callee_restores(function, cfi_);
         if (moves_sp) {
-            instruction("move", "$sp,$fp");
+            instruction("move", anchor_.empty() ? std::string("$sp,$fp")
+                                                : "$sp," + reg_name(anchor_));
             if (cfi_) output_ << ".cfi_def_cfa_register 29\n";
             if (saves_ra_) restore_ra();
         }
         if (saves_fp_) {
             instruction(address_load(), "$fp," + memory(saved_fp_offset_, "sp"));
             if (cfi_) output_ << ".cfi_restore 30\n";
+        }
+        if (!anchor_.empty()) {
+            instruction(subtarget_.has_feature(Feature::Mips3) ? "ld" : "lw",
+                        reg_name(anchor_) + "," +
+                            memory(saved_anchor_offset_, "sp"));
+            if (cfi_) {
+                output_ << ".cfi_restore "
+                        << function.frame.cfa_anchor_register->value << '\n';
+            }
         }
     }
 
@@ -12059,7 +12444,7 @@ private:
             offset = static_cast<std::int64_t>(piece.location.stack_offset);
             if (parameter_entry) {
                 offset += frame_size_ + abi.return_address_bytes;
-                if (realignment_) base = "sp";
+                base = fixed_base();
             } else {
                 base = "sp";
             }
@@ -12117,15 +12502,6 @@ private:
         return size;
     }
 
-    // The largest slot alignment beyond the ABI stack alignment, or zero.
-    static std::uint32_t frame_realignment(const machine::Function& function) {
-        const auto stack = std::max(8U, function.frame.stack_alignment);
-        std::uint32_t result = 0;
-        for (const auto& slot : function.stack_slots)
-            if (!slot.elided && slot.alignment > stack) result = std::max(result, slot.alignment);
-        return result;
-    }
-
     bool finalize_frame(machine::Function& function) {
         auto offset = outgoing_size(function);
         function.frame.outgoing_argument_size = offset;
@@ -12134,11 +12510,19 @@ private:
         // addresses incoming arguments and register saves, and rounds $fp up
         // to the largest slot alignment as the base of every other slot.
         realignment_ = frame_realignment(function);
-        if (realignment_ && (has_dynamic_stack(function) || realignment_ > 32768U)) {
-            diagnostics_.error(function.location, has_dynamic_stack(function)
-                ? "MIPS cannot realign a frame that also has a variable-length allocation"
-                : "MIPS frame alignment exceeds 32768 bytes");
+        if (realignment_ > 32768U) {
+            diagnostics_.error(function.location,
+                               "MIPS frame alignment exceeds 32768 bytes");
             return false;
+        }
+        anchor_ = {};
+        if (realignment_ && has_dynamic_stack(function)) {
+            if (!function.frame.cfa_anchor_register) {
+                diagnostics_.error(function.location,
+                                   "MIPS realigned dynamic frame has no anchor");
+                return false;
+            }
+            anchor_ = gpr_name(*function.frame.cfa_anchor_register);
         }
         bool has_call = false;
         for (const auto& block : function.blocks) {
@@ -12185,8 +12569,9 @@ private:
             }
         }
         has_call_ = has_call;
+        const auto home = variadic_home_reserve(function);
         if (!has_dynamic_stack(function) && offset == 0 && !has_call && !incoming_stack &&
-            function.callee_saved_registers.empty()) {
+            function.callee_saved_registers.empty() && home == 0) {
             saved_fp_offset_ = 0;
             saved_ra_offset_ = 0;
             saves_fp_ = false;
@@ -12219,8 +12604,17 @@ private:
         } else {
             saved_ra_offset_ = 0;
         }
+        // The anchor is preserved like a callee-saved register.
+        if (!anchor_.empty()) {
+            const auto bytes =
+                subtarget_.has_feature(Feature::Mips3) ? 8U : 4U;
+            offset = align_up(offset, bytes);
+            saved_anchor_offset_ = offset;
+            offset += bytes;
+        }
+        // A callee variadic home area ends at the incoming arguments.
         frame_size_ = align_up(
-            offset, std::max(8U, function.frame.stack_alignment));
+            offset + home, std::max(8U, function.frame.stack_alignment));
         if (frame_size_ > 32760U) {
             diagnostics_.error(
                 function.location,
@@ -12582,8 +12976,8 @@ private:
             assignment.pieces.size() == 1 &&
             assignment.pieces.front().location.kind == LocationKind::Stack &&
             assignment.pieces.front().value_bits == target.mode.bits) {
-            const auto incoming =
-                incoming_offset(assignment.pieces.front().location.stack_offset);
+            const auto incoming = incoming_offset(static_cast<std::int64_t>(
+                assignment.pieces.front().location.stack_offset));
             if (const auto destination = assigned_fpr(function, target)) {
                 instruction(target.mode.bits <= 32 ? "lwc1" : "ldc1",
                             reg_name(*destination) + "," +
@@ -15942,6 +16336,12 @@ private:
     mir::StackUsage stack_usage_;
     // Alignment of $fp in a realigned frame, or zero.
     std::uint32_t realignment_{};
+    // The register that holds a realigned dynamic frame's bottom, and where
+    // its incoming value is saved.
+    std::string_view anchor_;
+    std::uint32_t saved_anchor_offset_{};
+    // Interfaces already diagnosed as unplaceable, by source position.
+    std::set<std::pair<const SourceFile*, std::size_t>> unplaceable_;
     std::uint32_t saved_fp_offset_{};
     std::uint32_t saved_ra_offset_{};
     // Blocks of the active function that run with its frame, and whether the
@@ -16405,6 +16805,56 @@ void AssemblyEmitter::emit_integer_pair_binary(
             instruction("move", "$t4,$t0");
             instruction("move", "$t5,$t1");
         }
+        store_pair();
+        return;
+    }
+    case Opcode::Mulhu:
+    case Opcode::Mulhs: {
+        // The high 64 bits of the 128-bit product, from the four 32-bit
+        // products of the words: t6/t7 accumulate bits 64-127, and the
+        // carries out of bits 32-63 (t5) and 64-95 (t7's start) go up.
+        instruction("multu", "$t0,$t2");
+        instruction("mfhi", "$t4");
+        instruction("multu", "$t0,$t3");
+        instruction("mflo", "$t5");
+        instruction("mfhi", "$t6");
+        instruction("addu", "$t4,$t4,$t5");
+        instruction("sltu", "$t5,$t4,$t5");
+        instruction("multu", "$t1,$t2");
+        instruction("mflo", "$t7");
+        instruction("addu", "$t4,$t4,$t7");
+        instruction("sltu", "$t7,$t4,$t7");
+        instruction("addu", "$t5,$t5,$t7");
+        instruction("mfhi", "$t7");
+        instruction("addu", "$t6,$t6,$t7");
+        instruction("sltu", "$t7,$t6,$t7");
+        instruction("addu", "$t6,$t6,$t5");
+        instruction("sltu", "$t5,$t6,$t5");
+        instruction("addu", "$t7,$t7,$t5");
+        instruction("multu", "$t1,$t3");
+        instruction("mflo", "$t5");
+        instruction("addu", "$t6,$t6,$t5");
+        instruction("sltu", "$t5,$t6,$t5");
+        instruction("addu", "$t7,$t7,$t5");
+        instruction("mfhi", "$t5");
+        instruction("addu", "$t7,$t7,$t5");
+        if (opcode == Opcode::Mulhs) {
+            // A negative operand's unsigned value exceeds its signed one by
+            // 2^64, which adds the other operand to the high half.
+            for (const auto& [sign, low, high] :
+                 {std::tuple{"$t1", "$t2", "$t3"},
+                  std::tuple{"$t3", "$t0", "$t1"}}) {
+                instruction("sra", std::string("$t5,") + sign + ",31");
+                instruction("and", std::string("$t4,") + low + ",$t5");
+                instruction("and", std::string("$t5,") + high + ",$t5");
+                instruction("sltu", "$at,$t6,$t4");
+                instruction("subu", "$t6,$t6,$t4");
+                instruction("subu", "$t7,$t7,$t5");
+                instruction("subu", "$t7,$t7,$at");
+            }
+        }
+        instruction("move", "$t4,$t6");
+        instruction("move", "$t5,$t7");
         store_pair();
         return;
     }
@@ -19090,8 +19540,9 @@ void AssemblyEmitter::emit_terminator(
 void AssemblyEmitter::emit_function(machine::Function& function) {
     const auto& entity = hir_.function(function.source);
     frame_active_ = true;
-    active_signature_ = classify_entity(entity, function.location);
+    active_signature_ = classify_entity(entity, function.location, {}, true);
     if (!active_signature_) return;
+    anchor_ = {};
     hilo_write_barrier_ = 0;
     fpu_multiply_pending_ = false;
     delayed_register_.reset();
@@ -19186,7 +19637,7 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
     // MIPS II has no odd single-precision arithmetic registers; code that
     // uses them leaves the ISA to the assembler's CPU.
     else if (subtarget_.has_feature(Feature::Mips2)) {
-        if (!odd_fpr_colors(subtarget_)) output_ << ".set mips2\n";
+        if (!odd_single_fprs(subtarget_)) output_ << ".set mips2\n";
     } else output_ << ".set mips1\n";
     unsigned alignment_power = 2;
     if (options_.function_alignment != 0) {
@@ -19213,8 +19664,11 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
     output_ << ".type " << symbol << ",@function\n"
             << ".ent " << symbol << '\n' << symbol << ":\n"
             << "\t.frame\t"
-            << respell_registers(function.frame.has_frame_pointer && !realignment_
-                                     ? "$fp" : "$sp")
+            << respell_registers(!anchor_.empty() ? reg_name(anchor_)
+                                 : function.frame.has_frame_pointer &&
+                                         !realignment_
+                                     ? std::string("$fp")
+                                     : std::string("$sp"))
             << ',' << frame_size_ << ','
             << respell_registers("$ra") << '\n';
     // A naked function has no unwind description.
@@ -19268,6 +19722,20 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
                         << static_cast<std::int64_t>(saved_fp_offset_) -
                                frame_size_
                         << '\n';
+            }
+        }
+        if (!anchor_.empty()) {
+            const auto id = function.frame.cfa_anchor_register->value;
+            instruction(subtarget_.has_feature(Feature::Mips3) ? "sd" : "sw",
+                        reg_name(anchor_) + "," +
+                            memory(saved_anchor_offset_, "sp"));
+            instruction("move", reg_name(anchor_) + ",$sp");
+            if (cfi) {
+                output_ << ".cfi_offset " << id << ","
+                        << static_cast<std::int64_t>(saved_anchor_offset_) -
+                               frame_size_
+                        << '\n'
+                        << ".cfi_def_cfa_register " << id << '\n';
             }
         }
         if (realignment_) {

@@ -780,10 +780,14 @@ private:
                                "variadic state cannot classify its fixed prefix");
             return;
         }
-        const auto cursor = abi_cursor_count(
+        auto cursor = abi_cursor_count(
             classified.layout.call.named_cursors, state->cursor);
-        const auto displacement = static_cast<std::size_t>(state->base) +
-                                  cursor * state->stride;
+        if (state->limit) {
+            cursor = std::min<std::size_t>(cursor, *state->limit);
+        }
+        const auto displacement =
+            static_cast<std::int64_t>(state->base) +
+            static_cast<std::int64_t>(cursor) * state->stride;
         if (state->kind == AbiVariadicStateKind::CursorOffset) {
             out_ << "  " << reference(value.id) << " = add "
                  << ir_type(hir_, value.type) << " 0, " << displacement
@@ -827,9 +831,14 @@ private:
                  << " to ptr\n";
             base = "%mir.va.aligned." + suffix;
         }
+        // llvm.va_start already points a cursor address past the named
+        // arguments.
         const auto adjustment =
             state->kind == AbiVariadicStateKind::RegisterSaveAddress
-                ? displacement : state->base;
+                ? displacement
+            : state->kind == AbiVariadicStateKind::CursorAddress
+                ? std::int64_t{0}
+                : std::int64_t{state->base};
         out_ << "  " << reference(value.id)
              << " = getelementptr i8, ptr " << base
              << ", i64 " << adjustment << '\n';

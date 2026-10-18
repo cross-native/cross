@@ -115,7 +115,8 @@ starting with a letter or `_`. A value is:
   `\t`; a string cannot span lines;
 - an identifier other than `true` and `false`, which stands for the string
   with the same spelling;
-- an unsigned decimal integer;
+- a decimal integer, which may start with `-` only where a property says
+  so;
 - `true` or `false`; or
 - a list of strings or identifiers, such as `["a0", "a1"]`; `[]` is empty.
 
@@ -591,9 +592,13 @@ of the convention:
   `variadic_save_alignment`, a power of two, with one slot of the bank's
   `register_bits` per register.
 - `variadic_home_bank` makes a variadic function store its incoming argument
-  registers of that bank in the caller's stack at
-  `variadic_home_base + index * variadic_home_stride`; the stride must not
-  be 0.
+  registers of that bank at `variadic_home_base + index *
+  variadic_home_stride`, counted like a `"cursor_address"` state from the
+  start of the caller's argument area; the stride must not be 0. A negative
+  `variadic_home_base` places the slots in the function's own frame directly
+  below the incoming stack arguments, which every slot must precede, and
+  stores only the registers of unnamed arguments there, so that they and the
+  stack arguments form one sequence.
 - A `variadic_shadow` block copies each argument passed in its
   `source_bank` into the register at the same position of its
   `target_bank`. Both banks must share a cursor, and `target_bank` needs at
@@ -650,29 +655,30 @@ a `variadic_state` block of the function's ABI:
 | `cursor` | text | none | see below |
 | `base` | integer | `0` | no |
 | `stride` | integer | `0` | see below |
+| `limit` | integer | none | no |
 | `alignment` | integer | `1` | no |
 | `llvm_va_list_offset` | integer | none | no |
 
 With `n` the number of positions of `cursor` that the named arguments use,
-the kinds are:
+but no more than `limit`, or 0 without `cursor`, the kinds are:
 
 - `"cursor_offset"`: the integer `base + n * stride`;
 - `"cursor_address"`: the address `base + n * stride` in the incoming stack
   arguments, counted from the start of the caller's argument area, including
   its `argument_stack_base` bytes;
 - `"register_save_address"`: the address `base + n * stride` in the area of
-  `variadic_save_banks`, which must not be empty; without `cursor`, `n` is
-  0; and
+  `variadic_save_banks`, which must not be empty; and
 - `"stack_address"`: the address just past the stack arguments of the named
   parameters, rounded up to `alignment`, plus `base`.
 
-`"cursor_offset"` and `"cursor_address"` need `cursor` and a nonzero
-`stride`. `cursor` names a cursor, which need not be the name of a bank.
-`alignment` is a power of two. `type` is the exact Cross scalar or pointer
-type, without qualifiers, that the binding must have: typedefs and generic
-arguments are resolved first, and no conversion applies. State names, and
-the names of a definition's bindings, must be unique. A definition without
-bindings reserves no storage for them.
+A state with `cursor` needs a nonzero `stride`, and one without `cursor`
+has neither `stride` nor `limit`; `base` and `stride` may be negative.
+`cursor` names a cursor, which need not be the name of a bank. `alignment`
+is a power of two. `type` is the exact Cross scalar or pointer type, without
+qualifiers, that the binding must have: typedefs and generic arguments are
+resolved first, and no conversion applies. State names, and the names of a
+definition's bindings, must be unique. A definition without bindings
+reserves no storage for them.
 
 `-emit-llvm` describes the `llvm.va_start` area with
 `variadic_va_list_bytes`, `variadic_va_list_alignment`, and each state's

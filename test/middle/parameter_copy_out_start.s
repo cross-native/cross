@@ -12,6 +12,10 @@ _start:
         # The fixture uses floating point: enable CP1 before entering it.
         mfc0 $8,$12
         lui $9,0x2000
+        # The 64-bit address ABIs use the 64-bit FPU (Status.FR).
+.ifdef CROSS_MIPS_FR64
+        lui $9,0x2400
+.endif
         or $8,$8,$9
         mtc0 $8,$12
         nop

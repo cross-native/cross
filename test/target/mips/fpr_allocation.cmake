@@ -3,7 +3,8 @@
 
 # Floating values take FPRs on every hard-float CPU. FR=0 doubles and the
 # singles of MIPS I-IV and FPXX MIPS32 code use even registers; a
-# single-precision FPU also uses the odd ones unless -mno-odd-spreg. MIPS I
+# single-precision FPU also uses the odd ones unless -mno-odd-spreg, and so
+# does FP32 MIPS32 code in functions without FR=0 doubles. MIPS I
 # saves both halves of a preserved pair, separates a transfer into the odd
 # half from the next use of the pair, and moves f64 words directly; floating
 # comparisons branch directly into blocks with phis.
@@ -42,16 +43,21 @@ set(odd_arithmetic
     "\n\t[a-z]+[.][a-z.]+\t[^\n]*[$]f([0-9]*[13579])[,\n]")
 
 foreach(cpu r3000 mips2 mips32 mips32r2 vr4300)
+    # MIPS32 keeps to even registers under -mfpxx.
+    set(fpu "")
+    if(cpu MATCHES "^mips32")
+        set(fpu -mfpxx)
+    endif()
     foreach(triple mips mipsel)
         set(name "${cpu}-${triple}")
         compile(${name} "${SOURCE}"
-                -target ${triple}-unknown-elf -mabi=o32 -march=${cpu})
+                -target ${triple}-unknown-elf -mabi=o32 -march=${cpu} ${fpu})
         set(even "${assembly}")
         compile(${name}-single "${SINGLE_SOURCE}"
-                -target ${triple}-unknown-elf -mabi=o32 -march=${cpu})
+                -target ${triple}-unknown-elf -mabi=o32 -march=${cpu} ${fpu})
         string(APPEND even "${assembly}")
         compile(${name}-branch "${BRANCH_SOURCE}"
-                -target ${triple}-unknown-elf -mabi=o32 -march=${cpu})
+                -target ${triple}-unknown-elf -mabi=o32 -march=${cpu} ${fpu})
         string(APPEND even "${assembly}")
         function_body("${even}" fma32 body)
         if(body MATCHES "[\t ](lwc1|swc1)[\t ]" OR
@@ -75,6 +81,60 @@ foreach(cpu r3000 mips2 mips32 mips32r2 vr4300)
         endif()
     endforeach()
 endforeach()
+
+# FP32 MIPS32 code colors odd single registers where no FR=0 double could
+# overlap them, and every function with a double keeps to even registers.
+foreach(cpu mips32 mips32r2)
+    compile(${cpu}-odd "${SINGLE_SOURCE}"
+            -target mips-unknown-elf -mabi=o32 -march=${cpu})
+    function_body("${assembly}" pressure32 body)
+    if(NOT body MATCHES "${odd_arithmetic}")
+        message(FATAL_ERROR "${cpu}: FP32 singles did not color odd registers\n${body}")
+    endif()
+    compile(${cpu}-pairs "${SOURCE}"
+            -target mips-unknown-elf -mabi=o32 -march=${cpu})
+    string(REGEX MATCHALL "\n[.]ent [a-z_0-9]+" entries "${assembly}")
+    foreach(entry IN LISTS entries)
+        string(REGEX REPLACE "\n[.]ent " "" symbol "${entry}")
+        function_body("${assembly}" ${symbol} body)
+        if(body MATCHES "\n\t[a-z]+[.]d\t" AND body MATCHES "${odd_arithmetic}")
+            message(FATAL_ERROR
+                "${cpu}: ${symbol} has doubles and odd register $f${CMAKE_MATCH_1}\n${body}")
+        endif()
+    endforeach()
+endforeach()
+
+# Their objects are FP32 with odd single registers; FPXX code, and MIPS II
+# code, which has no odd single registers, is FPXX without them.
+find_program(LLVM_READELF NAMES llvm-readelf)
+if(LLVM_READELF)
+    foreach(case
+            "mips32||Hard float [(]double precision[)]|00000001"
+            "mips32r2||Hard float [(]double precision[)]|00000001"
+            "mips32|-mfpxx|Hard float [(]32-bit CPU, Any FPU[)]|00000000"
+            "mips2||Hard float [(]32-bit CPU, Any FPU[)]|00000000")
+        string(REPLACE "|" ";" fields "${case}")
+        list(GET fields 0 cpu)
+        list(GET fields 1 fpu)
+        list(GET fields 2 fp_abi)
+        list(GET fields 3 flags)
+        set(object "${OUTPUT}.${cpu}${fpu}.o")
+        execute_process(
+            COMMAND "${CC}" -c -O2 -target mips-unknown-elf -mabi=o32
+                    -march=${cpu} ${fpu} "${SINGLE_SOURCE}" -o "${object}"
+            RESULT_VARIABLE status ERROR_VARIABLE stderr)
+        if(NOT status EQUAL 0)
+            message(FATAL_ERROR "${cpu} ${fpu} object failed\n${stderr}")
+        endif()
+        execute_process(COMMAND "${LLVM_READELF}" -A "${object}"
+                        OUTPUT_VARIABLE attributes)
+        if(NOT attributes MATCHES "FP ABI: ${fp_abi}\n" OR
+           NOT attributes MATCHES "FLAGS 1: ${flags}\n")
+            message(FATAL_ERROR
+                "${cpu} ${fpu}: expected FP ABI '${fp_abi}', flags ${flags}\n${attributes}")
+        endif()
+    endforeach()
+endif()
 
 compile(mips1 "${SOURCE}" -target mips-unknown-elf -mabi=o32 -march=r3000)
 # A preserved double's odd half has its own save.

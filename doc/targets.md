@@ -307,7 +307,7 @@ options adjust them:
 | --- | --- |
 | `-mhard-float`, `-msoft-float`, `-msingle-float` | FPU availability. |
 | `-mfp32`, `-mfpxx`, `-mfp64` | FPU register model. |
-| `-modd-spreg` | The FPU has odd-numbered single-precision registers; the MIPS32 and MIPS64 CPUs with an FPU other than the GS464, and `allegrex`, enable it. A single-precision FPU then keeps `f32` values in all 32 registers; other FPUs keep them in even registers, which also hold `f64` values as even/odd pairs under `-mfp32`. |
+| `-modd-spreg` | The FPU has odd-numbered single-precision registers; the MIPS32 and MIPS64 CPUs with an FPU other than the GS464, and `allegrex`, enable it. A single-precision FPU and a 64-bit-register FPU (`-mfp64`) then keep values in all 32 registers; under `-mfp32`, where an `f64` occupies an even/odd pair, a function without `f64` values keeps its `f32` values in all 32 registers and others keep floating values in even registers. `-mfpxx` code and FPUs without them use even registers only. |
 | `-mllsc` | 32-bit LL/SC atomics. |
 | `-mfix4300` | Separate consecutive floating-point multiplies affected by the VR4300 erratum. |
 | `-mnan2008` | Use the IEEE 754-2008 NaN encoding of MIPS32 Release 2 FPUs; the output declares it with `.nan 2008`. |
@@ -321,10 +321,13 @@ a 64-bit CPU.
 The objects record the CPU's ISA level, the ABI (`o32` or `eabi32` in ELF32),
 `32bitmode` for 64-bit registers in ELF32, `noreorder`, and `nan2008` in the
 header flags, and the floating-point ABI in `.MIPS.abiflags`: soft float,
-single precision, 64-bit FPRs, FP32 on CPUs without `ldc1` and `sdc1` (such
-as MIPS I), and otherwise FPXX with no odd single-precision registers,
+single precision, 64-bit FPRs, FP32 with odd single-precision registers on
+CPUs that have them under `-mfp32` and on CPUs without `ldc1` and `sdc1`
+(such as MIPS I), and otherwise FPXX with no odd single-precision registers,
 because the code uses only the part of the paired-register convention that
-runs on 32- and 64-bit FPUs alike.
+runs on 32- and 64-bit FPUs alike. FP32 objects are compatible with FP32
+and FPXX objects but not with 64-bit-FPR ones; `-mfpxx` keeps MIPS32 code
+FPXX.
 With 64-bit addresses, symbol addresses use two instructions by default, so
 symbols must lie in the low 2 GB or in the sign-extended KSEG0/KSEG1 range
 unless `-mcmodel=large` is given. Assembly output names general registers by
@@ -367,20 +370,31 @@ its feature gates and whether it is privileged or volatile):
 | Built-in | Instruction | Needs |
 | --- | --- | --- |
 | `$::_mfc0(out u32 value, n)`, `$::_mtc0(in u32 value, n)` | `mfc0`, `mtc0` of coprocessor 0 register `n` | |
-| `$::_dmfc0`, `$::_dmtc0` with `u64` | `dmfc0`, `dmtc0` | MIPS III |
+| `$::_mfc0(out u32 value, n, sel)`, `$::_mtc0(in u32 value, n, sel)` | `mfc0`, `mtc0` of register `n` with select `sel` | MIPS32 |
+| `$::_dmfc0`, `$::_dmtc0` with `u64` | `dmfc0`, `dmtc0`, with an optional select | MIPS III; with a select MIPS64 |
 | `$::_tlbp()`, `$::_tlbr()`, `$::_tlbwi()`, `$::_tlbwr()` | TLB probe, read, and writes | |
 | `$::_cache(operation, object)` | `cache operation` on the line that holds `object` (`*pointer` or `pointer[index]`) | MIPS III or MIPS32 |
 | `$::_sync()` | `sync` | MIPS II |
+| `$::_syscall()`, `$::_syscall(code)`, `$::_break()`, `$::_break(code)` | `syscall` with a 20-bit code, `break` with a 10-bit code | |
+| `$::_wait()` | `wait` | MIPS32 |
 | `$::_cfc1(out u32 value, n)`, `$::_ctc1(in u32 value, n)` | FPU control register `n`; 31 is the FCSR | hard float |
 | `$::_sqrt`, `$::_abs`, `$::_neg` with `f32` or `f64` operands | `sqrt.s`/`.d`, `abs.s`/`.d`, `neg.s`/`.d` | hard float; `sqrt` MIPS II; `f64` not with `-msingle-float` |
 | `$::_eret()` | `eret`; naked functions only | MIPS III or MIPS32 |
+| `$::_rfe(in u32 value)` | `jr` through a register with `rfe` in its delay slot; naked functions only | MIPS I and II |
 | `$::_jr(in value)` | `jr` through a register; naked functions only | |
+| `$::_b(label)` | branch to a label of the function; naked functions only | |
+| `$::_beq(in a, in b, label)`, `$::_bne(in a, in b, label)` | branch if two registers are equal or differ; naked functions only | |
+| `$::_beqz`, `$::_bnez`, `$::_bltz`, `$::_bgez`, `$::_blez`, `$::_bgtz` with `(in a, label)` | branch on a register compared with zero, as a signed integer for an ordering; naked functions only | |
 | `$::_nop()` | `nop` | |
 
-Register numbers and cache operations are constants. Coprocessor 0, TLB,
-cache, `sync`, and FCSR forms are kept, in order with memory accesses and each
-other; every coprocessor 0 and FCSR read is volatile, since Count, Random,
-Cause, and the FCSR flags change without a write. `sqrt`, `abs`, and `neg`
+Register numbers, selects, codes, and cache operations are constants.
+Coprocessor 0, TLB, cache, `sync`, `syscall`, `break`, `wait`, and FCSR
+forms are kept, in order with memory accesses and each other; every
+coprocessor 0 and FCSR read is volatile, since Count, Random, Cause, and the
+FCSR flags change without a write. An exception handler that `syscall` or
+`break` enters from managed code must preserve every register. Branch forms
+take `u32` and `i32` or, from MIPS III, `u64` and `i64` operands, and the
+compiler fills their delay slots. `sqrt`, `abs`, and `neg`
 are optimized like arithmetic. Floating-point operations are not ordered
 against `$::_ctc1` or `$::_cfc1`.
 
@@ -399,8 +413,8 @@ separated by two instructions that are not loads or cache operations. MIPS I
 code is assumed to run unmapped or through an unchanged mapping.
 
 A `[[naked]]` function names a register for each parameter and its result,
-binds every local object to a register, and leaves through `$::_jr` or
-`$::_eret`:
+binds every local object to a register, and leaves through `$::_jr`,
+`$::_eret`, or `$::_rfe`:
 
 ```text
 [[naked, clobber("k0", "k1")]]
@@ -422,20 +436,45 @@ no frame: a value that needs another register, stack storage, a call, a
 `return`, or an instruction that writes a register outside its clobbers,
 interface, and bound registers (such as `hi` and `lo` for a multiply, which
 `clobber("hi", "lo")` permits) is an error. No `clobber` list can name `gp`,
-`sp`, or `fp`, which hold compiler state across calls. `[[raw_inline]]` functions are inlined into it. Other functions cannot
-call a naked function that has parameters or a result.
+`sp`, or `fp`, which hold compiler state across calls. `[[raw_inline]]`
+functions are inlined into it. Other functions call a naked function with
+each argument and the result in the register its parameter and result name;
+a call keeps every register outside the function's clobbers and interface,
+and cannot pass `out` or `inout` parameters.
 
 A variadic definition reads its unnamed arguments through the states of its
 ABI. Under `o32`, `arg_area` (`void *`) is the C `va_start` address: the
 definition stores `a0`–`a3` in the 16 bytes that the caller reserves for them,
 so the unnamed arguments form one sequence of 4-byte slots in which `f64` and
 `i64` values start at a multiple of 8, and the pointer may be passed to a C
-function that takes a `va_list`. Under `x32` and `x64`, `gp_arg_area` and
-`fp_arg_area` point at the saved integer and floating argument registers that
-follow the named arguments and `overflow_arg_area` at the stack arguments
-that follow them; `n64` has `gp_arg_area` for its one
-sequence of argument registers and `overflow_arg_area`. Under `eabi32`,
-`arg_area` reaches only the unnamed arguments passed on the stack.
+function that takes a `va_list`. Under `n64`, `arg_area` is the C `va_list`
+in the same way: the definition stores the argument registers of its unnamed
+arguments directly below its stack arguments, so that all of them form one
+sequence of 8-byte slots; `gp_arg_area` (`u64 *`) has the same address, and
+`overflow_arg_area` points at the stack arguments that follow the named ones.
+Under `eabi32`, the definition likewise stores the general registers of its
+unnamed arguments as 4-byte slots directly below its stack arguments, where
+`i64` and `f64` values start at a multiple of 8. Without a double-precision
+FPU, every unnamed argument travels in that sequence, and `arg_area` is GCC's
+`va_list`. With one, unnamed `f64` values travel in `f12`–`f19`, and GCC's
+`va_list` is this record, whose fields hold the states of the same names:
+
+```text
+struct va_list_record {
+    void *overflow_arg_area;
+    void *gpr_top;
+    void *fpr_top;
+    u8 gpr_offset;
+    u8 fpr_offset;
+    u8 reserved[2];
+};
+```
+
+Under `x32` and `x64`, `gp_arg_area` and `fp_arg_area` point at the saved
+integer and floating argument registers that follow the named arguments, and
+`overflow_arg_area` at the stack arguments that follow them. These Cross ABIs
+have no C `va_list`; a definition that forwards its unnamed arguments to C
+selects `o32`, `eabi32`, or `n64`, for example with `[[abi("n64")]]`.
 
 ### Small data
 
@@ -557,6 +596,3 @@ and `clo` are SPECIAL functions 0x16 and 0x17, not the MIPS32 encodings.
 - `-emit-llvm` and `-emit-gimple` output ignores the profile's floating
   environment: it is valid only where no exception traps and denormal results
   are kept.
-- On MIPS, a function that allocates a variable-length array cannot also have
-  a local aligned beyond the stack alignment (8 bytes under o32 and EABI, 16
-  under n64 and the Cross ABIs).

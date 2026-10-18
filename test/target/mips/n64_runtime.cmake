@@ -97,9 +97,12 @@ if(DEFINED GCC_SOURCE AND NOT "${GCC_SOURCE}" STREQUAL "")
                 "${GCC_SOURCE}" -o "${OUTPUT}.gcc.o")
     list(APPEND objects "${OUTPUT}.gcc.o")
 endif()
+# Startups shared with 32-bit address tests enable Status.FR, which these
+# ABIs need, under CROSS_MIPS_FR64.
 run_checked(startup "${LLVM_MC}" --filetype=obj
             --triple=${n64_arch}-unknown-elf --mcpu=mips64
-            --mattr=+noabicalls "${STARTUP}" -o "${start}")
+            --mattr=+noabicalls --defsym=CROSS_MIPS_FR64=1 "${STARTUP}"
+            -o "${start}")
 run_checked(link-elf64 "${LLD}" -m ${n64_link_emulation} -T "${LINKER}"
             "${start}" ${objects} -o "${image}")
 

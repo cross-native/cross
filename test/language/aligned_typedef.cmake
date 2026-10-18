@@ -123,8 +123,15 @@ typedef wide_u32 lanes [[vector_size(16)]];
         endif()
     endif()
 else()
-    compile(realigned_vla "MIPS cannot realign a frame that also has a variable-length allocation"
+    # A realigned frame that also allocates on the stack keeps its fixed
+    # frame bottom in an anchor register.
+    compile(realigned_vla ""
         "typedef u8 line_u8 [[aligned(64)]];
 global u32 f(in u32 count) { line_u8 cell = 1u8; u8 bytes[count]; bytes[0] = cell; return bytes[0]; }\n"
         -target mips-unknown-elf -O0)
+    file(READ "${OUTPUT}/realigned_vla.s" text)
+    if(NOT text MATCHES "\tmove\t[$]s7,[$]sp\n" OR
+       NOT text MATCHES "\tmove\t[$]sp,[$]s7\n")
+        message(FATAL_ERROR "realigned_vla keeps no frame anchor\n${text}")
+    endif()
 endif()

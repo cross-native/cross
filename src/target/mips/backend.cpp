@@ -354,14 +354,21 @@ public:
                 }
             }
             for (const auto& value : function.values) {
+                // A call places a naked callee's arguments and takes its
+                // result in the registers of its interface.
                 if (value.kind == mir::ValueKind::Call && value.callee) {
                     const auto& callee = hir_module.function(*value.callee);
-                    if (callee.naked && (!callee.parameters.empty() ||
-                                         callee.result_location)) {
+                    if (callee.naked &&
+                        std::any_of(callee.parameters.begin(),
+                                    callee.parameters.end(),
+                                    [](const hir::Parameter& parameter) {
+                                        return parameter.mode !=
+                                               ParameterMode::In;
+                                    })) {
                         diagnostics.error(
                             value.location,
-                            "calls to a MIPS naked function with manual "
-                            "parameters or a result are not implemented");
+                            "calls to a MIPS naked function with out or "
+                            "inout parameters are not implemented");
                     }
                 }
                 if (value.kind != mir::ValueKind::Call || value.callee ||

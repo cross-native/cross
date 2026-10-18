@@ -69,7 +69,10 @@ public:
         case '"': return string();
         default: break;
         }
-        if (std::isdigit(static_cast<unsigned char>(ch)) != 0) {
+        const bool negative =
+            ch == '-' && offset_ + 1 < input_.size() &&
+            std::isdigit(static_cast<unsigned char>(input_[offset_ + 1])) != 0;
+        if (negative || std::isdigit(static_cast<unsigned char>(ch)) != 0) {
             const auto begin = offset_++;
             while (offset_ < input_.size() &&
                    std::isdigit(static_cast<unsigned char>(input_[offset_])) != 0) {
@@ -166,7 +169,9 @@ private:
 struct ModelValue {
     enum class Kind { Text, Integer, Boolean, List } kind{Kind::Text};
     std::string text;
+    // The magnitude of an integer; `negative` gives its sign.
     std::uint64_t integer{};
+    bool negative{};
     bool boolean{};
     std::vector<std::string> list;
 };
@@ -1204,10 +1209,12 @@ private:
         }
         if (current_.kind == ModelTokenKind::Integer) {
             result.kind = ModelValue::Kind::Integer;
+            const auto digits = current_.text.starts_with('-') ? 1U : 0U;
             const auto parsed = std::from_chars(
-                current_.text.data(),
+                current_.text.data() + digits,
                 current_.text.data() + current_.text.size(),
                 result.integer);
+            result.negative = digits != 0 && result.integer != 0;
             if (parsed.ec != std::errc{}) {
                 fail(current_.line, "model integer is out of range");
                 return std::nullopt;
@@ -1415,6 +1422,7 @@ private:
         const auto found = properties.find(std::string(name));
         if (found == properties.end()) return std::nullopt;
         if (found->second.value.kind != ModelValue::Kind::Integer ||
+            found->second.value.negative ||
             found->second.value.integer > static_cast<std::uint64_t>(
                                                 std::numeric_limits<unsigned>::max())) {
             fail(found->second.line,
@@ -1423,6 +1431,25 @@ private:
             return std::nullopt;
         }
         return static_cast<unsigned>(found->second.value.integer);
+    }
+
+    // The few properties that state offsets may be negative.
+    std::optional<int> signed_property(
+        const ModelProperties& properties, std::string_view name) {
+        const auto found = properties.find(std::string(name));
+        if (found == properties.end()) return std::nullopt;
+        const auto& value = found->second.value;
+        const auto limit = static_cast<std::uint64_t>(
+                               std::numeric_limits<int>::max()) +
+                           (value.negative ? 1U : 0U);
+        if (value.kind != ModelValue::Kind::Integer || value.integer > limit) {
+            fail(found->second.line, "model property '" + std::string(name) +
+                                         "' must be an integer");
+            return std::nullopt;
+        }
+        return value.negative
+                   ? static_cast<int>(-static_cast<std::int64_t>(value.integer))
+                   : static_cast<int>(value.integer);
     }
 
     std::optional<AbiRegisterFailure> abi_failure(
@@ -1671,7 +1698,7 @@ private:
         result.variadic_home_bank =
             text_property(properties, "variadic_home_bank").value_or("");
         if (const auto value =
-                unsigned_property(properties, "variadic_home_base")) {
+                signed_property(properties, "variadic_home_base")) {
             result.variadic_home_base = *value;
         }
         if (const auto value =
@@ -1932,8 +1959,8 @@ private:
             }
             if (!known_properties(
                     block.properties,
-                    {"type", "kind", "cursor", "base", "stride", "alignment",
-                     "llvm_va_list_offset"})) {
+                    {"type", "kind", "cursor", "base", "stride", "limit",
+                     "alignment", "llvm_va_list_offset"})) {
                 return std::nullopt;
             }
             AbiVariadicState state;
@@ -1966,12 +1993,18 @@ private:
             state.cursor =
                 text_property(block.properties, "cursor").value_or("");
             if (const auto value =
-                    unsigned_property(block.properties, "base")) {
+                    signed_property(block.properties, "base")) {
                 state.base = *value;
             }
             if (const auto value =
-                    unsigned_property(block.properties, "stride")) {
+                    signed_property(block.properties, "stride")) {
                 state.stride = *value;
+            }
+            state.limit = unsigned_property(block.properties, "limit");
+            if (state.limit && state.cursor.empty()) {
+                fail(block.line,
+                     "ABI variadic state limit requires a cursor");
+                return std::nullopt;
             }
             if (const auto value =
                     unsigned_property(block.properties, "alignment")) {
@@ -1979,14 +2012,12 @@ private:
             }
             state.llvm_va_list_offset = unsigned_property(
                 block.properties, "llvm_va_list_offset");
-            const bool needs_cursor =
-                state.kind == AbiVariadicStateKind::CursorOffset ||
-                state.kind == AbiVariadicStateKind::CursorAddress;
-            if (needs_cursor &&
-                (state.cursor.empty() || state.stride == 0)) {
+            // Without a cursor, n is 0 and the state is its base.
+            if (state.cursor.empty() != (state.stride == 0) &&
+                state.kind != AbiVariadicStateKind::StackAddress) {
                 fail(block.line,
-                     "cursor-based ABI variadic state requires a nonempty "
-                     "cursor and nonzero stride");
+                     "ABI variadic state with a cursor requires a nonzero "
+                     "stride, and one without a cursor no stride");
                 return std::nullopt;
             }
             if (state.alignment == 0 ||
@@ -2077,6 +2108,11 @@ private:
             result.variadic_home_stride == 0) {
             fail(line,
                  "ABI variadic home bank requires a nonzero stride");
+            return std::nullopt;
+        }
+        if (result.variadic_home_base < 0 &&
+            result.variadic_home_bank.empty()) {
+            fail(line, "a negative variadic_home_base requires a home bank");
             return std::nullopt;
         }
         if (!result.variadic_supported &&
@@ -2507,14 +2543,22 @@ private:
                      model + " has an invalid variadic home bank");
                 return false;
             }
+            // A callee home area lies wholly below the incoming arguments.
+            if (abi.variadic_home_base < 0 &&
+                abi.variadic_home_base +
+                        static_cast<std::int64_t>(bank->arguments.size()) *
+                            abi.variadic_home_stride >
+                    0) {
+                fail(property_line(properties, "variadic_home_base"),
+                     model + " places variadic home slots on both sides of "
+                             "the incoming arguments");
+                return false;
+            }
         }
         for (std::size_t index = 0; index < abi.variadic_states.size();
              ++index) {
             const auto& state = abi.variadic_states[index];
-            const bool needs_cursor =
-                state.kind == AbiVariadicStateKind::CursorOffset ||
-                state.kind == AbiVariadicStateKind::CursorAddress;
-            if ((needs_cursor && !cursor_known(state.cursor)) ||
+            if ((!state.cursor.empty() && !cursor_known(state.cursor)) ||
                 (state.kind == AbiVariadicStateKind::RegisterSaveAddress &&
                  abi.variadic_save_banks.empty()) ||
                 (state.llvm_va_list_offset &&
@@ -2533,7 +2577,13 @@ private:
         const std::string& name, const ModelProperty& property) {
         switch (property.value.kind) {
         case ModelValue::Kind::Boolean: return property.value.boolean;
-        case ModelValue::Kind::Integer: return property.value.integer;
+        case ModelValue::Kind::Integer:
+            if (property.value.negative) {
+                fail(property.line, "compiler option property '" + name +
+                                        "' cannot be negative");
+                return std::nullopt;
+            }
+            return property.value.integer;
         case ModelValue::Kind::Text: return property.value.text;
         case ModelValue::Kind::List:
             fail(property.line,

@@ -508,12 +508,14 @@ bool allocate_stack_value(const AbiEntry& abi, const AbiValue& value,
 bool allocate_partial_stack_piece(
     const AbiEntry& abi, const PieceRequest& request,
     std::size_t cursor, AllocationState& state,
-    ArgumentAssignment& assignment) {
+    ArgumentAssignment& assignment, std::size_t minimum_alignment = 1) {
     // A piece wider than a slot keeps its whole carrier; in a packed area
-    // it is also aligned like that carrier.
+    // it is also aligned like that carrier, and the first piece of a value
+    // that no register holds like its rule's stack_alignment.
     const auto bytes = std::max<std::size_t>(
         abi.stack_slot_bytes, (request.carrier_bits + 7U) / 8U);
-    std::size_t alignment = abi.stack_slot_bytes;
+    std::size_t alignment =
+        std::max<std::size_t>(abi.stack_slot_bytes, minimum_alignment);
     std::size_t offset{};
     if (abi.stack_layout == AbiStackLayout::Slots) {
         if (cursor >
@@ -921,15 +923,21 @@ SignatureClassificationResult classify_signature_values(
                             false);
                     }
                 } else {
+                    auto alignment =
+                        assignment.pieces.empty() && work.lowered.rule
+                            ? std::size_t{work.lowered.rule->stack_alignment}
+                            : std::size_t{1};
                     for (const auto& pending : work.partial_stack) {
                         if (!allocate_partial_stack_piece(
                                 abi, pending.request, pending.cursor,
-                                stack, assignment)) {
+                                stack, assignment,
+                                std::max<std::size_t>(alignment, 1))) {
                             return signature_fail(
                                 std::move(layout),
                                 ClassificationError::SizeOverflow,
                                 index, false);
                         }
+                        alignment = 1;
                     }
                 }
                 if (fixed_argument_count &&
@@ -1214,9 +1222,11 @@ VariadicStateValue variadic_state_value(
     const AbiVariadicState& state,
     std::span<const AbiCursorUsage> named_cursors,
     std::size_t variadic_stack_offset) {
+    auto count = abi_cursor_count(named_cursors, state.cursor);
+    if (state.limit) count = std::min<std::size_t>(count, *state.limit);
     const auto displacement =
-        static_cast<std::size_t>(state.base) +
-        abi_cursor_count(named_cursors, state.cursor) * state.stride;
+        static_cast<std::int64_t>(state.base) +
+        static_cast<std::int64_t>(count) * state.stride;
     switch (state.kind) {
     case AbiVariadicStateKind::CursorOffset:
         return {VariadicStateBase::None, displacement};
@@ -1229,7 +1239,8 @@ VariadicStateValue variadic_state_value(
     }
     const auto alignment = static_cast<std::size_t>(state.alignment);
     return {VariadicStateBase::IncomingArguments,
-            ((variadic_stack_offset + alignment - 1U) & ~(alignment - 1U)) +
+            static_cast<std::int64_t>(
+                (variadic_stack_offset + alignment - 1U) & ~(alignment - 1U)) +
                 state.base};
 }
 

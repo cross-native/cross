@@ -5313,6 +5313,10 @@ private:
 
     bool machine_operand_matches(const InstructionOperandEntry& field,
                                  const Expr& argument) {
+        if (field.allow_label) {
+            return argument.kind == Expr::Kind::Name &&
+                   hir_.label(current_.source, argument) != nullptr;
+        }
         const auto type = infer_type(argument);
         const bool name = argument.kind == Expr::Kind::Name;
         if (field.allow_memory && memory_designator(argument)) {
@@ -5403,6 +5407,12 @@ private:
         };
         const auto* form = select_machine_form(expression);
         if (!form) co_return std::nullopt;
+        if (naked_ &&
+            (form->control == InstructionControlEffect::UnconditionalBranch ||
+             (form->control == InstructionControlEffect::ConditionalBranch &&
+              form->branch_condition != InstructionBranchCondition::None))) {
+            co_return co_await lower_machine_branch_async(expression, *form);
+        }
         // A naked body leaves through a raw return; raw branches stay in the
         // raw lowerer, structured control and goto cover branching here.
         const bool exit = form->control == InstructionControlEffect::RawReturn ||
@@ -5486,6 +5496,74 @@ private:
             terminate(TerminatorKind::Unreachable, expression.location,
                       std::nullopt, {});
         }
+        co_return result;
+    }
+
+    // A branch form in a naked body: a branch to its label, after the
+    // comparison its registry entry describes when it is conditional. The
+    // target selects and schedules the branch instruction.
+    ContinuationTask<std::optional<ValueId>> lower_machine_branch_async(
+        const Expr& expression, const InstructionEntry& form) {
+        const auto location = expression.location;
+        const auto& target = without_parentheses(*expression.arguments.back());
+        const auto* label = hir_.label(current_.source, target);
+        const auto found = label ? label_blocks_.find(label->id.value)
+                                 : label_blocks_.end();
+        if (found == label_blocks_.end()) {
+            failed_ = true;
+            co_return std::nullopt;
+        }
+        const auto result = add_value(
+            ValueKind::VoidValue, *hir_.builtin(BuiltinType::Void), location);
+        if (form.control == InstructionControlEffect::UnconditionalBranch) {
+            terminate(TerminatorKind::Branch, location, std::nullopt,
+                      {found->second});
+            co_return result;
+        }
+        std::vector<ValueId> operands;
+        for (std::size_t index = 0; index + 1 < form.operands.size();
+             ++index) {
+            const auto value = co_await lower_expression_async(
+                without_parentheses(*expression.arguments[index]));
+            if (!value) co_return std::nullopt;
+            operands.push_back(*value);
+        }
+        const auto type =
+            hir_.unqualified(current_.values[operands.front().value].type);
+        if (operands.size() == 1) {
+            operands.push_back(constant(0, type, location));
+        } else {
+            operands[1] = cast(operands[1], type, location);
+        }
+        auto operation = BinaryOperation::Equal;
+        switch (form.branch_condition) {
+        case InstructionBranchCondition::None:
+        case InstructionBranchCondition::Equal:
+            break;
+        case InstructionBranchCondition::NotEqual:
+            operation = BinaryOperation::NotEqual;
+            break;
+        case InstructionBranchCondition::LessThanZero:
+            operation = BinaryOperation::SignedLess;
+            break;
+        case InstructionBranchCondition::GreaterEqualZero:
+            operation = BinaryOperation::SignedGreaterEqual;
+            break;
+        case InstructionBranchCondition::LessEqualZero:
+            operation = BinaryOperation::SignedLessEqual;
+            break;
+        case InstructionBranchCondition::GreaterThanZero:
+            operation = BinaryOperation::SignedGreater;
+            break;
+        }
+        const auto condition = add_value(
+            ValueKind::Binary, *hir_.builtin(BuiltinType::Bool), location);
+        current_.values[condition.value].binary = operation;
+        current_.values[condition.value].operands = std::move(operands);
+        const auto next = new_block(location);
+        terminate(TerminatorKind::ConditionalBranch, location, condition,
+                  {found->second, next});
+        enter(next);
         co_return result;
     }
 

@@ -121,8 +121,10 @@ struct AbiVariadicState {
     std::string type;
     AbiVariadicStateKind kind{AbiVariadicStateKind::CursorOffset};
     std::string cursor;
-    unsigned base{};
-    unsigned stride{};
+    int base{};
+    int stride{};
+    // The largest count of cursor positions the state uses, if any.
+    std::optional<unsigned> limit;
     unsigned alignment{1};
     // Optional layout hook used only by the LLVM-text debug serializer.  The
     // production compiler derives the same state directly from the ABI plan.
@@ -233,7 +235,8 @@ struct AbiEntry {
     std::vector<std::string> variadic_save_banks;
     unsigned variadic_save_alignment{1};
     std::string variadic_home_bank;
-    unsigned variadic_home_base{};
+    // Negative: the callee's home area directly below the incoming arguments.
+    int variadic_home_base{};
     unsigned variadic_home_stride{};
     unsigned variadic_va_list_bytes{};
     unsigned variadic_va_list_alignment{1};
@@ -357,6 +360,19 @@ enum class InstructionControlEffect {
     Trap,
 };
 
+// The comparison of a compare-and-branch form: of its two register operands,
+// or of its one with zero, where an ordering compares signed integers. A
+// target that lowers naked functions as managed code branches on it.
+enum class InstructionBranchCondition {
+    None,
+    Equal,
+    NotEqual,
+    LessThanZero,
+    GreaterEqualZero,
+    LessEqualZero,
+    GreaterThanZero,
+};
+
 struct InstructionEntry {
     std::string_view name;
     // `feature` is the primary feature retained for concise diagnostics and
@@ -397,6 +413,9 @@ struct InstructionEntry {
     // Scheduling facts for resources the hardware does not interlock.
     std::vector<HazardFact> hazard_writes{};
     std::vector<HazardFact> hazard_uses{};
+    // The condition of a ConditionalBranch form, when it has one.
+    InstructionBranchCondition branch_condition{
+        InstructionBranchCondition::None};
 
     InstructionEntry() = default;
 

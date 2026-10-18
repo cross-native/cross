@@ -125,9 +125,18 @@ foreach(endian IN LISTS MIPS_ENDIANS)
             endif()
             list(APPEND objects "${out}.gcc.o")
         endif()
-        execute_process(COMMAND "${LLVM_MC}" --filetype=obj --triple=${arch}-unknown-elf
-            --mcpu=mips3 --mattr=+noabicalls,-fp64 "${STARTUP}" -o "${out}.start.o"
-            RESULT_VARIABLE s)
+        # STARTUP_AS, an assembler that takes cc's target options such as the
+        # Cross as, gives the startup the ABI tag of STARTUP_AS_FLAGS, which
+        # linkers check against the compiled units; llvm-mc tags it o32.
+        if(DEFINED STARTUP_AS AND NOT "${STARTUP_AS}" STREQUAL "")
+            execute_process(COMMAND "${STARTUP_AS}" -target ${arch}-unknown-elf
+                -march=mips3 ${STARTUP_AS_FLAGS} "${STARTUP}" -o "${out}.start.o"
+                RESULT_VARIABLE s)
+        else()
+            execute_process(COMMAND "${LLVM_MC}" --filetype=obj --triple=${arch}-unknown-elf
+                --mcpu=mips3 --mattr=+noabicalls,-fp64 "${STARTUP}" -o "${out}.start.o"
+                RESULT_VARIABLE s)
+        endif()
         if(NOT s EQUAL 0)
             message(FATAL_ERROR "MIPS startup assembly failed (${cpu}/${endian})")
         endif()
