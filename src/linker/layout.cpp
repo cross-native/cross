@@ -1002,6 +1002,10 @@ void Link::lay_out_section(Placement& placement, bool final) {
     } else if (!fixed) {
         if (region == default_index && (alloc || loaded)) region = default_region(placement);
         start = regions_[region].current;
+        if (const auto& run = regions_[region].tbss_run;
+            run && tbss(*output) && start == run->first) {
+            start = run->second;
+        }
     } else {
         start = *fixed;
         section_alignment = statement_alignment;
@@ -1122,7 +1126,14 @@ void Link::lay_out_section(Placement& placement, bool final) {
         current_section_ = &placement;
         prefer_next_ = false;
     }
-    dot_ = tbss(*output) ? start : start + size;
+    if (tbss(*output)) {
+        if (!state.tbss_run || state.current != state.tbss_run->first) state.tbss_run.emplace(start, start);
+        state.tbss_run->second = start + size;
+        dot_ = state.tbss_run->first;
+    } else {
+        state.tbss_run.reset();
+        dot_ = start + size;
+    }
     if (statement && statement->update_dot) {
         if (const auto value = evaluate(*statement->update_dot)) dot_ = mask(value->value);
     }

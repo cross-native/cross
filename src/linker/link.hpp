@@ -9,10 +9,12 @@
 #include <deque>
 #include <functional>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace cross::linker {
@@ -285,6 +287,10 @@ private:
         std::uint64_t last_address{};
         std::uint64_t last_load{};
         std::uint64_t last_size{};
+        // The start and end of the run of TLS NOBITS sections that ends the
+        // region: `.` stays at its start, and each such section follows the
+        // previous one in the TLS block.
+        std::optional<std::pair<std::uint64_t, std::uint64_t>> tbss_run;
     };
     std::vector<RegionState> regions_;
     // GNU ld's choice of a section for a symbol assigned from `.` outside

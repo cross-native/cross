@@ -194,3 +194,44 @@ run_failing("no _gp" "${LD}" -T "${OUTPUT}/no-gp.ld" "${OUTPUT}/o32-big.o" "${OU
             -o "${OUTPUT}/no-gp.elf")
 expect("no _gp" "${run_stderr}"
        "o32-big[.]o:[(][.]text[.]boot[+]0x14[)]: R_MIPS_GOT16 against '[.]data' needs _gp, which nothing defines")
+
+# TLS NOBITS sections that a script splits follow one another in the TLS
+# block while the next section starts where the first one did, as LLD
+# links them (GNU ld overlaps their symbols).
+file(WRITE "${OUTPUT}/split-tbss.s" "\t.section .tdata,\"awT\",@progbits
+\t.globl first_word
+first_word:
+\t.word 1
+\t.section .tbss,\"awT\",@nobits
+\t.globl first_block
+first_block:
+\t.space 16
+\t.section .tbss.second,\"awT\",@nobits
+\t.globl second_block
+second_block:
+\t.space 32
+\t.text
+\t.globl __start
+__start:
+\tlui $2, %tprel_hi(second_block)
+\taddiu $2, $2, %tprel_lo(second_block)
+\t.data
+\t.globl after
+after:
+\t.word 5
+")
+file(WRITE "${OUTPUT}/split-tbss.ld" "SECTIONS { . = 0x80010000; .text : { *(.text) } .tdata : { *(.tdata) } .tbss : { *(.tbss) } .tbss2 : { *(.tbss.second) } .data : { *(.data) } }\n")
+run_checked("split .tbss assembly" "${AS}" -target mips-unknown-elf -march=mips32r2 "${OUTPUT}/split-tbss.s"
+            -o "${OUTPUT}/split-tbss.o")
+run_checked("split .tbss link" "${LD}" -T "${OUTPUT}/split-tbss.ld" "${OUTPUT}/split-tbss.o"
+            -o "${OUTPUT}/split-tbss.elf")
+symbol_value("${OUTPUT}/split-tbss.elf" first_block first)
+symbol_value("${OUTPUT}/split-tbss.elf" second_block second)
+symbol_value("${OUTPUT}/split-tbss.elf" after data)
+expect_value("second TLS block offset" "0x${second}" "0x${first} + 16")
+if(LLVM_READELF)
+    execute_process(COMMAND "${LLVM_READELF}" -lS "${OUTPUT}/split-tbss.elf" OUTPUT_VARIABLE headers)
+    string(REGEX MATCH "\\.tbss +NOBITS +([0-9a-f]+)" tbss_line "${headers}")
+    expect_value(".data address" "0x${data}" "0x${CMAKE_MATCH_1}")
+    expect("split .tbss segment" "${headers}" "TLS +0x[0-9a-f]+ 0x[0-9a-f]+ 0x[0-9a-f]+ 0x00004 0x00034 ")
+endif()
