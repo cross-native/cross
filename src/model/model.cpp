@@ -49,6 +49,16 @@ struct ModelToken {
     unsigned line{1};
 };
 
+// ASCII classes; model files are ASCII outside strings and comments.
+constexpr bool model_digit(char ch) { return ch >= '0' && ch <= '9'; }
+constexpr bool model_letter(char ch) {
+    return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z');
+}
+constexpr bool model_space(char ch) {
+    return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' ||
+           ch == '\v' || ch == '\f';
+}
+
 class ModelLexer {
 public:
     explicit ModelLexer(std::string_view input) : input_(input) {}
@@ -59,36 +69,35 @@ public:
         if (offset_ == input_.size()) return {ModelTokenKind::End, {}, line};
         const char ch = input_[offset_];
         switch (ch) {
-        case '{': ++offset_; return {ModelTokenKind::LeftBrace, "{", line};
-        case '}': ++offset_; return {ModelTokenKind::RightBrace, "}", line};
-        case '[': ++offset_; return {ModelTokenKind::LeftBracket, "[", line};
-        case ']': ++offset_; return {ModelTokenKind::RightBracket, "]", line};
-        case '(': ++offset_; return {ModelTokenKind::LeftParen, "(", line};
-        case ')': ++offset_; return {ModelTokenKind::RightParen, ")", line};
-        case '=': ++offset_; return {ModelTokenKind::Equal, "=", line};
-        case ',': ++offset_; return {ModelTokenKind::Comma, ",", line};
-        case ';': ++offset_; return {ModelTokenKind::Semicolon, ";", line};
+        // Punctuation carries no text.
+        case '{': ++offset_; return {ModelTokenKind::LeftBrace, {}, line};
+        case '}': ++offset_; return {ModelTokenKind::RightBrace, {}, line};
+        case '[': ++offset_; return {ModelTokenKind::LeftBracket, {}, line};
+        case ']': ++offset_; return {ModelTokenKind::RightBracket, {}, line};
+        case '(': ++offset_; return {ModelTokenKind::LeftParen, {}, line};
+        case ')': ++offset_; return {ModelTokenKind::RightParen, {}, line};
+        case '=': ++offset_; return {ModelTokenKind::Equal, {}, line};
+        case ',': ++offset_; return {ModelTokenKind::Comma, {}, line};
+        case ';': ++offset_; return {ModelTokenKind::Semicolon, {}, line};
         case '"': return string();
         default: break;
         }
-        const bool negative =
-            ch == '-' && offset_ + 1 < input_.size() &&
-            std::isdigit(static_cast<unsigned char>(input_[offset_ + 1])) != 0;
-        if (negative || std::isdigit(static_cast<unsigned char>(ch)) != 0) {
+        const bool negative = ch == '-' && offset_ + 1 < input_.size() &&
+                              model_digit(input_[offset_ + 1]);
+        if (negative || model_digit(ch)) {
             const auto begin = offset_++;
-            while (offset_ < input_.size() &&
-                   std::isdigit(static_cast<unsigned char>(input_[offset_])) != 0) {
+            while (offset_ < input_.size() && model_digit(input_[offset_])) {
                 ++offset_;
             }
             return {ModelTokenKind::Integer,
                     std::string(input_.substr(begin, offset_ - begin)), line};
         }
-        if (std::isalpha(static_cast<unsigned char>(ch)) != 0 || ch == '_') {
+        if (model_letter(ch) || ch == '_') {
             const auto begin = offset_++;
             while (offset_ < input_.size()) {
                 const char item = input_[offset_];
-                if (std::isalnum(static_cast<unsigned char>(item)) == 0 &&
-                    item != '_' && item != '-' && item != '.') {
+                if (!model_letter(item) && !model_digit(item) && item != '_' &&
+                    item != '-' && item != '.') {
                     break;
                 }
                 ++offset_;
@@ -103,8 +112,7 @@ public:
 private:
     void skip_trivia() {
         for (;;) {
-            while (offset_ < input_.size() &&
-                   std::isspace(static_cast<unsigned char>(input_[offset_])) != 0) {
+            while (offset_ < input_.size() && model_space(input_[offset_])) {
                 if (input_[offset_++] == '\n') ++line_;
             }
             if (offset_ < input_.size() && input_[offset_] == '#') {
@@ -1189,7 +1197,7 @@ private:
                 result.boolean = current_.text == "true";
             } else {
                 result.kind = ModelValue::Kind::Text;
-                result.text = current_.text;
+                result.text = std::move(current_.text);
             }
             advance();
             return result;
@@ -1220,7 +1228,7 @@ private:
                          "model lists contain only strings or identifiers");
                     return std::nullopt;
                 }
-                result.list.push_back(current_.text);
+                result.list.push_back(std::move(current_.text));
                 advance();
                 if (current_.kind == ModelTokenKind::RightBracket) break;
                 if (!expect(ModelTokenKind::Comma, "',' between list items")) {
@@ -1245,7 +1253,7 @@ private:
             fail(current_.line, "expected model property name");
             return false;
         }
-        const auto name = current_.text;
+        auto name = std::move(current_.text);
         const auto line = current_.line;
         advance();
         if (!expect(ModelTokenKind::Equal, "'=' after model property name")) {
@@ -1256,11 +1264,11 @@ private:
         if (!expect(ModelTokenKind::Semicolon, "';' after model property")) {
             return false;
         }
-        if (!result.emplace(
-                name, ModelProperty{std::move(*value), line}).second) {
+        if (result.contains(name)) {
             fail(line, "duplicate model property '" + name + "'");
             return false;
         }
+        result.add(std::move(name), ModelProperty{std::move(*value), line});
         return true;
     }
 

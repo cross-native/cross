@@ -4,11 +4,13 @@
 
 #include "model/model.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
-#include <unordered_map>
+#include <utility>
 #include <vector>
 
 // Property values of model entries as the parser reads them, shared by the
@@ -30,7 +32,37 @@ struct ModelProperty {
     unsigned line{};
 };
 
-using ModelProperties = std::unordered_map<std::string, ModelProperty>;
+// The properties of an entry or block in source order. Entries have few,
+// so a lookup scans them.
+class ModelProperties {
+public:
+    using Item = std::pair<std::string, ModelProperty>;
+
+    [[nodiscard]] auto begin() const { return items_.begin(); }
+    [[nodiscard]] auto end() const { return items_.end(); }
+    [[nodiscard]] std::vector<Item>::const_iterator find(
+        std::string_view name) const {
+        return std::find_if(items_.begin(), items_.end(),
+                            [&](const Item& item) { return item.first == name; });
+    }
+    [[nodiscard]] bool contains(std::string_view name) const {
+        return find(name) != items_.end();
+    }
+    [[nodiscard]] const ModelProperty& at(std::string_view name) const {
+        const auto found = find(name);
+        if (found == items_.end()) throw std::out_of_range("model property");
+        return found->second;
+    }
+    // False when the entry already has the property.
+    bool add(std::string name, ModelProperty property) {
+        if (contains(name)) return false;
+        items_.emplace_back(std::move(name), std::move(property));
+        return true;
+    }
+
+private:
+    std::vector<Item> items_;
+};
 
 // The compiled-in target of an architecture name that `cc --print-targets`
 // prints.
