@@ -279,7 +279,7 @@ function_body("${OUTPUT}.unroll_risc.s"
 function_body("${OUTPUT}.unroll_risc_no_delay.s"
               mips_copy_edge_delay empty_copy_edge)
 if(NOT scheduled_copy_edge MATCHES
-       "[\t ]beq[\t ][^\n]*\n[\t ]+addu[\t ][^\n]*\n[\t ]+move[\t ]" OR
+       "[\t ]beq[\t ][^\n]*\n[\t ]+addiu?[\t ][^\n]*\n[\t ]+move[\t ]" OR
    NOT empty_copy_edge MATCHES
        "[\t ]beq[\t ][^\n]*\n[\t ]+nop\n[\t ]+move[\t ]")
     message(FATAL_ERROR
@@ -665,7 +665,9 @@ function_body("${OUTPUT}.r3000.s" mips_piece_caller piece_caller_r3000)
 # PHI copies: two rotating doubles copy once each per pass, with no swap
 # through a scratch; a constant counter and a value from the parameters
 # enter their loop without a swap; a heading carried across private calls
-# is not split around them.
+# is not split around them. A rotation copies once per pass, before the
+# loop computes the new value, and a counter's increment follows its last
+# use, so the latch copies nothing back.
 function_body("${OUTPUT}.size.s" mips_rotate_doubles rotate_doubles)
 function_body("${OUTPUT}.enabled.s" mips_entry_counter entry_counter)
 function_body("${OUTPUT}.size.s" mips_entry_counter entry_counter_size)
@@ -675,7 +677,8 @@ list(LENGTH rotate_moves rotate_move_count)
 string(REGEX MATCHALL "[\t ](sw|lw)[\t ]" carried_memory "${carried_call}")
 list(LENGTH carried_memory carried_memory_count)
 if(rotate_doubles MATCHES "[\t ]mov\\.d[\t ]+\\$f2," OR
-   rotate_move_count GREATER 3 OR
+   rotate_move_count GREATER 2 OR
+   NOT entry_counter MATCHES "[\t ]bnel?[\t ][^\n]*\n[\t ]+daddiu[\t ]" OR
    entry_counter MATCHES "[\t ]move[\t ]+\\$at," OR
    entry_counter_size MATCHES "[\t ]move[\t ]+\\$at," OR
    NOT carried_memory_count EQUAL 2)
@@ -1471,4 +1474,106 @@ if(size_skip MATCHES "[\t ]b[\t ]" OR
         "-fno-tree-loop-rotate was ignored, or -Os did not spend its growth "
         "on a pointer\nOz:\n${size_skip}\nno rotation:\n${size_skip_top}\n"
         "Os:\n${size_skip_os}\nno growth:\n${size_skip_os_indexed}")
+endif()
+# Floating constants that only stores read, zeros, and a load that is only
+# reinterpreted use general registers; -fno-machine-combine keeps the FPU.
+function_body("${OUTPUT}.enabled.s" store_values store_values_general)
+function_body("${OUTPUT}.no_machine_combine.s" store_values store_values_fpu)
+if(store_values_general MATCHES "[\t ](mtc1|mfc1|swc1|lwc1)[\t ]" OR
+   NOT store_values_general MATCHES "[\t ]sw[\t ]+\\$zero," OR
+   NOT store_values_fpu MATCHES "[\t ]swc1[\t ]" OR
+   NOT store_values_fpu MATCHES "[\t ]mfc1[\t ]")
+    message(FATAL_ERROR
+        "floating constants, zeros, or reinterpreted loads did not use "
+        "general registers, or -fno-machine-combine was ignored\n"
+        "O2:\n${store_values_general}\n"
+        "no machine combine:\n${store_values_fpu}")
+endif()
+# At a size goal, floating constants that only one PHI reads merge as bits
+# in a general register with one transfer; speed goals and
+# -fno-machine-combine keep the floating constants and copy them on the
+# edges.
+function_body("${OUTPUT}.size.s" phi_constants phi_constants_size)
+function_body("${OUTPUT}.size_no_machine_combine.s" phi_constants
+              phi_constants_size_fpu)
+function_body("${OUTPUT}.enabled.s" phi_constants phi_constants_speed)
+string(REGEX MATCHALL "[\t ]mtc1[\t ]" phi_constants_transfers
+       "${phi_constants_size}")
+list(LENGTH phi_constants_transfers phi_constants_transfer_count)
+if(phi_constants_size MATCHES "[\t ]mov[.]s[\t ]" OR
+   NOT phi_constants_transfer_count EQUAL 1 OR
+   NOT phi_constants_size_fpu MATCHES "[\t ]mov[.]s[\t ]" OR
+   NOT phi_constants_speed MATCHES "[\t ]mov[.]s[\t ]")
+    message(FATAL_ERROR
+        "a size goal did not merge floating constants as bits, or a speed "
+        "goal or -fno-machine-combine did\nOz:\n${phi_constants_size}\n"
+        "Oz without machine combine:\n${phi_constants_size_fpu}\n"
+        "O2:\n${phi_constants_speed}")
+endif()
+# The loop's header only tests and its latch's increment feeds the latch's
+# branch, so the latch computes the body's first operation, the table
+# index's shift, for the next pass in that branch's delay slot.
+function_body("${OUTPUT}.size_no_delay.s" size_skip_sum size_skip_no_delay)
+if(NOT size_skip MATCHES "[\t ]bne[\t ][^\n]*\n[\t ]+sll[\t ]" OR
+   size_skip_no_delay MATCHES "[\t ]bne[\t ][^\n]*\n[\t ]+sll[\t ]")
+    message(FATAL_ERROR
+        "the latch did not carry the body's first operation into its delay "
+        "slot, or -fno-schedule-insns2 did\nOz:\n${size_skip}\n"
+        "no delay slots:\n${size_skip_no_delay}")
+endif()
+# A speed goal hoists the loop's multiplier constants into the headroom as
+# well, since the preserved registers they cost are repaid; a size goal and
+# -fno-move-loop-invariants keep them in the loop.
+function_body("${OUTPUT}.enabled.s" headroom_loop headroom_speed)
+function_body("${OUTPUT}.no_licm.s" headroom_loop headroom_no_licm)
+function_body("${OUTPUT}.size.s" headroom_loop headroom_size)
+foreach(variant speed no_licm size)
+    string(FIND "${headroom_${variant}}" ",65208\n" headroom_constant_${variant})
+    string(FIND "${headroom_${variant}}" "%lo(mips_headroom_vx)"
+           headroom_access_${variant})
+endforeach()
+if(headroom_constant_speed EQUAL -1 OR
+   NOT headroom_constant_speed LESS headroom_access_speed OR
+   headroom_constant_no_licm LESS headroom_access_no_licm OR
+   headroom_constant_size LESS headroom_access_size)
+    message(FATAL_ERROR
+        "a speed goal did not hoist a loop constant into the headroom, or "
+        "a size goal or -fno-move-loop-invariants did\n"
+        "O2:\n${headroom_speed}\nno LICM:\n${headroom_no_licm}\n"
+        "Oz:\n${headroom_size}")
+endif()
+# Under -mfix4300, other ready work separates consecutive floating
+# multiplies, which -fno-schedule-insns leaves to a NOP; the loop branch of
+# a multiply chain runs the load that leads its target in its branch-likely
+# slot, which -fno-schedule-insns2 leaves empty.
+compile_variant(fix4300_no_delay -mfix4300 -fno-schedule-insns2)
+function_body("${OUTPUT}.fix4300.s" fix4300_pair fix_pair)
+function_body("${OUTPUT}.fix4300_no_schedule.s" fix4300_pair fix_pair_plain)
+function_body("${OUTPUT}.fix4300.s" fix4300_chain fix_chain)
+function_body("${OUTPUT}.fix4300_no_delay.s" fix4300_chain fix_chain_plain)
+set(fix_adjacent "mul[.]d[^\n]*\n[\t ]+nop\n[\t ]+mul[.]d")
+set(fix_led "[\t ]bnel[\t ][^\n]*\n[\t ]+ldc1[\t ]")
+if(fix_pair MATCHES "${fix_adjacent}" OR
+   NOT fix_pair_plain MATCHES "${fix_adjacent}" OR
+   NOT fix_chain MATCHES "${fix_led}" OR
+   fix_chain_plain MATCHES "${fix_led}")
+    message(FATAL_ERROR
+        "-mfix4300 multiplies were not separated by other work, a loop "
+        "branch did not run its target's load in its slot, or "
+        "-fno-schedule-insns or -fno-schedule-insns2 was ignored\n"
+        "pair:\n${fix_pair}\npair unscheduled:\n${fix_pair_plain}\n"
+        "chain:\n${fix_chain}\nchain without slots:\n${fix_chain_plain}")
+endif()
+# A comparison chain's branch runs the next arm's first operation, the
+# shift, in its delay slot: its result takes a register that no value live
+# on the taken edge holds. -fno-schedule-insns2 leaves the slot empty.
+function_body("${OUTPUT}.enabled.s" classify_chain classify_slots)
+function_body("${OUTPUT}.no_delay.s" classify_chain classify_unfilled)
+set(classify_speculated "[\t ]bne[\t ][^\n]*\n[\t ]+sll[\t ]")
+if(NOT classify_slots MATCHES "${classify_speculated}" OR
+   classify_unfilled MATCHES "${classify_speculated}")
+    message(FATAL_ERROR
+        "a comparison chain's branch did not run the next arm's shift in "
+        "its delay slot, or -fno-schedule-insns2 did\n"
+        "O2:\n${classify_slots}\nno delay slots:\n${classify_unfilled}")
 endif()

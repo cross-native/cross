@@ -120,7 +120,8 @@ global i32 mips_successor_call_compare(in i32 a, in i32 b) {
 
 // Unrolled, its remainder loop's exit branch encodes the copy-free edge, so
 // the back edge's copies (of a value that the next pass also keeps as the
-// previous one) follow a filled delay slot.
+// previous one, which the step reads after the new value) follow a filled
+// delay slot.
 [[abi("o32"), noinline]]
 global u32 mips_copy_edge_delay(in u32 seed, in u32 count) {
     u32 value = seed;
@@ -128,9 +129,9 @@ global u32 mips_copy_edge_delay(in u32 seed, in u32 count) {
     u32 previous = 5u32;
     for (u32 index = 0u32; index < count; ++index) {
         const u32 next = (value ^ (value >> 7u32)) * 2654435761u32 + step;
+        step = step + (previous & 3u32) + 3u32;
         previous = value;
         value = next;
-        step = step + 3u32;
     }
     return value ^ step ^ previous;
 }
@@ -1184,4 +1185,120 @@ global u32 size_skip_sum(in u32 k, in u32 x) {
         if (j != k) sum = sum + (mips_size_table[j] ^ x);
     }
     return sum;
+}
+
+// A floating constant that only stores read is stored from a general
+// register, a zero from $zero, and a load whose only reader reinterprets it
+// loads into a general register.
+global f32 mips_store_matrix[4];
+global u32 mips_store_words[4];
+
+union mips_store_view {
+    f32 value;
+    u32 bits;
+};
+
+global u32 store_values(in u32 k) {
+    mips_store_matrix[0] = 0.9950042f32;
+    mips_store_matrix[1] = 0.0f32;
+    mips_store_matrix[2] = 1.0f32;
+    mips_store_words[k & 3u32] = 0u32;
+    union mips_store_view view;
+    view.value = mips_store_matrix[(k >> 2) & 3u32];
+    return view.bits;
+}
+
+// At a size goal, floating constants that only one PHI reads merge as their
+// bits in a general register: each edge loads its constant's bits and one
+// transfer follows the merge, instead of a transfer per constant and a copy
+// per edge.
+global f32 mips_phi_cells[16];
+
+global void phi_constants(in u32 mask) {
+    for (u32 i = 0u32; i < 16u32; ++i) {
+        mips_phi_cells[i] = mips_phi_cells[i] +
+            (((mask >> i) & 1u32) != 0u32 ? 0.75f32 : -0.5f32);
+    }
+}
+
+// At a speed goal the loop's constants also take the colors that hoisting
+// keeps free for allocation, as allocating both functions shows that the
+// preserved registers they cost are repaid; a size goal keeps them in the
+// loop, as they would need preserved registers.
+global i32 mips_headroom_px[32];
+global i32 mips_headroom_py[32];
+global i32 mips_headroom_vx[32];
+global i32 mips_headroom_vy[32];
+
+global u32 headroom_loop(in u32 count) {
+    u32 hits = 0u32;
+    for (u32 n = 0u32; n < count; ++n) {
+        const u32 k = n & 31u32;
+        i32 vy = mips_headroom_vy[k] - 6554i32;
+        i32 py = mips_headroom_py[k] + vy;
+        if (py < 0i32) {
+            py = 0i32 - py;
+            vy = (i32)(((i64)(0i32 - vy) * 52429i64) >> 16);
+            hits = hits + 1u32;
+        }
+        i32 vx = (i32)(((i64)mips_headroom_vx[k] * 65208i64) >> 16);
+        i32 px = mips_headroom_px[k] + vx;
+        if (px < -1048576i32 || px > 1048576i32) {
+            vx = 0i32 - vx;
+            px = mips_headroom_px[k];
+        }
+        mips_headroom_px[k] = px;
+        mips_headroom_py[k] = py;
+        mips_headroom_vx[k] = vx;
+        mips_headroom_vy[k] = vy;
+    }
+    return hits;
+}
+
+// Under -mfix4300 the emitter separates consecutive floating multiplies
+// with a NOP, so the scheduler puts other ready work between them; and a
+// loop branch whose block offers nothing for its delay slot runs a load
+// that it moves to the front of its target there instead of a multiply.
+global f64 mips_fix_data[64];
+
+global f64 fix4300_pair(in u32 count) {
+    f64 x = 0.5f64;
+    f64 y = 0.25f64;
+    for (u32 i = 0u32; i < count; ++i) {
+        const f64 scaled_x = x * 0.75f64;
+        const f64 scaled_y = y * 0.875f64;
+        const f64 sample = mips_fix_data[i & 63u32];
+        x = scaled_x + sample;
+        y = scaled_y - sample;
+    }
+    return x + y;
+}
+
+global f64 fix4300_chain(in const f64 *data, in u32 count) {
+    f64 result = 0.125f64;
+    for (u32 i = 0u32; i < count; ++i) {
+        result = (result * 0.999999f64 + data[i]) * 0.5f64;
+    }
+    return result;
+}
+
+// A comparison chain: each test's branch runs the next arm's first
+// operation in its delay slot, which may compute there because its result
+// takes a register that no value live on the taken edge holds.
+global u32 classify_chain(in const u32 *data, in u32 count) {
+    u32 result = 0u32;
+    for (u32 index = 0u32; index < count; ++index) {
+        const u32 value = data[index];
+        const u32 selector = value & 3u32;
+        if (selector == 0u32) {
+            result = result + value;
+        } else if (selector == 1u32) {
+            result = result ^ (value << 1);
+        } else if (selector == 2u32) {
+            result = result + (value >> 2);
+        } else {
+            result = result - (value >> 3);
+        }
+    }
+    return result;
 }

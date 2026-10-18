@@ -2180,6 +2180,294 @@ _start:
 	move $a0,$v0
 	jal print_hex
 	nop
+	li $a0,0x1
+	li $a1,0x3
+	li $a2,0x5
+	jal k_q_store_values
+	nop
+	move $a0,$v0
+	jal print_hex
+	nop
+	li $a0,0x7
+	li $a1,0x2
+	li $a2,0x0
+	jal k_q_store_values
+	nop
+	move $a0,$v0
+	jal print_hex
+	nop
+	li $a0,0xffffffff
+	li $a1,0x80000000
+	li $a2,0x7fffffff
+	jal k_q_store_values
+	nop
+	move $a0,$v0
+	jal print_hex
+	nop
+	li $a0,0x12345678
+	li $a1,0x9abcdef0
+	li $a2,0x2b
+	jal k_q_store_values
+	nop
+	move $a0,$v0
+	jal print_hex
+	nop
+	li $a0,0x80000000
+	li $a1,0xffffffff
+	li $a2,0x10
+	jal k_q_store_values
+	nop
+	move $a0,$v0
+	jal print_hex
+	nop
+	li $a0,0xf
+	li $a1,0x10
+	li $a2,0x21
+	jal k_q_store_values
+	nop
+	move $a0,$v0
+	jal print_hex
+	nop
+	li $a0,0x1
+	li $a1,0x3
+	li $a2,0x5
+	jal k_q_phi_constants
+	nop
+	move $a0,$v0
+	jal print_hex
+	nop
+	li $a0,0x7
+	li $a1,0x2
+	li $a2,0x0
+	jal k_q_phi_constants
+	nop
+	move $a0,$v0
+	jal print_hex
+	nop
+	li $a0,0xffffffff
+	li $a1,0x80000000
+	li $a2,0x7fffffff
+	jal k_q_phi_constants
+	nop
+	move $a0,$v0
+	jal print_hex
+	nop
+	li $a0,0x12345678
+	li $a1,0x9abcdef0
+	li $a2,0x2b
+	jal k_q_phi_constants
+	nop
+	move $a0,$v0
+	jal print_hex
+	nop
+	li $a0,0x80000000
+	li $a1,0xffffffff
+	li $a2,0x10
+	jal k_q_phi_constants
+	nop
+	move $a0,$v0
+	jal print_hex
+	nop
+	li $a0,0xf
+	li $a1,0x10
+	li $a2,0x21
+	jal k_q_phi_constants
+	nop
+	move $a0,$v0
+	jal print_hex
+	nop
+	li $a0,0x1
+	li $a1,0x3
+	li $a2,0x5
+	jal k_q_carry_slot
+	nop
+	move $a0,$v0
+	jal print_hex
+	nop
+	li $a0,0x7
+	li $a1,0x2
+	li $a2,0x0
+	jal k_q_carry_slot
+	nop
+	move $a0,$v0
+	jal print_hex
+	nop
+	li $a0,0xffffffff
+	li $a1,0x80000000
+	li $a2,0x7fffffff
+	jal k_q_carry_slot
+	nop
+	move $a0,$v0
+	jal print_hex
+	nop
+	li $a0,0x12345678
+	li $a1,0x9abcdef0
+	li $a2,0x2b
+	jal k_q_carry_slot
+	nop
+	move $a0,$v0
+	jal print_hex
+	nop
+	li $a0,0x80000000
+	li $a1,0xffffffff
+	li $a2,0x10
+	jal k_q_carry_slot
+	nop
+	move $a0,$v0
+	jal print_hex
+	nop
+	li $a0,0xf
+	li $a1,0x10
+	li $a2,0x21
+	jal k_q_carry_slot
+	nop
+	move $a0,$v0
+	jal print_hex
+	nop
+	li $a0,0x1
+	li $a1,0x3
+	li $a2,0x5
+	jal k_q_headroom
+	nop
+	move $a0,$v0
+	jal print_hex
+	nop
+	li $a0,0x7
+	li $a1,0x2
+	li $a2,0x0
+	jal k_q_headroom
+	nop
+	move $a0,$v0
+	jal print_hex
+	nop
+	li $a0,0xffffffff
+	li $a1,0x80000000
+	li $a2,0x7fffffff
+	jal k_q_headroom
+	nop
+	move $a0,$v0
+	jal print_hex
+	nop
+	li $a0,0x12345678
+	li $a1,0x9abcdef0
+	li $a2,0x2b
+	jal k_q_headroom
+	nop
+	move $a0,$v0
+	jal print_hex
+	nop
+	li $a0,0x80000000
+	li $a1,0xffffffff
+	li $a2,0x10
+	jal k_q_headroom
+	nop
+	move $a0,$v0
+	jal print_hex
+	nop
+	li $a0,0xf
+	li $a1,0x10
+	li $a2,0x21
+	jal k_q_headroom
+	nop
+	move $a0,$v0
+	jal print_hex
+	nop
+	li $a0,0x1
+	li $a1,0x3
+	li $a2,0x5
+	jal k_q_multiply_chain
+	nop
+	move $a0,$v0
+	jal print_hex
+	nop
+	li $a0,0x7
+	li $a1,0x2
+	li $a2,0x0
+	jal k_q_multiply_chain
+	nop
+	move $a0,$v0
+	jal print_hex
+	nop
+	li $a0,0xffffffff
+	li $a1,0x80000000
+	li $a2,0x7fffffff
+	jal k_q_multiply_chain
+	nop
+	move $a0,$v0
+	jal print_hex
+	nop
+	li $a0,0x12345678
+	li $a1,0x9abcdef0
+	li $a2,0x2b
+	jal k_q_multiply_chain
+	nop
+	move $a0,$v0
+	jal print_hex
+	nop
+	li $a0,0x80000000
+	li $a1,0xffffffff
+	li $a2,0x10
+	jal k_q_multiply_chain
+	nop
+	move $a0,$v0
+	jal print_hex
+	nop
+	li $a0,0xf
+	li $a1,0x10
+	li $a2,0x21
+	jal k_q_multiply_chain
+	nop
+	move $a0,$v0
+	jal print_hex
+	nop
+	li $a0,0x1
+	li $a1,0x3
+	li $a2,0x5
+	jal k_q_classify_chain
+	nop
+	move $a0,$v0
+	jal print_hex
+	nop
+	li $a0,0x7
+	li $a1,0x2
+	li $a2,0x0
+	jal k_q_classify_chain
+	nop
+	move $a0,$v0
+	jal print_hex
+	nop
+	li $a0,0xffffffff
+	li $a1,0x80000000
+	li $a2,0x7fffffff
+	jal k_q_classify_chain
+	nop
+	move $a0,$v0
+	jal print_hex
+	nop
+	li $a0,0x12345678
+	li $a1,0x9abcdef0
+	li $a2,0x2b
+	jal k_q_classify_chain
+	nop
+	move $a0,$v0
+	jal print_hex
+	nop
+	li $a0,0x80000000
+	li $a1,0xffffffff
+	li $a2,0x10
+	jal k_q_classify_chain
+	nop
+	move $a0,$v0
+	jal print_hex
+	nop
+	li $a0,0xf
+	li $a1,0x10
+	li $a2,0x21
+	jal k_q_classify_chain
+	nop
+	move $a0,$v0
+	jal print_hex
+	nop
 	move $a0,$zero
 	addiu $v0,$zero,1
 	addiu $t9,$zero,1

@@ -2824,8 +2824,9 @@ if(BUILD_TESTING)
     # Global addressing, immediate comparisons, filled delay slots, loop
     # constants, narrow values, and shared addresses on each CPU class and
     # byte order, under the N64 console profile's trapping floating
-    # environment, and with the enabling controls switched off for
-    # comparison. Each entry:
+    # environment and the VR4300's Cross ABI profile, on Release 2 CPUs,
+    # and with the enabling controls switched off for comparison. Each
+    # entry:
     # name|ISA|endian|address model|QEMU CPU|optimization|flags.
     foreach(quality_case
             "vr4300|vr4300|BE|32|R4000|-O2|-mprofile=vr4300-o32"
@@ -2842,7 +2843,12 @@ if(BUILD_TESTING)
             "mips32|mips32|BE|32|24Kf|-O2|-target mips-unknown-elf -mabi=o32 -march=mips32"
             "mips32_le|mips32|LE|32|24Kf|-O2|-target mipsel-unknown-elf -mabi=o32 -march=mips32"
             "n64|mips64|BE|64|MIPS64R2-generic|-O2|-mprofile=mips64-n64 -mabi=n64"
-            "n64_le|mips64|LE|64|MIPS64R2-generic|-O2|-mprofile=mips64el-n64 -mabi=n64")
+            "n64_le|mips64|LE|64|MIPS64R2-generic|-O2|-mprofile=mips64el-n64 -mabi=n64"
+            "vr4300_x64|vr4300|BE|32|R4000|-O2|-mprofile=vr4300-x64"
+            "vr4300_x64_oz|vr4300|BE|32|R4000|-Oz|-mprofile=vr4300-x64"
+            "mips32r2|mips32r2|BE|32|24Kf|-O2|-target mips-unknown-elf -mabi=o32 -march=mips32r2"
+            "mips32r2_oz_le|mips32r2|LE|32|24Kf|-Oz|-target mipsel-unknown-elf -mabi=o32 -march=mips32r2"
+            "mips64r2_o3|mips64r2|BE|64|MIPS64R2-generic|-O3|-mprofile=mips64-n64 -mabi=n64 -march=mips64r2")
         string(REPLACE "|" ";" quality_fields "${quality_case}")
         list(GET quality_fields 0 quality_name)
         list(GET quality_fields 1 quality_isa)

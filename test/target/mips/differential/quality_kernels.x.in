@@ -977,3 +977,192 @@ global u32 k_q_select_zero(in u32 a, in u32 b, in u32 c) {
     const u64 third = (wide & 0xffff0000ffffu64) != 0u64 ? wide >> 7 : (u64)c;
     return first + second * 3u32 + ((u32)third ^ (u32)(third >> 32));
 }
+
+// Floating constants that only stores read are stored from general
+// registers, and a zero from $zero; a load whose only reader reinterprets
+// it in the other bank loads there, and so does a store of a reinterpreted
+// value.
+global f32 q_store_floats[8];
+global f64 q_store_doubles[4];
+global u8 q_zero_bytes[4] = { 1u8, 2u8, 3u8, 4u8 };
+global u16 q_zero_halves[4] = { 5u16, 6u16, 7u16, 8u16 };
+global u32 q_zero_words[4] = { 9u32, 10u32, 11u32, 12u32 };
+global u64 q_zero_doubles[2] = { 13u64, 14u64 };
+
+union QWord {
+    f32 value;
+    u32 bits;
+};
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_store_values(in u32 a, in u32 b, in u32 c) {
+    q_store_floats[0] = 0.9950042f32;
+    q_store_floats[1] = 0.0f32;
+    q_store_floats[2] = -0.0f32;
+    q_store_floats[3] = 1.0f32;
+    q_store_floats[4u32 + (a & 3u32)] = -2.5f32;
+    q_store_doubles[0] = 1.5f64;
+    q_store_doubles[1] = 0.0f64;
+    q_store_doubles[2u32 + (b & 1u32)] = -0.0f64;
+    q_zero_bytes[a & 3u32] = 0u8;
+    q_zero_halves[b & 3u32] = 0u16;
+    q_zero_words[c & 3u32] = 0u32;
+    q_zero_doubles[a & 1u32] = 0u64;
+    union QWord put;
+    put.bits = a * 16777619u32 ^ c;
+    q_store_floats[(b + 1u32) & 7u32] = put.value;
+    union QBits wide;
+    wide.bits = ((u64)b << 32) | (u64)(a ^ c);
+    q_store_doubles[(c >> 1) & 3u32] = wide.value;
+    u32 total = 0u32;
+    for (u32 i = 0u32; i < 8u32; ++i) {
+        union QWord get;
+        get.value = q_store_floats[(i + a) & 7u32];
+        total = total * 31u32 + get.bits;
+    }
+    for (u32 i = 0u32; i < 4u32; ++i) {
+        union QBits get;
+        get.value = q_store_doubles[i];
+        total = total ^ (u32)get.bits ^ (u32)(get.bits >> 32) * 7u32;
+        total = total + q_zero_bytes[i] + q_zero_halves[i] * 3u32 +
+                q_zero_words[i] * 5u32;
+    }
+    return total + (u32)q_zero_doubles[0] + (u32)q_zero_doubles[1] * 9u32;
+}
+
+// At a size goal, floating constants that only one PHI reads merge as their
+// bits in a general register, transferred once after the merge.
+global f32 q_phi_cells[8];
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_phi_constants(in u32 a, in u32 b, in u32 c) {
+    f32 total = 0.0f32;
+    for (u32 i = 0u32; i < 8u32; ++i) {
+        const f32 step = ((a >> i) & 1u32) != 0u32 ? 0.75f32 : -0.5f32;
+        const f64 wide = ((b >> i) & 1u32) != 0u32 ? 2.5f64 : -0.125f64;
+        q_phi_cells[i] = q_phi_cells[i] * 0.5f32 + step;
+        total = total + step * (f32)(c & 7u32) + (f32)wide;
+    }
+    union QWord view;
+    view.value = total + q_phi_cells[c & 7u32];
+    return view.bits;
+}
+
+// A loop whose header only tests and whose latch's operations all feed its
+// branch computes the body's first operation for the next pass in the
+// latch, where it fills the branch's delay slot.
+global u32 q_carry_cells[32];
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_carry_slot(in u32 a, in u32 b, in u32 c) {
+    for (u32 i = 0u32; i < 32u32; ++i) {
+        q_carry_cells[i] = a * (i + 1u32) ^ (b >> (i & 15u32));
+    }
+    u32 total = c;
+    for (u32 round = 0u32; round < 4u32; ++round) {
+        const u32 k = (a + round * 7u32) & 31u32;
+        for (u32 j = 0u32; j < 32u32; ++j) {
+            if (j != k && q_carry_cells[j] > total) {
+                total = total + (q_carry_cells[j] >> 3);
+            }
+        }
+    }
+    return total;
+}
+
+// A loop whose constants take the colors that hoisting keeps free for
+// allocation at a speed goal, at the cost of preserved registers.
+global i32 q_headroom_px[32];
+global i32 q_headroom_py[32];
+global i32 q_headroom_vx[32];
+global i32 q_headroom_vy[32];
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_headroom(in u32 a, in u32 b, in u32 c) {
+    u32 seed = a ^ (b << 7);
+    for (u32 k = 0u32; k < 32u32; ++k) {
+        seed = seed * 1664525u32 + 1013904223u32;
+        q_headroom_px[k] = (i32)(seed & 1048575u32) - 524288i32;
+        q_headroom_py[k] = (i32)((seed >> 12) & 1048575u32);
+        q_headroom_vx[k] = (i32)((seed >> 7) & 262143u32) - 131072i32;
+        q_headroom_vy[k] = (i32)(c & 4095u32);
+    }
+    u32 hits = 0u32;
+    for (u32 n = 0u32; n < 100u32 + (c & 63u32); ++n) {
+        const u32 k = n & 31u32;
+        i32 vy = q_headroom_vy[k] - 6554i32;
+        i32 py = q_headroom_py[k] + vy;
+        if (py < 0i32) {
+            py = 0i32 - py;
+            vy = (i32)(((i64)(0i32 - vy) * 52429i64) >> 16);
+            hits = hits + 1u32;
+        }
+        i32 vx = (i32)(((i64)q_headroom_vx[k] * 65208i64) >> 16);
+        i32 px = q_headroom_px[k] + vx;
+        if (px < -1048576i32 || px > 1048576i32) {
+            vx = 0i32 - vx;
+            px = q_headroom_px[k];
+        }
+        q_headroom_px[k] = px;
+        q_headroom_py[k] = py;
+        q_headroom_vx[k] = vx;
+        q_headroom_vy[k] = vy;
+    }
+    u32 sum = hits;
+    for (u32 k = 0u32; k < 32u32; ++k) {
+        sum = sum * 31u32 + (u32)q_headroom_px[k];
+        sum = sum * 31u32 + (u32)q_headroom_py[k];
+    }
+    return sum;
+}
+
+// Floating multiply chains: under -mfix4300 (the N64 profile) other work
+// separates consecutive multiplies, and a loop branch runs the load that
+// leads its target in its slot.
+global f64 q_chain_data[16];
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_multiply_chain(in u32 a, in u32 b, in u32 c) {
+    for (u32 i = 0u32; i < 16u32; ++i) {
+        q_chain_data[i] = (f64)((a >> (i & 15u32)) & 255u32) * 0.0625f64 +
+            (f64)(b & 7u32);
+    }
+    f64 result = 0.125f64;
+    f64 x = 0.5f64;
+    f64 y = 0.25f64;
+    for (u32 i = 0u32; i < 16u32 + (c & 15u32); ++i) {
+        const f64 sample = q_chain_data[i & 15u32];
+        result = (result * 0.875f64 + sample) * 0.5f64;
+        x = x * 0.75f64 + sample;
+        y = y * 0.625f64 - sample;
+    }
+    union QBits bits;
+    bits.value = result + x * 0.5f64 + y;
+    return (u32)bits.bits ^ (u32)(bits.bits >> 32);
+}
+
+// A comparison chain whose branches run the next arm's first operation in
+// their delay slots, in registers that no value of the taken edges holds.
+global u32 q_classify_cells[16];
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_classify_chain(in u32 a, in u32 b, in u32 c) {
+    for (u32 i = 0u32; i < 16u32; ++i) {
+        q_classify_cells[i] = a * (i + 3u32) + (b >> (i & 7u32));
+    }
+    u32 result = c;
+    for (u32 i = 0u32; i < 16u32; ++i) {
+        const u32 value = q_classify_cells[i];
+        const u32 selector = value & 3u32;
+        if (selector == 0u32) {
+            result = result + value;
+        } else if (selector == 1u32) {
+            result = result ^ (value << 1);
+        } else if (selector == 2u32) {
+            result = result + (value >> 2);
+        } else {
+            result = result - (value >> 3);
+        }
+    }
+    return result;
+}

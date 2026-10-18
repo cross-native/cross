@@ -101,6 +101,9 @@ enum class LoweringPass : std::uint16_t {
     DuplicateBranchBlocks,
     ElideUnusedSpillSlots,
     SelectBitFields,
+    SelectValueBanks,
+    CarryLoopOperations,
+    CopyRotatingPhis,
 };
 
 // Physical GPR identities use the architectural register numbers.  Machine
@@ -301,6 +304,15 @@ std::uint32_t frame_realignment(const machine::Function& function) {
 
 bool phi_instruction(const machine::Instruction& instruction) {
     return instruction.opcode == Opcode::Phi;
+}
+
+// The instructions LI of a word is: one for a 16-bit word or one whose low
+// half is zero, else two (the expansion of LLVM MC and GNU as).
+unsigned word_instructions(std::uint32_t word) {
+    const auto value = static_cast<std::int32_t>(word);
+    return (value >= -32768 && value <= 32767) || word <= 0xffffU ||
+                   (word & 0xffffU) == 0
+               ? 1U : 2U;
 }
 
 // The cycles a preserved register costs a call: its save and its restore.
@@ -4105,6 +4117,101 @@ private:
                 }
             }
         }
+        // A conditional branch whose own block offers nothing for its delay
+        // slot and whose taken edge starts with a branch may run the first
+        // operation of the block it falls through to in its slot, when that
+        // operation's result is dead on the taken edge
+        // (plan_fallthrough_delays). Its result then avoids the registers
+        // of the values live on that edge.
+        if (options_.schedule_insns2) {
+            const auto first_operation = [&](const machine::Block& block)
+                -> const machine::Instruction* {
+                for (const auto& instruction : block.instructions) {
+                    const auto opcode = decode_opcode(instruction.opcode);
+                    if (instruction.opcode == Opcode::Phi ||
+                        (instruction.kind == machine::InstructionKind::Target &&
+                         (opcode == Opcode::LifetimeStart ||
+                          opcode == Opcode::LifetimeEnd ||
+                          opcode == Opcode::IntrinsicNoop))) {
+                        continue;
+                    }
+                    return &instruction;
+                }
+                return nullptr;
+            };
+            for (std::size_t at = 0; at + 1 < function.layout.size(); ++at) {
+                const auto& branching = function.blocks[function.layout[at].value];
+                if (branching.instructions.empty() ||
+                    branching.instructions.back().kind !=
+                        machine::InstructionKind::ConditionalBranch ||
+                    !slot_needs_operation(branching)) {
+                    continue;
+                }
+                const auto next = function.layout[at + 1];
+                std::optional<machine::BlockId> taken;
+                bool falls = false;
+                for (const auto successor : branching.successors) {
+                    if (successor == next) {
+                        falls = true;
+                    } else {
+                        taken = successor;
+                    }
+                }
+                if (!falls || !taken || taken->value >= block_count ||
+                    next.value >= block_count ||
+                    function.blocks[next.value].predecessors.size() != 1) {
+                    continue;
+                }
+                const auto* lent = first_operation(function.blocks[next.value]);
+                const auto* target = first_operation(function.blocks[taken->value]);
+                if (!lent || !target ||
+                    (target->kind != machine::InstructionKind::ConditionalBranch &&
+                     target->kind != machine::InstructionKind::Branch) ||
+                    !carried_operation(function, *lent)) {
+                    continue;
+                }
+                const auto result = virtual_id(lent->defs.front());
+                // A result that a PHI merges, such as an updated
+                // accumulator, would need a copy in another register.
+                if (!result || std::any_of(
+                        function.blocks.begin(), function.blocks.end(),
+                        [&](const machine::Block& block) {
+                            return std::any_of(
+                                block.instructions.begin(),
+                                block.instructions.end(),
+                                [&](const machine::Instruction& phi) {
+                                    return phi.opcode == Opcode::Phi &&
+                                        std::find(phi.uses.begin(),
+                                                  phi.uses.end(),
+                                                  lent->defs.front()) !=
+                                            phi.uses.end();
+                                });
+                        })) {
+                    continue;
+                }
+                auto edge = live_in[taken->value];
+                for (const auto& phi : function.blocks[taken->value].instructions) {
+                    if (phi.opcode != Opcode::Phi) continue;
+                    for (std::size_t index = 0;
+                         index + 1 < phi.operands.size(); index += 2) {
+                        const auto* from = std::get_if<machine::BlockOperand>(
+                            &phi.operands[index]);
+                        const auto* value = std::get_if<machine::RegisterOperand>(
+                            &phi.operands[index + 1]);
+                        if (from && value && from->target == branching.id) {
+                            if (const auto id = virtual_id(value->value)) {
+                                edge.insert(*id);
+                            }
+                        }
+                    }
+                }
+                for (const auto other : edge) {
+                    if (other == *result || other >= count) continue;
+                    interference[*result].insert(other);
+                    interference[other].insert(*result);
+                }
+            }
+        }
         // A copy that reinterprets integer bits costs nothing when both
         // values share a color.
         for (const auto& block : function.blocks) {
@@ -7777,6 +7884,702 @@ private:
         return changed;
     }
 
+    bool layout_blocks(machine::Function& function) {
+        if (!options_.reorder_blocks) return false;
+        return native::schedule_block_layout(
+            function,
+            [&](machine::BlockId block) {
+                return std::any_of(
+                    function.labels.begin(), function.labels.end(),
+                    [&](const machine::Function::LocalLabel& label) {
+                        return label.block == block;
+                    });
+            },
+            true);
+    }
+
+    bool copy_rotations(machine::Function& function) {
+        if (!options_.schedule_insns || !options_.register_allocation ||
+            naked_) {
+            return false;
+        }
+        return native::copy_rotating_phis(
+            function, phi_instruction,
+            [this](machine::Function& target, const machine::Register& like) {
+                auto copy = create_integer_temporary(target, like.mode, {},
+                                                     "rotated");
+                target.virtual_register_classes[copy.id] =
+                    target.virtual_register_classes[like.id];
+                return copy;
+            });
+    }
+
+    bool carry_operations(machine::Function& function) {
+        if (!options_.schedule_insns2 ||
+            !options_.register_allocation || naked_) {
+            return false;
+        }
+        native::CarriedOperationPolicy policy;
+        policy.is_phi = phi_instruction;
+        policy.emits_nothing = [](const machine::Instruction& value) {
+            const auto opcode = decode_opcode(value.opcode);
+            return value.kind == machine::InstructionKind::Target &&
+                (opcode == Opcode::LifetimeStart ||
+                 opcode == Opcode::LifetimeEnd ||
+                 opcode == Opcode::IntrinsicNoop);
+        };
+        policy.is_movable = [&](const machine::Instruction& value) {
+            return carried_operation(function, value);
+        };
+        policy.slot_empty = [](const machine::Block& block) {
+            return slot_needs_operation(block);
+        };
+        policy.phi_opcode = Opcode::Phi;
+        policy.clone_register = [this](machine::Function& target,
+                                       const machine::Register& like) {
+            return create_integer_temporary(target, like.mode, {},
+                                            "carried");
+        };
+        return native::carry_loop_operations(function, policy);
+    }
+
+    // Loop constants leave their loops while the policy's pressure limit
+    // allows (native::hoist_loop_constants). That limit keeps headroom
+    // below the colors; when hoisting into the headroom as well takes more
+    // constants out of loops, allocation decides between the two
+    // functions (allocate_scheduled_registers).
+    bool hoist_constants(machine::Function& function) {
+        if (!options_.move_loop_invariants ||
+            !options_.register_allocation || naked_) {
+            return false;
+        }
+        native::LoopConstantPolicy policy;
+        // A 16-bit or `lui` constant, a floating constant, or the
+        // high part of a global address costs an instruction on
+        // every trip, an FPR transfer a hazard delay too.
+        policy.is_constant = [](const machine::Instruction& value) {
+            const auto opcode = decode_opcode(value.opcode);
+            return opcode == Opcode::Constant ||
+                opcode == Opcode::Fconstant ||
+                opcode == Opcode::GlobalHigh;
+        };
+        policy.is_phi = phi_instruction;
+        policy.bank = [&](const machine::Register& value)
+            -> std::optional<unsigned> {
+            if (value.kind != machine::RegisterKind::Virtual ||
+                value.id >= function.virtual_register_classes.size()) {
+                return std::nullopt;
+            }
+            const auto kind = function.virtual_register_classes[value.id];
+            if (kind == machine::VirtualRegisterClass::Integer &&
+                (value.mode.bits <= 32 ||
+                 subtarget_.has_feature(Feature::Mips3))) {
+                return 0U;
+            }
+            if (kind == machine::VirtualRegisterClass::Floating &&
+                colorable_floating(subtarget_, value.mode.bits)) {
+                return 1U;
+            }
+            return std::nullopt;
+        };
+        // Like the scheduler's peaks, leave colors for loop-PHI
+        // interference and emitter staging. For size, a hoisted
+        // constant must not need a register the function would
+        // then save and restore: one beyond the volatile colors
+        // and the function's peak pressure.
+        const bool size =
+            options_.optimize_for == OptimizationGoal::Size ||
+            options_.optimize_for == OptimizationGoal::MinimumSize;
+        const auto* abi = managed_abi_model(
+            hir_, hir_.function(function.source), subtarget_,
+            options_);
+        const auto colors =
+            [&](const std::vector<machine::PhysicalRegisterId>& list) {
+                return static_cast<unsigned>(std::count_if(
+                    list.begin(), list.end(),
+                    [&](machine::PhysicalRegisterId color) {
+                        if (!size) return true;
+                        const auto name = color.value >= fpr_physical_base
+                            ? fpr_name(color) : gpr_name(color);
+                        return abi &&
+                            std::find(abi->call_clobbers.begin(),
+                                      abi->call_clobbers.end(),
+                                      name) != abi->call_clobbers.end();
+                    }));
+            };
+        const auto gprs = colors(allocatable_gprs(function));
+        const auto fprs = colors(allocatable_fprs());
+        policy.capacity = {gprs > 3U ? gprs - 3U : 0U,
+                           fprs > 2U ? fprs - 2U : 0U};
+        policy.colors = {
+            static_cast<unsigned>(allocatable_gprs(function).size()),
+            static_cast<unsigned>(allocatable_fprs().size())};
+        const bool changed = native::hoist_loop_constants(function, policy);
+        // The headroom takes only constants that cost an instruction where
+        // they are: one that heads its block, or that its block's branch
+        // follows without reading it, can run in a delay slot instead.
+        std::unordered_set<std::uint32_t> slot_constants;
+        for (const auto& block : function.blocks) {
+            const auto& instructions = block.instructions;
+            const auto first = std::find_if(
+                instructions.begin(), instructions.end(),
+                [](const machine::Instruction& value) {
+                    const auto opcode = decode_opcode(value.opcode);
+                    return !phi_instruction(value) &&
+                        !(value.kind == machine::InstructionKind::Target &&
+                          (opcode == Opcode::LifetimeStart ||
+                           opcode == Opcode::LifetimeEnd ||
+                           opcode == Opcode::IntrinsicNoop));
+                });
+            const auto slot = [&](const machine::Instruction& value) {
+                const auto opcode = decode_opcode(value.opcode);
+                const auto* immediate = value.operands.empty()
+                    ? nullptr
+                    : std::get_if<machine::ImmediateOperand>(
+                          &value.operands.front());
+                if (value.defs.size() != 1 ||
+                    (opcode != Opcode::GlobalHigh &&
+                     (opcode != Opcode::Constant || !immediate ||
+                      immediate->high != 0 ||
+                      word_instructions(static_cast<std::uint32_t>(
+                          immediate->value)) != 1 ||
+                      (value.defs.front().mode.bits > 32 &&
+                       static_cast<std::int64_t>(immediate->value) !=
+                           static_cast<std::int32_t>(immediate->value))))) {
+                    return;
+                }
+                slot_constants.insert(value.defs.front().id);
+            };
+            if (first != instructions.end()) slot(*first);
+            if (instructions.size() >= 2) {
+                const auto& branch = instructions.back();
+                const auto& last = instructions[instructions.size() - 2];
+                if ((branch.kind == machine::InstructionKind::Branch ||
+                     branch.kind ==
+                         machine::InstructionKind::ConditionalBranch) &&
+                    !last.defs.empty() &&
+                    std::find(branch.uses.begin(), branch.uses.end(),
+                              last.defs.front()) == branch.uses.end()) {
+                    slot(last);
+                }
+            }
+        }
+        auto headroom = policy;
+        headroom.capacity = {gprs, fprs};
+        headroom.is_constant = [&](const machine::Instruction& value) {
+            return policy.is_constant(value) &&
+                !(value.defs.size() == 1 &&
+                  value.defs.front().kind == machine::RegisterKind::Virtual &&
+                  slot_constants.contains(value.defs.front().id));
+        };
+        auto widened = function;
+        if (!native::hoist_loop_constants(widened, headroom)) return changed;
+        // Constants in loops, weighted by how often their blocks run.
+        const auto loop_constants = [&](const machine::Function& value) {
+            const auto weights = block_weights(value);
+            std::uint64_t total{};
+            for (const auto& block : value.blocks) {
+                if (block.id.value >= weights.size() ||
+                    weights[block.id.value] <= 1) {
+                    continue;
+                }
+                for (const auto& instruction : block.instructions) {
+                    if (policy.is_constant(instruction)) {
+                        total += weights[block.id.value];
+                    }
+                }
+            }
+            return total;
+        };
+        const auto kept = loop_constants(function);
+        const auto hoisted = loop_constants(widened);
+        if (hoisted >= kept) return changed;
+        headroom_fallback_ = std::move(function);
+        headroom_gain_ = kept - hoisted;
+        function = std::move(widened);
+        return true;
+    }
+
+    // An integer operation that is one instruction whatever registers it
+    // gets and that may run on a path that does not need its result: it
+    // neither touches memory nor traps.
+    bool carried_operation(const machine::Function& function,
+                           const machine::Instruction& value) const {
+        if (value.kind != machine::InstructionKind::Target ||
+            value.defs.size() != 1 || value.may_load || value.may_store ||
+            value.has_side_effects || value.patch ||
+            !value.clobbers.empty()) {
+            return false;
+        }
+        // One register holds each value: a word, or a doubleword from
+        // MIPS III on.
+        const auto single = [&](const machine::Register& value) {
+            return value.mode.bits <= 32 ||
+                (value.mode.bits <= 64 &&
+                 subtarget_.has_feature(Feature::Mips3));
+        };
+        const auto definition = value.defs.front();
+        if (definition.kind != machine::RegisterKind::Virtual ||
+            definition.id >= function.virtual_register_classes.size() ||
+            function.virtual_register_classes[definition.id] !=
+                machine::VirtualRegisterClass::Integer ||
+            !single(definition) ||
+            std::any_of(value.uses.begin(), value.uses.end(),
+                        [&](const machine::Register& use) {
+                            return use.kind !=
+                                       machine::RegisterKind::Virtual ||
+                                   !single(use);
+                        })) {
+            return false;
+        }
+        switch (decode_opcode(value.opcode)) {
+        case Opcode::Add:
+        case Opcode::Sub:
+        case Opcode::And:
+        case Opcode::Or:
+        case Opcode::Xor:
+        case Opcode::Shl:
+        case Opcode::ShrS:
+        case Opcode::ShrU:
+        case Opcode::Neg:
+        case Opcode::Not:
+        case Opcode::PointerOffset:
+        case Opcode::GlobalHigh:
+            return value.uses.size() <= 2;
+        case Opcode::IndexedAddress: {
+            const auto* scale = value.operands.empty()
+                ? nullptr
+                : std::get_if<machine::ImmediateOperand>(
+                      &value.operands.back());
+            return scale && scale->value == 1 && value.uses.size() == 2;
+        }
+        default: return false;
+        }
+    }
+
+    // Whether every operation of a block before its branch feeds that
+    // branch, so that none of them can fill its delay slot.
+    static bool slot_needs_operation(const machine::Block& block) {
+        if (block.instructions.empty()) return false;
+        const auto& terminator = block.instructions.back();
+        if (terminator.kind != machine::InstructionKind::Branch &&
+            terminator.kind != machine::InstructionKind::ConditionalBranch) {
+            return false;
+        }
+        std::unordered_set<std::uint32_t> needed;
+        for (const auto& use : terminator.uses) {
+            if (use.kind == machine::RegisterKind::Virtual) {
+                needed.insert(use.id);
+            }
+        }
+        for (auto instruction = block.instructions.rbegin() + 1;
+             instruction != block.instructions.rend(); ++instruction) {
+            if (phi_instruction(*instruction)) continue;
+            const auto opcode = decode_opcode(instruction->opcode);
+            if (instruction->kind == machine::InstructionKind::Target &&
+                (opcode == Opcode::LifetimeStart ||
+                 opcode == Opcode::LifetimeEnd ||
+                 opcode == Opcode::IntrinsicNoop)) {
+                continue;
+            }
+            const bool feeds = std::any_of(
+                instruction->defs.begin(), instruction->defs.end(),
+                [&](const machine::Register& definition) {
+                    return definition.kind ==
+                               machine::RegisterKind::Virtual &&
+                           needed.contains(definition.id);
+                });
+            if (!feeds) return false;
+            for (const auto& use : instruction->uses) {
+                if (use.kind == machine::RegisterKind::Virtual) {
+                    needed.insert(use.id);
+                }
+            }
+        }
+        return true;
+    }
+
+    // Values that are only moved take the register bank of what moves
+    // them. A floating constant that only stores read is stored from a
+    // general register, which needs no FPU transfer; a load whose only
+    // reader reinterprets it in the other bank loads straight into that
+    // bank, and a store of a value reinterpreted from the other bank stores
+    // its source. At a size goal, floating constants that only one PHI
+    // reads merge as their bits in a general register, transferred once
+    // after the merge: each edge loads its constant's bits, where a delay
+    // slot can take it, instead of every constant needing a transfer and a
+    // register and every edge a copy. An integer store of zero stores
+    // $zero.
+    bool select_value_banks(machine::Function& function) {
+        if (!options_.machine_combine || naked_) return false;
+        const auto virtual_id = [&](const machine::Register& value)
+            -> std::optional<std::uint32_t> {
+            if (value.kind != machine::RegisterKind::Virtual ||
+                value.id >= function.virtual_registers.size()) {
+                return std::nullopt;
+            }
+            return value.id;
+        };
+        const auto floating = [&](const machine::Register& value) {
+            const auto id = virtual_id(value);
+            return id && function.virtual_register_classes[*id] ==
+                machine::VirtualRegisterClass::Floating;
+        };
+        const auto integer = [&](const machine::Register& value) {
+            const auto id = virtual_id(value);
+            return id && function.virtual_register_classes[*id] ==
+                machine::VirtualRegisterClass::Integer;
+        };
+        // Doubleword integers are word pairs before MIPS III, and wider
+        // ones always take several registers.
+        const auto pair = [&](const machine::Register& value) {
+            return value.mode.bits > 64 ||
+                (value.mode.bits > 32 &&
+                 !subtarget_.has_feature(Feature::Mips3));
+        };
+        // A value held whole by one register of either bank.
+        const auto whole = [&](const machine::Register& value) {
+            return (value.mode.bits == 32 || value.mode.bits == 64) &&
+                !pair(value) && colorable_floating(subtarget_, value.mode.bits);
+        };
+        // The index of a store's stored value among its uses.
+        const auto stored_value = [](const machine::Instruction& value)
+            -> std::optional<std::size_t> {
+            if (value.kind != machine::InstructionKind::Target) {
+                return std::nullopt;
+            }
+            switch (decode_opcode(value.opcode)) {
+            case Opcode::Store:
+            case Opcode::Fstore:
+            case Opcode::GlobalStore:
+            case Opcode::FglobalStore:
+                return value.uses.size() == 1 ? std::optional<std::size_t>{0}
+                                              : std::nullopt;
+            case Opcode::PointerStore:
+            case Opcode::FpointerStore:
+                return value.uses.size() == 2 ? std::optional<std::size_t>{1}
+                                              : std::nullopt;
+            default: return std::nullopt;
+            }
+        };
+        const auto other_bank = [](Opcode opcode) -> std::optional<Opcode> {
+            switch (opcode) {
+            case Opcode::Store: return Opcode::Fstore;
+            case Opcode::Fstore: return Opcode::Store;
+            case Opcode::GlobalStore: return Opcode::FglobalStore;
+            case Opcode::FglobalStore: return Opcode::GlobalStore;
+            case Opcode::PointerStore: return Opcode::FpointerStore;
+            case Opcode::FpointerStore: return Opcode::PointerStore;
+            case Opcode::LoadSigned:
+            case Opcode::LoadUnsigned: return Opcode::Fload;
+            case Opcode::Fload: return Opcode::LoadSigned;
+            case Opcode::PointerLoadSigned:
+            case Opcode::PointerLoadUnsigned: return Opcode::FpointerLoad;
+            case Opcode::FpointerLoad: return Opcode::PointerLoadSigned;
+            case Opcode::IndexedLoadSigned:
+            case Opcode::IndexedLoadUnsigned: return Opcode::FindexedLoad;
+            case Opcode::FindexedLoad: return Opcode::IndexedLoadSigned;
+            case Opcode::GlobalLoadSigned:
+            case Opcode::GlobalLoadUnsigned: return Opcode::FglobalLoad;
+            case Opcode::FglobalLoad: return Opcode::GlobalLoadSigned;
+            default: return std::nullopt;
+            }
+        };
+        // A store's register operands list its uses in order.
+        const auto replace_use = [](machine::Instruction& value,
+                                    std::size_t index,
+                                    const machine::Register& replacement) {
+            value.uses[index] = replacement;
+            std::size_t ordinal = 0;
+            for (auto& operand : value.operands) {
+                auto* reg = std::get_if<machine::RegisterOperand>(&operand);
+                if (reg && ordinal++ == index) {
+                    reg->value = replacement;
+                    break;
+                }
+            }
+        };
+
+        struct Site {
+            std::size_t block{};
+            std::size_t index{};
+        };
+        // Each value's definition, number of reads, and last reader.
+        std::vector<std::optional<Site>> definition;
+        std::vector<std::optional<Site>> reader;
+        std::vector<unsigned> uses;
+        const auto survey = [&] {
+            const auto count = function.virtual_registers.size();
+            definition.assign(count, std::nullopt);
+            reader.assign(count, std::nullopt);
+            uses.assign(count, 0U);
+            for (std::size_t block = 0; block < function.blocks.size();
+                 ++block) {
+                const auto& instructions = function.blocks[block].instructions;
+                for (std::size_t index = 0; index < instructions.size();
+                     ++index) {
+                    const auto& value = instructions[index];
+                    for (const auto& def : value.defs) {
+                        if (const auto id = virtual_id(def)) {
+                            definition[*id] = Site{block, index};
+                        }
+                    }
+                    for (const auto* list : {&value.uses,
+                                             &value.live_across_call}) {
+                        for (const auto& use : *list) {
+                            if (const auto id = virtual_id(use)) {
+                                ++uses[*id];
+                                reader[*id] = Site{block, index};
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        const auto at = [&](const Site& site) -> machine::Instruction& {
+            return function.blocks[site.block].instructions[site.index];
+        };
+
+        bool changed = false;
+        // Floating constants that only stores read.
+        survey();
+        std::vector<unsigned> stored(function.virtual_registers.size());
+        for (const auto& block : function.blocks) {
+            for (const auto& value : block.instructions) {
+                if (const auto index = stored_value(value)) {
+                    if (const auto id = virtual_id(value.uses[*index])) {
+                        ++stored[*id];
+                    }
+                }
+            }
+        }
+        std::vector<std::optional<machine::Register>> retyped(
+            function.virtual_registers.size());
+        for (auto& block : function.blocks) {
+            for (auto& value : block.instructions) {
+                if (value.kind != machine::InstructionKind::Target ||
+                    decode_opcode(value.opcode) != Opcode::Fconstant ||
+                    value.defs.size() != 1 || value.operands.empty() ||
+                    !floating(value.defs.front()) ||
+                    !whole(value.defs.front())) {
+                    continue;
+                }
+                const auto id = value.defs.front().id;
+                if (uses[id] == 0 || stored[id] != uses[id]) continue;
+                const auto replacement = create_integer_temporary(
+                    function, value.defs.front().mode, value.location,
+                    "stored.constant");
+                value.opcode = Opcode::Constant;
+                value.defs = {replacement};
+                retyped[id] = replacement;
+                changed = true;
+            }
+        }
+        if (changed) {
+            for (auto& block : function.blocks) {
+                for (auto& value : block.instructions) {
+                    const auto index = stored_value(value);
+                    if (!index) continue;
+                    const auto id = virtual_id(value.uses[*index]);
+                    if (!id || *id >= retyped.size() || !retyped[*id]) continue;
+                    value.opcode = *other_bank(decode_opcode(value.opcode));
+                    replace_use(value, *index, *retyped[*id]);
+                }
+            }
+        }
+
+        // Reinterpretations between the banks next to a load or store.
+        survey();
+        std::vector<std::vector<bool>> erased(function.blocks.size());
+        for (std::size_t block = 0; block < function.blocks.size(); ++block) {
+            erased[block].assign(function.blocks[block].instructions.size(),
+                                 false);
+        }
+        for (std::size_t block = 0; block < function.blocks.size(); ++block) {
+            auto& instructions = function.blocks[block].instructions;
+            for (std::size_t index = 0; index < instructions.size(); ++index) {
+                auto& reinterpret = instructions[index];
+                if (reinterpret.kind != machine::InstructionKind::Target ||
+                    decode_opcode(reinterpret.opcode) != Opcode::Freinterpret ||
+                    reinterpret.uses.size() != 1 ||
+                    reinterpret.defs.size() != 1) {
+                    continue;
+                }
+                const auto source = reinterpret.uses.front();
+                const auto target = reinterpret.defs.front();
+                const auto source_id = virtual_id(source);
+                const auto target_id = virtual_id(target);
+                if (!source_id || !target_id || !whole(source) ||
+                    source.mode.bits != target.mode.bits ||
+                    floating(source) == floating(target) ||
+                    !(floating(source) || integer(source)) ||
+                    !(floating(target) || integer(target))) {
+                    continue;
+                }
+                // A load whose only reader is this reinterpretation.
+                if (const auto site = definition[*source_id];
+                    site && uses[*source_id] == 1) {
+                    auto& load = at(*site);
+                    const auto opcode = other_bank(decode_opcode(load.opcode));
+                    if (load.kind == machine::InstructionKind::Target &&
+                        load.may_load && !load.may_store &&
+                        !load.has_side_effects && !load.patch &&
+                        load.defs.size() == 1 && opcode &&
+                        (*opcode == Opcode::Fload ||
+                         *opcode == Opcode::FpointerLoad ||
+                         *opcode == Opcode::FindexedLoad ||
+                         *opcode == Opcode::FglobalLoad) ==
+                            floating(target)) {
+                        load.opcode = *opcode;
+                        load.defs = {target};
+                        erased[block][index] = true;
+                        changed = true;
+                        continue;
+                    }
+                }
+                // A store that is the only reader of this reinterpretation.
+                if (uses[*target_id] != 1 || !reader[*target_id]) continue;
+                auto& store = at(*reader[*target_id]);
+                const auto stored_index = stored_value(store);
+                if (!stored_index || store.uses[*stored_index] != target) {
+                    continue;
+                }
+                store.opcode = *other_bank(decode_opcode(store.opcode));
+                replace_use(store, *stored_index, source);
+                erased[block][index] = true;
+                changed = true;
+            }
+        }
+        for (std::size_t block = 0; block < function.blocks.size(); ++block) {
+            auto& instructions = function.blocks[block].instructions;
+            std::size_t kept = 0;
+            for (std::size_t index = 0; index < instructions.size(); ++index) {
+                if (erased[block][index]) continue;
+                if (kept != index) {
+                    instructions[kept] = std::move(instructions[index]);
+                }
+                ++kept;
+            }
+            instructions.resize(kept);
+        }
+
+        // PHIs of floating constants that nothing else reads.
+        if (options_.optimize_for == OptimizationGoal::Size ||
+            options_.optimize_for == OptimizationGoal::MinimumSize) {
+            survey();
+            for (auto& block : function.blocks) {
+                std::size_t phis = 0;
+                while (phis < block.instructions.size() &&
+                       phi_instruction(block.instructions[phis])) {
+                    ++phis;
+                }
+                std::vector<machine::Instruction> transfers;
+                for (std::size_t index = 0; index < phis; ++index) {
+                    auto& phi = block.instructions[index];
+                    if (phi.defs.size() != 1 || !floating(phi.defs.front()) ||
+                        !whole(phi.defs.front()) || phi.uses.empty()) {
+                        continue;
+                    }
+                    std::unordered_map<std::uint32_t, unsigned> reads;
+                    for (const auto& use : phi.uses) {
+                        if (const auto id = virtual_id(use)) ++reads[*id];
+                    }
+                    const bool constants = std::all_of(
+                        phi.uses.begin(), phi.uses.end(),
+                        [&](const machine::Register& use) {
+                            const auto id = virtual_id(use);
+                            if (!id || !definition[*id] ||
+                                uses[*id] != reads[*id]) {
+                                return false;
+                            }
+                            const auto& constant = at(*definition[*id]);
+                            return constant.kind ==
+                                       machine::InstructionKind::Target &&
+                                decode_opcode(constant.opcode) ==
+                                    Opcode::Fconstant &&
+                                constant.defs.size() == 1 &&
+                                !constant.operands.empty() &&
+                                constant.defs.front().mode ==
+                                    phi.defs.front().mode;
+                        });
+                    if (!constants) continue;
+                    std::unordered_map<std::uint32_t, machine::Register> bits;
+                    for (const auto& [id, count] : reads) {
+                        (void)count;
+                        auto& constant = at(*definition[id]);
+                        const auto replacement = create_integer_temporary(
+                            function, constant.defs.front().mode,
+                            constant.location, "phi.bits");
+                        constant.opcode = Opcode::Constant;
+                        constant.defs = {replacement};
+                        bits.emplace(id, replacement);
+                    }
+                    for (auto& use : phi.uses) use = bits.at(use.id);
+                    for (auto& operand : phi.operands) {
+                        auto* reg =
+                            std::get_if<machine::RegisterOperand>(&operand);
+                        if (reg && reg->value.kind ==
+                                       machine::RegisterKind::Virtual &&
+                            bits.contains(reg->value.id)) {
+                            reg->value = bits.at(reg->value.id);
+                        }
+                    }
+                    const auto merged = create_integer_temporary(
+                        function, phi.defs.front().mode, phi.location,
+                        "phi.bits");
+                    auto transfer = target_instruction(Opcode::Freinterpret,
+                                                       phi.location);
+                    transfer.inline_site = phi.inline_site;
+                    transfer.uses = {merged};
+                    transfer.defs = {phi.defs.front()};
+                    phi.defs = {merged};
+                    transfers.push_back(std::move(transfer));
+                    changed = true;
+                }
+                block.instructions.insert(
+                    block.instructions.begin() +
+                        static_cast<std::ptrdiff_t>(phis),
+                    std::make_move_iterator(transfers.begin()),
+                    std::make_move_iterator(transfers.end()));
+            }
+        }
+
+        // Integer stores of zero.
+        survey();
+        for (auto& block : function.blocks) {
+            for (auto& value : block.instructions) {
+                const auto index = stored_value(value);
+                const auto opcode = decode_opcode(value.opcode);
+                if (!index || (opcode != Opcode::Store &&
+                               opcode != Opcode::PointerStore &&
+                               opcode != Opcode::GlobalStore)) {
+                    continue;
+                }
+                const auto source = value.uses[*index];
+                const auto id = virtual_id(source);
+                if (!id || !definition[*id] || pair(source)) {
+                    continue;
+                }
+                const auto& constant = at(*definition[*id]);
+                const auto* immediate = constant.operands.empty()
+                    ? nullptr
+                    : std::get_if<machine::ImmediateOperand>(
+                          &constant.operands.front());
+                if (constant.kind != machine::InstructionKind::Target ||
+                    decode_opcode(constant.opcode) != Opcode::Constant ||
+                    !immediate || immediate->value != 0 ||
+                    immediate->high != 0) {
+                    continue;
+                }
+                replace_use(value, *index,
+                            machine::Register::physical_register(
+                                {0}, source.mode));
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
     // A store of one register to memory, which the scheduler keeps in order
     // with the region's loads, stores, and operations that may trap.
     static bool ordered_store(const machine::Instruction& instruction) {
@@ -7785,7 +8588,9 @@ private:
             !instruction.clobbers.empty() ||
             std::any_of(instruction.uses.begin(), instruction.uses.end(),
                         [](machine::Register value) {
-                            return value.kind == machine::RegisterKind::Physical;
+                            return value.kind ==
+                                       machine::RegisterKind::Physical &&
+                                   value.id != 0;
                         })) {
             return false;
         }
@@ -7805,7 +8610,8 @@ private:
         // registry instruction forms, keeps its order with loads and other
         // such operations through dependencies instead.
         if (ordered_stores_ && ordered_store(instruction)) return false;
-        if (instruction.kind != machine::InstructionKind::Target ||
+        if ((instruction.kind != machine::InstructionKind::Target &&
+             instruction.kind != machine::InstructionKind::Copy) ||
             instruction.may_store ||
             (instruction.has_side_effects && !trap_only(instruction)) ||
             instruction.patch) {
@@ -7977,6 +8783,51 @@ private:
         }
     }
 
+    // The cycles an operation holds the single-issue pipeline: the -mtune
+    // issue cost of its principal instruction, which on CPUs without a
+    // pipelined FPU or multiplier is its latency.
+    unsigned estimated_issue(const machine::Instruction& instruction) const {
+        using I = Instruction;
+        const auto bits = instruction.defs.empty()
+            ? 32U : instruction.defs.front().mode.bits;
+        const bool wide = bits == 64 && subtarget_.has_feature(Feature::Mips3);
+        const bool single = bits <= 32;
+        const auto issue = [&](I item) {
+            return std::max(1U, subtarget_.instruction_cost(item).issue);
+        };
+        switch (decode_opcode(instruction.opcode)) {
+        case Opcode::Sdiv:
+        case Opcode::Srem:
+        case Opcode::Sdivrem: return issue(wide ? I::Ddiv : I::Div);
+        case Opcode::Udiv:
+        case Opcode::Urem:
+        case Opcode::Udivrem: return issue(wide ? I::Ddivu : I::Divu);
+        case Opcode::Mul:
+        case Opcode::MulStart:
+            if (!wide && decode_opcode(instruction.opcode) == Opcode::Mul &&
+                selects_three_operand_multiply(subtarget_)) {
+                return issue(I::Mul);
+            }
+            return issue(wide ? I::Dmult : I::Mult);
+        case Opcode::Mulhs: return issue(wide ? I::Dmult : I::Mult);
+        case Opcode::Mulhu: return issue(wide ? I::Dmultu : I::Multu);
+        case Opcode::Fadd: return issue(single ? I::AddS : I::AddD);
+        case Opcode::Fsub: return issue(single ? I::SubS : I::SubD);
+        case Opcode::Fmul: return issue(single ? I::MulS : I::MulD);
+        case Opcode::Fdiv: return issue(single ? I::DivS : I::DivD);
+        case Opcode::Fextend: return issue(I::CvtDS);
+        case Opcode::Ftruncate: return issue(I::CvtSD);
+        case Opcode::Sitofp:
+        case Opcode::Uitofp: return issue(single ? I::CvtSW : I::CvtDW);
+        case Opcode::Fptosi:
+        case Opcode::Fptoui:
+            return issue(instruction.uses.empty() ||
+                                 instruction.uses.front().mode.bits <= 32
+                             ? I::TruncWS : I::TruncWD);
+        default: return 1U;
+        }
+    }
+
     machine::Register create_hilo_dependency(machine::Function& function) {
         const machine::VirtualRegisterId id{
             static_cast<std::uint32_t>(function.virtual_registers.size())};
@@ -8101,7 +8952,8 @@ private:
 
         // Phi updates on a loop backedge are distinct SSA names.  Record the
         // relationship so scheduling cannot move a destructive/coalesced
-        // update ahead of a use of the current iteration's phi value.
+        // update ahead of a use of the current iteration's phi value, also
+        // when the update reaches its PHI through a later block (a latch).
         std::unordered_map<std::uint32_t, std::uint32_t>
             backedge_phi_sources;
         const auto reaches_owner = [&](machine::BlockId start) {
@@ -8123,14 +8975,12 @@ private:
             return false;
         };
         if (owner.value < current_.blocks.size()) {
-            for (const auto successor :
-                 current_.blocks[owner.value].successors) {
-                if (!reaches_owner(successor) ||
-                    successor.value >= current_.blocks.size()) {
-                    continue;
-                }
-                for (const auto& phi :
-                     current_.blocks[successor.value].instructions) {
+            for (const auto& block : current_.blocks) {
+                const bool phis = !block.instructions.empty() &&
+                    decode_opcode(block.instructions.front().opcode) ==
+                        Opcode::Phi;
+                if (!phis || !reaches_owner(block.id)) continue;
+                for (const auto& phi : block.instructions) {
                     if (decode_opcode(phi.opcode) != Opcode::Phi ||
                         phi.defs.size() != 1 ||
                         phi.defs.front().kind !=
@@ -8145,7 +8995,7 @@ private:
                         const auto* source =
                             std::get_if<machine::RegisterOperand>(
                                 &phi.operands[operand + 1]);
-                        if (edge && source && edge->target == owner &&
+                        if (edge && source &&
                             source->value.kind ==
                                 machine::RegisterKind::Virtual) {
                             backedge_phi_sources.emplace(
@@ -8439,6 +9289,12 @@ private:
             };
             unsigned hilo_write_gap{};
             unsigned hilo_result_gap{};
+            // Under -mfix4300 the emitter separates consecutive floating
+            // multiplies with a NOP: after one, prefer ready work that is
+            // not another.
+            const bool separate_multiplies =
+                subtarget_.has_feature(Feature::Fix4300);
+            bool after_multiply = false;
             // Without FPU transfer interlocks, the register a transfer writes is
             // usable one instruction late: prefer ready work that does not read
             // it, so the emitter need not separate the two with a NOP.
@@ -8510,6 +9366,16 @@ private:
                     }
                     return false;
                 }();
+                const bool ready_non_multiply = separate_multiplies &&
+                    after_multiply && [&] {
+                        for (std::size_t index = 0; index < count; ++index) {
+                            if (!emitted[index] && indegree[index] == 0 &&
+                                opcode_at(index) != Opcode::Fmul) {
+                                return true;
+                            }
+                        }
+                        return false;
+                    }();
                 const auto floating_bank = static_cast<std::size_t>(
                     machine::VirtualRegisterClass::Floating);
                 const auto integer_bank = static_cast<std::size_t>(
@@ -8584,6 +9450,10 @@ private:
                         reads_delayed_result(index)) {
                         score -= 10000;
                     }
+                    if (ready_non_multiply &&
+                        opcode_at(index) == Opcode::Fmul) {
+                        score -= 10000;
+                    }
                     if (ready_without_wait) {
                         score -= 1000 * static_cast<int>(wait(index));
                     }
@@ -8617,6 +9487,7 @@ private:
                 cycle = start + 1;
                 emitted[*best] = true;
                 order.push_back(*best);
+                after_multiply = opcode_at(*best) == Opcode::Fmul;
                 delayed_result.reset();
                 if (!subtarget_.has_feature(Feature::FpuTransferInterlocks) &&
                     (opcode_at(*best) == Opcode::Freinterpret ||
@@ -8751,9 +9622,11 @@ private:
             original[index] = index;
         }
         const auto original_pressure = measure_pressure(original);
-        // Under -mfix4300 the emitter separates consecutive floating
-        // multiplies with a NOP.
-        const auto estimated_cycles = [&](const std::vector<std::size_t>& plan) {
+        // An operation holds the pipeline for its issue cost (or one cycle
+        // when not `blocking`), and under -mfix4300 the emitter separates
+        // consecutive floating multiplies with a NOP.
+        const auto estimated_cycles = [&](const std::vector<std::size_t>& plan,
+                                          bool blocking = true) {
             std::vector<unsigned> ready(count);
             unsigned next_issue{};
             unsigned completion{};
@@ -8776,7 +9649,9 @@ private:
                 }
                 ready[index] = issue +
                     estimated_latency(instructions[begin + index]);
-                next_issue = issue + 1;
+                next_issue = issue +
+                    (blocking ? estimated_issue(instructions[begin + index])
+                              : 1U);
                 completion = std::max(completion, ready[index]);
             }
             return completion;
@@ -8951,8 +9826,8 @@ private:
         }
         if (order == original) return false;
         const auto scheduled_pressure = measure_pressure(order);
-        const auto original_cycles = estimated_cycles(original);
-        const auto scheduled_cycles = estimated_cycles(order);
+        const auto original_cycles = estimated_cycles(original, false);
+        const auto scheduled_cycles = estimated_cycles(order, false);
         const bool removes_hilo_stalls =
             speed &&
             hilo_stalls(order) < hilo_stalls(original);
@@ -9248,7 +10123,43 @@ private:
         return moves;
     }
 
+    // Allocates the scheduled function, and when loop constants were also
+    // hoisted into the headroom, the function hoisted below it, scheduled
+    // the same way, keeping the headroom when it leaves no further value
+    // without a color and needs no further moves or preserved registers
+    // than the cycles of the constants it takes out of loops repay; under a
+    // size goal it may need no further preserved register at all.
     bool allocate_scheduled_registers(machine::Function& function) {
+        const bool changed = allocate_schedule(function);
+        if (!headroom_fallback_) return changed;
+        auto hoisted = std::move(function);
+        function = std::move(*headroom_fallback_);
+        headroom_fallback_.reset();
+        (void)copy_rotations(function);
+        (void)layout_blocks(function);
+        (void)schedule_instructions(function);
+        (void)carry_operations(function);
+        (void)split_entry_parameters(function);
+        (void)allocate_schedule(function);
+        const bool size =
+            options_.optimize_for == OptimizationGoal::Size ||
+            options_.optimize_for == OptimizationGoal::MinimumSize;
+        const auto cost = [&](const machine::Function& value) {
+            return preserved_register_cycles *
+                       value.callee_saved_registers.size() +
+                   weighted_moves(value);
+        };
+        const bool keep =
+            uncolored_values(hoisted) <= uncolored_values(function) &&
+            (size ? hoisted.callee_saved_registers.size() <=
+                            function.callee_saved_registers.size() &&
+                        weighted_moves(hoisted) <= weighted_moves(function)
+                  : cost(hoisted) < cost(function) + headroom_gain_);
+        if (keep) function = std::move(hoisted);
+        return true;
+    }
+
+    bool allocate_schedule(machine::Function& function) {
         if (!schedule_fallback_) return allocate_with_scratch_colors(function);
         auto fallback = std::move(*schedule_fallback_);
         schedule_fallback_.reset();
@@ -9721,6 +10632,12 @@ private:
                 return split_global_addresses(function);
             });
         passes.add(
+            {{LoweringPass::SelectValueBanks},
+             Stage::InstructionCombining, "select-value-banks"},
+            [this](machine::Function& function) {
+                return select_value_banks(function);
+            });
+        passes.add(
             {{LoweringPass::EliminateRedundantExpressions},
              Stage::Canonicalization, "eliminate-redundant-expressions"},
             [this](machine::Function& function) {
@@ -9895,94 +10812,31 @@ private:
             {{LoweringPass::HoistLoopConstants}, Stage::InstructionCombining,
              "hoist-loop-constants"},
             [this](machine::Function& function) {
-                if (!options_.move_loop_invariants ||
-                    !options_.register_allocation || naked_) {
-                    return false;
-                }
-                native::LoopConstantPolicy policy;
-                // A 16-bit or `lui` constant, a floating constant, or the
-                // high part of a global address costs an instruction on
-                // every trip, an FPR transfer a hazard delay too.
-                policy.is_constant = [](const machine::Instruction& value) {
-                    const auto opcode = decode_opcode(value.opcode);
-                    return opcode == Opcode::Constant ||
-                        opcode == Opcode::Fconstant ||
-                        opcode == Opcode::GlobalHigh;
-                };
-                policy.is_phi = phi_instruction;
-                policy.bank = [&](const machine::Register& value)
-                    -> std::optional<unsigned> {
-                    if (value.kind != machine::RegisterKind::Virtual ||
-                        value.id >= function.virtual_register_classes.size()) {
-                        return std::nullopt;
-                    }
-                    const auto kind = function.virtual_register_classes[value.id];
-                    if (kind == machine::VirtualRegisterClass::Integer &&
-                        (value.mode.bits <= 32 ||
-                         subtarget_.has_feature(Feature::Mips3))) {
-                        return 0U;
-                    }
-                    if (kind == machine::VirtualRegisterClass::Floating &&
-                        colorable_floating(subtarget_, value.mode.bits)) {
-                        return 1U;
-                    }
-                    return std::nullopt;
-                };
-                // Like the scheduler's peaks, leave colors for loop-PHI
-                // interference and emitter staging. For size, a hoisted
-                // constant must not need a register the function would
-                // then save and restore: one beyond the volatile colors
-                // and the function's peak pressure.
-                const bool size =
-                    options_.optimize_for == OptimizationGoal::Size ||
-                    options_.optimize_for == OptimizationGoal::MinimumSize;
-                const auto* abi = managed_abi_model(
-                    hir_, hir_.function(function.source), subtarget_,
-                    options_);
-                const auto colors =
-                    [&](const std::vector<machine::PhysicalRegisterId>& list) {
-                        return static_cast<unsigned>(std::count_if(
-                            list.begin(), list.end(),
-                            [&](machine::PhysicalRegisterId color) {
-                                if (!size) return true;
-                                const auto name = color.value >= fpr_physical_base
-                                    ? fpr_name(color) : gpr_name(color);
-                                return abi &&
-                                    std::find(abi->call_clobbers.begin(),
-                                              abi->call_clobbers.end(),
-                                              name) != abi->call_clobbers.end();
-                            }));
-                    };
-                const auto gprs = colors(allocatable_gprs(function));
-                const auto fprs = colors(allocatable_fprs());
-                policy.capacity = {gprs > 3U ? gprs - 3U : 0U,
-                                   fprs > 2U ? fprs - 2U : 0U};
-                policy.colors = {
-                    static_cast<unsigned>(allocatable_gprs(function).size()),
-                    static_cast<unsigned>(allocatable_fprs().size())};
-                return native::hoist_loop_constants(function, policy);
+                return hoist_constants(function);
+            });
+        passes.add(
+            {{LoweringPass::CopyRotatingPhis}, Stage::Scheduling,
+             "copy-rotating-phis"},
+            [this](machine::Function& function) {
+                return copy_rotations(function);
             });
         passes.add(
             {{LoweringPass::ScheduleBlockLayout}, Stage::Scheduling,
               "schedule-block-layout"},
             [this](machine::Function& function) {
-                if (!options_.reorder_blocks) return false;
-                return native::schedule_block_layout(
-                    function,
-                    [&](machine::BlockId block) {
-                        return std::any_of(
-                            function.labels.begin(), function.labels.end(),
-                            [&](const machine::Function::LocalLabel& label) {
-                                return label.block == block;
-                            });
-                    },
-                    true);
+                return layout_blocks(function);
             });
         passes.add(
             {{LoweringPass::ScheduleInstructions}, Stage::Scheduling,
               "schedule-instructions"},
             [this](machine::Function& function) {
                 return schedule_instructions(function);
+            });
+        passes.add(
+            {{LoweringPass::CarryLoopOperations}, Stage::Scheduling,
+              "carry-loop-operations"},
+            [this](machine::Function& function) {
+                return carry_operations(function);
             });
         passes.add(
             {{LoweringPass::SplitEntryParameters}, Stage::RegisterAllocation,
@@ -10354,6 +11208,11 @@ private:
     bool latency_schedules_{};
     bool ordered_stores_{};
     std::optional<machine::Function> schedule_fallback_;
+    // The function with loop constants hoisted only below the headroom,
+    // and the weighted cycles that hoisting into the headroom saves; see
+    // hoist_constants.
+    std::optional<machine::Function> headroom_fallback_;
+    std::uint64_t headroom_gain_{};
     // How often the block being scheduled runs, and the cycles the latency
     // schedules save, weighted by how often their blocks run.
     std::uint64_t region_weight_{1};
@@ -10592,15 +11451,6 @@ private:
         std::vector<FloatLiteral> floats;
         std::vector<IntegerLiteral> integers;
     };
-
-    // The instructions load_immediate emits: LI is one instruction for a
-    // 16-bit word or one whose low half is zero, else two.
-    static unsigned word_instructions(std::uint32_t word) {
-        const auto value = static_cast<std::int32_t>(word);
-        return (value >= -32768 && value <= 32767) || word <= 0xffffU ||
-                       (word & 0xffffU) == 0
-                   ? 1U : 2U;
-    }
 
     static unsigned immediate_instructions(std::uint64_t value) {
         const auto low = static_cast<std::uint32_t>(value);
@@ -12209,6 +13059,10 @@ private:
     std::optional<std::string_view> assigned_gpr(
         const machine::Function& function,
         machine::Register value) const {
+        // A store of zero reads $zero (select_value_banks).
+        if (value.kind == machine::RegisterKind::Physical && value.id == 0) {
+            return gpr_names[0];
+        }
         if (value.kind != machine::RegisterKind::Virtual ||
             value.id >= function.virtual_register_assignments.size() ||
             !function.virtual_register_assignments[value.id]) {
@@ -16197,19 +17051,18 @@ private:
         // move it as a unit without parsing assembly text or splitting a
         // legalization sequence.
         if (opcode == Opcode::Constant && candidate.operands.size() == 1) {
-            // LI of a signed or unsigned 16-bit value is one instruction.
+            // LI of a word that a 16-bit form or LUI alone loads is one
+            // instruction (word_instructions).
             const auto* immediate =
                 std::get_if<machine::ImmediateOperand>(
                     &candidate.operands.front());
             if (!immediate || immediate->high != 0) return false;
             const auto value = static_cast<std::int64_t>(immediate->value);
             const auto bits = candidate.defs.front().mode.bits;
-            const auto wrapped = bits >= 64 ? value
-                : static_cast<std::int64_t>(
-                      static_cast<std::int32_t>(immediate->value));
-            return (wrapped >= std::numeric_limits<std::int16_t>::min() &&
-                    wrapped <= 0xffff) &&
-                (bits <= 32 || value == wrapped);
+            const auto word = static_cast<std::int32_t>(
+                static_cast<std::uint32_t>(immediate->value));
+            return word_instructions(static_cast<std::uint32_t>(word)) == 1 &&
+                (bits <= 32 || value == word);
         }
         if (opcode == Opcode::GlobalHigh || opcode == Opcode::StackAddress ||
             (opcode == Opcode::GlobalAddress && data_base)) {
@@ -16738,6 +17591,145 @@ private:
             result.set(*id + 1);
         }
         return result;
+    }
+
+    // A branch whose own block offers nothing for its delay slot may run
+    // its target's first operation there and resume after it
+    // (plan_successor_delay_slots). When that operation cannot run in a
+    // slot, the first later one of the target that can, and that may move
+    // before every operation ahead of it, leads the target instead.
+    void lead_branch_targets(machine::Function& function) {
+        if (!options_.schedule_insns2 || !selects_branch_likely()) return;
+        const auto registers = [&](const std::vector<machine::Register>& list) {
+            PhysicalSet result;
+            for (const auto& value : list) {
+                result |= physical_registers(function, value);
+            }
+            return result;
+        };
+        const auto opcode_of = [](const machine::Instruction& value) {
+            return value.kind == machine::InstructionKind::Target
+                ? decode_opcode(value.opcode) : Opcode::None;
+        };
+        // HI and LO are ordered through value tokens, not registers.
+        const auto token = [&](const machine::Register& value) {
+            return value.kind == machine::RegisterKind::Virtual &&
+                value.id < function.virtual_register_classes.size() &&
+                function.virtual_register_classes[value.id] ==
+                    machine::VirtualRegisterClass::Memory;
+        };
+        const auto hilo = [&](const machine::Instruction& value) {
+            switch (opcode_of(value)) {
+            case Opcode::MulStart:
+            case Opcode::MoveFromLo:
+            case Opcode::Mul:
+            case Opcode::Mulhs:
+            case Opcode::Mulhu:
+            case Opcode::Sdiv:
+            case Opcode::Udiv:
+            case Opcode::Srem:
+            case Opcode::Urem:
+            case Opcode::Sdivrem:
+            case Opcode::Udivrem:
+                return true;
+            default:
+                return std::any_of(value.uses.begin(), value.uses.end(),
+                                   token) ||
+                    std::any_of(value.defs.begin(), value.defs.end(), token);
+            }
+        };
+        // Whether an operation separates two that the emitter would
+        // otherwise separate with a NOP: floating multiplies under
+        // -mfix4300, an FPU transfer and a reader of its register, and
+        // HI/LO accesses.
+        const auto separates = [&](const machine::Instruction& before,
+                                   const machine::Instruction& after) {
+            if (hilo(before) || hilo(after)) return true;
+            const auto first = opcode_of(before);
+            if (first == Opcode::Fmul && opcode_of(after) == Opcode::Fmul) {
+                return subtarget_.has_feature(Feature::Fix4300);
+            }
+            return (first == Opcode::Freinterpret ||
+                    first == Opcode::Fconstant) &&
+                !subtarget_.has_feature(Feature::FpuTransferInterlocks) &&
+                std::any_of(after.uses.begin(), after.uses.end(),
+                            [&](const machine::Register& use) {
+                                return std::find(before.defs.begin(),
+                                                 before.defs.end(),
+                                                 use) != before.defs.end();
+                            });
+        };
+        std::vector<bool> led(function.blocks.size());
+        for (const auto& source : function.blocks) {
+            if (source.instructions.empty()) continue;
+            const auto& branch = source.instructions.back();
+            if ((branch.kind != machine::InstructionKind::ConditionalBranch &&
+                 branch.kind != machine::InstructionKind::Branch) ||
+                delay_slot_plan(function, source)) {
+                continue;
+            }
+            const auto next = layout_successor(function, source.id);
+            for (const auto& operand : branch.operands) {
+                const auto* target = std::get_if<machine::BlockOperand>(&operand);
+                if (!target || target->target == next ||
+                    target->target.value >= function.blocks.size() ||
+                    led[target->target.value] ||
+                    function.blocks[target->target.value].id != target->target ||
+                    function.frame.prologue_block == target->target) {
+                    continue;
+                }
+                led[target->target.value] = true;
+                auto& instructions =
+                    function.blocks[target->target.value].instructions;
+                std::size_t first = 0;
+                while (first + 1 < instructions.size() &&
+                       no_output_prefix(instructions[first])) {
+                    ++first;
+                }
+                if (first + 2 >= instructions.size() ||
+                    single_delay_slot_instruction(function,
+                                                  instructions[first]) ||
+                    slot_store(function, instructions[first])) {
+                    continue;
+                }
+                for (auto candidate = first + 1;
+                     candidate + 1 < instructions.size(); ++candidate) {
+                    const auto& value = instructions[candidate];
+                    if (!single_delay_slot_instruction(function, value) ||
+                        hilo(value) ||
+                        separates(instructions[candidate - 1],
+                                  instructions[candidate + 1])) {
+                        continue;
+                    }
+                    const auto reads = registers(value.uses);
+                    const auto writes = registers(value.defs);
+                    bool movable = true;
+                    for (auto passed = first; passed < candidate && movable;
+                         ++passed) {
+                        const auto& other = instructions[passed];
+                        const auto other_writes =
+                            registers(other.defs) | registers(other.clobbers);
+                        movable =
+                            (other.kind == machine::InstructionKind::Target ||
+                             other.kind == machine::InstructionKind::Copy) &&
+                            !other.has_side_effects && !other.patch &&
+                            !other.may_store &&
+                            !(value.may_load && trap_only(other)) &&
+                            !(reads & other_writes).any() &&
+                            !(writes & (other_writes | registers(other.uses)))
+                                 .any();
+                    }
+                    if (!movable) continue;
+                    auto moved = std::move(instructions[candidate]);
+                    instructions.erase(instructions.begin() +
+                                       static_cast<std::ptrdiff_t>(candidate));
+                    instructions.insert(instructions.begin() +
+                                            static_cast<std::ptrdiff_t>(first),
+                                        std::move(moved));
+                    break;
+                }
+            }
+        }
     }
 
     // The registers a block's PHIs take from `predecessor` and those they
@@ -21292,6 +22284,7 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
     // their neighbors' plans; replan until the skipped blocks are exactly
     // the forwarded ones, or else keep every block in the layout.
     skipped_layout_.clear();
+    lead_branch_targets(function);
     compute_physical_liveness(function);
     for (unsigned round = 0;; ++round) {
         plan_cross_block_delays(function);

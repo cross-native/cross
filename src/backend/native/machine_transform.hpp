@@ -119,6 +119,48 @@ struct LoopConstantPolicy {
 [[nodiscard]] bool hoist_loop_constants(machine::Function& function,
                                         const LoopConstantPolicy& policy);
 
+using RegisterFactory = std::function<machine::Register(
+    machine::Function&, const machine::Register&)>;
+
+// A PHI whose value on its loop's back edge is another PHI of the same
+// header (`second = first; first = next`) takes a copy of that value, made
+// just before the loop computes the other PHI's new value in a block that
+// every pass to the latch runs through.
+// The back edge's parallel copy then needs neither move once allocation
+// shares the copy's color with the PHI it feeds and the new value's with
+// the other PHI's: scheduling keeps each update after the uses of its PHI's
+// current value that precede it.
+[[nodiscard]] bool copy_rotating_phis(machine::Function& function,
+                                      const MachineInstructionPredicate& is_phi,
+                                      const RegisterFactory& clone_register);
+
+// What a target tells loop-carried operations: which instructions are PHIs
+// and which emit no code, which operations may run on a path that does not
+// need them (pure, one instruction, no memory access, no trap), whether a
+// block's own operations leave its terminator's delay slot empty, the PHI
+// opcode, and how to make a virtual register like a given one.
+struct CarriedOperationPolicy {
+    MachineInstructionPredicate is_phi;
+    MachineInstructionPredicate emits_nothing;
+    MachineInstructionPredicate is_movable;
+    std::function<bool(const machine::Block&)> slot_empty;
+    machine::TargetOpcodeId phi_opcode;
+    std::function<machine::Register(machine::Function&,
+                                    const machine::Register&)>
+        clone_register;
+};
+
+// A loop whose header only tests (PHIs and a conditional branch) and whose
+// latch leaves its delay slot empty has nothing to put there: the latch's
+// operations feed its branch, and the header offers no first operation.
+// The first operation of the body block that only the header reaches moves
+// into the header's two predecessors, each computing it from the values it
+// passes the header, and a PHI in the header merges them; the latch's copy
+// fills its delay slot. Its operands must come from outside the loop or
+// from the header's PHIs.
+[[nodiscard]] bool carry_loop_operations(
+    machine::Function& function, const CarriedOperationPolicy& policy);
+
 // What a target tells PHI constant rematerialization: which instructions
 // materialize a constant and which are PHIs, and how to make a virtual
 // register like a given one, with its fallback home.

@@ -875,6 +875,333 @@ bool hoist_loop_constants(machine::Function& function,
     return changed;
 }
 
+bool copy_rotating_phis(machine::Function& function,
+                        const MachineInstructionPredicate& is_phi,
+                        const RegisterFactory& clone_register) {
+    const auto count = function.blocks.size();
+    if (count < 2 || function.entry.value >= count) return false;
+    for (std::uint32_t block = 0; block < count; ++block) {
+        if (function.blocks[block].id.value != block) return false;
+    }
+    const auto dominance = block_dominance(function);
+    bool changed = false;
+    for (const auto& loop : natural_loops(function, dominance)) {
+        auto& header = function.blocks[loop.header];
+        std::optional<std::uint32_t> latch;
+        unsigned latches = 0;
+        for (const auto predecessor : header.predecessors) {
+            if (predecessor.value < count && loop.members[predecessor.value]) {
+                latch = predecessor.value;
+                ++latches;
+            }
+        }
+        if (latches != 1) continue;
+        // Each header PHI's value on the back edge.
+        std::unordered_map<std::uint32_t, machine::Register> carried;
+        for (const auto& phi : header.instructions) {
+            if (!is_phi(phi) || phi.defs.size() != 1) continue;
+            for (std::size_t index = 0; index + 1 < phi.operands.size();
+                 index += 2) {
+                const auto* from =
+                    std::get_if<machine::BlockOperand>(&phi.operands[index]);
+                const auto* value = std::get_if<machine::RegisterOperand>(
+                    &phi.operands[index + 1]);
+                if (from && value && from->target.value == *latch) {
+                    carried.emplace(phi.defs.front().id, value->value);
+                }
+            }
+        }
+        for (auto& phi : header.instructions) {
+            if (!is_phi(phi) || phi.defs.size() != 1) continue;
+            const auto fed = phi.defs.front();
+            const auto found = carried.find(fed.id);
+            if (found == carried.end()) continue;
+            // `fed` takes the value of `rotated`, another PHI of the header,
+            // whose own new value the latch computes.
+            const auto rotated = found->second;
+            const auto next = carried.find(rotated.id);
+            if (rotated.kind != machine::RegisterKind::Virtual ||
+                rotated.id == fed.id || next == carried.end() ||
+                next->second.kind != machine::RegisterKind::Virtual ||
+                rotated.id >= function.virtual_register_classes.size() ||
+                fed.id >= function.virtual_register_classes.size() ||
+                function.virtual_register_classes[rotated.id] !=
+                    function.virtual_register_classes[fed.id]) {
+                continue;
+            }
+            // The block of the loop that computes it, which every pass to
+            // the latch runs through.
+            std::vector<machine::Instruction>* instructions = nullptr;
+            std::vector<machine::Instruction>::iterator update;
+            for (std::uint32_t block = 0; block < count && !instructions;
+                 ++block) {
+                if (!loop.members[block] || block == loop.header ||
+                    !dominance.dominates(block, *latch)) {
+                    continue;
+                }
+                auto& candidates = function.blocks[block].instructions;
+                update = std::find_if(
+                    candidates.begin(), candidates.end(),
+                    [&](const machine::Instruction& instruction) {
+                        return std::find(instruction.defs.begin(),
+                                         instruction.defs.end(),
+                                         next->second) != instruction.defs.end();
+                    });
+                if (update != candidates.end()) instructions = &candidates;
+            }
+            if (!instructions || is_phi(*update)) continue;
+            // The PHI it feeds must be dead from there on through the pass:
+            // read neither at or after the update in its block nor in a
+            // block the pass reaches from there before the header.
+            const auto updating = static_cast<std::uint32_t>(
+                std::find_if(function.blocks.begin(), function.blocks.end(),
+                             [&](const machine::Block& block) {
+                                 return &block.instructions == instructions;
+                             }) -
+                function.blocks.begin());
+            const auto at = static_cast<std::size_t>(
+                update - instructions->begin());
+            std::vector<bool> after(count);
+            std::vector<std::uint32_t> pending;
+            for (const auto successor : function.blocks[updating].successors) {
+                pending.push_back(successor.value);
+            }
+            while (!pending.empty()) {
+                const auto block = pending.back();
+                pending.pop_back();
+                if (block >= count || !loop.members[block] ||
+                    block == loop.header || after[block]) {
+                    continue;
+                }
+                after[block] = true;
+                for (const auto successor : function.blocks[block].successors) {
+                    pending.push_back(successor.value);
+                }
+            }
+            bool dead = true;
+            for (const auto& block : function.blocks) {
+                for (std::size_t index = 0;
+                     index < block.instructions.size() && dead; ++index) {
+                    const auto& instruction = block.instructions[index];
+                    if (std::find(instruction.uses.begin(),
+                                  instruction.uses.end(),
+                                  fed) == instruction.uses.end()) {
+                        continue;
+                    }
+                    if (is_phi(instruction)) {
+                        // Read at the end of the predecessor it arrives from.
+                        for (std::size_t operand = 0;
+                             operand + 1 < instruction.operands.size();
+                             operand += 2) {
+                            const auto* from = std::get_if<machine::BlockOperand>(
+                                &instruction.operands[operand]);
+                            const auto* value =
+                                std::get_if<machine::RegisterOperand>(
+                                    &instruction.operands[operand + 1]);
+                            if (from && value && value->value == fed &&
+                                from->target.value < count &&
+                                (from->target.value == updating ||
+                                 after[from->target.value])) {
+                                dead = false;
+                            }
+                        }
+                    } else if ((block.id.value == updating && index >= at) ||
+                               after[block.id.value]) {
+                        dead = false;
+                    }
+                }
+            }
+            if (!dead) continue;
+            machine::Instruction copy;
+            copy.kind = machine::InstructionKind::Copy;
+            copy.location = phi.location;
+            copy.inline_site = phi.inline_site;
+            const auto target = clone_register(function, rotated);
+            copy.uses = {rotated};
+            copy.defs = {target};
+            // Before the loop computes the rotated PHI's new value, so that
+            // value may take the rotated PHI's color.
+            instructions->insert(update, std::move(copy));
+            for (std::size_t index = 0; index + 1 < phi.operands.size();
+                 index += 2) {
+                const auto* from =
+                    std::get_if<machine::BlockOperand>(&phi.operands[index]);
+                auto* value = std::get_if<machine::RegisterOperand>(
+                    &phi.operands[index + 1]);
+                if (from && value && from->target.value == *latch) {
+                    value->value = target;
+                    if (index / 2 < phi.uses.size()) phi.uses[index / 2] = target;
+                }
+            }
+            found->second = target;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+bool carry_loop_operations(machine::Function& function,
+                           const CarriedOperationPolicy& policy) {
+    const auto count = function.blocks.size();
+    if (count < 3 || function.entry.value >= count) return false;
+    for (std::uint32_t block = 0; block < count; ++block) {
+        if (function.blocks[block].id.value != block) return false;
+    }
+    const auto dominance = block_dominance(function);
+    const auto loops = natural_loops(function, dominance);
+    // Each value's defining block.
+    std::vector<std::optional<std::uint32_t>> defined(
+        function.virtual_registers.size());
+    for (const auto& block : function.blocks) {
+        for (const auto& instruction : block.instructions) {
+            for (const auto& definition : instruction.defs) {
+                if (definition.kind == machine::RegisterKind::Virtual &&
+                    definition.id < defined.size()) {
+                    defined[definition.id] = block.id.value;
+                }
+            }
+        }
+    }
+    bool changed = false;
+    for (const auto& loop : loops) {
+        const auto header = loop.header;
+        auto& tested = function.blocks[header];
+        if (tested.predecessors.size() != 2 || header == function.entry.value ||
+            tested.instructions.empty() ||
+            tested.instructions.back().kind !=
+                machine::InstructionKind::ConditionalBranch ||
+            std::any_of(tested.instructions.begin(),
+                        tested.instructions.end() - 1,
+                        [&](const machine::Instruction& instruction) {
+                            return !policy.is_phi(instruction) &&
+                                   !policy.emits_nothing(instruction);
+                        })) {
+            continue;
+        }
+        // The entry edge and the back edge.
+        std::optional<std::uint32_t> preheader;
+        std::optional<std::uint32_t> latch;
+        for (const auto predecessor : tested.predecessors) {
+            if (predecessor.value >= count) continue;
+            (loop.members[predecessor.value] ? latch : preheader) =
+                predecessor.value;
+        }
+        if (!preheader || !latch || *latch == header ||
+            function.blocks[*preheader].instructions.empty() ||
+            function.blocks[*latch].instructions.empty() ||
+            !control_transfer(
+                function.blocks[*preheader].instructions.back()) ||
+            !control_transfer(function.blocks[*latch].instructions.back()) ||
+            !policy.slot_empty(function.blocks[*latch])) {
+            continue;
+        }
+        // The body block that only the test reaches, and its first
+        // operation.
+        std::optional<std::uint32_t> body;
+        for (const auto successor : tested.successors) {
+            if (successor.value < count && successor.value != *latch &&
+                loop.members[successor.value] &&
+                function.blocks[successor.value].predecessors.size() == 1) {
+                body = successor.value;
+            }
+        }
+        if (!body) continue;
+        auto& instructions = function.blocks[*body].instructions;
+        const auto first = std::find_if(
+            instructions.begin(), instructions.end(),
+            [&](const machine::Instruction& instruction) {
+                return !policy.emits_nothing(instruction);
+            });
+        if (first == instructions.end() ||
+            !structurally_pure_single_definition(*first) ||
+            !policy.is_movable(*first)) {
+            continue;
+        }
+        // Its operands come from outside the loop or from the test's PHIs,
+        // whose incoming values each predecessor supplies.
+        std::unordered_map<std::uint32_t, std::pair<machine::Register,
+                                                    machine::Register>>
+            incoming;
+        for (const auto& phi : tested.instructions) {
+            if (!policy.is_phi(phi) || phi.defs.size() != 1) continue;
+            std::optional<machine::Register> from_preheader;
+            std::optional<machine::Register> from_latch;
+            for (std::size_t index = 0; index + 1 < phi.operands.size();
+                 index += 2) {
+                const auto* from =
+                    std::get_if<machine::BlockOperand>(&phi.operands[index]);
+                const auto* value = std::get_if<machine::RegisterOperand>(
+                    &phi.operands[index + 1]);
+                if (!from || !value) continue;
+                if (from->target.value == *preheader) {
+                    from_preheader = value->value;
+                } else if (from->target.value == *latch) {
+                    from_latch = value->value;
+                }
+            }
+            if (from_preheader && from_latch) {
+                incoming.emplace(phi.defs.front().id,
+                                 std::pair{*from_preheader, *from_latch});
+            }
+        }
+        const bool operands_available = std::all_of(
+            first->uses.begin(), first->uses.end(),
+            [&](const machine::Register& use) {
+                if (use.kind != machine::RegisterKind::Virtual ||
+                    use.id >= defined.size()) {
+                    return false;
+                }
+                if (incoming.contains(use.id)) return true;
+                return defined[use.id] && !loop.members[*defined[use.id]] &&
+                       dominance.dominates(*defined[use.id], *preheader);
+            });
+        if (!operands_available) continue;
+
+        // Each predecessor computes the operation for the iteration it
+        // enters, and the test merges the two results.
+        const auto operation = *first;
+        instructions.erase(first);
+        const auto result = operation.defs.front();
+        const auto copy_into = [&](std::uint32_t block, bool from_latch) {
+            auto copy = operation;
+            const auto passed = [&](machine::Register value) {
+                const auto found = value.kind == machine::RegisterKind::Virtual
+                    ? incoming.find(value.id) : incoming.end();
+                if (found == incoming.end()) return value;
+                return from_latch ? found->second.second : found->second.first;
+            };
+            for (auto& use : copy.uses) use = passed(use);
+            for (auto& operand : copy.operands) {
+                if (auto* reg = std::get_if<machine::RegisterOperand>(&operand)) {
+                    reg->value = passed(reg->value);
+                }
+            }
+            const auto definition = policy.clone_register(function, result);
+            copy.defs = {definition};
+            auto& target = function.blocks[block].instructions;
+            target.insert(target.end() - 1, std::move(copy));
+            return definition;
+        };
+        const auto from_preheader = copy_into(*preheader, false);
+        const auto from_latch = copy_into(*latch, true);
+        machine::Instruction merge;
+        merge.kind = machine::InstructionKind::Target;
+        merge.opcode = policy.phi_opcode;
+        merge.location = operation.location;
+        merge.inline_site = operation.inline_site;
+        merge.operands = {machine::BlockOperand{{*preheader}},
+                          machine::RegisterOperand{from_preheader},
+                          machine::BlockOperand{{*latch}},
+                          machine::RegisterOperand{from_latch}};
+        merge.uses = {from_preheader, from_latch};
+        merge.defs = {result};
+        auto& merged = function.blocks[header].instructions;
+        merged.insert(merged.begin(), std::move(merge));
+        changed = true;
+    }
+    return changed;
+}
+
 bool schedule_block_layout(
     machine::Function& function,
     const MachineBlockPredicate& is_addressable,

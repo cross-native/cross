@@ -53,6 +53,12 @@ unsigned k_q_entry_swap(unsigned, unsigned, unsigned);
 unsigned k_q_carried_call(unsigned, unsigned, unsigned);
 unsigned k_q_rotate_f64(unsigned, unsigned, unsigned);
 unsigned k_q_select_zero(unsigned, unsigned, unsigned);
+unsigned k_q_store_values(unsigned, unsigned, unsigned);
+unsigned k_q_phi_constants(unsigned, unsigned, unsigned);
+unsigned k_q_carry_slot(unsigned, unsigned, unsigned);
+unsigned k_q_headroom(unsigned, unsigned, unsigned);
+unsigned k_q_multiply_chain(unsigned, unsigned, unsigned);
+unsigned k_q_classify_chain(unsigned, unsigned, unsigned);
 }
 
 int main() {
@@ -326,5 +332,41 @@ int main() {
     std::printf("%08x\n", k_q_select_zero(0x12345678u, 0x9abcdef0u, 0x2bu)); std::fflush(stdout);
     std::printf("%08x\n", k_q_select_zero(0x80000000u, 0xffffffffu, 0x10u)); std::fflush(stdout);
     std::printf("%08x\n", k_q_select_zero(0xfu, 0x10u, 0x21u)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_store_values(0x1u, 0x3u, 0x5u)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_store_values(0x7u, 0x2u, 0x0u)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_store_values(0xffffffffu, 0x80000000u, 0x7fffffffu)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_store_values(0x12345678u, 0x9abcdef0u, 0x2bu)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_store_values(0x80000000u, 0xffffffffu, 0x10u)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_store_values(0xfu, 0x10u, 0x21u)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_phi_constants(0x1u, 0x3u, 0x5u)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_phi_constants(0x7u, 0x2u, 0x0u)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_phi_constants(0xffffffffu, 0x80000000u, 0x7fffffffu)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_phi_constants(0x12345678u, 0x9abcdef0u, 0x2bu)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_phi_constants(0x80000000u, 0xffffffffu, 0x10u)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_phi_constants(0xfu, 0x10u, 0x21u)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_carry_slot(0x1u, 0x3u, 0x5u)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_carry_slot(0x7u, 0x2u, 0x0u)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_carry_slot(0xffffffffu, 0x80000000u, 0x7fffffffu)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_carry_slot(0x12345678u, 0x9abcdef0u, 0x2bu)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_carry_slot(0x80000000u, 0xffffffffu, 0x10u)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_carry_slot(0xfu, 0x10u, 0x21u)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_headroom(0x1u, 0x3u, 0x5u)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_headroom(0x7u, 0x2u, 0x0u)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_headroom(0xffffffffu, 0x80000000u, 0x7fffffffu)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_headroom(0x12345678u, 0x9abcdef0u, 0x2bu)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_headroom(0x80000000u, 0xffffffffu, 0x10u)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_headroom(0xfu, 0x10u, 0x21u)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_multiply_chain(0x1u, 0x3u, 0x5u)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_multiply_chain(0x7u, 0x2u, 0x0u)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_multiply_chain(0xffffffffu, 0x80000000u, 0x7fffffffu)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_multiply_chain(0x12345678u, 0x9abcdef0u, 0x2bu)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_multiply_chain(0x80000000u, 0xffffffffu, 0x10u)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_multiply_chain(0xfu, 0x10u, 0x21u)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_classify_chain(0x1u, 0x3u, 0x5u)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_classify_chain(0x7u, 0x2u, 0x0u)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_classify_chain(0xffffffffu, 0x80000000u, 0x7fffffffu)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_classify_chain(0x12345678u, 0x9abcdef0u, 0x2bu)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_classify_chain(0x80000000u, 0xffffffffu, 0x10u)); std::fflush(stdout);
+    std::printf("%08x\n", k_q_classify_chain(0xfu, 0x10u, 0x21u)); std::fflush(stdout);
     return 0;
 }
