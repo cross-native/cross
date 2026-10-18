@@ -158,7 +158,8 @@ foreach(arch mips x86)
     endforeach()
 endforeach()
 
-# The CPUs that predate the composed entries keep their features.
+# The CPUs that predate the composed entries, with the features GCC and
+# LLVM list for them.
 function(expect_features arch name)
     set(want ${ARGN})
     set(have ${${arch}_${name}_features})
@@ -210,26 +211,27 @@ expect_features(x86 x86-64-v3 avx avx2 base bmi bmi2 cx16 f16c fma lzcnt movbe
 expect_features(x86 x86-64-v4 avx avx2 avx512bw avx512cd avx512dq avx512f
     avx512vl base bmi bmi2 cx16 f16c fma lzcnt movbe popcnt sse3 sse4.1 sse4.2
     ssse3 xsave)
-expect_features(x86 haswell aes avx avx2 base bmi bmi2 cx16 f16c fma fsgsbase
+expect_features(x86 haswell avx avx2 base bmi bmi2 cx16 f16c fma fsgsbase
     invpcid lzcnt movbe pclmul popcnt rdrnd rdtscp sse3 sse4.1 sse4.2 ssse3
     xsave xsaveopt)
-expect_features(x86 skylake adx aes avx avx2 base bmi bmi2 clflushopt cx16
-    f16c fma fsgsbase invpcid lzcnt movbe pclmul pku popcnt rdrnd rdseed
+expect_features(x86 skylake adx aes avx avx2 base bmi bmi2 clflushopt cx16 f16c
+    fma fsgsbase invpcid lzcnt movbe pclmul popcnt prefetchw rdrnd rdseed
     rdtscp sse3 sse4.1 sse4.2 ssse3 xsave xsavec xsaveopt xsaves)
 expect_features(x86 skylake-avx512 adx aes avx avx2 avx512bw avx512cd avx512dq
-    avx512f avx512vl base bmi bmi2 clflushopt cx16 f16c fma fsgsbase invpcid
-    lzcnt movbe pclmul pku popcnt rdrnd rdseed rdtscp sse3 sse4.1 sse4.2 ssse3
-    xsave xsavec xsaveopt xsaves)
-expect_features(x86 znver1 adx aes avx avx2 base bmi bmi2 cx16 f16c fma
-    fsgsbase lzcnt monitor movbe pclmul popcnt prefetchw rdrnd rdseed rdtscp
-    sha sse3 sse4.1 sse4.2 ssse3 xsave xsavec xsaveopt xsaves)
-expect_features(x86 znver2 adx aes avx avx2 base bmi bmi2 clwb cx16 f16c fma
-    fsgsbase lzcnt monitor movbe pclmul popcnt prefetchw rdpid rdrnd rdseed
+    avx512f avx512vl base bmi bmi2 clflushopt clwb cx16 f16c fma fsgsbase
+    invpcid lzcnt movbe pclmul pku popcnt prefetchw rdrnd rdseed rdtscp sse3
+    sse4.1 sse4.2 ssse3 xsave xsavec xsaveopt xsaves)
+expect_features(x86 znver1 adx aes avx avx2 base bmi bmi2 clflushopt cx16 f16c
+    fma fsgsbase lzcnt monitor movbe pclmul popcnt prefetchw rdrnd rdseed
     rdtscp sha sse3 sse4.1 sse4.2 ssse3 xsave xsavec xsaveopt xsaves)
-expect_features(x86 znver3 adx aes avx avx2 base bmi bmi2 clwb cx16 f16c fma
-    fsgsbase gfni lzcnt monitor movbe pclmul popcnt prefetchw rdpid rdrnd
-    rdseed rdtscp sha sse3 sse4.1 sse4.2 ssse3 vaes vpclmulqdq xsave xsavec
-    xsaveopt xsaves)
+expect_features(x86 znver2 adx aes avx avx2 base bmi bmi2 clflushopt clwb cx16
+    f16c fma fsgsbase lzcnt monitor movbe pclmul popcnt prefetchw rdpid rdrnd
+    rdseed rdtscp sha sse3 sse4.1 sse4.2 ssse3 wbnoinvd xsave xsavec xsaveopt
+    xsaves)
+expect_features(x86 znver3 adx aes avx avx2 base bmi bmi2 clflushopt clwb cx16
+    f16c fma fsgsbase invpcid lzcnt monitor movbe pclmul pku popcnt prefetchw
+    rdpid rdrnd rdseed rdtscp sha sse3 sse4.1 sse4.2 ssse3 vaes vpclmulqdq
+    wbnoinvd xsave xsavec xsaveopt xsaves)
 
 # Features of composed CPUs.
 function(has arch name)
