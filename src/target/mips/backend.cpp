@@ -201,10 +201,30 @@ public:
             diagnostics.command_error(
                 "-mfix-r10000 requires branch-likely instructions");
         }
-        if (options.position_independent || options.pie ||
-            subtarget.has_feature(Feature::AbiCalls)) {
-            diagnostics.command_error(
-                "MIPS PIC/PIE and -mabicalls need a GP/GOT call model and are not implemented yet");
+        if (pic_model(subtarget, options) != PicModel::None) {
+            // -fpic and -fpie imply -mabicalls, as on MIPS GNU/Linux, but
+            // not over an explicit -mno-abicalls (whose source is the flag,
+            // where a -march CPU's default names the CPU).
+            const auto abicalls = options.resolved_options.find("m.abicalls");
+            if (!subtarget.has_feature(Feature::AbiCalls) &&
+                abicalls != options.resolved_options.end() &&
+                abicalls->second.origin == OptionOrigin::CommandLine &&
+                abicalls->second.source.starts_with('-')) {
+                diagnostics.command_error(
+                    "MIPS position-independent code needs -mabicalls");
+            }
+            if (elf_abi_tag(subtarget.abi_info()) != ElfAbiTag::Default) {
+                diagnostics.command_error(
+                    "-mabicalls code is not defined for the '" +
+                    std::string(subtarget.abi()) + "' ABI");
+            }
+            for (const auto& base : options.data_bases) {
+                if (base.base == "gp") {
+                    diagnostics.command_error(
+                        "data_base '" + base.name +
+                        "' uses $gp, which holds the GOT pointer of -mabicalls code");
+                }
+            }
         }
         if (options.code_model == CodeModel::Large) {
             // The large model materializes complete 64-bit symbol addresses
@@ -228,10 +248,13 @@ public:
                 "Allegrex VFPU is registered but awaits overlapping scalar/vector/matrix register lowering");
         }
         for (const auto& object : hir_module.objects) {
-            if (object.is_thread_local) {
+            if (object.is_thread_local &&
+                (object.tls_model == "local-dynamic" ||
+                 object.tls_model == "global-dynamic")) {
                 diagnostics.error(
                     object.location,
-                    "MIPS TLS lowering is not implemented yet; Cross will not insert a hidden resolver call");
+                    "TLS model '" + object.tls_model +
+                        "' requires a hidden resolver call; standalone Cross supports call-free static TLS models instead");
             }
         }
         check_data_base_registers(hir_module, subtarget, options,

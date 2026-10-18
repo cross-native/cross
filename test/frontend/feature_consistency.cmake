@@ -28,7 +28,7 @@ if(NOT status EQUAL 0)
     message(FATAL_ERROR "MIPS --print-features failed\n${stderr}")
 endif()
 foreach(feature binary128_storage binary128_arithmetic fixed_vectors
-                atomics variadics thread_local address_spaces)
+                atomics variadics address_spaces)
     if(features MATCHES "[$]::feature::${feature}([\r\n]|$)")
         message(FATAL_ERROR
             "MIPS --print-features over-reports ${feature}\n${features}")
@@ -36,6 +36,9 @@ foreach(feature binary128_storage binary128_arithmetic fixed_vectors
 endforeach()
 if(NOT features MATCHES "[$]::feature::integer128([\r\n]|$)")
     message(FATAL_ERROR "MIPS --print-features omits integer128\n${features}")
+endif()
+if(NOT features MATCHES "[$]::feature::thread_local([\r\n]|$)")
+    message(FATAL_ERROR "MIPS --print-features omits thread_local\n${features}")
 endif()
 
 execute_process(

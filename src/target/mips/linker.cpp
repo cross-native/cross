@@ -10,6 +10,8 @@
 #include <cstdio>
 #include <functional>
 #include <map>
+#include <set>
+#include <tuple>
 #include <string>
 
 namespace cross::mips {
@@ -135,14 +137,35 @@ std::string relocation_name(std::uint32_t type) {
     case r_mips_lo16: return "R_MIPS_LO16";
     case r_mips_gprel16: return "R_MIPS_GPREL16";
     case r_mips_literal: return "R_MIPS_LITERAL";
-    case 9: return "R_MIPS_GOT16";
+    case r_mips_got16: return "R_MIPS_GOT16";
     case r_mips_pc16: return "R_MIPS_PC16";
-    case 11: return "R_MIPS_CALL16";
+    case r_mips_call16: return "R_MIPS_CALL16";
     case r_mips_gprel32: return "R_MIPS_GPREL32";
     case r_mips_64: return "R_MIPS_64";
+    case r_mips_got_disp: return "R_MIPS_GOT_DISP";
+    case r_mips_got_page: return "R_MIPS_GOT_PAGE";
+    case r_mips_got_ofst: return "R_MIPS_GOT_OFST";
+    case r_mips_got_hi16: return "R_MIPS_GOT_HI16";
+    case r_mips_got_lo16: return "R_MIPS_GOT_LO16";
     case r_mips_sub: return "R_MIPS_SUB";
     case r_mips_higher: return "R_MIPS_HIGHER";
     case r_mips_highest: return "R_MIPS_HIGHEST";
+    case r_mips_call_hi16: return "R_MIPS_CALL_HI16";
+    case r_mips_call_lo16: return "R_MIPS_CALL_LO16";
+    case r_mips_jalr: return "R_MIPS_JALR";
+    case r_mips_tls_dtpmod32: return "R_MIPS_TLS_DTPMOD32";
+    case r_mips_tls_dtprel32: return "R_MIPS_TLS_DTPREL32";
+    case r_mips_tls_dtpmod64: return "R_MIPS_TLS_DTPMOD64";
+    case r_mips_tls_dtprel64: return "R_MIPS_TLS_DTPREL64";
+    case r_mips_tls_gd: return "R_MIPS_TLS_GD";
+    case r_mips_tls_ldm: return "R_MIPS_TLS_LDM";
+    case r_mips_tls_dtprel_hi16: return "R_MIPS_TLS_DTPREL_HI16";
+    case r_mips_tls_dtprel_lo16: return "R_MIPS_TLS_DTPREL_LO16";
+    case r_mips_tls_gottprel: return "R_MIPS_TLS_GOTTPREL";
+    case r_mips_tls_tprel32: return "R_MIPS_TLS_TPREL32";
+    case r_mips_tls_tprel64: return "R_MIPS_TLS_TPREL64";
+    case r_mips_tls_tprel_hi16: return "R_MIPS_TLS_TPREL_HI16";
+    case r_mips_tls_tprel_lo16: return "R_MIPS_TLS_TPREL_LO16";
     case r_mips_pc32: return "R_MIPS_PC32";
     default: return "relocation type " + std::to_string(type);
     }
@@ -162,14 +185,46 @@ std::int64_t sign_extend(std::uint64_t value, unsigned bits) {
 unsigned field_size(std::uint32_t type) {
     switch (type) {
     case r_mips_16: return 2;
-    case r_mips_64: return 8;
+    case r_mips_64: case r_mips_tls_dtprel64: case r_mips_tls_tprel64: return 8;
     case r_mips_32: case r_mips_26: case r_mips_hi16: case r_mips_lo16: case r_mips_gprel16:
     case r_mips_literal: case r_mips_pc16: case r_mips_gprel32: case r_mips_higher:
-    case r_mips_highest: case r_mips_pc32:
+    case r_mips_highest: case r_mips_pc32: case r_mips_got16: case r_mips_call16:
+    case r_mips_got_disp: case r_mips_got_page: case r_mips_got_ofst: case r_mips_got_hi16:
+    case r_mips_got_lo16: case r_mips_call_hi16: case r_mips_call_lo16: case r_mips_jalr:
+    case r_mips_tls_dtprel32: case r_mips_tls_gd: case r_mips_tls_ldm:
+    case r_mips_tls_dtprel_hi16: case r_mips_tls_dtprel_lo16: case r_mips_tls_gottprel:
+    case r_mips_tls_tprel32: case r_mips_tls_tprel_hi16: case r_mips_tls_tprel_lo16:
         return 4;
     default:
         return 0;
     }
+}
+
+// The relocations whose value is the offset of a GOT entry from gp (or,
+// for R_MIPS_GOT_OFST, an offset in a GOT page), which make the link create
+// a GOT.
+bool got_relocation(std::uint32_t type) {
+    switch (type) {
+    case r_mips_got16: case r_mips_call16: case r_mips_got_disp: case r_mips_got_page:
+    case r_mips_got_ofst: case r_mips_got_hi16: case r_mips_got_lo16: case r_mips_call_hi16:
+    case r_mips_call_lo16: case r_mips_tls_gd: case r_mips_tls_ldm: case r_mips_tls_gottprel:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// The local GOT entries of R_MIPS_GOT_HI16-style pairs, which GNU ld takes
+// from the top of the local entries.
+bool high_got_relocation(std::uint32_t type) {
+    return type == r_mips_got_hi16 || type == r_mips_got_lo16 || type == r_mips_call_hi16 ||
+           type == r_mips_call_lo16;
+}
+
+// A 64 KiB GOT page entry: the address rounded for the sign of its low
+// half, which the low part's offset completes.
+std::uint64_t got_page(std::uint64_t value) {
+    return (value + 0x8000U) & ~std::uint64_t{0xffff};
 }
 
 class MipsLinker final : public linker::Target {
@@ -426,6 +481,69 @@ public:
     void relocate(const linker::RelocationContext& context,
                   std::span<std::uint8_t> bytes) const override;
 
+    std::vector<std::unique_ptr<InputSection>> create_sections(
+        std::span<InputSection* const> sections) override {
+        for (auto* section : sections) {
+            for (const auto& relocation : section->relocations) {
+                if (!got_relocation(relocation.type & 0xffU)) continue;
+                // GNU ld's .got, in the first file that needs it.
+                auto got = std::make_unique<InputSection>();
+                got->file = section->file;
+                got->name = ".got";
+                got->flags = elf::shf_alloc | elf::shf_write | shf_mips_gprel;
+                got->alignment = 16;
+                got->entry_size = got_entry();
+                got_ = {};
+                got_.section = got.get();
+                std::vector<std::unique_ptr<InputSection>> result;
+                result.push_back(std::move(got));
+                return result;
+            }
+        }
+        return {};
+    }
+
+    [[nodiscard]] std::vector<std::pair<std::string, InputSection*>> created_symbols() const override {
+        if (!got_.section) return {};
+        return {{"_GLOBAL_OFFSET_TABLE_", got_.section}};
+    }
+
+    void size_sections(std::span<InputSection* const> sections) override;
+    // GNU ld's use of the R_MIPS_JALR hint: `jalr $t9` becomes `bal` and
+    // `jr $t9` becomes `b` when the callee is defined within reach.
+    void relax_call(const linker::RelocationContext& context,
+                    const assembler::Relocation& relocation,
+                    std::span<std::uint8_t> bytes) const {
+        const auto symbol = context.symbol(relocation.symbol.value);
+        const auto offset = relocation.offset;
+        if (symbol.undefined || symbol.removed || offset > bytes.size() || bytes.size() - offset < 4) {
+            return;
+        }
+        const auto target = mask(address(context, symbol, context.section().rela ? relocation.addend : 0));
+        if ((target & 3U) != 0) return;
+        const auto from = mask(context.place(offset) + 4);
+        const auto distance = output_.elf64 ? static_cast<std::int64_t>(target - from)
+                                            : sign_extend(mask(target - from), 32);
+        if (distance < -0x20000 || distance > 0x1ffff) return;
+        const auto word = static_cast<std::uint32_t>(read(bytes, offset, 4));
+        const auto field = static_cast<std::uint32_t>(static_cast<std::uint64_t>(distance) >> 2U) & 0xffffU;
+        if (word == 0x0320f809U) {
+            write_bytes(bytes, offset, 0x04110000U | field, 4);
+        } else if ((word & ~1U) == 0x03200008U) {
+            write_bytes(bytes, offset, 0x10000000U | field, 4);
+        }
+    }
+    void fill_sections(
+        std::span<InputSection* const> sections,
+        const std::function<std::unique_ptr<linker::RelocationContext>(const InputSection&)>& context)
+        override;
+
+    [[nodiscard]] bool implicit_symbol(std::string_view name) const override {
+        // GNU ld resolves _gp_disp, the distance from an o32 .cpload to gp,
+        // and __gnu_local_gp, gp itself, without definitions.
+        return name == "__gnu_local_gp" || (name == "_gp_disp" && !output_.elf64);
+    }
+
     [[nodiscard]] bool sections_end_locals(const linker::OutputFormat& format) const override {
         // IRIX 5 compatible ELF32 counts only section symbols as local.
         return !format.traditional && !output_.elf64;
@@ -545,8 +663,11 @@ public:
                "  . = DATA_SEGMENT_ALIGN (CONSTANT (MAXPAGESIZE), CONSTANT (COMMONPAGESIZE));\n"
                "  .eh_frame : ONLY_IF_RW { KEEP (*(.eh_frame)) }\n"
                "  .gcc_except_table : ONLY_IF_RW { *(.gcc_except_table .gcc_except_table.*) }\n"
+               "  .tdata : { PROVIDE_HIDDEN (__tdata_start = .); *(.tdata .tdata.*) }\n"
+               "  .tbss : { *(.tbss .tbss.*) *(.tcommon) }\n"
                "  .data : { _fdata = .; *(.data .data.*) }\n"
                "  HIDDEN (_gp = ALIGN(16) + 0x7ff0);\n"
+               "  .got : { *(.got) }\n"
                "  .sdata : { *(.sdata .sdata.*) }\n"
                "  .lit8 : { *(.lit8) }\n"
                "  .lit4 : { *(.lit4) }\n"
@@ -811,11 +932,12 @@ private:
         bool paired{true};
     };
 
-    // The in-place addend of a REL relocation: a R_MIPS_HI16 takes the low
-    // half from the next R_MIPS_LO16 of its symbol; the addend of a
-    // R_MIPS_26 is unsigned against a section symbol (as in GNU ld).
+    // The in-place addend of a REL relocation: a R_MIPS_HI16, or a
+    // R_MIPS_GOT16 against a local symbol, takes the low half from the next
+    // R_MIPS_LO16 of its symbol; the addend of a R_MIPS_26 is unsigned
+    // against a section symbol (as in GNU ld).
     [[nodiscard]] InPlace rel_addend(const InputSection& section, std::size_t index,
-                                     bool section_symbol) const {
+                                     bool section_symbol, bool local_symbol = false) const {
         const auto& relocations = section.relocations;
         const auto& relocation = relocations[index];
         const auto type = relocation.type & 0xffU;
@@ -830,6 +952,9 @@ private:
             const auto target = (field & jump26_mask) << 2U;
             return {section_symbol ? static_cast<std::int64_t>(target) : sign_extend(target, 28)};
         }
+        case r_mips_got16:
+            if (!local_symbol) return {sign_extend(field & 0xffffU, 16)};
+            [[fallthrough]];
         case r_mips_hi16: {
             InPlace result{static_cast<std::int64_t>((field & 0xffffU) << 16U), false};
             for (std::size_t next = index + 1; next < relocations.size(); ++next) {
@@ -846,9 +971,19 @@ private:
         case r_mips_lo16:
         case r_mips_gprel16:
         case r_mips_literal:
+        case r_mips_call16: case r_mips_got_disp: case r_mips_got_page: case r_mips_got_ofst:
+        case r_mips_got_hi16: case r_mips_got_lo16: case r_mips_call_hi16: case r_mips_call_lo16:
+        case r_mips_tls_gd: case r_mips_tls_ldm: case r_mips_tls_dtprel_hi16:
+        case r_mips_tls_dtprel_lo16: case r_mips_tls_gottprel: case r_mips_tls_tprel_hi16:
+        case r_mips_tls_tprel_lo16:
             return {sign_extend(field & 0xffffU, 16)};
         case r_mips_pc16:
             return {sign_extend((field & 0xffffU) << 2U, 18)};
+        case r_mips_jalr:
+            return {0};
+        case r_mips_tls_dtprel64:
+        case r_mips_tls_tprel64:
+            return {static_cast<std::int64_t>(field)};
         default:
             return {sign_extend(field, 32)};
         }
@@ -872,6 +1007,62 @@ private:
         }
     }
 
+    [[nodiscard]] unsigned got_entry() const { return output_.elf64 ? 8U : 4U; }
+
+    // The address a relocation names: its symbol's plus the addend, with a
+    // merged section's offset mapped.
+    [[nodiscard]] static std::uint64_t address(const linker::RelocationContext& context,
+                                               const linker::SymbolValue& symbol,
+                                               std::int64_t addend) {
+        const auto a = static_cast<std::uint64_t>(addend);
+        return symbol.removed ? a : symbol.merge ? context.merged(*symbol.merge, a) : symbol.value + a;
+    }
+
+    [[nodiscard]] std::uint64_t mask(std::uint64_t value) const {
+        return output_.elf64 ? value : value & 0xffffffffU;
+    }
+
+    // The GOT entry a relocation takes, by the value it holds: an
+    // address or a 64 KiB page for the local entries, and for the TLS
+    // ones the relocation type and the TLS address.
+    struct GotKey {
+        std::uint32_t type{};
+        std::uint64_t value{};
+        auto operator<=>(const GotKey&) const = default;
+    };
+    [[nodiscard]] std::optional<GotKey> got_key(const linker::RelocationContext& context,
+                                                std::uint32_t type,
+                                                const linker::SymbolValue& symbol,
+                                                std::int64_t addend) const {
+        const auto value = mask(address(context, symbol, addend));
+        switch (type) {
+        // In a static link every symbol binds locally, so a %got or
+        // %call16 of a global symbol holds its address, of a local one the
+        // page that the paired %lo completes; R_MIPS_GOT_PAGE never decays
+        // to R_MIPS_GOT_DISP.
+        case r_mips_got16:
+        case r_mips_call16:
+            return GotKey{0, symbol.local ? mask(got_page(value)) : value};
+        case r_mips_got_page: return GotKey{0, mask(got_page(value))};
+        case r_mips_got_disp: case r_mips_got_hi16: case r_mips_got_lo16:
+        case r_mips_call_hi16: case r_mips_call_lo16:
+            return GotKey{0, value};
+        case r_mips_tls_ldm: return GotKey{r_mips_tls_ldm, 0};
+        case r_mips_tls_gd: case r_mips_tls_gottprel: return GotKey{type, value};
+        default: return std::nullopt;
+        }
+    }
+
+    struct Got {
+        InputSection* section{};
+        // The entries before the TLS ones: two reserved, those GNU ld
+        // estimates for addresses and pages, and of TLS entries.
+        std::size_t local{};
+        std::size_t tls{};
+        std::map<GotKey, std::size_t> entries;
+    };
+    Got got_;
+
     assembler::ObjectInfo output_;
     std::optional<std::string> first_;
     std::uint32_t flags_{};
@@ -888,6 +1079,181 @@ private:
     std::string fp_file_;
 };
 
+// The size of the GOT, which GNU ld estimates before layout: an entry
+// for each global symbol and for each local symbol and addend that need
+// one, and an estimate of the 64 KiB pages that R_MIPS_GOT_PAGE and %got
+// of local symbols reach, from the ranges of offsets in each section,
+// at most five more than the loadable size spans; then the TLS entries,
+// two for general dynamic, one for initial exec, and two shared ones for
+// local dynamic.
+void MipsLinker::size_sections(std::span<InputSection* const> sections) {
+    if (!got_.section) return;
+    std::set<const linker::Symbol*> globals;
+    std::set<std::tuple<const InputFile*, std::uint32_t, std::int64_t>> locals;
+    std::set<std::pair<std::uint32_t, const void*>> tls_globals;
+    std::set<std::tuple<std::uint32_t, const InputFile*, std::uint32_t>> tls_locals;
+    bool ldm = false;
+    std::map<const InputSection*, std::vector<std::pair<std::int64_t, std::int64_t>>> ranges;
+    std::uint64_t pages = 0;
+    std::uint64_t loadable = 0;
+    const auto pages_for = [](const std::pair<std::int64_t, std::int64_t>& range) {
+        return static_cast<std::uint64_t>(range.second - range.first + 0x1ffff) >> 16U;
+    };
+    // GNU ld's mips_elf_record_got_page_entry.
+    const auto page_reference = [&](const InputSection* target, std::int64_t offset) {
+        auto& list = ranges[target];
+        auto range = list.begin();
+        while (range != list.end() && offset > range->second + 0xffff) ++range;
+        if (range == list.end() || offset < range->first - 0xffff) {
+            list.insert(range, {offset, offset});
+            ++pages;
+            return;
+        }
+        auto before = pages_for(*range);
+        if (offset < range->first) {
+            range->first = offset;
+        } else if (offset > range->second) {
+            const auto next = std::next(range);
+            if (next != list.end() && offset >= next->first - 0xffff) {
+                before += pages_for(*next);
+                range->second = next->second;
+                list.erase(next);
+            } else {
+                range->second = offset;
+            }
+        }
+        pages += pages_for(*range) - before;
+    };
+    for (auto* section : sections) {
+        if (section == got_.section) continue;
+        if (section->alloc()) loadable += (section->size + 15U) & ~std::uint64_t{15};
+        const auto& file = *section->file;
+        for (std::size_t index = 0; index < section->relocations.size(); ++index) {
+            const auto& relocation = section->relocations[index];
+            const auto type = relocation.type & 0xffU;
+            const auto symbol_index = relocation.symbol.value;
+            if (!got_relocation(type) || symbol_index >= file.symbols.size()) continue;
+            const auto& entry = file.symbols[symbol_index];
+            const auto* global = entry.global;
+            const auto addend = section->rela
+                ? relocation.addend
+                : rel_addend(*section, index, entry.type == elf::stt_section, !global).value;
+            const auto page = [&] {
+                if (global) {
+                    if (global->defined() && global->section) {
+                        page_reference(global->section,
+                                       static_cast<std::int64_t>(global->value) + addend);
+                    } else {
+                        globals.insert(global);
+                    }
+                } else if (entry.shndx != 0 && entry.shndx < file.sections.size() &&
+                           file.sections[entry.shndx]) {
+                    page_reference(file.sections[entry.shndx].get(),
+                                   static_cast<std::int64_t>(entry.value) + addend);
+                }
+            };
+            switch (type) {
+            case r_mips_tls_ldm:
+                ldm = true;
+                break;
+            case r_mips_tls_gd:
+            case r_mips_tls_gottprel:
+                if (global) tls_globals.insert({type, global});
+                else tls_locals.insert({type, &file, symbol_index});
+                break;
+            case r_mips_got_page:
+                page();
+                break;
+            case r_mips_got16:
+            case r_mips_got_hi16:
+            case r_mips_got_lo16:
+                if (global) globals.insert(global);
+                else page();
+                if (type == r_mips_got_lo16 && !global) locals.insert({&file, symbol_index, addend});
+                break;
+            case r_mips_call16:
+            case r_mips_call_hi16:
+            case r_mips_call_lo16:
+            case r_mips_got_disp:
+                if (global) globals.insert(global);
+                else if (type != r_mips_call_hi16) locals.insert({&file, symbol_index, addend});
+                break;
+            default:
+                break;
+            }
+        }
+    }
+    pages = std::min(pages, (loadable >> 16U) + 5U);
+    got_.local = 2 + globals.size() + locals.size() + pages;
+    std::size_t tls = ldm ? 2 : 0;
+    for (const auto& [type, symbol] : tls_globals) tls += type == r_mips_tls_gd ? 2 : 1;
+    for (const auto& [type, file, symbol] : tls_locals) tls += type == r_mips_tls_gd ? 2 : 1;
+    got_.tls = tls;
+    got_.section->size = (got_.local + got_.tls) * got_entry();
+    got_.section->data.assign(got_.section->size, 0);
+}
+
+// The GOT's contents: the reserved entries, GNU ld's lazy resolver slot and
+// module pointer, then each entry in the order relocations first take it,
+// as GNU ld assigns the local ones; TLS entries hold the module 1 of the
+// executable and offsets from the TLS block.
+void MipsLinker::fill_sections(
+    std::span<InputSection* const> sections,
+    const std::function<std::unique_ptr<linker::RelocationContext>(const InputSection&)>& make) {
+    if (!got_.section) return;
+    auto& data = got_.section->data;
+    const auto entry_bytes = got_entry();
+    got_.entries.clear();
+    std::size_t low = 2;
+    std::size_t high = got_.local == 0 ? 0 : got_.local - 1;
+    std::size_t tls = got_.local;
+    const auto put = [&](std::size_t index, std::uint64_t value) {
+        if ((index + 1) * entry_bytes <= data.size()) write_bytes(data, index * entry_bytes, value, entry_bytes);
+    };
+    put(0, 0);
+    put(1, std::uint64_t{1} << (entry_bytes * 8 - 1));
+    for (auto* section : sections) {
+        if (section == got_.section) continue;
+        std::unique_ptr<linker::RelocationContext> context;
+        for (std::size_t index = 0; index < section->relocations.size(); ++index) {
+            const auto& relocation = section->relocations[index];
+            const auto type = relocation.type & 0xffU;
+            if (!got_relocation(type) || type == r_mips_got_ofst) continue;
+            if (!context) context = make(*section);
+            const auto symbol = context->symbol(relocation.symbol.value);
+            const auto addend = section->rela
+                ? relocation.addend
+                : rel_addend(*section, index, symbol.section, symbol.local).value;
+            const auto key = got_key(*context, type, symbol, addend);
+            if (!key || got_.entries.contains(*key)) continue;
+            if (key->type == 0) {
+                if (low > high) {
+                    context->error(relocation.offset, "internal error: not enough GOT space for local GOT entries");
+                    return;
+                }
+                const auto at = high_got_relocation(type) ? high-- : low++;
+                got_.entries.emplace(*key, at);
+                put(at, key->value);
+                continue;
+            }
+            const auto base = context->tls_base();
+            if (!base) {
+                context->error(relocation.offset, relocation_name(type) + " against '" +
+                                                      std::string(symbol.name) +
+                                                      "' needs a TLS segment, which the link lacks");
+                return;
+            }
+            got_.entries.emplace(*key, tls);
+            if (type == r_mips_tls_gottprel) {
+                put(tls++, key->value - (*base + tls_tp_offset));
+            } else {
+                put(tls++, 1);
+                put(tls++, type == r_mips_tls_ldm ? 0 : key->value - (*base + tls_dtp_offset));
+            }
+        }
+    }
+}
+
 void MipsLinker::relocate(const linker::RelocationContext& context,
                           std::span<std::uint8_t> bytes) const {
     const auto& section = context.section();
@@ -903,9 +1269,11 @@ void MipsLinker::relocate(const linker::RelocationContext& context,
         const auto type = relocation.type & 0xffU;
         const auto second = (relocation.type >> 8U) & 0xffU;
         const auto third = (relocation.type >> 16U) & 0xffU;
-        if ((type == r_mips_none && second == r_mips_none && third == r_mips_none) || type == r_mips_jalr) {
+        if (type == r_mips_jalr && second == r_mips_none) {
+            relax_call(context, relocation, bytes);
             continue;
         }
+        if (type == r_mips_none && second == r_mips_none && third == r_mips_none) continue;
         const auto symbol = context.symbol(relocation.symbol.value);
         std::string name = symbol.name.empty() ? std::string("<absolute>") : std::string(symbol.name);
         const auto offset = relocation.offset;
@@ -923,9 +1291,8 @@ void MipsLinker::relocate(const linker::RelocationContext& context,
         }
         const auto size = field_size(type);
         const auto store_size = field_size(store_type);
-        if (size == 0 || store_size == 0 || type == r_mips_sub) {
-            context.error(offset, "unsupported " + relocation_name(type) + " against '" + name + "'" +
-                                      (type == 9 || type == 11 ? " (PIC code is not supported)" : ""));
+        if (size == 0 || store_size == 0 || type == r_mips_sub || type == r_mips_jalr) {
+            context.error(offset, "unsupported " + relocation_name(type) + " against '" + name + "'");
             continue;
         }
         if (offset > bytes.size() || store_size > bytes.size() - offset) {
@@ -943,11 +1310,11 @@ void MipsLinker::relocate(const linker::RelocationContext& context,
                 context.error(offset, relocation_name(type) + " needs an explicit addend");
                 continue;
             }
-            const auto in_place = rel_addend(section, index, symbol.section);
+            const auto in_place = rel_addend(section, index, symbol.section, symbol.local);
             addend = in_place.value;
             if (!in_place.paired) {
-                context.warning(offset, "can't find matching R_MIPS_LO16 relocation for "
-                                        "R_MIPS_HI16 against '" + name + "'");
+                context.warning(offset, "can't find matching R_MIPS_LO16 relocation for " +
+                                            relocation_name(type) + " against '" + name + "'");
             }
         }
         // A section symbol names its section; the addend says where.
@@ -959,6 +1326,47 @@ void MipsLinker::relocate(const linker::RelocationContext& context,
         std::uint64_t value = symbol.removed ? a
                               : symbol.merge ? context.merged(*symbol.merge, a)
                                              : symbol.value + a;
+        const auto needs_gp = [&]() -> std::optional<std::uint64_t> {
+            const auto gp = context.gp();
+            if (!gp) {
+                context.error(offset, relocation_name(type) + " against '" + name +
+                                          "' needs _gp, which nothing defines");
+            }
+            return gp;
+        };
+        if (symbol.undefined && implicit_symbol(symbol.name)) {
+            // _gp_disp is gp less the address of the %hi, which the %lo four
+            // bytes later reaches with the same addend; __gnu_local_gp is gp.
+            const auto gp = needs_gp();
+            if (!gp) continue;
+            if (symbol.name == "__gnu_local_gp") {
+                value = *gp + a;
+            } else if (type == r_mips_hi16 || type == r_mips_lo16) {
+                value = *gp - p + a + (type == r_mips_lo16 ? 4U : 0U);
+            } else {
+                context.error(offset, relocation_name(type) + " against '_gp_disp'; only "
+                                      "R_MIPS_HI16 and R_MIPS_LO16 may refer to it");
+                continue;
+            }
+        } else if (got_relocation(type)) {
+            // The offset of the symbol's GOT entry from gp, or the offset
+            // of its address in its GOT page.
+            const auto gp = needs_gp();
+            if (!gp) continue;
+            if (type == r_mips_got_ofst) {
+                value = mask(value) - mask(got_page(mask(value)));
+            } else {
+                const auto key = got_key(context, type, symbol, addend);
+                const auto found = got_.section && key ? got_.entries.find(*key) : got_.entries.end();
+                if (found == got_.entries.end() || !got_.section->output) {
+                    context.error(offset, "internal error: " + relocation_name(type) + " against '" +
+                                              name + "' has no GOT entry");
+                    continue;
+                }
+                value = got_.section->output->address + got_.section->offset +
+                        found->second * got_entry() - *gp;
+            }
+        }
         switch (type) {
         case r_mips_gprel16:
         case r_mips_literal:
@@ -977,6 +1385,27 @@ void MipsLinker::relocate(const linker::RelocationContext& context,
         case r_mips_pc32:
             value -= p;
             break;
+        case r_mips_tls_tprel_hi16:
+        case r_mips_tls_tprel_lo16:
+        case r_mips_tls_tprel32:
+        case r_mips_tls_tprel64:
+        case r_mips_tls_dtprel_hi16:
+        case r_mips_tls_dtprel_lo16:
+        case r_mips_tls_dtprel32:
+        case r_mips_tls_dtprel64: {
+            // Offsets from the thread pointer, 0x7000 past the start of the
+            // TLS block, or from its DTP-relative base 0x8000 past it.
+            const auto base = context.tls_base();
+            if (!base) {
+                context.error(offset, relocation_name(type) + " against '" + name +
+                                          "' needs a TLS segment, which the link lacks");
+                continue;
+            }
+            const bool tp = type == r_mips_tls_tprel_hi16 || type == r_mips_tls_tprel_lo16 ||
+                            type == r_mips_tls_tprel32 || type == r_mips_tls_tprel64;
+            value -= *base + (tp ? tls_tp_offset : tls_dtp_offset);
+            break;
+        }
         default:
             break;
         }
@@ -1010,8 +1439,42 @@ void MipsLinker::relocate(const linker::RelocationContext& context,
         case r_mips_64:
             write_bytes(bytes, offset, wide ? value : static_cast<std::uint64_t>(sign_extend(value, 32)), 8);
             break;
-        case r_mips_hi16: replace(high16(value), 0xffffU); break;
-        case r_mips_lo16: replace(low16(value), 0xffffU); break;
+        case r_mips_hi16:
+        case r_mips_got_hi16:
+        case r_mips_call_hi16:
+        case r_mips_tls_tprel_hi16:
+        case r_mips_tls_dtprel_hi16:
+            replace(high16(value), 0xffffU);
+            break;
+        case r_mips_lo16:
+        case r_mips_got_lo16:
+        case r_mips_call_lo16:
+        case r_mips_tls_tprel_lo16:
+        case r_mips_tls_dtprel_lo16:
+            replace(low16(value), 0xffffU);
+            break;
+        case r_mips_got16:
+        case r_mips_call16:
+        case r_mips_got_disp:
+        case r_mips_got_page:
+        case r_mips_got_ofst:
+        case r_mips_tls_gd:
+        case r_mips_tls_ldm:
+        case r_mips_tls_gottprel:
+            if (signed_value < -32768 || signed_value > 32767) {
+                out_of_range(type == r_mips_got_ofst ? " of its GOT page" : " of _gp", -32768, 32767);
+                continue;
+            }
+            replace(low16(value), 0xffffU);
+            break;
+        case r_mips_tls_tprel32:
+        case r_mips_tls_dtprel32:
+            write_bytes(bytes, offset, value, 4);
+            break;
+        case r_mips_tls_tprel64:
+        case r_mips_tls_dtprel64:
+            write_bytes(bytes, offset, value, 8);
+            break;
         case r_mips_higher: replace(higher16(value), 0xffffU); break;
         case r_mips_highest: replace(highest16(value), 0xffffU); break;
         case r_mips_gprel16:

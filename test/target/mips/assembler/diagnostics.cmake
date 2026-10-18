@@ -63,8 +63,12 @@ expect(local error ".set noreorder|        b .Lmissing|        nop"
        "local.s:2:11: error: undefined local symbol '.Lmissing'" ${o32})
 expect(range error ".set noreorder|        beq $0, $0, far|        nop|        .space 0x40000|far: nop"
        "range.s:2:21: error: branch target is out of range" ${o32})
-expect(operator error "        lw $2, %got(x)($28)"
-       "operator.s:1:16: error: relocation operator %got is not supported" ${o32})
+expect(operator error "        lw $2, %foo(x)($28)"
+       "operator.s:1:16: error: relocation operator %foo is not supported" ${o32})
+expect(nested-operator error "        lw $2, %got(%lo(x))($28)"
+       "nested-operator.s:1:16: error: relocation operator %got[(]%lo[)] is not supported" ${o32})
+expect(neg error "        lui $2, %hi(%neg(%gp_rel(f)))"
+       "neg.s:1:17: error: %neg[(]%gp_rel[(][.][.][.][)][)] needs a 64-bit [(]n64[)] object" ${o32})
 expect(li error "        li $2, 0x100000000"
        "li.s:1:16: error: li needs a 32-bit immediate; use dli for 64-bit values" ${o32})
 expect(dli error ".set mips2|        dli $2, 5" "dli.s:2:9: error: instruction 'dli' is not available in mips2" ${o32})

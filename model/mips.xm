@@ -375,6 +375,9 @@ abi "o32" {
         "f8", "f9", "f10", "f11", "f12", "f13", "f14", "f15",
         "f16", "f17", "f18", "f19", "memory"
     ];
+    # In -mabicalls code a callee computes its own gp from $t9, so callers
+    # reload theirs after a call.
+    pic_call_clobbers = ["gp"];
 
     # A 128-bit integer returns in v0, v1, a0, and a1, where GCC returns
     # its 16-byte scalar integer modes.

@@ -1,8 +1,8 @@
 # Copyright (C) 2026 Cross contributors
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
-# The `as` tool: target, profile, ISA, ABI, byte-order, and floating-point
-# options select the object's class and MIPS flags; inputs come from files,
+# The `as` tool: target, profile, ISA, ABI, byte-order, floating-point, and
+# PIC options select the object's class and MIPS flags; inputs come from files,
 # standard input, .include, and .incbin; command errors are diagnosed.
 
 foreach(required AS OUTPUT)
@@ -56,6 +56,9 @@ selection(eabi "-target mips-unknown-elf -march=mips32 -mabi=eabi" "Flags: +0x50
 selection(psp "-mprofile=psp-allegrex" "little endian" "Flags: +0x10003001, noreorder, eabi32, mips2"
           "FP ABI: Hard float [(]single precision[)]")
 selection(n64 "-mprofile=mips64el-n64" "Class: +ELF64" "little endian" "Flags: +0x60000001")
+selection(abicalls "-target mips-unknown-elf -mabicalls" "Flags: +0x1007, noreorder, pic, cpic, o32")
+selection(call-nonpic "-target mips-unknown-elf -call_nonpic" "Flags: +0x1005, noreorder, cpic, o32")
+selection(non-shared "-target mips-unknown-elf -KPIC -non_shared" "Flags: +0x1001, noreorder, o32")
 
 # The default output is a.out in the working directory.
 execute_process(COMMAND "${AS}" -target mips-unknown-elf "${source}" WORKING_DIRECTORY "${OUTPUT}"
@@ -103,7 +106,6 @@ expect_failure(unknown "as: error: unknown argument '-frob'" -frob "${source}")
 expect_failure(bad-level "as: error: unknown argument '-Ofast'" -Ofast "${source}")
 expect_failure(unimplemented-target "is not implemented" -target sparc-unknown-elf "${source}")
 expect_failure(gnu-x86 "-EB, -EL, -32, and -64 select MIPS variants" -target x86_64-unknown-linux-gnu -EB "${source}")
-expect_failure(pic "MIPS PIC objects [(]-mabicalls[)] are not supported" -target mips-unknown-elf -mabicalls "${source}")
 expect_failure(missing "cannot open input file" -target mips-unknown-elf missing.s)
 
 execute_process(COMMAND "${AS}" --help OUTPUT_VARIABLE text RESULT_VARIABLE status)

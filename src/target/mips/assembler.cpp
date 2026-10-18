@@ -19,6 +19,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace cross::mips {
 namespace {
@@ -84,7 +85,70 @@ enum : std::uint16_t {
     // A plain 16-bit immediate that only layout makes absolute.
     fixup_signed16,
     fixup_unsigned16,
+    // The GOT and call operators of SVR4 PIC code.
+    fixup_got16,
+    fixup_call16,
+    fixup_got_disp,
+    fixup_got_page,
+    fixup_got_ofst,
+    fixup_got_hi16,
+    fixup_got_lo16,
+    fixup_call_hi16,
+    fixup_call_lo16,
+    // %hi and %lo of %neg(%gp_rel(sym)), the n64 GPREL16/SUB/HI16 and
+    // GPREL16/SUB/LO16 compositions.
+    fixup_gp_disp_hi16,
+    fixup_gp_disp_lo16,
+    // The TLS operators.
+    fixup_tls_gd,
+    fixup_tls_ldm,
+    fixup_dtprel_hi16,
+    fixup_dtprel_lo16,
+    fixup_gottprel,
+    fixup_tprel_hi16,
+    fixup_tprel_lo16,
+    // Data: .gpword, .gpdword, .dtprelword, .dtpreldword, .tprelword, and
+    // .tpreldword.
+    fixup_gprel32,
+    fixup_gprel64,
+    fixup_dtprel32,
+    fixup_dtprel64,
+    fixup_tprel32,
+    fixup_tprel64,
+    // .reloc with a relocation that has no field.
+    fixup_none,
+    fixup_jalr,
+    // The n64 `jal` macro's GOT load: %call16, or %got_disp for a symbol
+    // that turns out local.
+    fixup_call16_or_disp,
+    // The R_MIPS_JALR hint of the `jal` macro, which, unlike that of
+    // `.reloc`, names a local symbol's section in RELA objects.
+    fixup_jalr_hint,
 };
+
+// The operators whose relocations name TLS symbols.
+bool tls_fixup(std::uint16_t kind) {
+    switch (kind) {
+    case fixup_tls_gd: case fixup_tls_ldm: case fixup_dtprel_hi16: case fixup_dtprel_lo16:
+    case fixup_gottprel: case fixup_tprel_hi16: case fixup_tprel_lo16: case fixup_dtprel32:
+    case fixup_dtprel64: case fixup_tprel32: case fixup_tprel64:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// The operators that give the high half of a value split across two
+// instructions, which round for the sign of the low half.
+bool high_part_fixup(std::uint16_t kind) {
+    switch (kind) {
+    case fixup_hi16: case fixup_got_hi16: case fixup_call_hi16: case fixup_gp_disp_hi16:
+    case fixup_dtprel_hi16: case fixup_tprel_hi16:
+        return true;
+    default:
+        return false;
+    }
+}
 
 enum class Abi : std::uint8_t { O32, N64, Eabi32 };
 
@@ -326,6 +390,14 @@ std::string lower(std::string_view text) {
 bool is_int16(std::int64_t value) { return value >= -32768 && value <= 32767; }
 bool is_uint16(std::int64_t value) { return value >= 0 && value <= 65535; }
 
+// A label of local binding, which GNU as treats as internal to the file
+// (its pic_need_relax): not global, weak, common, or undefined.
+bool local_symbol(const assembler::Symbol& symbol) {
+    using Binding = assembler::Symbol::Binding;
+    return symbol.section && !symbol.common &&
+           (symbol.binding == Binding::Local || symbol.binding == Binding::Unset);
+}
+
 // GPR names of the o32 and EABI conventions; n64 renames 8-15.
 std::optional<unsigned> gpr_number(std::string_view name, bool n64) {
     unsigned number = 0;
@@ -556,6 +628,8 @@ public:
             }
         }
         nan2008_ = model.nan2008;
+        // -mabicalls starts as `.abicalls` does (GNU as's -KPIC).
+        pic_ = abicalls_ = subtarget.has_feature(Feature::AbiCalls);
     }
 
     [[nodiscard]] assembler::ObjectInfo object() const override {
@@ -571,6 +645,7 @@ public:
         }
         if (noreorder_) flags |= ef_mips_noreorder;
         if (pic_) flags |= ef_mips_pic | ef_mips_cpic;
+        if (abicalls_) flags |= ef_mips_cpic;
         if (nan2008_) flags |= ef_mips_nan2008;
         return flags;
     }
@@ -631,12 +706,27 @@ public:
     }
 
     [[nodiscard]] assembler::FixupInfo fixup_info(FixupKind kind) const override {
-        return {4, kind.value == fixup_branch16};
+        switch (kind.value) {
+        case fixup_none: case fixup_jalr: case fixup_jalr_hint: return {0, false};
+        case fixup_gprel64: case fixup_dtprel64: case fixup_tprel64: return {8, false};
+        default: return {4, kind.value == fixup_branch16};
+        }
     }
 
     void instruction(Assembler& as, Statement& statement) override;
     bool directive(Assembler& as, Statement& statement) override;
-    void label(Assembler&, SymbolId id) override { labels_.push_back(id); }
+    void label(Assembler& as, SymbolId id) override {
+        // A `.reloc` at this label applies here.
+        for (auto pending = pending_relocs_.begin(); pending != pending_relocs_.end();) {
+            if (pending->label == id) {
+                as.add_fixup(FixupKind{pending->kind}, pending->expression, pending->location);
+                pending = pending_relocs_.erase(pending);
+            } else {
+                ++pending;
+            }
+        }
+        labels_.push_back(id);
+    }
     void flush(Assembler& as) override;
     void finish(Assembler& as) override;
     bool apply_fixup(Assembler& as, const assembler::Fixup& fixup, std::int64_t value,
@@ -646,9 +736,9 @@ public:
         const assembler::Symbol& symbol, const assembler::Section* symbol_section) const override;
     void order_relocations(std::vector<assembler::Relocation>& relocations) const override;
     // GNU as keeps relocations in the order of their fixups and moves each
-    // HI16 that its next fixup does not match before the LO16 it pairs
-    // with, the most recent first.
-    static void gnu_order(std::vector<assembler::Relocation>& relocations);
+    // HI16 (or GOT16 of a local symbol) that its next fixup does not match
+    // before the LO16 it pairs with, the most recent first.
+    void gnu_order(std::vector<assembler::Relocation>& relocations) const;
 
 private:
     struct Settings {
@@ -807,6 +897,26 @@ private:
                            std::optional<std::uint8_t> fill,
                            const std::vector<SymbolId>& labels);
 
+    // Whether a %got names a symbol of local binding: its REL addend is a
+    // high part, which pairs with the %lo after it.
+    [[nodiscard]] bool local_got(Assembler& as, const assembler::Fixup& fixup) const {
+        const auto value = as.evaluate(fixup.expression, false, true);
+        return value && value->add && local_symbol(as.symbol(*value->add));
+    }
+    [[nodiscard]] bool paired_high(const assembler::Relocation& relocation) const {
+        return relocation.type == r_mips_hi16 ||
+               (relocation.type == r_mips_got16 && local_got16_.contains(relocation.target.value));
+    }
+    // The PIC directives, which emit instructions.
+    void put(Assembler& as, std::string_view name, std::initializer_list<std::int64_t> registers,
+             std::optional<PendingFixup> fixup, SourceLocation location);
+    void pic_directive(Assembler& as, std::string_view name, Statement& statement);
+    // .gpword and the other relocated data directives.
+    void relocated_data(Assembler& as, std::string_view name, Statement& statement);
+    void reloc_directive(Assembler& as, Statement& statement);
+    // GNU as's SVR4 PIC forms of `j` and `jal` to a symbol.
+    void pic_jump(Assembler& as, bool call, Statement& statement);
+
     Model model_;
     const Subtarget& subtarget_;
     unsigned optimize_{2};
@@ -818,7 +928,34 @@ private:
     std::unordered_map<std::string_view, const Form*> named_;
     std::unordered_map<const ModelInstruction*, const Form*> encoded_forms_;
     bool noreorder_{};
+    // GNU as's SVR4 PIC mode (`.abicalls`, `.option pic2`), and whether the
+    // file is abicalls code at all, which `.option pic0` leaves on.
     bool pic_{};
+    bool abicalls_{};
+    // The register of `.cplocal`, and the save of `.cpsetup` that
+    // `.cpreturn` restores: a stack offset or a register.
+    unsigned gp_register_{28};
+    // The `.cprestore` slot, which the o32 PIC `jal` macro reloads $gp
+    // from, relative to the `.frame` register; `.ent` invalidates both.
+    std::optional<std::int64_t> cprestore_offset_;
+    bool cprestore_valid_{};
+    unsigned frame_register_{29};
+    bool frame_valid_{};
+    std::optional<std::int64_t> cpreturn_offset_;
+    std::optional<unsigned> cpreturn_register_;
+    // The targets of %got relocations of local symbols.
+    mutable std::unordered_set<std::uint32_t> local_got16_;
+    // `.reloc` relocations at labels defined later.
+    struct PendingReloc {
+        SymbolId label{};
+        std::uint16_t kind{};
+        ExpressionId expression{};
+        SourceLocation location;
+    };
+    std::vector<PendingReloc> pending_relocs_;
+    // The targets of o32 PIC `jal` macros that took the %call16 form
+    // before their symbols were defined.
+    std::vector<std::pair<ExpressionId, SourceLocation>> forward_calls_;
     bool nan2008_{};
     // Code or a .set directive appeared, after which .module may not.
     bool started_{};
@@ -939,27 +1076,58 @@ std::optional<Immediate> MipsTarget::immediate(Assembler& as, Cursor& cursor) {
     Immediate result;
     result.location = cursor.location();
     if (cursor.peek() == '%') {
-        cursor.consume("%");
-        const auto name = cursor.identifier();
-        if (!name || !cursor.consume("(")) {
-            as.error(result.location, "expected a relocation operator such as %lo(symbol)");
-            return std::nullopt;
+        // An operator, or %hi or %lo of %neg(%gp_rel(...)).
+        std::vector<std::string> names;
+        while (cursor.peek() == '%') {
+            cursor.consume("%");
+            const auto name = cursor.identifier();
+            if (!name || !cursor.consume("(")) {
+                as.error(result.location, "expected a relocation operator such as %lo(symbol)");
+                return std::nullopt;
+            }
+            names.emplace_back(*name);
+            cursor.skip_space();
         }
-        if (*name == "hi") result.relocation = fixup_hi16;
-        else if (*name == "lo") result.relocation = fixup_lo16;
-        else if (*name == "gp_rel") result.relocation = fixup_gprel16;
-        else if (*name == "higher") result.relocation = fixup_higher;
-        else if (*name == "highest") result.relocation = fixup_highest;
-        else {
-            as.error(result.location, "relocation operator %" + std::string(*name) +
-                                          " is not supported");
+        static constexpr std::pair<std::string_view, std::uint16_t> operators[] = {
+            {"hi", fixup_hi16},          {"lo", fixup_lo16},
+            {"gp_rel", fixup_gprel16},   {"higher", fixup_higher},
+            {"highest", fixup_highest},  {"got", fixup_got16},
+            {"call16", fixup_call16},    {"got_disp", fixup_got_disp},
+            {"got_page", fixup_got_page}, {"got_ofst", fixup_got_ofst},
+            {"got_hi", fixup_got_hi16},  {"got_lo", fixup_got_lo16},
+            {"call_hi", fixup_call_hi16}, {"call_lo", fixup_call_lo16},
+            {"tlsgd", fixup_tls_gd},     {"tlsldm", fixup_tls_ldm},
+            {"dtprel_hi", fixup_dtprel_hi16}, {"dtprel_lo", fixup_dtprel_lo16},
+            {"gottprel", fixup_gottprel}, {"tprel_hi", fixup_tprel_hi16},
+            {"tprel_lo", fixup_tprel_lo16},
+        };
+        if (names.size() == 3 && (names[0] == "hi" || names[0] == "lo") &&
+            names[1] == "neg" && names[2] == "gp_rel") {
+            if (!model_.elf64) {
+                as.error(result.location, "%neg(%gp_rel(...)) needs a 64-bit (n64) object");
+                return std::nullopt;
+            }
+            result.relocation = names[0] == "hi" ? fixup_gp_disp_hi16 : fixup_gp_disp_lo16;
+        } else if (names.size() == 1) {
+            for (const auto& [name, kind] : operators) {
+                if (names[0] == name) result.relocation = kind;
+            }
+        }
+        if (!result.relocation) {
+            std::string spelled = "%" + names.back();
+            for (auto name = names.rbegin() + 1; name != names.rend(); ++name) {
+                spelled = "%" + *name + "(" + spelled + ")";
+            }
+            as.error(result.location, "relocation operator " + spelled + " is not supported");
             return std::nullopt;
         }
         const auto expression = as.parse_expression(cursor);
         if (!expression) return std::nullopt;
-        if (!cursor.consume(")")) {
-            as.error(cursor.location(), "expected ')'");
-            return std::nullopt;
+        for (std::size_t index = 0; index < names.size(); ++index) {
+            if (!cursor.consume(")")) {
+                as.error(cursor.location(), "expected ')'");
+                return std::nullopt;
+            }
         }
         result.expression = *expression;
         return result;
@@ -1626,7 +1794,8 @@ bool MipsTarget::parse_operand(Assembler& as, Cursor& cursor, const ModelInstruc
         value.value = *cc;
         return true;
     }
-    case OperandTypeId::Cp0: {
+    case OperandTypeId::Cp0:
+    case OperandTypeId::Hwr: {
         const auto rest = cursor.rest();
         std::optional<unsigned> number;
         std::size_t end = 1;
@@ -1635,7 +1804,9 @@ bool MipsTarget::parse_operand(Assembler& as, Cursor& cursor, const ModelInstruc
             number = small_number(rest.substr(1, end - 1), 31);
         }
         if (!number) {
-            as.error(value.location, "expected a coprocessor 0 register $0-$31");
+            as.error(value.location, id == OperandTypeId::Cp0
+                                         ? "expected a coprocessor 0 register $0-$31"
+                                         : "expected a hardware register $0-$31");
             return false;
         }
         cursor.set_position(cursor.position() + end);
@@ -1952,6 +2123,14 @@ void MipsTarget::instruction(Assembler& as, Statement& statement) {
     if (found == forms_.end()) {
         as.error(location, "unknown instruction '" + std::string(statement.name) + "'");
         return;
+    }
+    if (pic_ && (name == "j" || name == "jal")) {
+        auto probe = cursor;
+        probe.skip_space();
+        if (probe.peek() != '$') {
+            pic_jump(as, name == "jal", statement);
+            return;
+        }
     }
     const auto& forms = found->second;
     // The first form the current ISA has whose operands the text has the
@@ -2352,14 +2531,34 @@ bool MipsTarget::directive(Assembler& as, Statement& statement) {
     }
     if (name == ".option") {
         const auto option = cursor.identifier();
-        if (option && *option == "pic0") pic_ = false;
-        else if (option && *option == "pic2") pic_ = true;
-        else as.error(statement.location, "unsupported .option");
+        if (option && *option == "pic0") {
+            pic_ = false;
+        } else if (option && *option == "pic2") {
+            pic_ = true;
+            abicalls_ = true;
+        } else {
+            as.error(statement.location, "unsupported .option");
+        }
         if (!cursor.at_end()) as.error(cursor.location(), "unexpected text after .option");
         return true;
     }
     if (name == ".abicalls") {
         pic_ = true;
+        abicalls_ = true;
+        return true;
+    }
+    if (name == ".cpload" || name == ".cprestore" || name == ".cpsetup" || name == ".cplocal" ||
+        name == ".cpreturn" || name == ".cpadd") {
+        pic_directive(as, name, statement);
+        return true;
+    }
+    if (name == ".gpword" || name == ".gpdword" || name == ".dtprelword" ||
+        name == ".dtpreldword" || name == ".tprelword" || name == ".tpreldword") {
+        relocated_data(as, name, statement);
+        return true;
+    }
+    if (name == ".reloc") {
+        reloc_directive(as, statement);
         return true;
     }
     if (name == ".nan") {
@@ -2387,6 +2586,7 @@ bool MipsTarget::directive(Assembler& as, Statement& statement) {
         procedure_ = {};
         procedure_.symbol = as.symbol(*symbol_name, statement.location);
         as.symbol(*procedure_.symbol).type = elf::stt_func;
+        frame_valid_ = cprestore_valid_ = false;
         if (!cursor.at_end()) as.error(cursor.location(), "unexpected text after .ent");
         return true;
     }
@@ -2402,6 +2602,8 @@ bool MipsTarget::directive(Assembler& as, Statement& statement) {
         const auto return_register = gpr(as, cursor);
         if (!return_register) return true;
         procedure_.frame_register = *frame;
+        frame_register_ = *frame;
+        frame_valid_ = true;
         procedure_.frame_offset = *size;
         procedure_.return_register = *return_register;
         if (!cursor.at_end()) as.error(cursor.location(), "unexpected text after .frame");
@@ -2470,9 +2672,7 @@ bool MipsTarget::directive(Assembler& as, Statement& statement) {
         return true;
     }
     if (model_.gnu) align_data(as, name);
-    if (name == ".cpload" || name == ".cprestore" || name == ".cpsetup" || name == ".cplocal" ||
-        name == ".cpreturn" || name == ".cpadd" || name == ".gpword" || name == ".gpdword" ||
-        name == ".insn" || name == ".mips16" || name == ".nomips16" || name == ".micromips" ||
+    if (name == ".insn" || name == ".mips16" || name == ".nomips16" || name == ".micromips" ||
         name == ".nomicromips") {
         as.error(statement.location, "unsupported MIPS directive '" + name + "'");
         return true;
@@ -2480,7 +2680,283 @@ bool MipsTarget::directive(Assembler& as, Statement& statement) {
     return false;
 }
 
+void MipsTarget::put(Assembler& as, std::string_view name,
+                     std::initializer_list<std::int64_t> registers,
+                     std::optional<PendingFixup> fixup, SourceLocation location) {
+    std::vector<OperandValue> values;
+    for (const auto number : registers) {
+        OperandValue item;
+        item.value = number;
+        item.location = location;
+        values.push_back(item);
+    }
+    if (fixup) {
+        OperandValue item;
+        item.fixup = fixup;
+        item.location = location;
+        values.push_back(item);
+    }
+    (void)emit(as, named(name), values);
+}
+
+// GNU as's PIC directives. Each is ignored outside SVR4 PIC mode, and
+// .cpload and .cprestore also in 64-bit objects, .cpsetup, .cplocal, and
+// .cpreturn in 32-bit ones.
+void MipsTarget::pic_directive(Assembler& as, std::string_view name, Statement& statement) {
+    auto& cursor = statement.operands;
+    const auto location = statement.location;
+    const bool new_abi = name == ".cpsetup" || name == ".cplocal" || name == ".cpreturn";
+    if (!pic_ || (name != ".cpadd" && new_abi != model_.elf64)) return;
+    const auto gp = static_cast<std::int64_t>(gp_register_);
+    const auto symbol = [&](std::string_view text) {
+        const auto id = as.symbol(text, location);
+        if (!as.symbol(id).defined()) as.symbol(id).type = elf::stt_object;
+        return as.symbol_reference(id, location);
+    };
+    const auto memory = [&](std::string_view mnemonic, std::int64_t reg, std::int64_t offset) {
+        std::vector<OperandValue> values(2);
+        values[0].value = reg;
+        values[1].value = offset;
+        values[1].base = 29;
+        values[0].location = values[1].location = location;
+        (void)emit(as, named(mnemonic), values);
+    };
+    const auto offset = [&]() -> std::optional<std::int64_t> {
+        cursor.skip_space();
+        const auto value_location = cursor.location();
+        const auto value = as.parse_absolute(cursor);
+        if (value && !is_int16(*value)) {
+            as.error(value_location, "the offset " + std::to_string(*value) +
+                                         " does not fit 16 bits");
+            return std::nullopt;
+        }
+        return value;
+    };
+    // -mno-shared code is an executable's: gp comes from __gnu_local_gp.
+    const bool shared = subtarget_.has_feature(Feature::Shared) || model_.elf64;
+    if (name == ".cpload") {
+        const auto reg = gpr(as, cursor);
+        if (!reg) return;
+        if (!options_.noreorder) as.warning(location, ".cpload not in noreorder section");
+        const auto base = symbol(shared ? "_gp_disp" : "__gnu_local_gp");
+        put(as, "lui", {gp}, PendingFixup{fixup_hi16, base, location}, location);
+        put(as, "addiu", {gp, gp}, PendingFixup{fixup_lo16, base, location}, location);
+        if (shared) put(as, "addu", {gp, gp, *reg}, std::nullopt, location);
+    } else if (name == ".cprestore") {
+        const auto value = offset();
+        if (!value) return;
+        cprestore_offset_ = *value;
+        cprestore_valid_ = true;
+        memory("sw", gp, *value);
+    } else if (name == ".cpsetup") {
+        const auto reg = gpr(as, cursor);
+        if (!reg || !comma(as, cursor)) return;
+        cursor.skip_space();
+        if (cursor.peek() == '$') {
+            cpreturn_register_ = gpr(as, cursor);
+            cpreturn_offset_.reset();
+            if (!cpreturn_register_) return;
+        } else {
+            cpreturn_offset_ = offset();
+            cpreturn_register_.reset();
+            if (!cpreturn_offset_) return;
+        }
+        if (!comma(as, cursor)) return;
+        const auto label = as.parse_expression(cursor);
+        if (!label) return;
+        if (cpreturn_offset_) memory("sd", gp, *cpreturn_offset_);
+        else put(as, "or", {*cpreturn_register_, gp, 0}, std::nullopt, location);
+        put(as, "lui", {gp}, PendingFixup{fixup_gp_disp_hi16, *label, location}, location);
+        put(as, "addiu", {gp, gp}, PendingFixup{fixup_gp_disp_lo16, *label, location}, location);
+        put(as, "daddu", {gp, gp, *reg}, std::nullopt, location);
+    } else if (name == ".cplocal") {
+        const auto reg = gpr(as, cursor);
+        if (reg) gp_register_ = *reg;
+    } else if (name == ".cpreturn") {
+        if (cpreturn_offset_) memory("ld", gp, *cpreturn_offset_);
+        else if (cpreturn_register_) put(as, "or", {gp, *cpreturn_register_, 0}, std::nullopt, location);
+    } else {
+        const auto reg = gpr(as, cursor);
+        if (!reg) return;
+        put(as, model_.elf64 ? "daddu" : "addu", {*reg, *reg, gp}, std::nullopt, location);
+    }
+    if (!cursor.at_end()) as.error(cursor.location(), "unexpected text after " + std::string(name));
+}
+
+void MipsTarget::relocated_data(Assembler& as, std::string_view name, Statement& statement) {
+    auto& cursor = statement.operands;
+    const bool wide = name == ".gpdword" || name == ".dtpreldword" || name == ".tpreldword";
+    const bool gp_relative = name == ".gpword" || name == ".gpdword";
+    // Outside PIC code .gpword and .gpdword are .word and .dword.
+    if (gp_relative && !pic_) {
+        if (model_.gnu) align_data(as, wide ? ".dword" : ".word");
+        flush(as);
+        do {
+            const auto value = as.parse_expression(cursor);
+            if (!value) return;
+            as.emit_value(*value, wide ? 8 : 4, statement.location);
+        } while (cursor.consume(","));
+        if (!cursor.at_end()) as.error(cursor.location(), "unexpected text after " + std::string(name));
+        return;
+    }
+    if (gp_relative && model_.gnu) align_data(as, wide ? ".dword" : ".word");
+    flush(as);
+    cursor.skip_space();
+    const auto location = cursor.location();
+    const auto value = as.parse_expression(cursor);
+    if (!value) return;
+    if (!cursor.at_end()) {
+        as.error(cursor.location(), "unexpected text after " + std::string(name));
+        return;
+    }
+    const auto kind = name == ".gpword"        ? fixup_gprel32
+                      : name == ".gpdword"     ? fixup_gprel64
+                      : name == ".dtprelword"  ? fixup_dtprel32
+                      : name == ".dtpreldword" ? fixup_dtprel64
+                      : name == ".tprelword"   ? fixup_tprel32
+                                               : fixup_tprel64;
+    as.add_fixup(FixupKind{kind}, *value, location);
+    as.emit_integer(0, wide ? 8 : 4);
+}
+
+void MipsTarget::pic_jump(Assembler& as, bool call, Statement& statement) {
+    auto& cursor = statement.operands;
+    const auto location = statement.location;
+    cursor.skip_space();
+    const auto target_location = cursor.location();
+    const auto target = as.parse_expression(cursor);
+    if (!target) return;
+    if (!cursor.at_end()) {
+        as.error(cursor.location(), "unexpected text after operands");
+        return;
+    }
+    if (!call) {
+        // A `j` cannot reach an absolute address in PIC code.
+        std::vector<OperandValue> values(1);
+        values[0].fixup = PendingFixup{fixup_branch16, *target, target_location};
+        values[0].location = target_location;
+        (void)emit(as, named("b"), values);
+        return;
+    }
+    const auto gp = static_cast<std::int64_t>(gp_register_);
+    const auto load = [&](std::string_view mnemonic, std::int64_t reg, std::uint16_t kind,
+                          std::int64_t base) {
+        std::vector<OperandValue> values(2);
+        values[0].value = reg;
+        values[1].base = base;
+        values[1].fixup = PendingFixup{kind, *target, target_location};
+        values[0].location = values[1].location = location;
+        (void)emit(as, named(mnemonic), values);
+    };
+    const auto load_delay = [&] {
+        if (!options_.architecture.interlocks.load) put(as, "nop", {}, std::nullopt, location);
+    };
+    const auto& expression = as.expression(*target);
+    const bool bare = expression.kind == assembler::Expression::Kind::Symbol &&
+                      expression.specifier == 0;
+    if (model_.elf64) {
+        load("ld", 25, fixup_call16_or_disp, gp);
+    } else {
+        // GNU as chooses the local form for a symbol of local binding at
+        // the end of the file; here a symbol counts as local when it
+        // already is.
+        const auto value = as.evaluate(*target, false);
+        if (value && value->add && local_symbol(as.symbol(*value->add))) {
+            load("lw", 25, fixup_got16, gp);
+            load_delay();
+            put(as, "addiu", {25, 25}, PendingFixup{fixup_lo16, *target, target_location}, location);
+        } else {
+            if (!value || !value->add || !as.symbol(*value->add).section) {
+                forward_calls_.emplace_back(*target, target_location);
+            }
+            load("lw", 25, fixup_call16, gp);
+            load_delay();
+        }
+    }
+    // The R_MIPS_JALR hint, which REL objects give only a bare symbol.
+    if (model_.elf64 || bare) as.add_fixup(FixupKind{fixup_jalr_hint}, *target, target_location);
+    put(as, "jalr", {31, 25}, std::nullopt, location);
+    if (model_.elf64) return;
+    if (!cprestore_offset_) {
+        as.warning(location, "no .cprestore pseudo-op used in PIC code");
+        return;
+    }
+    if (!frame_valid_) {
+        as.warning(location, "no .frame pseudo-op used in PIC code");
+        frame_valid_ = true;
+    }
+    if (!cprestore_valid_) {
+        as.warning(location, "no .cprestore pseudo-op used in PIC code");
+        cprestore_valid_ = true;
+    }
+    if (options_.noreorder) put(as, "nop", {}, std::nullopt, location);
+    std::vector<OperandValue> values(2);
+    values[0].value = gp;
+    values[1].value = *cprestore_offset_;
+    values[1].base = frame_register_;
+    values[0].location = values[1].location = location;
+    (void)emit(as, named("lw"), values);
+}
+
+// `.reloc OFFSET, NAME, EXPRESSION` for the relocations without a field,
+// R_MIPS_NONE and the R_MIPS_JALR hint of a call; OFFSET is `.` or a label
+// of the current section.
+void MipsTarget::reloc_directive(Assembler& as, Statement& statement) {
+    auto& cursor = statement.operands;
+    cursor.skip_space();
+    const auto location = cursor.location();
+    const auto offset = as.parse_expression(cursor);
+    if (!offset || !comma(as, cursor)) return;
+    cursor.skip_space();
+    const auto type_location = cursor.location();
+    const auto type = cursor.identifier();
+    if (!type || (*type != "R_MIPS_JALR" && *type != "R_MIPS_NONE")) {
+        as.error(type_location, ".reloc supports R_MIPS_JALR and R_MIPS_NONE");
+        return;
+    }
+    const auto kind = *type == "R_MIPS_JALR" ? fixup_jalr : fixup_none;
+    if (!comma(as, cursor)) return;
+    const auto expression = as.parse_expression(cursor);
+    if (!expression) return;
+    if (!cursor.at_end()) {
+        as.error(cursor.location(), "unexpected text after .reloc");
+        return;
+    }
+    flush(as);
+    const auto& place = as.expression(*offset);
+    if (place.kind != assembler::Expression::Kind::Symbol || place.specifier != 0) {
+        as.error(location, "the .reloc offset must be '.' or a label");
+        return;
+    }
+    const auto& label = as.symbol(place.symbol);
+    if (!label.defined()) {
+        pending_relocs_.push_back({place.symbol, kind, *expression, location});
+        return;
+    }
+    if (!label.section || *label.section != as.current_section()) {
+        as.error(location, "the .reloc offset must be in the current section");
+        return;
+    }
+    auto& fragment = as.section(*label.section).fragments[label.fragment];
+    fragment.fixups.push_back({label.fragment, static_cast<std::uint32_t>(label.offset),
+                               FixupKind{kind}, *expression, location});
+}
+
 void MipsTarget::finish(Assembler& as) {
+    for (const auto& pending : pending_relocs_) {
+        as.error(pending.location, "the .reloc offset '" + as.symbol(pending.label).name +
+                                       "' is not defined");
+    }
+    // GNU as relaxes such a call to the %got and %lo form when the symbol
+    // turns out local.
+    for (const auto& [target, location] : forward_calls_) {
+        const auto value = as.evaluate(target, false);
+        if (value && value->add && local_symbol(as.symbol(*value->add))) {
+            as.error(location, "a PIC 'jal' to the local symbol '" +
+                                   as.symbol(*value->add).name +
+                                   "' must follow its definition");
+        }
+    }
     // .text, .data, and .bss always exist; LLVM MC aligns them to 16 bytes,
     // GNU as for embedded targets to what they hold.
     for (const auto& [name, type, flags] :
@@ -2579,11 +3055,31 @@ void MipsTarget::finish(Assembler& as) {
 
 bool MipsTarget::apply_fixup(Assembler& as, const assembler::Fixup& fixup, std::int64_t value,
                              std::span<std::uint8_t> bytes, bool relocated) const {
+    const auto kind = fixup.kind.value;
+    if (kind == fixup_none || kind == fixup_jalr || kind == fixup_jalr_hint) return true;
+    if (kind >= fixup_got16 && !relocated) {
+        as.error(fixup.location, "this relocation operator needs a symbol");
+        return false;
+    }
+    if (kind >= fixup_gprel32 && kind <= fixup_tprel64) {
+        // A data field holds a REL relocation's addend.
+        as.write_integer(bytes, static_cast<std::uint64_t>(value));
+        return true;
+    }
     const auto word = static_cast<std::uint32_t>(as.read_integer(bytes));
     const auto unsigned_value = static_cast<std::uint64_t>(value);
     std::uint32_t field = 0;
     std::uint32_t mask = 0xffff;
-    switch (fixup.kind.value) {
+    if (kind >= fixup_got16) {
+        // A REL addend splits across a high part and its low part like
+        // %hi and %lo; %got of a local symbol is such a high part, of a
+        // global one a plain addend.
+        const bool high = high_part_fixup(kind) || (kind == fixup_got16 && local_got(as, fixup));
+        as.write_integer(bytes, insert_field(word, high ? high16(unsigned_value)
+                                                         : low16(unsigned_value)));
+        return true;
+    }
+    switch (kind) {
     case fixup_hi16: field = high16(unsigned_value); break;
     case fixup_lo16: field = low16(unsigned_value); break;
     case fixup_gprel16:
@@ -2673,9 +3169,65 @@ std::optional<assembler::RelocationChoice> MipsTarget::relocation(
     case fixup_jump26: return assembler::RelocationChoice{r_mips_26};
     case fixup_branch16: return assembler::RelocationChoice{r_mips_pc16, false, -4};
     default:
-        as.error(fixup.location, "this operand must be absolute; use a relocation operator such as %lo");
-        return std::nullopt;
+        break;
     }
+    const auto kind = fixup.kind.value;
+    if (kind >= fixup_got16 && kind <= fixup_jalr_hint) {
+        // Relocations of TLS operators name TLS symbols.
+        if (tls_fixup(kind)) as.symbol(*value.add).type = elf::stt_tls;
+        // A %got of a local symbol pairs with the %lo that follows it.
+        if (kind == fixup_got16 && local_symbol(symbol)) local_got16_.insert(value.add->value);
+        if ((kind == fixup_gprel64 || kind == fixup_gp_disp_hi16 ||
+             kind == fixup_gp_disp_lo16) && !model_.elf64) {
+            as.error(fixup.location, "this relocation needs a 64-bit (n64) object");
+            return std::nullopt;
+        }
+        std::uint32_t type = 0;
+        switch (kind) {
+        case fixup_got16: type = r_mips_got16; break;
+        case fixup_call16: type = r_mips_call16; break;
+        case fixup_got_disp: type = r_mips_got_disp; break;
+        case fixup_got_page: type = r_mips_got_page; break;
+        case fixup_got_ofst: type = r_mips_got_ofst; break;
+        case fixup_got_hi16: type = r_mips_got_hi16; break;
+        case fixup_got_lo16: type = r_mips_got_lo16; break;
+        case fixup_call_hi16: type = r_mips_call_hi16; break;
+        case fixup_call_lo16: type = r_mips_call_lo16; break;
+        case fixup_gp_disp_hi16: type = r_mips_gprel16 | r_mips_sub << 8U | r_mips_hi16 << 16U; break;
+        case fixup_gp_disp_lo16: type = r_mips_gprel16 | r_mips_sub << 8U | r_mips_lo16 << 16U; break;
+        case fixup_tls_gd: type = r_mips_tls_gd; break;
+        case fixup_tls_ldm: type = r_mips_tls_ldm; break;
+        case fixup_dtprel_hi16: type = r_mips_tls_dtprel_hi16; break;
+        case fixup_dtprel_lo16: type = r_mips_tls_dtprel_lo16; break;
+        case fixup_gottprel: type = r_mips_tls_gottprel; break;
+        case fixup_tprel_hi16: type = r_mips_tls_tprel_hi16; break;
+        case fixup_tprel_lo16: type = r_mips_tls_tprel_lo16; break;
+        case fixup_gprel32: type = r_mips_gprel32; break;
+        case fixup_gprel64: type = r_mips_gprel32 | r_mips_64 << 8U; break;
+        case fixup_dtprel32: type = r_mips_tls_dtprel32; break;
+        case fixup_dtprel64: type = r_mips_tls_dtprel64; break;
+        case fixup_tprel32: type = r_mips_tls_tprel32; break;
+        case fixup_tprel64: type = r_mips_tls_tprel64; break;
+        case fixup_none: type = r_mips_none; break;
+        case fixup_call16_or_disp:
+            type = local_symbol(symbol) ? r_mips_got_disp : r_mips_call16;
+            break;
+        default: type = r_mips_jalr; break;
+        }
+        // Which relocations keep a local symbol rather than its section:
+        // GNU as keeps the TLS ones and R_MIPS_JALR, LLVM MC also those of
+        // a single GOT entry and of calls. A REL %got pairs with its %lo
+        // like %hi, so mergeable data keeps the symbol.
+        const bool entry = kind == fixup_call16 || kind == fixup_got_disp ||
+                           kind == fixup_got_hi16 || kind == fixup_got_lo16 ||
+                           kind == fixup_call_hi16 || kind == fixup_call_lo16;
+        const bool keep = tls_fixup(kind) || kind == fixup_jalr ||
+                          (kind == fixup_jalr_hint && !model_.elf64) || (!model_.gnu && entry) ||
+                          (kind == fixup_got16 && merge && !model_.elf64);
+        return assembler::RelocationChoice{type, keep};
+    }
+    as.error(fixup.location, "this operand must be absolute; use a relocation operator such as %lo");
+    return std::nullopt;
 }
 
 void MipsTarget::order_relocations(std::vector<assembler::Relocation>& relocations) const {
@@ -2689,8 +3241,9 @@ void MipsTarget::order_relocations(std::vector<assembler::Relocation>& relocatio
                      [](const assembler::Relocation& left, const assembler::Relocation& right) {
                          return left.offset < right.offset;
                      });
-    // As LLVM MC does, an unmatched HI16 moves before the LO16 with the
-    // lowest addend no less than its own, preferring an unmatched one.
+    // As LLVM MC does, an unmatched HI16 (or GOT16 of a local symbol)
+    // moves before the LO16 with the lowest addend no less than its own,
+    // preferring an unmatched one.
     struct Entry {
         assembler::Relocation relocation;
         bool matched{};
@@ -2699,7 +3252,7 @@ void MipsTarget::order_relocations(std::vector<assembler::Relocation>& relocatio
     std::vector<std::list<Entry>::iterator> highs;
     for (const auto& relocation : relocations) {
         sorted.push_back({relocation});
-        if (relocation.type == r_mips_hi16) highs.push_back(std::prev(sorted.end()));
+        if (paired_high(relocation)) highs.push_back(std::prev(sorted.end()));
     }
     for (const auto high : highs) {
         const auto& r = high->relocation;
@@ -2724,7 +3277,7 @@ void MipsTarget::order_relocations(std::vector<assembler::Relocation>& relocatio
     for (const auto& entry : sorted) relocations[index++] = entry.relocation;
 }
 
-void MipsTarget::gnu_order(std::vector<assembler::Relocation>& relocations) {
+void MipsTarget::gnu_order(std::vector<assembler::Relocation>& relocations) const {
     // The section's fixups in creation order; a fixup resolved in place is
     // a gap, which separates a HI16 from the LO16 after it.
     struct Link {
@@ -2742,6 +3295,9 @@ void MipsTarget::gnu_order(std::vector<assembler::Relocation>& relocations) {
     const auto is = [](const Link& link, std::uint32_t type) {
         return link.relocation && link.relocation->type == type;
     };
+    const auto high_part = [&](const Link& link) {
+        return link.relocation && paired_high(*link.relocation);
+    };
     const auto matched = [&](Position high) {
         const auto after = std::next(high);
         return after != chain.end() && is(*after, r_mips_lo16) &&
@@ -2751,7 +3307,7 @@ void MipsTarget::gnu_order(std::vector<assembler::Relocation>& relocations) {
     // A HI16 whose predecessor in the list has its LO16 next replaces it.
     std::vector<Position> highs;
     for (auto position = chain.begin(); position != chain.end(); ++position) {
-        if (!is(*position, r_mips_hi16)) continue;
+        if (!high_part(*position)) continue;
         if (!highs.empty() && matched(highs.back())) highs.back() = position;
         else highs.push_back(position);
     }
@@ -2770,7 +3326,7 @@ void MipsTarget::gnu_order(std::vector<assembler::Relocation>& relocations) {
                  (!claimed && position->addend == low->addend))) {
                 low = position;
             }
-            claimed = is(*position, r_mips_hi16) && matched(position);
+            claimed = high_part(*position) && matched(position);
         }
         if (low == chain.end()) continue;
         high->addend = low->addend;
@@ -2789,10 +3345,6 @@ void MipsTarget::gnu_order(std::vector<assembler::Relocation>& relocations) {
 std::optional<std::vector<std::uint8_t>> assemble(
     const std::vector<const SourceFile*>& sources, const Subtarget& subtarget,
     const assembler::Options& options, SourceManager& manager, Diagnostics& diagnostics) {
-    if (subtarget.has_feature(Feature::AbiCalls)) {
-        diagnostics.command_error("MIPS PIC objects (-mabicalls) are not supported");
-        return std::nullopt;
-    }
     if (subtarget.has_feature(Feature::Mips16) || subtarget.has_feature(Feature::MicroMips)) {
         diagnostics.command_error("MIPS16 and microMIPS encodings are not supported");
         return std::nullopt;

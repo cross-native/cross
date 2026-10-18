@@ -1529,7 +1529,7 @@ private:
                  "compilation_selectable", "function_selectable",
                  "elf_abi_tag", "features", "private_carrier_bits",
                  "natural_alignment_limit",
-                 "call_clobbers", "argument_register_failure",
+                 "call_clobbers", "pic_call_clobbers", "argument_register_failure",
                  "result_register_failure", "stack_layout",
                  "argument_stack_base", "stack_alignment",
                  "stack_slot_bytes", "return_address_bytes",
@@ -1625,6 +1625,9 @@ private:
         }
         if (const auto value = list_property(properties, "call_clobbers")) {
             result.call_clobbers = *value;
+        }
+        if (const auto value = list_property(properties, "pic_call_clobbers")) {
+            result.pic_call_clobbers = *value;
         }
         if (const auto value =
                 text_property(properties, "argument_register_failure")) {
@@ -2294,13 +2297,17 @@ private:
                 return false;
             }
         }
-        for (const auto& clobber : abi.call_clobbers) {
-            if (clobber != "memory" && clobber != "flags" &&
-                !find_register(target, clobber)) {
-                fail(property_line(properties, "call_clobbers"),
-                     model + " contains unknown call clobber '" + clobber +
-                         "'");
-                return false;
+        for (const auto* list : {&abi.call_clobbers, &abi.pic_call_clobbers}) {
+            const auto* property =
+                list == &abi.call_clobbers ? "call_clobbers" : "pic_call_clobbers";
+            for (const auto& clobber : *list) {
+                if (clobber != "memory" && clobber != "flags" &&
+                    !find_register(target, clobber)) {
+                    fail(property_line(properties, property),
+                         model + " contains unknown call clobber '" + clobber +
+                             "'");
+                    return false;
+                }
             }
         }
         const auto has_stack_region = [&](AbiStackRegion sought) {

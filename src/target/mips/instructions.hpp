@@ -24,6 +24,8 @@ enum class OperandTypeId : std::uint16_t {
     Cpr64,
     Fcc,
     Cp0,
+    // A hardware register of RDHWR.
+    Hwr,
     Fcr,
     Immediate,
     Expression,

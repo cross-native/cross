@@ -20,15 +20,47 @@ inline constexpr std::uint32_t r_mips_hi16 = 5;
 inline constexpr std::uint32_t r_mips_lo16 = 6;
 inline constexpr std::uint32_t r_mips_gprel16 = 7;
 inline constexpr std::uint32_t r_mips_literal = 8;
+inline constexpr std::uint32_t r_mips_got16 = 9;
 inline constexpr std::uint32_t r_mips_pc16 = 10;
+inline constexpr std::uint32_t r_mips_call16 = 11;
 inline constexpr std::uint32_t r_mips_gprel32 = 12;
 inline constexpr std::uint32_t r_mips_64 = 18;
+inline constexpr std::uint32_t r_mips_got_disp = 19;
+inline constexpr std::uint32_t r_mips_got_page = 20;
+inline constexpr std::uint32_t r_mips_got_ofst = 21;
+inline constexpr std::uint32_t r_mips_got_hi16 = 22;
+inline constexpr std::uint32_t r_mips_got_lo16 = 23;
 inline constexpr std::uint32_t r_mips_sub = 24;
 inline constexpr std::uint32_t r_mips_higher = 28;
 inline constexpr std::uint32_t r_mips_highest = 29;
+inline constexpr std::uint32_t r_mips_call_hi16 = 30;
+inline constexpr std::uint32_t r_mips_call_lo16 = 31;
 inline constexpr std::uint32_t r_mips_rel16 = 33;
 inline constexpr std::uint32_t r_mips_jalr = 37;
+inline constexpr std::uint32_t r_mips_tls_dtpmod32 = 38;
+inline constexpr std::uint32_t r_mips_tls_dtprel32 = 39;
+inline constexpr std::uint32_t r_mips_tls_dtpmod64 = 40;
+inline constexpr std::uint32_t r_mips_tls_dtprel64 = 41;
+inline constexpr std::uint32_t r_mips_tls_gd = 42;
+inline constexpr std::uint32_t r_mips_tls_ldm = 43;
+inline constexpr std::uint32_t r_mips_tls_dtprel_hi16 = 44;
+inline constexpr std::uint32_t r_mips_tls_dtprel_lo16 = 45;
+inline constexpr std::uint32_t r_mips_tls_gottprel = 46;
+inline constexpr std::uint32_t r_mips_tls_tprel32 = 47;
+inline constexpr std::uint32_t r_mips_tls_tprel64 = 48;
+inline constexpr std::uint32_t r_mips_tls_tprel_hi16 = 49;
+inline constexpr std::uint32_t r_mips_tls_tprel_lo16 = 50;
 inline constexpr std::uint32_t r_mips_pc32 = 248;
+
+// The thread pointer (UserLocal, which `rdhwr $3, $29` reads) points 0x7000
+// past the start of the static TLS block, and DTP-relative offsets count
+// from 0x8000 past the start of a module's block, so that signed 16-bit
+// offsets reach 64 KiB of TLS.
+inline constexpr std::uint64_t tls_tp_offset = 0x7000;
+inline constexpr std::uint64_t tls_dtp_offset = 0x8000;
+// The gp of a GOT: 0x7ff0 past its start, so that signed 16-bit offsets
+// reach 64 KiB of entries.
+inline constexpr std::uint64_t got_gp_offset = 0x7ff0;
 
 inline constexpr std::uint32_t sht_mips_reginfo = 0x70000006;
 inline constexpr std::uint32_t sht_mips_options = 0x7000000d;

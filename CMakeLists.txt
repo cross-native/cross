@@ -1810,6 +1810,13 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/target/mips/assembler/tool.cmake")
     set_tests_properties(cross_mips_assembler_tool PROPERTIES
         LABELS "feature.assembler;arch.mips;check.compile;endian.big;endian.little")
+    add_test(NAME cross_mips_assembler_pic
+        COMMAND "${CMAKE_COMMAND}"
+                -DAS=$<TARGET_FILE:cross_as>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-assembler-pic/case
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/assembler/pic.cmake")
+    set_tests_properties(cross_mips_assembler_pic PROPERTIES
+        LABELS "feature.assembler;feature.pic;feature.tls;arch.mips;check.compile;diagnostics;endian.big;endian.little")
     add_test(NAME cross_mips_assembler_linkers
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
@@ -1834,6 +1841,16 @@ if(BUILD_TESTING)
         set_tests_properties(cross_mips_linker_${linker_test} PROPERTIES
             LABELS "feature.linker;arch.mips;check.compile;endian.big;endian.little")
     endforeach()
+    # Static links of abicalls and TLS objects: the GOT, $gp, and the TLS
+    # segment.
+    add_test(NAME cross_mips_linker_abicalls
+        COMMAND "${CMAKE_COMMAND}"
+                -DAS=$<TARGET_FILE:cross_as>
+                -DLD=$<TARGET_FILE:cross_ld>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-linker/abicalls
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/linker/abicalls.cmake")
+    set_tests_properties(cross_mips_linker_abicalls PROPERTIES
+        LABELS "feature.linker;feature.pic;feature.tls;arch.mips;check.compile;diagnostics;endian.big;endian.little;profile.n64")
     add_test(NAME cross_mips_linker_gnu_ld
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
@@ -2135,6 +2152,127 @@ if(BUILD_TESTING)
             -P "${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.cmake")
         set_tests_properties(cross_mips_small_data_n64_gcc_${small_data_endian} PROPERTIES
             LABELS "check.runtime;arch.mips;endian.${small_data_endian};backend.native;feature.small_data;feature.interop;profile.n64;opt.O2")
+    endforeach()
+    # -mabicalls and TLS code: assembly, objects that GNU as encodes alike,
+    # pic_call_clobbers in a user model, and diagnostics.
+    add_test(NAME cross_mips_abicalls COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc>
+        -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/abicalls_runtime.x
+        -DMODEL=${CMAKE_SOURCE_DIR}/test/target/mips/abicalls.y
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-abicalls
+        -P "${CMAKE_SOURCE_DIR}/test/target/mips/abicalls.cmake")
+    set_tests_properties(cross_mips_abicalls PROPERTIES
+        LABELS "check.compile;diagnostics;arch.mips;endian.big;endian.little;backend.native;feature.pic;feature.tls;feature.abi;profile.n64;profile.custom;opt.O2")
+    # The same code at run time: VR4300 and R3000 o32 and x32 code in both
+    # byte orders on an R4000, whose startup emulates `rdhwr`, in PIC, PIE,
+    # -mno-shared, and absolute code, with a Cross partner or a GCC
+    # -mabicalls one, linked by LLD, the Cross ld, and GNU ld.
+    set(abicalls_dir ${CMAKE_SOURCE_DIR}/test/target/mips)
+    foreach(abicalls_case
+            "pic|-fPIC|-mabicalls|"
+            "pic_O0|-O0 -fPIC|-mabicalls|"
+            "x32|-mabi=x32 -fPIC|-mabicalls|"
+            "pie_ld|-fpie|-mabicalls|$<TARGET_FILE:cross_ld>"
+            "no_shared|-mabicalls -mno-shared|-mabicalls -mno-shared|"
+            "absolute|||")
+        string(REPLACE "|" ";" abicalls_fields "${abicalls_case}")
+        list(GET abicalls_fields 0 abicalls_name)
+        list(GET abicalls_fields 1 abicalls_flags)
+        list(GET abicalls_fields 2 abicalls_as_flags)
+        list(GET abicalls_fields 3 abicalls_ld)
+        string(REPLACE " " ";" abicalls_flags "${abicalls_flags}")
+        string(REPLACE " " ";" abicalls_as_flags "${abicalls_as_flags}")
+        add_test(NAME cross_mips_abicalls_runtime_${abicalls_name} COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc>
+            -DLD=${abicalls_ld}
+            -DSOURCE=${abicalls_dir}/abicalls_runtime.x
+            -DCALLEE_SOURCE=${abicalls_dir}/abicalls_partner.x
+            -DSTARTUP=${abicalls_dir}/abicalls_start.s
+            -DSTARTUP_AS=$<TARGET_FILE:cross_as>
+            "-DSTARTUP_AS_FLAGS=${abicalls_as_flags}"
+            -DMIPS_LINKER=${abicalls_dir}/abicalls.ld
+            "-DCC_FLAGS=${abicalls_flags}"
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-abicalls-runtime-${abicalls_name}
+            -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set(abicalls_level O2)
+        if(abicalls_flags MATCHES "-O0")
+            set(abicalls_level O0)
+        endif()
+        set_tests_properties(cross_mips_abicalls_runtime_${abicalls_name} PROPERTIES
+            LABELS "check.runtime;arch.mips;endian.big;endian.little;backend.native;feature.pic;feature.tls;feature.linker;opt.${abicalls_level}")
+    endforeach()
+    foreach(abicalls_ld gnu cross)
+        set(abicalls_test cross_mips_abicalls_runtime_gcc_${abicalls_ld})
+        set(abicalls_linker "")
+        if(abicalls_ld STREQUAL "cross")
+            set(abicalls_linker $<TARGET_FILE:cross_ld>)
+        endif()
+        add_test(NAME ${abicalls_test} COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc>
+            -DLD=${abicalls_linker}
+            -DSOURCE=${abicalls_dir}/abicalls_runtime.x
+            -DGCC_SOURCE=${abicalls_dir}/abicalls_partner.c
+            "-DGCC_FLAGS=-mabicalls;-fPIC;-G0;-ftls-model=initial-exec"
+            -DSTARTUP=${abicalls_dir}/abicalls_start.s
+            -DSTARTUP_AS=$<TARGET_FILE:cross_as>
+            -DSTARTUP_AS_FLAGS=-mabicalls
+            -DMIPS_LINKER=${abicalls_dir}/abicalls.ld
+            -DCC_FLAGS=-fPIC
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-abicalls-runtime-gcc-${abicalls_ld}
+            -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(${abicalls_test} PROPERTIES
+            LABELS "check.runtime;arch.mips;endian.big;endian.little;backend.native;feature.pic;feature.tls;feature.interop;feature.linker;opt.O2")
+    endforeach()
+    # n64: MIPS III code on an R4000 that emulates `rdhwr`, and MIPS64 R2
+    # code on a Loongson-3A4000, which reads UserLocal, with a Cross or GCC
+    # partner, linked by LLD or the Cross ld.
+    foreach(abicalls_case
+            "pic_big|big|-fPIC -march=mips3|R4000||"
+            "pic_little|little|-fPIC -march=mips3|R4000||"
+            "pic_O0|big|-O0 -fPIC -march=mips3|R4000||"
+            "pic_ld|big|-fPIC -march=mips3|R4000|cross|"
+            "no_shared|little|-mabicalls -mno-shared -march=mips3|R4000||"
+            "absolute|big|-march=mips3|R4000||"
+            "r2|little|-fPIC -march=mips64r2|Loongson-3A4000||"
+            "gcc|little|-fPIC -march=mips64r2|Loongson-3A4000||gcc"
+            "gcc_ld|big|-fPIC -march=mips64r2|Loongson-3A4000|cross|gcc")
+        string(REPLACE "|" ";" abicalls_fields "${abicalls_case}")
+        list(GET abicalls_fields 0 abicalls_name)
+        list(GET abicalls_fields 1 abicalls_endian)
+        list(GET abicalls_fields 2 abicalls_flags)
+        list(GET abicalls_fields 3 abicalls_cpu)
+        list(GET abicalls_fields 4 abicalls_ld)
+        list(GET abicalls_fields 5 abicalls_partner)
+        set(abicalls_linker "")
+        set(abicalls_partner_args -DCALLEE_SOURCE=${abicalls_dir}/abicalls_partner.x)
+        set(abicalls_level O2)
+        if(abicalls_flags MATCHES "-O0")
+            set(abicalls_level O0)
+        endif()
+        set(abicalls_labels "check.runtime;arch.mips;endian.${abicalls_endian};backend.native;feature.pic;feature.tls;profile.n64;opt.${abicalls_level}")
+        if(abicalls_ld STREQUAL "cross")
+            set(abicalls_linker $<TARGET_FILE:cross_ld>)
+            string(APPEND abicalls_labels ";feature.linker")
+        endif()
+        if(abicalls_partner STREQUAL "gcc")
+            set(abicalls_partner_args -DGCC_SOURCE=${abicalls_dir}/abicalls_partner.c
+                "-DGCC_FLAGS=-mabicalls -fPIC -G0 -ftls-model=initial-exec")
+            string(APPEND abicalls_labels ";feature.interop")
+        endif()
+        add_test(NAME cross_mips_abicalls_n64_${abicalls_name} COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc>
+            -DLD=${abicalls_linker}
+            -DSOURCE=${abicalls_dir}/abicalls_runtime.x
+            ${abicalls_partner_args}
+            -DSTARTUP=${abicalls_dir}/abicalls_n64_start.s
+            -DLINKER=${abicalls_dir}/abicalls-n64.ld
+            -DN64_ENDIAN=${abicalls_endian}
+            "-DEXTRA_FLAGS=${abicalls_flags}"
+            -DN64_QEMU_CPU=${abicalls_cpu}
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-abicalls-n64-${abicalls_name}
+            -P "${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.cmake")
+        set_tests_properties(cross_mips_abicalls_n64_${abicalls_name} PROPERTIES
+            LABELS "${abicalls_labels}")
     endforeach()
     add_test(NAME cross_mips_n64
         COMMAND "${CMAKE_COMMAND}"

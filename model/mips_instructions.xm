@@ -520,6 +520,16 @@ instruction "wsbh" {
     writes = ["rd"];
 }
 
+# The thread pointer of TLS code is hardware register 29 (UserLocal); CPUs
+# before Release 2 trap on the instruction, and a system may emulate it.
+instruction "rdhwr" {
+    architecture = "mips";
+    operands = ["rt:gpr", "rd:hwr"];
+    encoding = "011111 00000 rt:5 rd:5 00000 111011";
+    features = ["mips32r2", "mips64r2"];
+    writes = ["rt"];
+}
+
 instruction "wsbw" {
     architecture = "mips";
     operands = ["rd:gpr32", "rt:gpr32"];

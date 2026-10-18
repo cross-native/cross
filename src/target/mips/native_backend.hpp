@@ -25,6 +25,14 @@ namespace cross::mips {
 enum class ElfAbiTag : std::uint8_t { Default, Eabi32 };
 [[nodiscard]] ElfAbiTag elf_abi_tag(const AbiEntry& abi);
 
+// The SVR4 abicalls code model of a compilation (-mabicalls, which -fpic
+// and -fpie imply): none, position-independent code, which reaches every
+// symbol through the GOT, or -mno-shared code of an executable with 32-bit
+// addresses, which reaches the symbols it defines directly.
+enum class PicModel : std::uint8_t { None, Pic, Executable };
+[[nodiscard]] PicModel pic_model(const Subtarget& subtarget,
+                                 const CompilerOptions& options);
+
 [[nodiscard]] machine::Module lower_managed_machine(
     const mir::ManagedModule& managed, const hir::Module& hir_module,
     const Subtarget& subtarget, const CompilerOptions& options,

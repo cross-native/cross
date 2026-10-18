@@ -19,8 +19,8 @@
 #if $::has_feature($::feature::atomics)
 #error baseline MIPS must not advertise atomics without LL/SC
 #endif
-#if $::has_feature($::feature::thread_local)
-#error MIPS must not advertise unavailable thread-local lowering
+#if !$::has_feature($::feature::thread_local)
+#error MIPS lowers thread-local objects
 #endif
 #if $::has_feature($::feature::address_spaces)
 #error MIPS does not lower alternate address spaces yet

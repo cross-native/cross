@@ -289,6 +289,7 @@ abi "example-regs" {
 | `argument_register_failure` | text | `"stack"` | no |
 | `result_register_failure` | text | `"error"` | no |
 | `call_clobbers` | list | `[]` | no |
+| `pic_call_clobbers` | list | `[]` | no |
 | `elf_abi_tag` | text | none | no |
 | `features` | list | `[]` | no |
 | `private_carrier_bits` | integer | none | no |
@@ -348,7 +349,10 @@ function. Of a general register that the list omits, other than the stack
 and frame pointers, a call preserves only as many low bits as the
 `register_bits` of the entry's narrowest `"integer"` bank: on a MIPS CPU with
 64-bit registers, a call under `o32` or `x32` may change the upper 32 bits
-of `s0`-`s7`.
+of `s0`-`s7`. `pic_call_clobbers` lists, in the same form, the storage that
+a call may also change in position-independent code, such as MIPS
+`-mabicalls` code, where a callee computes its own GOT pointer: `o32` lists
+`gp`.
 
 `elf_abi_tag` sets the ELF ABI tag of objects compiled with the entry as
 their ABI (`-mabi` or the profile's `abi`); without it, objects get the tag
@@ -1277,7 +1281,7 @@ MIPS instructions have 32 bits. The operand types:
 | `fpr32`, `fpr64` | `$f0` to `$f31`. An odd register holds a 32-bit value only where odd single-precision registers exist, and a 64-bit value only with 64-bit FPRs. | Its number. | A floating register of 32 or 64 bits; needs `hard-float`, and for 64 bits not `single-float`. |
 | `cpr`, `cpr64` | As `fpr32` and `fpr64`, or a coprocessor register `$0` to `$31`, which counts in no register mask and no hazard. | Its number. | As `fpr32` and `fpr64`. |
 | `fcc` | `$fcc0` to `$fcc7`. | Its number. | None. |
-| `cp0`, `fcr` | A coprocessor 0 register `$0` to `$31`; an FPU control register `$0` to `$31` or `$f0` to `$f31`. | Its number. | A constant written in register syntax; `fcr` needs `hard-float`. |
+| `cp0`, `hwr`, `fcr` | A coprocessor 0 register `$0` to `$31`; a hardware register of `rdhwr` `$0` to `$31`; an FPU control register `$0` to `$31` or `$f0` to `$f31`. | Its number. | A constant written in register syntax; `fcr` needs `hard-float`. |
 | `uimmN`, `simmN` | An unsigned or signed integer of `N` bits, from 1 to 32. | The value. | A constant of `N` bits. |
 | `LOW..HIGH` | An integer from `LOW` to `HIGH`. | The value. | A constant. |
 | `imm` | An integer of up to 64 bits. | Macros only. | None. |

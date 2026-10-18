@@ -374,6 +374,8 @@ options adjust them:
 | `-mbranch-likely`, `-mcond-move`, `-mrotate` | Allow branch-likely, conditional-move, and rotate instructions. |
 | `-mcmodel=large` | Materialize full 64-bit addresses and call through registers. |
 | `-mlong-calls` | Call every function through a register (`lui`, `addiu`, `jalr`), so callers and callees need not lie in the same 256 MB region that `jal` reaches. |
+| `-mabicalls` | SVR4 abicalls code, described below; `-fpic`, `-fPIC`, `-fpie`, and `-fPIE` imply it. |
+| `-mno-shared` | With `-mabicalls` and 32-bit addresses, code for an executable, which reaches the symbols the group defines without the GOT. |
 
 Code with 64-bit addresses (`n64`, and `x64` on `mips64` triples) produces
 ELF64 objects that assume a 64-bit FPU; the other ABIs produce ELF32, even on
@@ -412,14 +414,53 @@ they keep a NaN operand's payload and raise no exception. `$::fmin` and
 `$::fmax` branch on quiet comparisons, which compare the second operand also
 when the first is a NaN, and copy the selected operand.
 
+`-mabicalls` code is SVR4 abicalls code, as GCC produces it for MIPS
+GNU/Linux, and its objects carry the `pic` and `cpic` header flags.
+`-fpic`, `-fPIC`, `-fpie`, and `-fPIE` select it unless `-mno-abicalls` is
+given, which is then an error. Every call goes through `$t9`, which holds the
+callee's address on entry: the GOT gives it through `%call16`, or for a
+function of local binding through its page entry. A function that reaches the
+GOT computes `$gp` from `$t9` on entry, through `_gp_disp` in `o32` and
+`%neg(%gp_rel(...))` with 64-bit addresses, and reaches objects, functions,
+and labels through GOT entries: a symbol of local binding through the entry of
+its 64 KiB page and a `%lo` or `%got_ofst` displacement, any other through its
+own entry. With `-mno-shared` and 32-bit addresses, functions instead take
+`$gp` from `__gnu_local_gp`, reach what the group defines with absolute
+addresses and `jal`, and use the GOT only for symbols that it does not define
+or defines weak; with 64-bit addresses `-mno-shared` code is the same as
+other `-mabicalls` code. A call may change `$gp` when the callee's ABI lists
+it in `call_clobbers` or, in `-mabicalls` code, in `pic_call_clobbers`
+([models.md](models.md#entry-properties)). `o32` lists it in
+`pic_call_clobbers`, so callers keep their `$gp` in the frame and reload it
+after a call;
+`n64` preserves it, so a function that sets up `$gp` saves its caller's first;
+`x32` and `x64` let calls change it. With `-mabicalls`, a function that
+needs `$gp` under an ABI that preserves `$gp` with 32-bit addresses, an
+interface that passes a value in `$t9`, a naked function that would reach the
+GOT, a `-mdata-bases` entry that uses `$gp`, and an ABI whose objects carry
+the EABI tag are errors.
+
+Thread-local objects go to `.tdata` and `.tbss`. Code reads the thread
+pointer with `rdhwr $3,$29` (hardware register 29, UserLocal), which Release
+2 CPUs execute when the system allows it; earlier CPUs, such as the VR4300,
+trap on it, and the system must emulate it, as Linux does. For them the
+instruction is assembled as MIPS32 Release 2. The thread pointer lies 0x7000
+past the start of the thread's TLS block, a copy of the TLS segment.
+`tls_model` selects `local-exec`, whose offset from the thread pointer the
+linker gives (`%tprel_hi` and `%tprel_lo`), or `initial-exec`, which loads
+it from the GOT (`%gottprel`); without it, an object that the group defines
+without `global` is local-exec and others initial-exec. Without `-mabicalls`
+there is no GOT and every access is local-exec, as with GCC. `global-dynamic`
+and `local-dynamic`, which call a resolver, are errors.
+
 Supported: integer and pointer operations, 64-bit integers on 32-bit CPUs,
 128-bit integers, hard-float `f32` and `f64`, structures and unions by value
 under every ABI, function pointers, variable-length arrays, computed goto,
-`$::patch` values, LL/SC atomics, variadic functions, the machine-instruction
-built-ins below, and naked functions. Not supported: vectors,
-register locations outside naked functions, position-independent code
-(`-mabicalls`), thread-local storage, MIPS16, microMIPS, and the Allegrex
-VFPU. They are diagnosed when used. A `[[musttail]]` call passes every
+`$::patch` values, LL/SC atomics, variadic functions, `-mabicalls` code,
+thread-local storage, the machine-instruction built-ins below, and naked
+functions. Not supported: vectors, register locations outside naked
+functions, MIPS16, microMIPS, and the Allegrex VFPU. They are diagnosed when
+used. A `[[musttail]]` call passes every
 argument in a register, cannot target a variadic function or leave a function
 that binds variadic state, and neither function may have `out` or `inout`
 parameters.

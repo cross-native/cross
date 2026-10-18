@@ -142,6 +142,7 @@ public:
     [[nodiscard]] std::uint64_t section_address(const InputSection& section,
                                                 std::uint64_t offset) const;
     [[nodiscard]] std::optional<std::uint64_t> gp() const;
+    [[nodiscard]] std::optional<std::uint64_t> tls_base() const;
     // Whether a relocation's symbol is code that `file` does not contribute.
     [[nodiscard]] bool foreign(const InputFile& file, std::uint32_t index) const;
     [[nodiscard]] std::uint64_t mask(std::uint64_t value) const {

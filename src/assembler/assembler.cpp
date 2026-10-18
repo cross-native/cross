@@ -4743,6 +4743,12 @@ std::vector<std::uint8_t> Assembler::Impl::write_elf_object() {
             if (type == elf::stt_notype) type = resolved->base->type;
             if (!size_expression && resolved->base->size) size_expression = &*resolved->base->size;
         }
+        // A label in a TLS section is a TLS symbol, as GNU as and LLVM MC
+        // make it.
+        if ((type == elf::stt_notype || type == elf::stt_object) && symbol.section &&
+            (as.sections_[symbol.section->value].flags & elf::shf_tls) != 0) {
+            type = elf::stt_tls;
+        }
         if (size_expression) {
             const auto value = as.evaluate(*size_expression, true);
             if (value && value->absolute()) {

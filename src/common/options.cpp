@@ -1275,6 +1275,17 @@ bool parse_as_options(int argc, char** argv, CompilerOptions& options,
             command.optimize = std::min(level, 2U);
             continue;
         }
+        // GNU as's MIPS PIC modes, of which the last applies: SVR4 PIC (as
+        // -mabicalls and `.abicalls` give), abicalls code without PIC
+        // (`.option pic0` after it), or neither.
+        if (argument == "-KPIC" || argument == "-call_shared" ||
+            argument == "-call_nonpic" || argument == "-non_shared") {
+            std::erase(command.directives, ".option pic0");
+            add_command_option(options, "m.abicalls", argument != "-non_shared",
+                               std::string(argument));
+            if (argument == "-call_nonpic") command.directives.emplace_back(".option pic0");
+            continue;
+        }
         // The MIPS GPR width, which `.module gp=` also sets.
         if (argument == "-mgp32" || argument == "-mgp64") {
             command.directives.push_back(".module gp=" + std::string(argument.substr(4)));
@@ -1393,6 +1404,9 @@ void print_as_help() {
                         enable or disable a registered target feature
   -mnan=2008|legacy     select the NaN encoding
   -mgp32, -mgp64        assume 32- or 64-bit general registers
+  -KPIC, -call_shared   assemble SVR4 PIC code, as after .abicalls
+  -call_nonpic          assemble abicalls code without PIC
+  -non_shared           assemble code without PIC
   -O0, -O1, -O2         keep every hazard nop, drop unneeded ones, or also
                         fill delay slots in .set reorder code (default -O2)
   --model=FILE          load a named compiler-definition file

@@ -194,6 +194,7 @@ COFF/PE, or Mach-O as the triple names (`x86_64-unknown-linux-gnu`,
 | `-EB`, `-EL` | Big- or little-endian output. |
 | `-mFEATURE`, `-mno-FEATURE`, `-mnan=2008\|legacy` | Target features, such as `-msoft-float`, `-msingle-float`, `-mfp32`, `-mfpxx`, and `-mfp64`, which set the floating-point ABI that `.MIPS.abiflags` records, and the errata workarounds `-mfix-r5900` and `-mfix-loongson3-llsc`, which the `-march` CPU may enable ([targets.md](targets.md#mips)). |
 | `-mgp32`, `-mgp64` | MIPS: the width of the general registers that `.MIPS.abiflags` records and the macros assume, as `.module gp=32` or `gp=64` sets it; by default the narrower of the ISA's and the ABI's registers, 32 bits for o32. |
+| `-KPIC`, `-call_shared`, `-mabicalls`, `-call_nonpic`, `-non_shared` | MIPS PIC modes, of which the last applies: SVR4 PIC code as after `.abicalls` (the first three), abicalls code without PIC as after `.abicalls` and `.option pic0`, or neither (the default). With `-mno-shared`, `.cpload` takes `$gp` from `__gnu_local_gp`. |
 | `-O0`, `-O1`, `-O2` | MIPS `.set reorder` code: keep every hazard `nop` the CPU might need, keep only the needed ones, or also fill delay slots (the default; `-O` is `-O1`). |
 | `-I DIR` | A further directory to search for `.include` and `.incbin` files. |
 | `--fatal-warnings`, `-W` | Treat warnings as errors, or suppress them. |
@@ -227,10 +228,18 @@ directives are `.set` (`push`, `pop`, `reorder`, `noreorder`, `at`, `noat`,
 `arch=CPU`, `gp=32`, `gp=64`, `fp=32`, `fp=xx`, `fp=64`, `oddspreg`,
 `nooddspreg`, and the `default` forms), `.module` before any code (`arch=`,
 `mipsN`, `gp=`, `fp=`, `oddspreg`, `nooddspreg`, `softfloat`, `hardfloat`,
-`singlefloat`, `doublefloat`), `.option pic0`, `.ent`, `.end`, `.frame`,
-`.mask`, `.fmask`, and `.nan`. As in GNU as, `.set mipsN` selects the model's
-CPU of that name, dropping a CPU extension such as Allegrex's, and also sets
-64-bit general and floating-point registers for a 64-bit ISA.
+`singlefloat`, `doublefloat`), `.abicalls`, `.option pic0` and `pic2`, the
+PIC directives `.cpload`, `.cprestore`, `.cpsetup`, `.cplocal`, `.cpreturn`,
+and `.cpadd`, `.gpword` and `.gpdword`, `.dtprelword`, `.dtpreldword`,
+`.tprelword`, and `.tpreldword`, `.reloc` with `R_MIPS_JALR` or
+`R_MIPS_NONE` at `.` or a label of the current section, `.ent`, `.end`,
+`.frame`, `.mask`, `.fmask`, and `.nan`. As in GNU as, `.set mipsN` selects
+the model's CPU of that name, dropping a CPU extension such as Allegrex's,
+and also sets 64-bit general and floating-point registers for a 64-bit ISA;
+the PIC directives do nothing outside SVR4 PIC code, `.cpload` and
+`.cprestore` nothing in ELF64 objects, and `.cpsetup`, `.cplocal`, and
+`.cpreturn` nothing in ELF32 ones; and `.gpword` and `.gpdword` give plain
+words outside SVR4 PIC code.
 
 The instructions are those of the loaded MIPS instruction table
 ([models.md](models.md#instruction-entries)), each accepted where the
@@ -247,7 +256,12 @@ needs MIPS IV or MIPS32, and a `sync` type or a coprocessor 0 register
 select MIPS32 or MIPS64. A floating-point register may be written `$N` in a
 load, store, or move (`lwc1 $4, 0($5)`, `mtc1 $2, $6`), where it counts in
 no register mask, but not in arithmetic. The relocation operators are
-`%hi`, `%lo`, `%gp_rel`, `%higher`, and `%highest`. The shipped macros are
+`%hi`, `%lo`, `%gp_rel`, `%higher`, and `%highest`; the GOT and call
+operators `%got`, `%call16`, `%got_disp`, `%got_page`, `%got_ofst`,
+`%got_hi`, `%got_lo`, `%call_hi`, and `%call_lo`; the TLS operators
+`%gottprel`, `%tprel_hi`, `%tprel_lo`, `%tlsgd`, `%tlsldm`, `%dtprel_hi`, and
+`%dtprel_lo`; and n64's `%hi(%neg(%gp_rel(SYMBOL)))` and `%lo` form. Labels
+in TLS sections are TLS symbols. The shipped macros are
 `li` and `dli`, expanded as GNU as expands 32-bit values (a `li` value that
 only layout settles becomes one `addiu`, whose immediate must then fit),
 `move`, `b`, `bal`, `beqz`, `bnez`, `beqzl`, `bnezl`, `negu`, `neg`, `not`,
@@ -255,7 +269,10 @@ only layout settles becomes one `addiu`, whose immediate must then fit),
 rotates by a register written with the immediate mnemonic, and
 three-register operations and traps whose last operand is a constant: the
 immediate instruction when it fits, otherwise the constant loaded into
-`$at`.
+`$at`. In SVR4 PIC code, as in GNU as, `jal SYMBOL` loads `$t9` from the GOT
+(through `%call16`, or in ELF32 objects for a symbol of local binding through
+its page entry and `%lo`), calls through `$t9`, and in ELF32 objects reloads
+`$gp` from the `.cprestore` slot; `j SYMBOL` becomes a branch.
 
 In `.set reorder` code, `as` separates each pair of instructions with the
 `nop`s the CPU needs unless the CPU model has the interlock: after a load or
@@ -306,9 +323,10 @@ object. Unlike GNU as:
 - `.lcomm` and `.comm` objects stay in `.bss` and common storage, where GNU as
   puts those of up to 8 bytes in `.sbss` and small common storage;
 - the `div` and `divu` macros, address macros such as `la` and `lw REG,
-  symbol`, `.insn`, `-g` line tables for assembly source, and PIC code
-  (`-mabicalls`, `.cpload`) are not available: write `div $zero, rs, rt` and
-  `%hi`/`%lo` pairs;
+  symbol`, `.insn`, and `-g` line tables for assembly source are not
+  available: write `div $zero, rs, rt` and `%hi`/`%lo` or GOT operator pairs;
+- in an ELF32 object, a PIC `jal` to a local symbol defined after it is an
+  error, where GNU as gives it the local form;
 - `-march` and `.set arch=` accept the CPUs that `cc --print-cpus` lists
   ([targets.md](targets.md#mips)), with the instructions of their ISA level
   and Allegrex's, but not the instructions that other CPUs add, such as the
@@ -521,15 +539,37 @@ unwind tables the same way, without sharing CIEs.
 **MIPS.** `ld` applies `R_MIPS_16`, `_32`, `_64`, `_26`, `_HI16`, `_LO16`,
 `_GPREL16`, `_GPREL32`, `_LITERAL`, `_PC16`, `_PC32`, `_HIGHER`, and
 `_HIGHEST`, the n64 combinations with `R_MIPS_64` and with `R_MIPS_SUB` and
-`_HI16` or `_LO16`, and ignores `R_MIPS_JALR` hints; PIC, TLS, MIPS16, and
-microMIPS relocations are diagnosed. A REL `R_MIPS_HI16` takes the low half
+`_HI16` or `_LO16`, the GOT relocations `R_MIPS_GOT16`, `_CALL16`,
+`_GOT_DISP`, `_GOT_PAGE`, `_GOT_OFST`, `_GOT_HI16`, `_GOT_LO16`,
+`_CALL_HI16`, and `_CALL_LO16`, and the TLS relocations `R_MIPS_TLS_GD`,
+`_TLS_LDM`, `_TLS_GOTTPREL`, `_TLS_TPREL_HI16`, `_TLS_TPREL_LO16`,
+`_TLS_DTPREL_HI16`, `_TLS_DTPREL_LO16`, `_TLS_TPREL32`, `_TLS_TPREL64`,
+`_TLS_DTPREL32`, and `_TLS_DTPREL64`; other TLS, MIPS16, and microMIPS
+relocations are diagnosed. As in GNU ld, a `jalr $t9` with an `R_MIPS_JALR`
+hint becomes a `bal` when the hint names a function that the link defines
+within the branch's reach. A REL `R_MIPS_HI16` takes the low half
 of its addend from the next `R_MIPS_LO16` of the same symbol, so several may
 share one; one without such a `R_MIPS_LO16` gets a warning. `R_MIPS_26`
 requires the target in the 256 MiB region of the delay slot. In ELF32 output
 every address is a 32-bit value, so symbol addresses read with
 `--just-symbols` and script addresses compare as such. gp-relative
 relocations need a definition of `_gp`, and those against local symbols add
-the gp value an object's `.reginfo` or `.MIPS.options` records. `R_MIPS_16`
+the gp value an object's `.reginfo` or `.MIPS.options` records.
+`_gp_disp`, which needs no definition, is `_gp` less the address of the
+field of its `R_MIPS_HI16`, which an `R_MIPS_LO16` four bytes later
+completes, and `__gnu_local_gp` is `_gp`. GOT
+relocations add a `.got` input section to the first object that has one,
+which `_GLOBAL_OFFSET_TABLE_`, a hidden symbol, starts. As in GNU ld's static
+executables, the GOT has two reserved entries, the second with only its top
+bit set, then the page and address entries of symbols of local binding, the
+entries of other symbols, and the TLS entries: initial-exec entries hold
+offsets from the thread pointer, global-dynamic pairs module 1 and the
+offset from the DTP, and the local-dynamic pair module 1. Unlike GNU ld,
+`ld` orders the TLS entries by first use. The TLS sections form a `PT_TLS`
+segment and must be adjacent; the first takes the largest alignment among
+them, `.tbss` takes no address space, TLS symbols hold offsets in the
+segment, and the thread pointer and the DTP lie 0x7000 and 0x8000 past its
+start. `R_MIPS_16`
 fills the 16-bit field at its offset, where GNU ld fills the low half of the
 32-bit word there. The header flags of the objects must agree on the ABI, the
 NaN encoding, and FP64, and their ISAs must extend one another; the output

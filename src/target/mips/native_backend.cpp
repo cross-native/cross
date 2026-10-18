@@ -534,6 +534,63 @@ const AbiRegisterBank* abi_bank(const AbiEntry& abi, std::string_view name) {
     return found == abi.banks.end() ? nullptr : &*found;
 }
 
+// Whether calls under `abi` may change the register `name`; with
+// -mabicalls also its pic_call_clobbers.
+bool abi_clobbers(const AbiEntry& abi, std::string_view name, bool pic) {
+    const auto contains = [&](const std::vector<std::string>& names) {
+        return std::find(names.begin(), names.end(), name) != names.end();
+    };
+    return contains(abi.call_clobbers) || (pic && contains(abi.pic_call_clobbers));
+}
+
+// Whether a symbol's ELF binding is local: a label that is not global, a
+// compiler label, or an entity the group defines without global, weak, or
+// weakref; a %got of it gives a 64 KiB page that the low part completes.
+bool local_symbol(const hir::Module& module, const machine::SymbolOperand& symbol) {
+    if (symbol.label) return !module.labels.at(symbol.label->value).is_global;
+    const auto local = [](const auto& entity) {
+        return entity.definition && entity.linkage != Linkage::Global && !entity.weak &&
+               !entity.weakref_target;
+    };
+    if (symbol.object) return local(module.object(*symbol.object));
+    if (symbol.function) return local(module.function(*symbol.function));
+    return true;
+}
+
+// Whether code reaches a symbol's address through the GOT: every symbol of
+// PIC code; in -mno-shared code those the group does not define, or defines
+// weak.
+bool got_symbol(PicModel pic, const hir::Module& module,
+                const machine::SymbolOperand& symbol) {
+    if (pic != PicModel::Executable) return pic == PicModel::Pic;
+    if (symbol.label) return false;
+    const auto defined = [](const auto& entity) {
+        return entity.definition && !entity.weak && !entity.weakref_target;
+    };
+    if (symbol.object) return !defined(module.object(*symbol.object));
+    if (symbol.function) return !defined(module.function(*symbol.function));
+    return false;
+}
+
+const hir::Object* thread_local_object(const hir::Module& module,
+                                       const machine::SymbolOperand& symbol) {
+    if (!symbol.object) return nullptr;
+    const auto& object = module.object(*symbol.object);
+    return object.is_thread_local ? &object : nullptr;
+}
+
+// The TLS model of an access: initial-exec loads the offset of the object
+// from the thread pointer from the GOT, local-exec has the linker give it.
+// As on x86-64, objects default to local-exec when the group defines them
+// without global and to initial-exec otherwise; without -mabicalls there is
+// no GOT and the program is one static module, so every access is
+// local-exec, as GCC makes it.
+bool initial_exec(PicModel pic, const hir::Object& object) {
+    if (pic == PicModel::None) return false;
+    if (!object.tls_model.empty()) return object.tls_model == "initial-exec";
+    return !(object.definition && object.linkage != Linkage::Global);
+}
+
 // Only a definition with [[variadic(...)]] bindings stores incoming registers.
 bool binds_variadic_state(const hir::Function& entity) {
     return entity.variadic && !entity.variadic_bindings.empty();
@@ -578,6 +635,22 @@ std::optional<SignatureLayout> classify_managed_interface(
     return std::move(classified.layout);
 }
 
+// Whether an argument or result of a classified interface travels in the
+// register `name`.
+bool layout_uses_register(const SignatureLayout& layout, std::string_view name) {
+    const auto in = [&](const std::vector<ValuePiece>& pieces) {
+        return std::any_of(pieces.begin(), pieces.end(), [&](const ValuePiece& piece) {
+            return piece.location.kind == LocationKind::Register && piece.location.reg == name;
+        });
+    };
+    return std::any_of(layout.call.arguments.begin(), layout.call.arguments.end(),
+                       [&](const ArgumentAssignment& argument) {
+                           return in(argument.pieces) || in(argument.shadows);
+                       }) ||
+           std::any_of(layout.results.begin(), layout.results.end(),
+                       [&](const ReturnAssignment& result) { return in(result.pieces); });
+}
+
 const AbiEntry* managed_abi_model(const hir::Module& module,
                                   const hir::Function& function,
                                   const Subtarget& subtarget,
@@ -601,9 +674,13 @@ const AbiEntry* managed_abi_model(const hir::Module& module,
             // reject a signature supported by its resolved source ABI.
             // Classify the complete interface (including hidden result
             // channels) before committing, using the same model and
-            // resolved ISA facts at caller and callee.
-            if (classify_managed_interface(module, function, subtarget, abi))
+            // resolved ISA facts at caller and callee. An abicalls call
+            // needs $t9 for the callee's address.
+            const auto layout = classify_managed_interface(module, function, subtarget, abi);
+            if (layout && (pic_model(subtarget, options) == PicModel::None ||
+                           !layout_uses_register(*layout, "t9"))) {
                 return &abi;
+            }
             break;
         }
     }
@@ -964,7 +1041,8 @@ public:
                    const CompilerOptions& options,
                    Diagnostics& diagnostics)
         : managed_(managed), hir_(hir_module), subtarget_(subtarget),
-          options_(options), diagnostics_(diagnostics) {}
+          options_(options), diagnostics_(diagnostics),
+          pic_(pic_model(subtarget, options)) {}
 
     machine::Module run() {
         std::vector<std::size_t> order;
@@ -1356,6 +1434,16 @@ private:
             return false;
         }
         return source_ && !mir::has_reachable_return(*source_);
+    }
+
+    // A thread-local object's address takes the thread pointer, which
+    // `rdhwr` reads into $v1.
+    void thread_pointer_clobber(machine::Instruction& result,
+                                std::optional<hir::ObjectId> object) const {
+        if (object && hir_.object(*object).is_thread_local) {
+            result.clobbers.push_back(
+                machine::Register::physical_register({3}, machine::i64));
+        }
     }
 
     Opcode load_opcode(hir::TypeId type, Opcode signed_opcode,
@@ -1829,6 +1917,7 @@ private:
                 result.operands.push_back(machine::SymbolOperand{
                     hir_.object(*value.object).link_symbol, 0, false,
                     value.object});
+                thread_pointer_clobber(result, value.object);
             }
             for (const auto operand : value.operands) {
                 const auto source = reg(operand);
@@ -1964,6 +2053,7 @@ private:
             result.operands.push_back(machine::SymbolOperand{
                 hir_.object(*value.object).link_symbol, 0, false,
                 value.object});
+            thread_pointer_clobber(result, value.object);
             result.defs.push_back(reg(value.id));
             return result;
         }
@@ -2132,6 +2222,7 @@ private:
             result.operands.push_back(machine::SymbolOperand{
                 hir_.object(*value.object).link_symbol, 0, false,
                 value.object});
+            thread_pointer_clobber(result, value.object);
             result.defs.push_back(reg(value.id));
             result.may_load = true;
             result.has_side_effects = value.is_volatile_access;
@@ -2147,6 +2238,7 @@ private:
             result.operands.push_back(machine::SymbolOperand{
                 hir_.object(*value.object).link_symbol, 0, false,
                 value.object});
+            thread_pointer_clobber(result, value.object);
             result.operands.push_back(register_operand(source));
             result.uses.push_back(source);
             result.may_store = true;
@@ -3009,13 +3101,24 @@ private:
                                                instruction.defs.end(), wide);
                         });
                 });
+        // An abicalls call loads the callee's address into $t9 after the
+        // arguments are in place.
+        const bool calls_through_t9 = pic_ != PicModel::None &&
+            std::any_of(function.blocks.begin(), function.blocks.end(),
+                [](const machine::Block& block) {
+                    return std::any_of(
+                        block.instructions.begin(), block.instructions.end(),
+                        [](const machine::Instruction& instruction) {
+                            return instruction.kind == machine::InstructionKind::Call;
+                        });
+                });
         if (!pair_scratch) {
             // These registers are never implicit emitter scratches on the
             // native-width scalar path. They are preferred because they
             // require no prologue save under o32/EABI.
             for (const auto id : {2U, 3U, 4U, 5U, 6U, 7U,
                                   14U, 15U, 24U, 25U}) {
-                integer_colors.push_back({id});
+                if (id != 25 || !calls_through_t9) integer_colors.push_back({id});
             }
             const bool needs_atomic_compare_scratch = std::any_of(
                 function.blocks.begin(), function.blocks.end(),
@@ -4612,12 +4715,9 @@ private:
 
         const auto* abi = managed_abi_model(hir_, entity, subtarget_, options_);
         const auto function_clobbers = [&](std::string_view name) {
-            const auto contains = [&](const std::vector<std::string>& names) {
-                return std::find(names.begin(), names.end(), name) !=
-                       names.end();
-            };
-            return (abi && contains(abi->call_clobbers)) ||
-                   contains(entity.clobbers);
+            return (abi && abi_clobbers(*abi, name, pic_ != PicModel::None)) ||
+                   std::find(entity.clobbers.begin(), entity.clobbers.end(), name) !=
+                       entity.clobbers.end();
         };
         std::unordered_set<std::uint32_t> saved;
         const auto preserve_storage = [&](machine::PhysicalRegisterId physical) {
@@ -5222,6 +5322,12 @@ private:
     // one offset. Each high part keeps a `%lo` of exactly its own symbol and
     // addend, the pair that assemblers and linkers match relocations by.
     // Objects that a data base reaches keep their global accesses.
+    // A symbol whose address is not %hi and %lo: one in the GOT, or a
+    // thread-local one.
+    bool absolute_unreachable(const machine::SymbolOperand& symbol) const {
+        return got_symbol(pic_, hir_, symbol) || thread_local_object(hir_, symbol);
+    }
+
     bool split_global_addresses(machine::Function& function) {
         if (!options_.combine_addresses || naked_) return false;
         bool changed = fold_data_base_addresses(function);
@@ -5374,7 +5480,7 @@ private:
                 const auto address = value.defs.front();
                 const auto id = virtual_id(address);
                 if (!symbol || symbol->is_function || !symbol->object || !id ||
-                    object_data_base(hir_, options_, *symbol)) {
+                    object_data_base(hir_, options_, *symbol) || absolute_unreachable(*symbol)) {
                     continue;
                 }
                 // Accesses that add the low part, directly or after an
@@ -5444,7 +5550,7 @@ private:
                     ? std::get_if<machine::SymbolOperand>(&value.operands[0])
                     : nullptr;
                 if (!symbol || !accepts_low_part(value) ||
-                    object_data_base(hir_, options_, *symbol)) {
+                    object_data_base(hir_, options_, *symbol) || absolute_unreachable(*symbol)) {
                     rewritten.push_back(std::move(value));
                     continue;
                 }
@@ -10220,6 +10326,7 @@ private:
     const Subtarget& subtarget_;
     const CompilerOptions& options_;
     Diagnostics& diagnostics_;
+    const PicModel pic_;
     machine::Module result_;
     machine::Function current_;
     const mir::ManagedFunction* source_{};
@@ -10312,7 +10419,8 @@ public:
           numeric_gprs_(hir_module.address_bits > 32 ||
                         elf_abi_tag(subtarget.abi_info()) !=
                             ElfAbiTag::Default),
-          wide_addresses_(hir_module.address_bits > 32) {
+          wide_addresses_(hir_module.address_bits > 32),
+          pic_(pic_model(subtarget, options)) {
         if (!subtarget.lacks_instructions()) return;
         const auto& instructions = subtarget.target().instruction_costs;
         for (std::size_t index = 0; index < instructions.size(); ++index) {
@@ -10359,6 +10467,9 @@ public:
         // EF_MIPS_NAN2008 tells linkers and loaders the NaN encoding, also of
         // an object without functions.
         if (subtarget_.has_feature(Feature::Nan2008)) result.header = ".nan 2008\n";
+        // SVR4 abicalls code: EF_MIPS_PIC and EF_MIPS_CPIC, as GNU as and
+        // LLVM MC set them for both directives.
+        if (pic_ != PicModel::None) result.header += ".abicalls\n.option pic2\n";
         if (elf_abi_tag(subtarget_.abi_info()) == ElfAbiTag::Eabi32) {
             // GNU MIPS linkers use this conventional empty marker in addition
             // to EF_MIPS_ABI_EABI32.
@@ -10555,6 +10666,31 @@ private:
         const machine::ImmediateOperand& immediate) const {
         return immediate.mode.bits == 64 &&
                pool_smaller(immediate_instructions(immediate.value), false);
+    }
+
+    // Whether a constant comes from a literal pool, as its emission
+    // decides: by size under size goals, and for an FR=0 double in FPRs
+    // whose words pass through memory.
+    bool loads_literal(const machine::Function& function,
+                       const machine::Instruction& value) const {
+        if (value.defs.empty()) return false;
+        const auto target = value.defs.front();
+        const auto* immediate = std::get_if<machine::ImmediateOperand>(&value.operands.front());
+        if (!immediate) return false;
+        if (value.opcode != Opcode::Fconstant) {
+            return !legalizes_to_pair(target) && prefer_integer_literal(*immediate);
+        }
+        const auto pair_fpr = legalizes_to_pair(target) ? assigned_fpr(function, target)
+                                                        : std::nullopt;
+        if (pair_fpr && immediate->value == 0) return false;
+        if (legalizes_to_pair(target) &&
+            !(pair_fpr && (prefer_float_literal(*immediate) ||
+                           fpr_words_through_memory(subtarget_)))) {
+            return false;
+        }
+        const auto destination = assigned_fpr(function, target);
+        if (destination && immediate->value == 0 && immediate->high == 0) return false;
+        return destination && (prefer_float_literal(*immediate) || pair_fpr);
     }
 
     const IntegerLiteral& integer_literal(
@@ -11520,6 +11656,12 @@ private:
     void materialize_symbol_address(std::string_view destination,
                                     const std::string& symbol) {
         const auto reg = reg_name(destination);
+        // PIC code reaches its own labels through a GOT page entry.
+        if (pic_ == PicModel::Pic) {
+            const auto low = got_high(destination, symbol, true);
+            instruction(address_add_immediate(), reg + "," + reg + "," + low);
+            return;
+        }
         if (large_code_model()) {
             instruction("lui", reg + ",%highest(" + symbol + ")");
             instruction("daddiu", reg + "," + reg + ",%higher(" + symbol + ")");
@@ -11534,12 +11676,9 @@ private:
                     reg + "," + reg + ",%lo(" + symbol + ")");
     }
 
-    std::string_view address_add_immediate() const {
-        return wide_addresses_ ? "daddiu" : "addiu";
-    }
-
     // An object's address: one instruction off the register of a data base
-    // that reaches it.
+    // that reaches it, the thread pointer plus an offset for a thread-local
+    // object, or from the GOT.
     void materialize_object_address(std::string_view destination,
                                     const machine::SymbolOperand& symbol) {
         if (const auto* base = object_data_base(hir_, options_, symbol)) {
@@ -11548,7 +11687,292 @@ private:
                             ",%gp_rel(" + symbol_expression(symbol) + ")");
             return;
         }
+        if (const auto* object = thread_local_object(hir_, symbol)) {
+            materialize_thread_local_address(destination, symbol, *object);
+            return;
+        }
+        if (got_symbol(pic_, hir_, symbol)) {
+            const auto low = got_high(destination, symbol);
+            if (low != "0") {
+                instruction(address_add_immediate(), reg_name(destination) + "," +
+                                                         reg_name(destination) + "," + low);
+            }
+            return;
+        }
         materialize_symbol_address(destination, assembly_symbol(symbol.name));
+    }
+
+    // Loads the GOT entry of a symbol into `destination` and returns the
+    // displacement that completes the address: for a symbol of local
+    // binding a 64 KiB page and the offset in it (%got and %lo, or n64's
+    // %got_page and %got_ofst), for another one its address (%got, or
+    // %got_disp) and the addend, which a register holds when it does not
+    // fit 16 bits.
+    std::string got_high(std::string_view destination, const std::string& expression,
+                         bool local) {
+        gp_used_ = true;
+        const auto reg = reg_name(destination);
+        if (local) {
+            instruction(address_load(), reg + (wide_addresses_ ? ",%got_page(" : ",%got(") +
+                                            expression + ")($gp)");
+            return (wide_addresses_ ? "%got_ofst(" : "%lo(") + expression + ")";
+        }
+        instruction(address_load(), reg + (wide_addresses_ ? ",%got_disp(" : ",%got(") +
+                                        expression + ")($gp)");
+        return "0";
+    }
+
+    std::string got_high(std::string_view destination, const machine::SymbolOperand& symbol) {
+        if (local_symbol(hir_, symbol)) {
+            return got_high(destination, symbol_expression(symbol), true);
+        }
+        got_high(destination, assembly_symbol(symbol.name), false);
+        if (symbol.addend == 0) return "0";
+        if (symbol.addend >= -32768 && symbol.addend <= 32767) return std::to_string(symbol.addend);
+        load_immediate("at", static_cast<std::uint64_t>(symbol.addend), hir_.address_bits);
+        instruction(address_add(), reg_name(destination) + "," + reg_name(destination) + ",$at");
+        return "0";
+    }
+
+    // A thread-local object's address: the thread pointer, which `rdhwr $3,
+    // $29` reads (a Release 2 instruction that systems emulate on earlier
+    // CPUs, and that their emulation expects in $v1, as GCC's code does),
+    // plus the object's offset from it, from the GOT for initial-exec or
+    // %tprel_hi and %tprel_lo for local-exec. $at holds the offset, so the
+    // address may go to $v1.
+    void materialize_thread_local_address(std::string_view destination,
+                                          const machine::SymbolOperand& symbol,
+                                          const hir::Object& object) {
+        const auto low = thread_local_high(destination, symbol, object);
+        if (low != "0") {
+            instruction(address_add_immediate(), reg_name(destination) + "," +
+                                                     reg_name(destination) + "," + low);
+        }
+    }
+
+    // The part of a thread-local address before the displacement, which
+    // the function returns.
+    std::string thread_local_high(std::string_view destination,
+                                  const machine::SymbolOperand& symbol,
+                                  const hir::Object& object) {
+        const auto reg = reg_name(destination);
+        if (initial_exec(pic_, object)) {
+            gp_used_ = true;
+            instruction(address_load(), "$at,%gottprel(" + assembly_symbol(symbol.name) + ")($gp)");
+            read_thread_pointer();
+            instruction(address_add(), reg + ",$v1,$at");
+            if (symbol.addend >= -32768 && symbol.addend <= 32767) {
+                return std::to_string(symbol.addend);
+            }
+            load_immediate("at", static_cast<std::uint64_t>(symbol.addend), hir_.address_bits);
+            instruction(address_add(), reg + "," + reg + ",$at");
+            return "0";
+        }
+        const auto expression = symbol_expression(symbol);
+        instruction("lui", "$at,%tprel_hi(" + expression + ")");
+        read_thread_pointer();
+        instruction(address_add(), reg + ",$v1,$at");
+        return "%tprel_lo(" + expression + ")";
+    }
+
+    void read_thread_pointer() {
+        // For a CPU before Release 2, which traps on the instruction, it is
+        // assembled as MIPS32 Release 2, as GCC does.
+        const bool emulated = !subtarget_.has_feature(Feature::Mips32r2) &&
+                              !subtarget_.has_feature(Feature::Mips64r2);
+        const bool lacked = unavailable_.erase("rdhwr") != 0;
+        if (emulated) output_ << ".set push\n.set mips32r2\n";
+        instruction("rdhwr", "$v1,$29");
+        if (emulated) output_ << ".set pop\n";
+        if (lacked) unavailable_.insert("rdhwr");
+    }
+
+    // The callee's address in $t9 for an abicalls call: from a GOT page
+    // entry for a function of local binding, else through %call16.
+    void load_callee_address(const machine::Instruction& call,
+                             const machine::SymbolOperand& callee) {
+        gp_used_ = true;
+        const auto symbol = assembly_symbol(callee.name);
+        const auto* entity = call.direct_callee ? &hir_.function(*call.direct_callee) : nullptr;
+        if (pic_ == PicModel::Pic && entity && entity->definition &&
+            entity->linkage != Linkage::Global && !entity->weak && !entity->weakref_target) {
+            const auto low = got_high("t9", symbol, true);
+            instruction(address_add_immediate(), "$t9,$t9," + low);
+            return;
+        }
+        instruction(address_load(), "$t9,%call16(" + symbol + ")($gp)");
+    }
+
+    // Whether an abicalls call to a symbol reaches it through the GOT and
+    // $t9: every such call of PIC code, and calls of -mno-shared code to
+    // functions the group does not define, or defines weak.
+    bool got_call(const machine::Instruction& call) const {
+        if (pic_ == PicModel::None ||
+            !std::holds_alternative<machine::SymbolOperand>(call.operands.front())) {
+            return false;
+        }
+        if (pic_ == PicModel::Pic || !call.direct_callee) return true;
+        const auto& callee = hir_.function(*call.direct_callee);
+        return !callee.definition || callee.weak || callee.weakref_target;
+    }
+
+    // Whether a call may change $gp: the callee's ABI may, also through its
+    // pic_call_clobbers; a naked callee keeps it.
+    bool call_clobbers_gp(const machine::Instruction& call) const {
+        if (call.direct_callee && hir_.function(*call.direct_callee).naked) return false;
+        const auto site = classify_call_site(hir_, subtarget_, options_, call);
+        return !site || abi_clobbers(*site->first, "gp", true);
+    }
+
+    // Whether emitting `value` reads $gp, the GOT pointer.
+    bool reads_gp(const machine::Function& function, const machine::Instruction& value) const {
+        if (value.kind == machine::InstructionKind::Call) return got_call(value);
+        if (value.kind != machine::InstructionKind::Target || value.operands.empty()) {
+            return false;
+        }
+        switch (decode_opcode(value.opcode)) {
+        case Opcode::GlobalAddress:
+        case Opcode::GlobalLoadSigned:
+        case Opcode::GlobalLoadUnsigned:
+        case Opcode::FglobalLoad:
+        case Opcode::GlobalStore:
+        case Opcode::FglobalStore:
+        case Opcode::AggregateLoad:
+        case Opcode::AggregateStore: {
+            const auto* symbol = std::get_if<machine::SymbolOperand>(&value.operands.front());
+            if (!symbol) return false;
+            if (const auto* object = thread_local_object(hir_, *symbol)) {
+                return initial_exec(pic_, *object);
+            }
+            return got_symbol(pic_, hir_, *symbol);
+        }
+        case Opcode::LabelAddress:
+        case Opcode::Patch:
+            return pic_ == PicModel::Pic;
+        case Opcode::Constant:
+        case Opcode::Fconstant:
+            return pic_ == PicModel::Pic && loads_literal(function, value);
+        default:
+            return false;
+        }
+    }
+
+    // Finds where a function reads $gp and the calls after which it
+    // reloads $gp: those that may change it and that a read follows on
+    // some path before another such call.
+    void analyze_gp(const machine::Function& function) {
+        gp_setup_ = gp_after_prologue_ = gp_used_ = false;
+        gp_reloads_.clear();
+        if (pic_ == PicModel::None) return;
+        std::unordered_map<std::uint32_t, bool> live_in;
+        const auto scan = [&](const machine::Block& block, bool record) {
+            bool live = false;
+            for (const auto successor : block.successors) live = live || live_in[successor.value];
+            for (auto item = block.instructions.rbegin(); item != block.instructions.rend();
+                 ++item) {
+                if (item->kind == machine::InstructionKind::Call && call_clobbers_gp(*item)) {
+                    if (live && record) gp_reloads_.insert(&*item);
+                    live = false;
+                }
+                if (reads_gp(function, *item)) {
+                    live = true;
+                    if (record) gp_setup_ = true;
+                }
+            }
+            return live;
+        };
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (auto block = function.blocks.rbegin(); block != function.blocks.rend(); ++block) {
+                const bool live = scan(*block, false);
+                auto& known = live_in[block->id.value];
+                if (live && !known) {
+                    known = true;
+                    changed = true;
+                }
+            }
+        }
+        for (const auto& block : function.blocks) scan(block, true);
+        // A function whose ABI preserves $gp saves the incoming value first.
+        gp_after_prologue_ = gp_setup_ && active_signature_ &&
+                             !abi_clobbers(*active_signature_->abi, "gp", true);
+    }
+
+    // The frame homes of $gp: the incoming value, which the prologue saves
+    // and the epilogue restores, and the function's own, which it reloads
+    // after calls.
+    void prepare_gp_frame(machine::Function& function) {
+        if (gp_after_prologue_ && !function.frame.elide_incoming_saves) {
+            const machine::PhysicalRegisterId gp{28};
+            if (std::find(function.callee_saved_registers.begin(),
+                          function.callee_saved_registers.end(),
+                          gp) == function.callee_saved_registers.end()) {
+                function.callee_saved_registers.push_back(gp);
+            }
+            if (!named_slot(function, "$callee.save.gp")) {
+                machine::StackSlot save;
+                save.id = {static_cast<std::uint32_t>(function.stack_slots.size())};
+                save.kind = machine::StackSlotKind::CalleeSave;
+                save.size = subtarget_.has_feature(Feature::Mips3) ? 8U : 4U;
+                save.saved_register = machine::Register::physical_register(
+                    gp, machine::IntegerMode{static_cast<std::uint16_t>(save.size * 8U)});
+                save.alignment = save.size;
+                save.location = function.location;
+                save.name = "$callee.save.gp";
+                function.stack_slots.push_back(std::move(save));
+            }
+        }
+        if (!gp_reloads_.empty() && !named_slot(function, "$gp.home")) {
+            machine::StackSlot home;
+            home.id = {static_cast<std::uint32_t>(function.stack_slots.size())};
+            home.kind = machine::StackSlotKind::Spill;
+            home.size = address_bytes();
+            home.alignment = home.size;
+            home.location = function.location;
+            home.name = "$gp.home";
+            function.stack_slots.push_back(std::move(home));
+        }
+    }
+
+    std::int64_t gp_slot_offset(const machine::Function& function) const {
+        const auto* slot = named_slot(function, "$gp.home");
+        if (!slot || !slot->frame_offset) {
+            diagnostics_.error(function.location, "internal error: MIPS $gp has no frame home");
+            return 0;
+        }
+        return *slot->frame_offset;
+    }
+
+    // $gp from $t9, the entry address: through _gp_disp, which the linker
+    // gives relative to the first instruction, or n64's %neg(%gp_rel); or
+    // in -mno-shared code from __gnu_local_gp.
+    void emit_gp_setup(const machine::Function& function) {
+        if (pic_ == PicModel::Executable) {
+            instruction("lui", "$gp,%hi(__gnu_local_gp)");
+            instruction("addiu", "$gp,$gp,%lo(__gnu_local_gp)");
+        } else if (!wide_addresses_) {
+            instruction("lui", "$gp,%hi(_gp_disp)");
+            instruction("addiu", "$gp,$gp,%lo(_gp_disp)");
+            instruction("addu", "$gp,$gp,$t9");
+        } else {
+            const auto symbol = assembly_symbol(function.symbol);
+            instruction("lui", "$gp,%hi(%neg(%gp_rel(" + symbol + ")))");
+            instruction("daddu", "$gp,$gp,$t9");
+            instruction("daddiu", "$gp,$gp,%lo(%neg(%gp_rel(" + symbol + ")))");
+        }
+    }
+
+    // After the frame is allocated: $gp when the prologue saved the
+    // incoming value, and the home it is reloaded from after calls.
+    void emit_gp_frame_entry(const machine::Function& function) {
+        if (gp_after_prologue_) emit_gp_setup(function);
+        if (!gp_reloads_.empty()) {
+            instruction(address_store(), "$gp," + memory(gp_slot_offset(function)));
+        }
+    }
+
+    std::string_view address_add_immediate() const {
+        return wide_addresses_ ? "daddiu" : "addiu";
     }
 
     std::string_view address_shift_left() const {
@@ -12547,7 +12971,7 @@ private:
     bool can_shrink_wrap(const machine::Function& function) const {
         const auto& entity = hir_.function(function.source);
         if (!options_.shrink_wrap || !active_signature_ ||
-            function.frame.elide_incoming_saves ||
+            function.frame.elide_incoming_saves || gp_after_prologue_ ||
             function.frame.program->prologue.empty() ||
             returns_twice_or_interrupt(entity) ||
             binds_variadic_state(entity) ||
@@ -13433,6 +13857,8 @@ private:
                 has_call = has_call || !tail;
             }
         }
+        analyze_gp(function);
+        prepare_gp_frame(function);
         const auto realigned_save = [&](const machine::StackSlot& slot) {
             return realignment_ && slot.name.starts_with("$callee.save.");
         };
@@ -14736,12 +15162,31 @@ private:
         const auto* callee_register =
             std::get_if<machine::RegisterOperand>(&call.operands.front());
         if (!callee_symbol && !callee_register) return;
+        // An abicalls call through a pointer or the GOT gives the callee its
+        // address in $t9, from which a PIC callee computes its $gp.
+        const bool through_t9 = callee_register ? pic_ != PicModel::None : got_call(call);
+        if (through_t9 && layout_uses_register(signature->layout, "t9")) {
+            diagnostics_.error(call.location,
+                               "the call passes a value in $t9, which an -mabicalls "
+                               "call takes for the callee's address");
+            return;
+        }
+        // -mno-shared code reaches the functions it defines with `jal` and
+        // `j`, which GNU as would rewrite in PIC mode.
+        const auto absolute_jump = [&](std::string_view opcode) {
+            if (pic_ != PicModel::None) output_ << ".option pic0\n";
+            instruction(opcode, assembly_symbol(callee_symbol->name));
+            if (pic_ != PicModel::None) output_ << ".option pic2\n";
+        };
         if (tail) {
             if (!callee_symbol) {
                 diagnostics_.error(call.location,
                                    "indirect MIPS tail calls are not selected");
                 return;
             }
+            // The callee's address comes from the GOT before the epilogue
+            // restores an incoming $gp.
+            if (through_t9) load_callee_address(call, *callee_symbol);
             if (cfi_) output_ << ".cfi_remember_state\n";
             const auto remembered = cfi_state_;
             const machine::Instruction* frame_delay = nullptr;
@@ -14753,12 +15198,14 @@ private:
             // With far calls the callee may lie outside the 256 MB
             // region a direct jump can name.  $at is the emitter's own
             // scratch and never carries an argument or a live value here.
-            if (far_calls()) {
+            if (through_t9) {
+                instruction("jr", "$t9");
+            } else if (far_calls()) {
                 materialize_symbol_address(
                     "at", assembly_symbol(callee_symbol->name));
                 instruction("jr", "$at");
             } else {
-                instruction("j", assembly_symbol(callee_symbol->name));
+                absolute_jump("j");
             }
             if (frame_delay) emit_frame_instruction(*frame_delay, false);
             else if (frame_size_ == 0) instruction("nop");
@@ -14775,13 +15222,19 @@ private:
         if (callee_register) {
             const auto target = input_gpr(function, callee_register->value,
                                           "at", call.location);
-            instruction("jalr", reg_name(target));
+            if (through_t9 && target != "t9") {
+                instruction("move", "$t9," + reg_name(target));
+            }
+            instruction("jalr", through_t9 ? std::string("$t9") : reg_name(target));
+        } else if (through_t9) {
+            load_callee_address(call, *callee_symbol);
+            instruction("jalr", "$t9");
         } else if (far_calls()) {
             materialize_symbol_address("at",
                                        assembly_symbol(callee_symbol->name));
             instruction("jalr", "$at");
         } else {
-            instruction("jal", assembly_symbol(callee_symbol->name));
+            absolute_jump("jal");
         }
         // A frame that does not save $ra loses the incoming value here.
         if (cfi_ && function.frame.elide_incoming_saves && !return_address_lost_) {
@@ -14794,6 +15247,9 @@ private:
             emit_target(function, *spare);
         } else {
             instruction("nop");
+        }
+        if (gp_reloads_.contains(&call)) {
+            instruction(address_load(), "$gp," + memory(gp_slot_offset(function)));
         }
         capture_call_result(function, call, *signature);
         if (dynamic_mark) {
@@ -17233,6 +17689,15 @@ private:
     bool return_address_lost_{};
     bool numeric_gprs_{};
     bool wide_addresses_{};
+    const PicModel pic_;
+    // For the function being emitted under -mabicalls: whether it reads
+    // $gp, which it then sets up at entry or, when its ABI preserves $gp,
+    // after saving the incoming value in its prologue; the calls after
+    // which it reloads $gp from its frame; and the GOT accesses emitted.
+    bool gp_setup_{};
+    bool gp_after_prologue_{};
+    std::unordered_set<const machine::Instruction*> gp_reloads_;
+    bool gp_used_{};
     // The instructions the -march CPU lacks, and those already reported.
     std::unordered_set<std::string_view> unavailable_;
     std::unordered_set<std::string> reported_unavailable_;
@@ -19063,6 +19528,12 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
                                     reg_name(base->base) + ")");
                     return;
                 }
+                if (pic_ == PicModel::Pic) {
+                    const auto low = got_high("t0", literal.label, true);
+                    instruction(target.mode.bits == 32 ? "lwc1" : "ldc1",
+                                reg_name(*destination) + "," + low + "($t0)");
+                    return;
+                }
                 if (large_code_model()) {
                     materialize_symbol_address("t0", literal.label);
                     instruction(target.mode.bits == 32 ? "lwc1" : "ldc1",
@@ -19092,6 +19563,9 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
                     instruction("ld", reg_name(destination) + ",%gp_rel(" +
                                           literal.label + ")(" +
                                           reg_name(base->base) + ")");
+                } else if (pic_ == PicModel::Pic) {
+                    const auto low = got_high("t0", literal.label, true);
+                    instruction("ld", reg_name(destination) + "," + low + "($t0)");
                 } else {
                     instruction("lui", "$t0,%hi(" + literal.label + ")");
                     instruction("ld", reg_name(destination) + ",%lo(" +
@@ -19131,14 +19605,21 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
                   legalizes_to_pair(value.uses.front());
         // A data base reaches a scalar directly off its register; word
         // pairs and addresses go through a register.
-        const auto access = base && opcode != Opcode::GlobalAddress && !pair
+        auto access = base && opcode != Opcode::GlobalAddress && !pair
             ? "%gp_rel(" + symbol_expression(symbol) + ")(" +
                   reg_name(base->base) + ")"
             : std::string("0($t0)");
         const auto address = opcode == Opcode::GlobalAddress
             ? output_gpr(function, value.defs.front(), "t0")
             : std::string_view{"t0"};
-        if (opcode == Opcode::GlobalAddress || !base || pair) {
+        const auto* tls_object = thread_local_object(hir_, symbol);
+        if (opcode != Opcode::GlobalAddress && !pair && tls_object) {
+            // A scalar access adds the low part of the address itself.
+            access = thread_local_high("t0", symbol, *tls_object) + "($t0)";
+        } else if (opcode != Opcode::GlobalAddress && !pair && !base &&
+                   got_symbol(pic_, hir_, symbol)) {
+            access = got_high("t0", symbol) + "($t0)";
+        } else if (opcode == Opcode::GlobalAddress || !base || pair) {
             materialize_object_address(address, symbol);
         }
         if (opcode == Opcode::GlobalAddress) {
@@ -20588,6 +21069,27 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
         prepare_parameter_homes(function);
         if (!finalize_frame(function)) return;
     }
+    analyze_gp(function);
+    if (pic_ != PicModel::None) {
+        if (layout_uses_register(active_signature_->layout, "t9")) {
+            diagnostics_.error(function.location,
+                               "the function takes a value in $t9, which -mabicalls "
+                               "callers set to its address");
+            return;
+        }
+        if (entity.naked && gp_setup_) {
+            diagnostics_.error(function.location,
+                               "a naked function cannot reach symbols through the GOT "
+                               "under -mabicalls");
+            return;
+        }
+        if (gp_after_prologue_ && !wide_addresses_) {
+            diagnostics_.error(function.location,
+                               "the ABI preserves $gp, which -mabicalls code with 32-bit "
+                               "addresses sets up at entry");
+            return;
+        }
+    }
     framed_ = machine::framed_blocks(function);
     stack_usage_ = {frame_size_, has_dynamic_stack(function)};
     function_location_ = function.location;
@@ -20635,7 +21137,8 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
     output_ << *directive << '\n';
     // ISA directives are scoped to the function, so an assembler's own ISA
     // and floating-point options apply again after it.
-    output_ << ".set push\n.set noreorder\n.set noat\n.option pic0\n";
+    output_ << ".set push\n.set noreorder\n.set noat\n";
+    if (pic_ == PicModel::None) output_ << ".option pic0\n";
     if (subtarget_.has_feature(Feature::Mips64r2)) output_ << ".set mips64r2\n";
     else if (subtarget_.has_feature(Feature::Mips64)) output_ << ".set mips64\n";
     else if (subtarget_.has_feature(Feature::Mips5)) output_ << ".set mips5\n";
@@ -20709,11 +21212,13 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
         output_ << ".cfi_startproc\n";
         describe_unsaved_registers(function);
     }
+    if (gp_setup_ && !gp_after_prologue_) emit_gp_setup(function);
     if (function.frame.program) {
         if (!function.frame.prologue_block) {
             for (const auto& instruction : function.frame.program->prologue) {
                 emit_frame_instruction(instruction);
             }
+            emit_gp_frame_entry(function);
         }
     } else if (frame_size_ != 0) {
         instruction(address_add_immediate(),
@@ -20765,11 +21270,15 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
             if (cfi) output_ << ".cfi_def_cfa_register 30\n";
         }
         emit_callee_saves(function, cfi);
+        emit_gp_frame_entry(function);
     } else if (function.frame.has_frame_pointer) {
         // A function that never returns and keeps nothing in a frame still
         // anchors the CFA in $fp before it allocates on the stack.
         instruction("move", "$fp,$sp");
         if (cfi) output_ << ".cfi_def_cfa_register 30\n";
+        if (gp_after_prologue_) emit_gp_setup(function);
+    } else if (gp_after_prologue_) {
+        emit_gp_setup(function);
     }
     // Entry homes run before a shrink-wrapped prologue.
     frame_active_ = !function.frame.prologue_block;
@@ -20837,6 +21346,7 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
             for (const auto& instruction : function.frame.program->prologue) {
                 emit_frame_instruction(instruction);
             }
+            emit_gp_frame_entry(function);
         }
         const auto delay_plan = delay_slot_plan(function, *found);
         const auto given = given_delay_instruction(found->id);
@@ -21014,6 +21524,10 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
                         "$sp,$sp," + std::to_string(frame_size_));
         }
     }
+    if (gp_used_ && !gp_setup_) {
+        diagnostics_.error(function.location,
+                           "internal error: MIPS function reads $gp it did not set up");
+    }
     if (cfi) output_ << ".cfi_endproc\n";
     if (debug_) {
         describe_homes(function);
@@ -21084,6 +21598,15 @@ mir::ManagedAssembly emit_managed_machine_assembly(
     (void)managed;
     return AssemblyEmitter(module, hir_module, subtarget, options,
                            diagnostics, debug).run();
+}
+
+PicModel pic_model(const Subtarget& subtarget, const CompilerOptions& options) {
+    if (!subtarget.has_feature(Feature::AbiCalls) && !options.position_independent) {
+        return PicModel::None;
+    }
+    return !subtarget.has_feature(Feature::Shared) && subtarget.abi_info().address_bits <= 32
+               ? PicModel::Executable
+               : PicModel::Pic;
 }
 
 ElfAbiTag elf_abi_tag(const AbiEntry& abi) {

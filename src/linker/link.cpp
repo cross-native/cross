@@ -719,7 +719,10 @@ bool Link::check_undefined() {
                 const auto index = relocation.symbol.value;
                 if (index == 0 || index >= file->symbols.size()) continue;
                 const auto* target = file->symbols[index].global;
-                if (!target || target->defined() || target->weak) continue;
+                if (!target || target->defined() || target->weak ||
+                    target_->implicit_symbol(target->name)) {
+                    continue;
+                }
                 auto& list = references[target];
                 if (list.empty()) order.push_back(target);
                 list.push_back(section->location(relocation.offset));
@@ -813,6 +816,17 @@ std::optional<std::uint64_t> Link::gp() const {
     if (!target || !target->defined()) return std::nullopt;
     if (target->section) return section_address(*target->section, target->value);
     return target->value;
+}
+
+std::optional<std::uint64_t> Link::tls_base() const {
+    // The TLS segment starts at its lowest TLS output section.
+    std::optional<std::uint64_t> base;
+    for (const auto& step : steps_) {
+        const auto* output = step.placement && step.placement->emitted ? step.placement->output : nullptr;
+        if (!output || !output->alloc() || (output->flags & elf::shf_tls) == 0) continue;
+        if (!base || output->address < *base) base = output->address;
+    }
+    return base;
 }
 
 bool Link::check_cross_references() {
@@ -910,6 +924,20 @@ bool Link::run() {
     allocate_commons();
     parse_frames();
     if (options_.eh_frame_header) create_frame_header();
+    for (auto& created : target_->create_sections(included_sections())) {
+        created->keep = true;
+        created->file->sections.push_back(std::move(created));
+    }
+    for (const auto& [name, section] : target_->created_symbols()) {
+        auto& defined = symbol(name);
+        if (defined.defined()) continue;
+        defined.kind = Symbol::Kind::Defined;
+        defined.section = section;
+        defined.value = 0;
+        defined.type = elf::stt_object;
+        defined.other = elf::stv_hidden;
+        defined.file = section->file;
+    }
     if (!place_sections()) return false;
     if (options_.gc_sections) collect_garbage();
     for (auto& placement : placements_) {
@@ -923,6 +951,7 @@ bool Link::run() {
         }
     }
     if (!check_undefined()) return false;
+    target_->size_sections(included_sections());
     prune_records();
     // Editing .eh_frame may exclude trailing input sections, which keep
     // their place without contents (GNU ld's SEC_EXCLUDE).

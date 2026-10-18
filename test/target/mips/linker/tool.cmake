@@ -7,8 +7,8 @@
 # --gc-keep-exported), --fatal-warnings, and diagnostics that name files,
 # sections, and symbols:
 # undefined and duplicate symbols, relocation overflow, unpaired %hi,
-# unsupported relocations, references into discarded sections, and objects
-# whose ABI, floating-point ABI, class, or byte order disagree.
+# references into discarded sections, objects whose ABI, floating-point ABI,
+# class, or byte order disagree, and abicalls objects linked with others.
 
 include("${CMAKE_CURRENT_LIST_DIR}/common.cmake")
 if(LINKER_TEST_SKIP)
@@ -129,6 +129,9 @@ if(LLVM_MC)
     file(WRITE "${OUTPUT}/pic.s" ".text\n.globl _start\n_start:\nlw $2, %got(value)($28)\n")
     run_checked("PIC object" "${LLVM_MC}" --filetype=obj --triple=mips-unknown-elf "${OUTPUT}/pic.s"
                 -o "${OUTPUT}/pic.o")
-    link_error(pic "pic[.]o:[(][.]text[+]0x0[)]: unsupported R_MIPS_GOT16 against 'value' [(]PIC code is not supported[)]"
-               "${OUTPUT}/pic.o" "${OUTPUT}/other.o")
+    # llvm-mc writes abicalls objects by default; as in GNU ld, linking them
+    # with other objects only warns.
+    run_checked("PIC link" "${LD}" "${OUTPUT}/pic.o" "${OUTPUT}/other.o" -o "${OUTPUT}/pic.elf")
+    expect("PIC link" "${run_stderr}"
+           "ld: warning: [^\n]*other[.]o: linking non-abicalls code with abicalls code of [^\n]*pic[.]o")
 endif()

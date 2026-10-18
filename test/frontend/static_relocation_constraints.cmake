@@ -221,11 +221,6 @@ foreach(action discard keep)
         }")
 endforeach()
 set(accepted_tls pass)
-if(MODE MATCHES "^mips")
-    # A successful source proof reaches the existing target diagnostic. This
-    # suite does not add MIPS runtime TLS or hide a source-validation failure.
-    set(accepted_tls "MIPS TLS lowering is not implemented yet")
-endif()
 foreach(action discard keep)
     if(action STREQUAL discard)
         set(expected "${accepted_tls}")

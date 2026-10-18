@@ -237,6 +237,9 @@ struct AbiEntry {
     std::vector<AbiRegisterBank> banks;
     std::vector<AbiRule> rules;
     std::vector<std::string> call_clobbers;
+    // The storage that a call also changes in position-independent code
+    // (MIPS -mabicalls), where the callee sets up its own GOT pointer.
+    std::vector<std::string> pic_call_clobbers;
     AbiRegisterFailure argument_register_failure{AbiRegisterFailure::Stack};
     AbiRegisterFailure result_register_failure{AbiRegisterFailure::Error};
     AbiStackLayout stack_layout{AbiStackLayout::Packed};

@@ -281,6 +281,9 @@ const SubtargetTable subtargets{
         {"branch-likely", false, true, {"mips2"}, {}},
         {"fix4300", false, true, {"mips3", "hard-float"}, {}},
         {"abicalls", false, true, {"mips1"}, {}},
+        // -mno-shared: -mabicalls code for an executable, which reaches
+        // its own symbols directly (GCC's -mno-shared).
+        {"shared", true, true, {"mips1"}, {}},
         {"mips16", false, true, {"mips1"}, {"micromips"}},
         {"micromips", false, true, {"mips32"}, {"mips16"}},
         {"single-float", false, true, {"hard-float"}, {"fp64", "fpxx"}},
@@ -372,8 +375,12 @@ std::vector<OptionDefinition> target_options() {
     boolean("long-calls", false,
             "call through a register so the callee may lie outside the "
             "caller's 256 MB region");
-    boolean("abicalls", false, "enable SVR4 PIC ABI calls",
-            OptionImplementation::Partial);
+    boolean("abicalls", false,
+            "generate SVR4 abicalls code: calls through $t9 and symbol "
+            "addresses from the GOT");
+    boolean("shared", true,
+            "with -mabicalls, make code suitable for shared objects; "
+            "-mno-shared lets executables reach their own symbols directly");
     boolean("mips16", false, "enable MIPS16 encoding",
             OptionImplementation::Partial);
     boolean("micromips", false, "enable microMIPS encoding",
@@ -421,8 +428,8 @@ std::optional<OperandType> operand_type(std::string_view name) {
     if (name == "cpr") return fpr(Id::Cpr, 32);
     if (name == "cpr64") return fpr(Id::Cpr64, 64);
     if (name == "fcc") return number(Id::Fcc, 7);
-    if (name == "cp0" || name == "fcr") {
-        auto result = number(name == "cp0" ? Id::Cp0 : Id::Fcr, 31);
+    if (name == "cp0" || name == "hwr" || name == "fcr") {
+        auto result = number(name == "cp0" ? Id::Cp0 : name == "hwr" ? Id::Hwr : Id::Fcr, 31);
         result.exposable = true;
         result.register_syntax = true;
         if (name == "fcr") result.required_features = {"hard-float"};
@@ -570,7 +577,7 @@ TargetInfo make_target(ByteOrder order, std::vector<TriplePrefix> prefixes) {
         // displacement; MIPS has no scaled index.
         {{32, 64, "integer", {0}, {}, {}, 16, "mips"},
          {64, 64, "integer", {0}, {}, {}, 16, "mips3"}},
-        {{"integer128", {}}, {"atomics", "m.llsc"}},
+        {{"integer128", {}}, {"atomics", "m.llsc"}, {"thread_local", {}}},
         {{"eabi32", 32}},
         target_hazard_events(),
         NakedLowering::Constrained,

@@ -193,6 +193,8 @@ public:
     [[nodiscard]] virtual std::uint64_t place(std::uint64_t offset) const = 0;
     // _gp, or nullopt when nothing defines it.
     [[nodiscard]] virtual std::optional<std::uint64_t> gp() const = 0;
+    // The start of the TLS segment, or nullopt without one.
+    [[nodiscard]] virtual std::optional<std::uint64_t> tls_base() const = 0;
     // The address of an offset within a merged section.
     [[nodiscard]] virtual std::uint64_t merged(const InputSection& section,
                                                std::uint64_t offset) const = 0;
@@ -232,6 +234,29 @@ public:
     // Applies a section's relocations to `bytes`, its copy in the output.
     virtual void relocate(const RelocationContext& context,
                           std::span<std::uint8_t> bytes) const = 0;
+    // Input sections the linker creates for the relocations of the included
+    // sections, such as the MIPS GOT, before placement. Each names the file
+    // it belongs to; the link keeps them.
+    virtual std::vector<std::unique_ptr<InputSection>> create_sections(
+        std::span<InputSection* const> /*sections*/) {
+        return {};
+    }
+    // Symbols at the start of created sections, such as MIPS
+    // _GLOBAL_OFFSET_TABLE_, which the link defines hidden unless an input
+    // defines them.
+    [[nodiscard]] virtual std::vector<std::pair<std::string, InputSection*>> created_symbols() const {
+        return {};
+    }
+    // Sizes the created sections for the sections that remain included.
+    virtual void size_sections(std::span<InputSection* const> /*sections*/) {}
+    // Fills the created sections once addresses are final; `context` gives
+    // the relocation view of an included section.
+    virtual void fill_sections(
+        std::span<InputSection* const> /*sections*/,
+        const std::function<std::unique_ptr<RelocationContext>(const InputSection&)>& /*context*/) {}
+    // A symbol the target defines for every link, such as MIPS _gp_disp,
+    // which needs no definition and is left out of the symbol table.
+    [[nodiscard]] virtual bool implicit_symbol(std::string_view /*name*/) const { return false; }
     // Whether the symbol table's sh_info counts the section symbols only,
     // not all local symbols (IRIX 5 conventions).
     [[nodiscard]] virtual bool sections_end_locals(const OutputFormat& format) const = 0;

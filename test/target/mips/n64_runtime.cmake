@@ -106,8 +106,13 @@ run_checked(startup "${LLVM_MC}" --filetype=obj
 run_checked(link-elf64 "${LLD}" -m ${n64_link_emulation} -T "${LINKER}"
             "${start}" ${objects} -o "${image}")
 
+# N64_QEMU_CPU selects another emulated CPU, such as an R4000 for MIPS III
+# code.
+if(NOT DEFINED N64_QEMU_CPU OR "${N64_QEMU_CPU}" STREQUAL "")
+    set(N64_QEMU_CPU MIPS64R2-generic)
+endif()
 execute_process(
-    COMMAND "${QEMU}" -M malta -cpu MIPS64R2-generic -m 64M -bios none
+    COMMAND "${QEMU}" -M malta -cpu ${N64_QEMU_CPU} -m 64M -bios none
             -kernel "${image}" -display none
             -serial none -serial none -serial stdio -monitor none
             -no-reboot -semihosting
@@ -117,5 +122,5 @@ execute_process(
     TIMEOUT 30)
 if(NOT qemu_status EQUAL 0 OR NOT qemu_stdout MATCHES "(^|[\r\n])P[\r\n]")
     message(FATAL_ERROR
-        "MIPS64R2 n64 execution did not report success (status ${qemu_status})\n${qemu_stdout}\n${qemu_stderr}")
+        "${N64_QEMU_CPU} n64 execution did not report success (status ${qemu_status})\n${qemu_stdout}\n${qemu_stderr}")
 endif()

@@ -9,6 +9,7 @@ namespace cross::linker {
 namespace {
 
 constexpr std::uint32_t pt_load = 1;
+constexpr std::uint32_t pt_tls = 7;
 constexpr std::uint32_t pt_gnu_eh_frame = 0x6474e550;
 constexpr std::uint32_t pt_gnu_stack = 0x6474e551;
 constexpr std::uint32_t pf_x = 1;
@@ -26,9 +27,18 @@ std::string hex(std::uint64_t value) {
     return out.str();
 }
 
+// A zero-filled TLS section takes no space in the image; each thread's
+// block holds it (GNU ld's IS_TBSS).
+bool tbss(const OutputSection& section) {
+    return section.nobits() && (section.flags & elf::shf_tls) != 0;
+}
+
 // Orphan placement classes: code, read-only data, data, zero-filled data.
+// TLS sections follow the data, where they stay together (GNU ld puts them
+// after .tdata).
 int section_class(std::uint64_t flags, bool nobits) {
     if ((flags & elf::shf_execinstr) != 0) return 0;
+    if ((flags & elf::shf_tls) != 0) return 2;
     if ((flags & elf::shf_write) == 0) return 1;
     return nobits ? 3 : 2;
 }
@@ -1112,7 +1122,7 @@ void Link::lay_out_section(Placement& placement, bool final) {
         current_section_ = &placement;
         prefer_next_ = false;
     }
-    dot_ = start + size;
+    dot_ = tbss(*output) ? start : start + size;
     if (statement && statement->update_dot) {
         if (const auto value = evaluate(*statement->update_dot)) dot_ = mask(value->value);
     }
@@ -1297,6 +1307,20 @@ void Link::compute_output_attributes() {
         placement->attributes = attributes;
         if (!statement) placement->created = type.has_value();
     }
+    // The first TLS output section takes the largest alignment of the TLS
+    // sections that follow it, so the TLS segment starts aligned (GNU ld's
+    // _bfd_elf_tls_setup).
+    OutputSection* first_tls = nullptr;
+    for (const auto& placement : placements_) {
+        if (!placement->output || !placement->created) continue;
+        auto& output = *placement->output;
+        if ((output.flags & elf::shf_tls) == 0) {
+            if (first_tls) break;
+            continue;
+        }
+        if (!first_tls) first_tls = &output;
+        first_tls->alignment = std::max(first_tls->alignment, output.alignment);
+    }
     final_ = false;
 }
 
@@ -1459,6 +1483,7 @@ bool Link::build_segments() {
         // or skips a page, it is loaded after a zero-filled section, or it
         // is writable after read-only sections on another page.
         auto sorted = allocated;
+        std::erase_if(sorted, [](const OutputSection* section) { return tbss(*section); });
         std::stable_sort(sorted.begin(), sorted.end(), [](const OutputSection* a, const OutputSection* b) {
             return a->load_address < b->load_address;
         });
@@ -1501,6 +1526,26 @@ bool Link::build_segments() {
                 if (writable(section)) segment.flags |= pf_w;
                 if ((section->flags & elf::shf_execinstr) != 0) segment.flags |= pf_x;
             }
+        }
+        // PT_TLS spans the TLS sections, which must be adjacent.
+        std::vector<OutputSection*> tls;
+        std::size_t first_tls = 0;
+        for (std::size_t index = 0; index < allocated.size(); ++index) {
+            if ((allocated[index]->flags & elf::shf_tls) == 0) continue;
+            if (tls.empty()) first_tls = index;
+            tls.push_back(allocated[index]);
+            if (index - first_tls + 1 != tls.size()) {
+                diagnostics_.command_error("TLS output sections '" + tls.front()->name +
+                                           "' and '" + tls.back()->name + "' are not adjacent");
+                return false;
+            }
+        }
+        if (!tls.empty()) {
+            Segment segment;
+            segment.type = pt_tls;
+            segment.flags = pf_r;
+            segment.sections = tls;
+            segments_.push_back(std::move(segment));
         }
         // GNU ld's PT_GNU_STACK once an input has .note.GNU-stack: executable
         // when an input asks for it or (the MIPS default) has no note.
@@ -1585,7 +1630,7 @@ void Link::assign_offsets() {
             }
             first_section = false;
             if (!section->nobits()) file_end = std::max(file_end, section->offset + section->size);
-            memory_end = std::max(memory_end, section->address + section->size);
+            if (!tbss(*section)) memory_end = std::max(memory_end, section->address + section->size);
         }
         segment.file_size = file_end - segment.offset;
         segment.memory_size = memory_end - segment.address;
@@ -1604,6 +1649,16 @@ void Link::assign_offsets() {
         if (placed.contains(section)) continue;
         if (section->nobits()) {
             section->offset = offset;
+            // A zero-filled TLS section takes the file position of its
+            // address in the loadable segment there (GNU ld).
+            for (const auto& segment : segments_) {
+                if (tbss(*section) && segment.type == pt_load && !segment.sections.empty() &&
+                    section->address >= segment.address &&
+                    section->address <= segment.address + segment.memory_size) {
+                    section->offset = segment.offset + (section->address - segment.address);
+                    break;
+                }
+            }
             continue;
         }
         offset = align_up(offset, section->alignment);
@@ -1616,9 +1671,16 @@ void Link::assign_offsets() {
         segment.offset = section->offset;
         segment.address = section->address;
         segment.physical_address = section->load_address;
-        segment.file_size = section->nobits() ? 0 : section->size;
-        segment.memory_size = section->size;
-        segment.alignment = section->alignment;
+        segment.file_size = 0;
+        segment.memory_size = 0;
+        segment.alignment = 1;
+        // A segment of several sections, such as PT_TLS, spans them.
+        for (const auto* member : segment.sections) {
+            const auto end = member->address + member->size - segment.address;
+            if (!member->nobits()) segment.file_size = std::max(segment.file_size, end);
+            segment.memory_size = std::max(segment.memory_size, end);
+            segment.alignment = std::max(segment.alignment, member->alignment);
+        }
     }
 }
 

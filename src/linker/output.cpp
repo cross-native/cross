@@ -27,6 +27,9 @@ public:
         return link_.mask(link_.address(section_) + offset);
     }
     [[nodiscard]] std::optional<std::uint64_t> gp() const override { return gp_; }
+    [[nodiscard]] std::optional<std::uint64_t> tls_base() const override {
+        return link_.tls_base();
+    }
     [[nodiscard]] std::uint64_t merged(const InputSection& section,
                                        std::uint64_t offset) const override {
         return link_.section_address(section, offset);
@@ -79,6 +82,9 @@ bool Link::contributes(const InputFile& file) const {
 
 bool Link::write_contents() {
     const auto pointer = gp();
+    target_->fill_sections(included_sections(), [&](const InputSection& section) {
+        return std::make_unique<SectionContext>(*this, section, pointer, diagnostics_);
+    });
     for (const auto& step : steps_) {
         auto* placement = step.placement;
         if (!placement || !placement->output || !placement->emitted) continue;
@@ -195,6 +201,11 @@ bool Link::write_executable() {
             symtab.u16(shndx);
         }
     };
+    // An executable's TLS symbols hold offsets in the TLS segment.
+    const auto tls = tls_base();
+    const auto tls_value = [&](std::uint8_t type, std::uint64_t value) {
+        return type == elf::stt_tls && tls ? mask(value - *tls) : value;
+    };
     const auto info = [](std::uint8_t binding, std::uint8_t type) {
         return static_cast<std::uint8_t>((static_cast<unsigned>(binding) << 4U) | (type & 0xfU));
     };
@@ -247,8 +258,8 @@ bool Link::write_executable() {
                     named = true;
                 }
                 file_symbols = true;
-                add_symbol(entry.name, value, entry.size, info(elf::stb_local, entry.type),
-                           entry.other, shndx);
+                add_symbol(entry.name, tls_value(entry.type, value), entry.size,
+                           info(elf::stb_local, entry.type), entry.other, shndx);
                 ++count;
             }
         }
@@ -259,6 +270,7 @@ bool Link::write_executable() {
                 // Undefined symbols that an object refers to stay, except
                 // weak ones, which GNU ld drops from executables.
                 if (!entry.defined() && (!entry.referenced || !entry.file || entry.weak ||
+                                         target_->implicit_symbol(entry.name) ||
                                          (options_.gc_sections && !live_references_.contains(&entry)))) {
                     continue;
                 }
@@ -293,7 +305,8 @@ bool Link::write_executable() {
                                            : (entry.weak ? elf::stb_weak : elf::stb_global);
                 // A symbol made local loses its visibility (GNU ld).
                 const auto other = local ? static_cast<std::uint8_t>(entry.other & ~3U) : entry.other;
-                add_symbol(entry.name, value, entry.size, info(binding, entry.type), other, shndx);
+                add_symbol(entry.name, entry.defined() ? tls_value(entry.type, value) : value,
+                           entry.size, info(binding, entry.type), other, shndx);
                 ++count;
             }
         }
