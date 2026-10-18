@@ -570,7 +570,7 @@ TargetInfo make_target(ByteOrder order, std::vector<TriplePrefix> prefixes) {
         // displacement; MIPS has no scaled index.
         {{32, 64, "integer", {0}, {}, {}, 16, "mips"},
          {64, 64, "integer", {0}, {}, {}, 16, "mips3"}},
-        {{"atomics", "m.llsc"}},
+        {{"integer128", {}}, {"atomics", "m.llsc"}},
         {{"eabi32", 32}},
         target_hazard_events(),
         NakedLowering::Constrained,
@@ -580,6 +580,8 @@ TargetInfo make_target(ByteOrder order, std::vector<TriplePrefix> prefixes) {
     result.instruction_model = &instruction_model;
     // %gp_rel offsets are relative to _gp, which $gp holds.
     result.data_base_registers = {"gp"};
+    // 64-bit integers are native from MIPS III and word pairs before it.
+    result.selected_integer_bits = 64;
     result.integrated_assembler = &mips::assemble;
     result.elf_machine = mips::em_mips;
     result.linker = &mips::make_linker_target;

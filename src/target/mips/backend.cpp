@@ -143,8 +143,12 @@ bool unsupported_interface_type(const hir::Module& module, hir::TypeId id) {
         return !type.record || !module.record(*type.record).complete ||
                module.record(*type.record).size > 8191U;
     }
+    const bool integer128 = type.kind == hir::Type::Kind::Builtin &&
+                            (type.builtin == BuiltinType::I128 ||
+                             type.builtin == BuiltinType::U128);
     return type.kind == hir::Type::Kind::Array ||
-           type.kind == hir::Type::Kind::Vector || type_bits(module, id) > 64;
+           type.kind == hir::Type::Kind::Vector ||
+           (type_bits(module, id) > 64 && !integer128);
 }
 
 class Backend final : public TargetBackend {
@@ -275,15 +279,17 @@ public:
                                            function.result_type)) {
                 diagnostics.error(
                     function.location,
-                    "MIPS native function results require scalars through 64 "
-                    "bits or complete records through 8191 bytes");
+                    "MIPS native function results require integers through 128 "
+                    "bits, other scalars through 64 bits, or complete records "
+                    "through 8191 bytes");
             }
             for (const auto& parameter : function.parameters) {
                 if (unsupported_interface_type(hir_module, parameter.type)) {
                     diagnostics.error(
                         parameter.location,
-                        "MIPS native parameters require scalars through 64 "
-                        "bits or complete records through 8191 bytes");
+                        "MIPS native parameters require integers through 128 "
+                        "bits, other scalars through 64 bits, or complete "
+                        "records through 8191 bytes");
                 }
                 if (parameter.physical_location &&
                     *parameter.physical_location != "auto" &&

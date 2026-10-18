@@ -322,6 +322,9 @@ public:
     // the selected ABI width on HIR prevents the middle end from silently
     // assuming x86-64 when a 32-bit or capability-oriented target is added.
     unsigned address_bits{64};
+    // The compilation ABI's limit on the natural alignment of scalars, in
+    // bytes; zero keeps the target's.
+    unsigned natural_alignment_limit{};
     // Private layout facts may be reused only in this exact prepared graph.
     std::shared_ptr<const EvaluationLayoutScopeIdentity> evaluation_layout_scope;
     AbiId default_abi;

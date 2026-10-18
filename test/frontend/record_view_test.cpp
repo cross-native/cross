@@ -29,12 +29,19 @@ int main(int argc, char** argv) {
     options.target = argv[1];
     options.abi = argv[2];
     auto target = *target_for_triple(options.target);
-    const auto bits = find_abi(target, options.abi, options.target)->address_bits;
+    const auto* abi_entry = find_abi(target, options.abi, options.target);
+    const auto bits = abi_entry->address_bits;
     // Inject a non-default data-layout policy, independent of physical calls.
     if (std::string_view(argv[3]) == "custom") target.data_layout.natural_alignment_limit = 2;
+    // A limit that the compilation ABI states takes precedence.
+    const auto alignment_limit = [&] {
+        return abi_entry->natural_alignment_limit != 0
+            ? abi_entry->natural_alignment_limit
+            : target.data_layout.natural_alignment_limit;
+    };
     const EvaluationLayout evaluation_layout{
         target.data_layout.byte_order == ByteOrder::Big ? EvaluationByteOrder::Big : EvaluationByteOrder::Little,
-        target.data_layout.natural_alignment_limit, target.data_layout.f80_storage_bytes,
+        alignment_limit(), target.data_layout.f80_storage_bytes,
         target.data_layout.f80_alignment, target.data_layout.code_addresses};
     SourceManager sources;
     const auto* source = sources.add("record-view.x", R"(
@@ -147,7 +154,7 @@ int main(int argc, char** argv) {
         const auto layout = layout_for(outer);
         const auto inner_id = layout->intern_type(record_type(*view));
         const auto& inner = layout->record(*layout->type(inner_id).record);
-        const auto alignment_bytes = std::min(bits / 8, target.data_layout.natural_alignment_limit);
+        const auto alignment_bytes = std::min(bits / 8, alignment_limit());
         const auto expected_tail = (extent + alignment_bytes - 1) / alignment_bytes * alignment_bytes;
         require(inner.alignment == 32 && inner.members[1].offset == expected_tail);
         require(inner.members[2].bit_width == 3);
@@ -211,7 +218,7 @@ int main(int argc, char** argv) {
         TokenSequence input;
         input.emplace_back(Token{TokenKind::Identifier, "kept", automatic.location});
         auto active_layout = evaluation_layout;
-        active_layout.natural_alignment_limit = alignment;
+        active_layout.natural_alignment_limit = alignment_limit();
         const auto result = evaluate_procedural_body(automatic, input, bits, size_of, align_of,
             active, diagnostics, {}, active_layout, {}, {}, &program);
         require(result && result->size() == 1 && result->front().text == "after" && !diagnostics.errors());
@@ -276,7 +283,7 @@ int main(int argc, char** argv) {
         if (!member) co_return {};
         co_return EvaluationMemberLayout{member->offset, member->alignment, member->bit_width, member->bit_offset};
     };
-    const auto tail_alignment = std::min(bits / 8, target.data_layout.natural_alignment_limit);
+    const auto tail_alignment = std::min(bits / 8, alignment_limit());
     isolation_program.evaluation_required_integer = [&](const Expr&, Diagnostics&,
         const LayoutQuery& size, const LayoutQuery&, std::string_view, const FunctionDecl*,
         std::span<const std::pair<NameKey, TypePtr>>, EvaluationIntegerContext)

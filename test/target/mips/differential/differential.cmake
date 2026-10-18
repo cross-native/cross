@@ -152,10 +152,18 @@ if(ADDRESS_MODEL STREQUAL "64")
                 "${start_object}" "${mips_object}" -o "${elf64}")
 else()
     # The startup is MIPS III code for the QEMU host but must carry a 32-bit
-    # FPU tag: MIPS I objects are FP32 and VR4300 objects are FPXX.
-    run_checked(startup "${LLVM_MC}" --filetype=obj
-                --triple=${mips_triple} --mcpu=mips3
-                --mattr=+noabicalls,-fp64 "${STARTUP}" -o "${start_object}")
+    # FPU tag: MIPS I objects are FP32 and VR4300 objects are FPXX. STARTUP_AS,
+    # an assembler that takes cc's target options, gives it the ABI tag of
+    # STARTUP_AS_FLAGS instead of llvm-mc's o32.
+    if(DEFINED STARTUP_AS AND NOT "${STARTUP_AS}" STREQUAL "")
+        split_flags("${STARTUP_AS_FLAGS}" startup_as_flags)
+        run_checked(startup "${STARTUP_AS}" -target ${mips_triple} -march=mips3
+                    ${startup_as_flags} "${STARTUP}" -o "${start_object}")
+    else()
+        run_checked(startup "${LLVM_MC}" --filetype=obj
+                    --triple=${mips_triple} --mcpu=mips3
+                    --mattr=+noabicalls,-fp64 "${STARTUP}" -o "${start_object}")
+    endif()
     run_checked(link-elf32 "${LLD}" -m ${elf32_format} -T "${LINKER}"
                 "${start_object}" "${mips_object}" -o "${elf32}")
     run_checked(flatten-image "${LLVM_OBJCOPY}" -O binary "${elf32}" "${image}")

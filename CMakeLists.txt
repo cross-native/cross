@@ -203,6 +203,7 @@ add_library(cross_middle
     src/middle/mir_pass.cpp
     src/middle/mir_ranges.cpp
     src/middle/mir_transform.cpp
+    src/middle/mir_wide.cpp
     src/middle/shrink_wrap.cpp
 )
 target_link_libraries(cross_middle PUBLIC cross_frontend cross_targets)
@@ -2808,6 +2809,118 @@ if(BUILD_TESTING)
         set_tests_properties(cross_mips_differential_boundary_${boundary_name} PROPERTIES
             LABELS "check.runtime;arch.mips;backend.native;feature.abi;feature.optimization;isa.${boundary_isa};endian.${boundary_endian_label};opt.${boundary_level_label}")
     endforeach()
+    # 128-bit integers against the x86-64 reference: o32 kernels call helpers
+    # in the private ABI or, with -fno-private-abi, in the compilation's x32,
+    # eabi32, x64, or n64. Each entry: name|ISA|endian|address model|QEMU
+    # CPU|optimization|flags|ABI of the startup (- for llvm-mc's o32).
+    foreach(wide_case
+            "vr4300_o0|vr4300|BE|32|R4000|-O0|-mprofile=vr4300-o32|-"
+            "vr4300_o2|vr4300|BE|32|R4000|-O2|-mprofile=vr4300-o32|-"
+            "vr4300_le_o2|vr4300|LE|32|R4000|-O2|-target mipsel-unknown-elf -mabi=o32 -march=vr4300|-"
+            "vr4300_os|vr4300|BE|32|R4000|-Os|-mprofile=vr4300-o32|-"
+            "vr4300_o3|vr4300|BE|32|R4000|-O3|-mprofile=vr4300-o32|-"
+            "r3000_o2|r3000|BE|32|R4000|-O2|-mprofile=r3000-o32|-"
+            "r3000_le_o0|r3000|LE|32|R4000|-O0|-target mipsel-unknown-elf -mabi=o32 -march=r3000|-"
+            "mips2_o2|mips2|BE|32|R4000|-O2|-target mips-unknown-elf -mabi=o32 -march=mips2|-"
+            "mips32_o2|mips32|BE|32|24Kf|-O2|-target mips-unknown-elf -mabi=o32 -march=mips32|-"
+            "mips32_le_o2|mips32|LE|32|24Kf|-O2|-target mipsel-unknown-elf -mabi=o32 -march=mips32|-"
+            "x32_o2|vr4300|BE|32|R4000|-O2|-target mips-unknown-elf -march=vr4300 -fno-private-abi|-"
+            "x32_r3000_le_o2|r3000|LE|32|R4000|-O2|-target mipsel-unknown-elf -march=r3000 -fno-private-abi|-"
+            "eabi32_o2|vr4300|BE|32|R4000|-O2|-target mips-unknown-elf -mabi=eabi32 -march=vr4300 -fno-private-abi|eabi32"
+            "eabi32_mips2_le_o0|mips2|LE|32|R4000|-O0|-target mipsel-unknown-elf -mabi=eabi32 -march=mips2 -fno-private-abi|eabi32"
+            "x64_o2|vr4300|BE|32|R4000|-O2|-target mips-unknown-elf -mabi=x64 -march=vr4300 -fno-private-abi|-"
+            "n64_o0|mips64|BE|64|MIPS64R2-generic|-O0|-mprofile=mips64-n64 -mabi=n64 -fno-private-abi|-"
+            "n64_o2|mips64|BE|64|MIPS64R2-generic|-O2|-mprofile=mips64-n64 -mabi=n64 -fno-private-abi|-"
+            "n64_le_o2|mips64|LE|64|MIPS64R2-generic|-O2|-mprofile=mips64el-n64 -mabi=n64 -fno-private-abi|-"
+            "x64_64_o2|mips64|BE|64|MIPS64R2-generic|-O2|-mprofile=mips64-n64 -fno-private-abi|-"
+            "x64_64_le_o3|mips64|LE|64|MIPS64R2-generic|-O3|-mprofile=mips64el-n64|-")
+        string(REPLACE "|" ";" wide_fields "${wide_case}")
+        list(GET wide_fields 0 wide_name)
+        list(GET wide_fields 1 wide_isa)
+        list(GET wide_fields 2 wide_endian)
+        list(GET wide_fields 3 wide_address)
+        list(GET wide_fields 4 wide_cpu)
+        list(GET wide_fields 5 wide_level)
+        list(GET wide_fields 6 wide_flags)
+        list(GET wide_fields 7 wide_startup_abi)
+        string(SUBSTRING "${wide_level}" 1 -1 wide_level_label)
+        if(wide_address STREQUAL "64")
+            set(wide_startup start_wide_n64.s)
+            set(wide_linker bare-n64.ld)
+        else()
+            set(wide_startup start_wide.s)
+            set(wide_linker bare.ld)
+        endif()
+        set(wide_assembler "")
+        if(NOT wide_startup_abi STREQUAL "-")
+            set(wide_assembler -DSTARTUP_AS=$<TARGET_FILE:cross_as>
+                "-DSTARTUP_AS_FLAGS=-mabi=${wide_startup_abi}")
+        endif()
+        if(wide_endian STREQUAL "LE")
+            set(wide_endian_label little)
+        else()
+            set(wide_endian_label big)
+        endif()
+        add_test(NAME cross_mips_differential_wide_${wide_name}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DTEMPLATE=${CMAKE_SOURCE_DIR}/test/target/mips/differential/wide_kernels.x.in
+                    -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/differential/${wide_startup}
+                    -DHOST_MAIN=${CMAKE_SOURCE_DIR}/test/target/mips/differential/main_wide.cpp
+                    -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/${wide_linker}
+                    -DWRAPPER_TEMPLATE=${CMAKE_SOURCE_DIR}/test/target/mips/runtime64.s.in
+                    -DWRAPPER_LINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare64.ld
+                    "-DTARGET_FLAGS=${wide_flags}"
+                    -DENDIAN=${wide_endian}
+                    -DADDRESS_MODEL=${wide_address}
+                    -DQEMU_CPU=${wide_cpu}
+                    -DOPT_LEVEL=${wide_level}
+                    ${wide_assembler}
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-differential-wide-${wide_name}
+                    -P "${CMAKE_SOURCE_DIR}/test/target/mips/differential/differential.cmake")
+        set_tests_properties(cross_mips_differential_wide_${wide_name} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;feature.integer128;feature.abi;isa.${wide_isa};endian.${wide_endian_label};opt.${wide_level_label}"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS")
+    endforeach()
+    # 128-bit integers and records by value across the n64 C ABI: Cross and
+    # GNU GCC call each other in both directions.
+    foreach(interop int128 records)
+        foreach(endian big little)
+            foreach(level O0 O2)
+                set(name cross_mips_n64_${interop}_c_${endian}_${level})
+                add_test(NAME ${name} COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/n64_${interop}.x
+                    -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/n64_${interop}_start.s
+                    -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare-n64.ld
+                    -DN64_ENDIAN=${endian}
+                    "-DEXTRA_FLAGS=-${level}"
+                    -DGCC_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/n64_${interop}.c
+                    "-DGCC_FLAGS=-G0"
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-n64-${interop}-c-${endian}-${level}
+                    -P "${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.cmake")
+                if(interop STREQUAL "int128")
+                    set(interop_label feature.integer128)
+                else()
+                    set(interop_label feature.records)
+                endif()
+                set_tests_properties(${name} PROPERTIES
+                    LABELS "check.runtime;arch.mips;backend.native;feature.abi;feature.interop;${interop_label};profile.n64;isa.mips64;endian.${endian};opt.${level}"
+                    SKIP_REGULAR_EXPRESSION "skipping MIPS n64")
+            endforeach()
+        endforeach()
+    endforeach()
+    # 128-bit placement and inline sequences in the assembly, and the
+    # 128-bit atomics, naked interfaces, and patch values MIPS diagnoses.
+    add_test(NAME cross_mips_int128 COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc>
+        -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/int128_errors.x
+        -DCODEGEN_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/int128_codegen.x
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-int128
+        -P "${CMAKE_SOURCE_DIR}/test/target/mips/int128.cmake")
+    set_tests_properties(cross_mips_int128 PROPERTIES
+        LABELS "check.compile;arch.mips;backend.native;feature.integer128;feature.abi;diagnostics;isa.vr4300;isa.mips64;profile.o32;profile.eabi32;profile.x32;profile.n64;endian.big;endian.little")
     add_test(NAME cross_model_system
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

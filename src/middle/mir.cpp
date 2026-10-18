@@ -21895,6 +21895,12 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
             });
         (void)promotion.run(module);
     }
+    // Integers wider than the target selects become pairs of halves at
+    // every level, before the passes that optimize the halves.
+    for (auto& function : module.functions) {
+        (void)expand_wide_integers(function, hir_module, subtarget, diagnostics);
+    }
+
     // A naked function has no frame: the scalar cells of its inlined
     // helpers and its dead temporaries disappear at every level.
     for (auto& function : module.functions) {

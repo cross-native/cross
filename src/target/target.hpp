@@ -73,7 +73,14 @@ enum class AbiValueKind {
     Array,
     Vector,
     Zero,
+    // Aggregates of one form: structures, or unions.
+    Structure,
+    Union,
 };
+
+// Whether a rule places whole values, the members that a flatten rule
+// places (fields and elements), or both.
+enum class AbiMemberScope { Any, Only, None };
 
 enum class AbiRuleAction {
     Direct,
@@ -182,6 +189,13 @@ struct AbiRule {
     // overlap one chunk. This expresses policies such as the SysV INTEGER
     // over SSE eightbyte merge without teaching the interpreter an ABI name.
     std::vector<std::string> merge_banks;
+    // The bank of a merged chunk that no field overlaps; empty leaves such
+    // a chunk without a register.
+    std::string padding_bank;
+    // A flatten rule applies only when every member it places takes one of
+    // these banks, and keeps one piece per member.
+    std::vector<std::string> member_banks;
+    AbiMemberScope members{AbiMemberScope::Any};
     bool require_natural_alignment{};
     std::vector<std::string> required_features;
     std::vector<std::string> forbidden_features;
@@ -217,6 +231,9 @@ struct AbiEntry {
     // Nonzero marks a private-call convention candidate for subtargets whose
     // native integer registers have this width.
     unsigned private_carrier_bits{};
+    // The largest natural alignment of a scalar in compilations with this
+    // ABI, in bytes; zero keeps the target's.
+    unsigned natural_alignment_limit{};
     std::vector<AbiRegisterBank> banks;
     std::vector<AbiRule> rules;
     std::vector<std::string> call_clobbers;
@@ -847,6 +864,9 @@ struct TargetInfo {
     // The registers that can hold the base of `data_base` model entries;
     // none when the target has no base-relative data addressing.
     std::vector<std::string_view> data_base_registers{};
+    // The widest integer the native backend selects. MIR splits integers
+    // twice as wide into halves first (mir::expand_wide_integers).
+    unsigned selected_integer_bits{128};
     // Cross's own assembler; none while objects of the target still go
     // through llvm-mc.
     IntegratedAssembler integrated_assembler{};

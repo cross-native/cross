@@ -172,6 +172,8 @@ abi "x64" {
     compilation_selectable = true;
     function_selectable = true;
     private_carrier_bits = 64;
+    # Records keep n64's layout: a 128-bit integer has 16-byte alignment.
+    natural_alignment_limit = 16;
     argument_register_failure = "partial";
     result_register_failure = "error";
     stack_layout = "packed";
@@ -374,12 +376,14 @@ abi "o32" {
         "f16", "f17", "f18", "f19", "memory"
     ];
 
+    # A 128-bit integer returns in v0, v1, a0, and a1, where GCC returns
+    # its 16-byte scalar integer modes.
     bank "integer" {
         class = "integer";
         cursor = "argument-slot";
         register_bits = 32;
         arguments = ["a0", "a1", "a2", "a3"];
-        results = ["v0", "v1"];
+        results = ["v0", "v1", "a0", "a1"];
     }
 
     # The repeated f14 endpoint is intentional. A direct f64 consumes two
@@ -435,22 +439,14 @@ abi "o32" {
         applies_to = ["arguments"];
     }
 
-    rule "integer64-result" {
+    rule "integer-wide-result" {
         match = ["integer"];
         action = "split";
         bank = "integer";
         min_bits = 33;
-        max_bits = 64;
+        max_bits = 128;
         unit_bits = 32;
         extension = "sign";
-        applies_to = ["results"];
-    }
-
-    rule "integer-wide-result-memory" {
-        match = ["integer"];
-        action = "indirect";
-        bank = "integer";
-        min_bits = 65;
         applies_to = ["results"];
     }
 
@@ -579,8 +575,10 @@ abi "n64" {
     gcc_calling_attribute = "";
     compilation_selectable = true;
     function_selectable = true;
-    # The n64 object class is defined on 64-bit FPRs.
+    # The n64 object class is defined on 64-bit FPRs. As in GCC, a 128-bit
+    # integer has 16-byte alignment.
     features = ["fp64"];
+    natural_alignment_limit = 16;
     argument_register_failure = "partial";
     result_register_failure = "error";
     stack_layout = "packed";
@@ -662,6 +660,8 @@ abi "n64" {
         requires_features = ["mips3"];
     }
 
+    # As GCC aligns a 16-byte-aligned argument, __int128 starts at an even
+    # register and an even stack slot.
     rule "integer-wide" {
         match = ["integer"];
         action = "split";
@@ -671,6 +671,7 @@ abi "n64" {
         unit_bits = 64;
         carrier_bits = 64;
         cursor_alignment = 2;
+        stack_alignment = 16;
         requires_features = ["mips3"];
     }
 
@@ -684,6 +685,19 @@ abi "n64" {
         carrier_bits = 64;
         requires_features = ["mips3"];
         applies_to = ["variadic_arguments"];
+    }
+
+    # Only the double members of a structure argument take floating-point
+    # registers, so a single-precision member is integer data.
+    rule "member-single" {
+        match = ["floating"];
+        action = "coerce";
+        bank = "integer";
+        max_bits = 32;
+        unit_bits = 64;
+        members = "only";
+        applies_to = ["fixed_arguments"];
+        requires_features = ["mips3"];
     }
 
     rule "floating32" {
@@ -716,14 +730,63 @@ abi "n64" {
         requires_features = ["mips3"];
     }
 
-    rule "aggregate-registers" {
-        match = ["pair", "aggregate", "array"];
+    # As GCC passes them, a named structure argument of any size travels in
+    # 64-bit chunks in the remaining argument registers and then on the
+    # stack: a chunk that holds a double member in a floating-point register,
+    # any other chunk, padding too, in a general register. A member that is
+    # itself a record or an array is integer data.
+    rule "structure-registers" {
+        match = ["structure"];
+        action = "flatten";
+        min_bits = 1;
+        unit_bits = 64;
+        merge_banks = ["floating", "integer"];
+        padding_bank = "integer";
+        require_natural_alignment = true;
+        cursor_alignment = "value";
+        members = "none";
+        applies_to = ["fixed_arguments"];
+        requires_features = ["mips3", "hard-float"];
+    }
+
+    # A structure of one or two floating members returns them in f0 and
+    # f2, one member in each.
+    rule "floating-structure-result" {
+        match = ["structure"];
         action = "flatten";
         min_bits = 1;
         max_bits = 128;
+        max_elements = 2;
+        member_banks = ["floating"];
+        members = "none";
+        applies_to = ["results"];
+        requires_features = ["mips3", "hard-float"];
+    }
+
+    # Every other record, unions, arrays, unnamed and misaligned ones
+    # included, is integer data in the same register and stack sequence, or
+    # in v0 and v1 as a result through 128 bits.
+    rule "aggregate-integer" {
+        match = ["pair", "aggregate", "array"];
+        action = "coerce";
+        bank = "integer";
+        min_bits = 1;
         unit_bits = 64;
-        merge_banks = ["floating", "integer"];
-        require_natural_alignment = true;
+        carrier_bits = 64;
+        cursor_alignment = "value";
+        applies_to = ["arguments"];
+        requires_features = ["mips3"];
+    }
+
+    rule "aggregate-integer-result" {
+        match = ["pair", "aggregate", "array"];
+        action = "coerce";
+        bank = "integer";
+        min_bits = 1;
+        max_bits = 128;
+        unit_bits = 64;
+        carrier_bits = 64;
+        applies_to = ["results"];
         requires_features = ["mips3"];
     }
 
@@ -786,12 +849,14 @@ abi "eabi32" {
         "f16", "f17", "f18", "f19", "memory"
     ];
 
+    # A 128-bit integer travels like a 64-bit one, in an aligned group of
+    # registers, and returns in v0, v1, a0, and a1.
     bank "integer" {
         class = "integer";
         cursor = "integer";
         register_bits = 32;
         arguments = ["a0", "a1", "a2", "a3", "t0", "t1", "t2", "t3"];
-        results = ["v0", "v1"];
+        results = ["v0", "v1", "a0", "a1"];
     }
 
     bank "floating32" {
@@ -887,7 +952,7 @@ abi "eabi32" {
         action = "split";
         bank = "integer";
         min_bits = 33;
-        max_bits = 64;
+        max_bits = 128;
         unit_bits = 32;
         cursor_alignment = 2;
         stack_alignment = 8;
@@ -899,7 +964,7 @@ abi "eabi32" {
         action = "split";
         bank = "integer";
         min_bits = 33;
-        max_bits = 64;
+        max_bits = 128;
         unit_bits = 32;
         applies_to = ["results"];
     }

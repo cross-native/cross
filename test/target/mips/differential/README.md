@@ -22,13 +22,20 @@ between backends rather than between the compiler and a hand-written oracle.
   addressing, immediate comparisons, branches against zero, filled delay
   slots, call argument placement, and boolean widenings. It runs on every CPU
   class and byte order, under n64, and with the transforms switched off.
-- `start_int.s`, `start_float.s`, `start_private.s`, `start_quality.s` --
+  `wide_kernels.x.in` exercises 128-bit integers: arithmetic, division,
+  shifts, rotations, comparisons, conversions, bit intrinsics, memory, and
+  calls of helpers that take and return them, which use the private ABI or,
+  with `-fno-private-abi`, the compilation's `x32`, `eabi32`, `x64`, or
+  `n64`.
+- `start_int.s`, `start_float.s`, `start_private.s`, `start_quality.s`,
+  `start_wide.s` --
   checked-in generated MIPS bare-metal startup, one per kernel set. Each
   calls every kernel with six argument triples and prints each `u32` result
   as 8 hex digits over the Malta UART, then exits through the UHI
-  semihosting trap. `start_quality_n64.s` calls the quality kernels under
-  n64.
-- `main_int.cpp`, `main_float.cpp`, `main_private.cpp`, `main_quality.cpp` --
+  semihosting trap. `start_quality_n64.s` and `start_wide_n64.s` call the
+  quality and 128-bit kernels under n64.
+- `main_int.cpp`, `main_float.cpp`, `main_private.cpp`, `main_quality.cpp`,
+  `main_wide.cpp` --
   checked-in generated host reference, printing the same values in the same
   order from the native x86-64 backend.
 - `generate.py` -- regenerates a kernel set's `start_*.s`/`main_*.cpp` pair
@@ -44,8 +51,10 @@ between backends rather than between the compiler and a hand-written oracle.
 Given `CC`, `HOST_CXX`, `TEMPLATE`, `STARTUP`, `HOST_MAIN`, `LINKER`,
 `WRAPPER_TEMPLATE`, `WRAPPER_LINKER`, `TARGET_FLAGS`, and `OUTPUT` (plus
 optional `OPT_LEVEL`, default `-O2`; `EXTRA_FLAGS`; `ENDIAN`, `BE` or `LE`,
-default `BE`; `QEMU_CPU`, default `R4000`; and `ADDRESS_MODEL`, `32` or `64`,
-default `32`), it substitutes `@ABI@` for both sides, compiles and runs
+default `BE`; `QEMU_CPU`, default `R4000`; `ADDRESS_MODEL`, `32` or `64`,
+default `32`; and `STARTUP_AS` with `STARTUP_AS_FLAGS`, an assembler that
+takes `cc`'s target options, such as the Cross `as`, which gives the 32-bit
+startup the ABI tag of its flags instead of llvm-mc's o32), it substitutes `@ABI@` for both sides, compiles and runs
 the host reference, compiles the MIPS side and runs it under
 `qemu-system-mips64`/`qemu-system-mips64el` through the same `bare.ld` +
 `runtime64.s.in`/`bare64.ld` wrapping as `runtime.cmake`, then splits both

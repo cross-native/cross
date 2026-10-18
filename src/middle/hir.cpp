@@ -246,6 +246,8 @@ public:
         module_.address_bits = abi && abi->address_bits != 0
                                    ? abi->address_bits
                                    : 64U;
+        module_.natural_alignment_limit =
+            abi ? abi->natural_alignment_limit : 0U;
         for (unsigned kind = static_cast<unsigned>(BuiltinType::Void);
              kind <= static_cast<unsigned>(BuiltinType::Label); ++kind) {
             (void)intern_type(builtin_type(static_cast<BuiltinType>(kind)));
@@ -3517,6 +3519,14 @@ std::string type_name(const Module& module, TypeId id) {
 
 namespace {
 
+// The largest natural alignment of a scalar: the compilation ABI's, else
+// the target's.
+unsigned scalar_alignment_limit(const Module& module, const TargetInfo& target) {
+    return module.natural_alignment_limit != 0
+               ? module.natural_alignment_limit
+               : target.data_layout.natural_alignment_limit;
+}
+
 std::optional<std::uint64_t> source_alignment(const Module& module, const TypePtr& type,
                                               const TargetInfo& target);
 
@@ -3555,7 +3565,7 @@ std::optional<std::uint64_t> source_alignment(const Module& module, const TypePt
     } else if (const auto size = source_natural_size(module, type, target)) {
         natural = natural_storage_alignment(*size,
             type->kind == cross::Type::Kind::Builtin && type->builtin == BuiltinType::F80,
-            target.data_layout.natural_alignment_limit, target.data_layout.f80_alignment);
+            scalar_alignment_limit(module, target), target.data_layout.f80_alignment);
     }
     if (!natural) return {};
     return std::max<std::uint64_t>(*natural, type->alignment);
@@ -3631,7 +3641,7 @@ std::optional<std::uint64_t> natural_alignment(
     if (!size) return std::nullopt;
     return natural_storage_alignment(*size,
         type.kind == Type::Kind::Builtin && type.builtin == BuiltinType::F80,
-        target.data_layout.natural_alignment_limit, target.data_layout.f80_alignment);
+        scalar_alignment_limit(module, target), target.data_layout.f80_alignment);
 }
 
 std::optional<std::uint64_t> layout_size(const Module& module, TypeId id,

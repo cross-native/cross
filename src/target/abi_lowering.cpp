@@ -118,7 +118,7 @@ bool rule_matches(const AbiEntry& abi, const AbiRule& rule,
                   const AbiValue& value, RuleUse use,
                   AbiFeatureSet features,
                   const AllocationState* allocation = nullptr,
-                  std::size_t argument_index = 0) {
+                  std::size_t argument_index = 0, bool member = false) {
     const auto kind = model_kind(
         value.transport == ValueTransport::ByReference
             ? ScalarKind::Pointer
@@ -150,18 +150,29 @@ bool rule_matches(const AbiEntry& abi, const AbiRule& rule,
             return false;
         }
     }
-    if (std::find(rule.matches.begin(), rule.matches.end(), kind) ==
-            rule.matches.end() &&
-        std::find(rule.matches.begin(), rule.matches.end(),
-                  AbiValueKind::Any) == rule.matches.end()) {
+    if ((rule.members == AbiMemberScope::Only && !member) ||
+        (rule.members == AbiMemberScope::None && member)) {
+        return false;
+    }
+    const auto form = value.union_value ? AbiValueKind::Union
+                                        : AbiValueKind::Structure;
+    if (std::none_of(rule.matches.begin(), rule.matches.end(),
+                     [&](AbiValueKind wanted) {
+                         return wanted == AbiValueKind::Any ||
+                                wanted == kind ||
+                                (kind == AbiValueKind::Aggregate &&
+                                 wanted == form);
+                     })) {
         return false;
     }
     if (bits < rule.min_bits ||
         (rule.max_bits != 0 && bits > rule.max_bits)) {
         return false;
     }
-    if (kind == AbiValueKind::Array &&
-        value.element_count > rule.max_elements) {
+    if ((kind == AbiValueKind::Array &&
+         value.element_count > rule.max_elements) ||
+        (kind == AbiValueKind::Aggregate &&
+         value.elements.size() > rule.max_elements)) {
         return false;
     }
     return !rule.require_natural_alignment || naturally_aligned(value);
@@ -237,7 +248,7 @@ std::optional<LoweredValue> lower_value(const AbiEntry& abi,
     if (depth >= 64) return std::nullopt;
     for (const auto& candidate : abi.rules) {
         if (!rule_matches(abi, candidate, value, use, features,
-                          allocation, argument_index)) {
+                          allocation, argument_index, depth != 0)) {
             continue;
         }
         const auto* rule = &candidate;
@@ -332,6 +343,17 @@ std::optional<LoweredValue> lower_value(const AbiEntry& abi,
                 }
             }
         }
+        if (!rule->member_banks.empty() &&
+            std::any_of(result.pieces.begin(), result.pieces.end(),
+                        [&](const PieceRequest& piece) {
+                            return !piece.bank ||
+                                   std::find(rule->member_banks.begin(),
+                                             rule->member_banks.end(),
+                                             piece.bank->canonical_name) ==
+                                       rule->member_banks.end();
+                        })) {
+            return std::nullopt;
+        }
         if (!rule->merge_banks.empty() && !result.pieces.empty()) {
             // A single wide child (notably a fixed vector) already names one
             // legal carrier and may encode an ABI continuation class inside
@@ -381,7 +403,16 @@ std::optional<LoweredValue> lower_value(const AbiEntry& abi,
                             selected_precedence = priority;
                         }
                     }
-                    if (!overlaps) continue;
+                    if (!overlaps) {
+                        if (const auto* padding =
+                                find_bank(abi, rule->padding_bank)) {
+                            merged.push_back(
+                                {padding, begin,
+                                 static_cast<std::uint16_t>(end - begin),
+                                 static_cast<std::uint16_t>(rule->unit_bits)});
+                        }
+                        continue;
+                    }
                     // Bank merging creates a new raw aggregate carrier.  A
                     // scalar child's extension does not describe aggregate
                     // padding (for example, a struct containing an i8 is not

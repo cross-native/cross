@@ -71,6 +71,8 @@ struct AbiValue {
     std::uint32_t element_count{};
     std::vector<AbiValue> elements;
     std::vector<std::uint32_t> element_offsets_bits;
+    // An aggregate that is a union rather than a structure.
+    bool union_value{};
 
     AbiValue() = default;
     explicit AbiValue(

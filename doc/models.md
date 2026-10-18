@@ -292,6 +292,7 @@ abi "example-regs" {
 | `elf_abi_tag` | text | none | no |
 | `features` | list | `[]` | no |
 | `private_carrier_bits` | integer | none | no |
+| `natural_alignment_limit` | integer | the target's | no |
 | `llvm_calling_convention` | text | `""` | no |
 | `gcc_calling_attribute` | text | `""` | no |
 
@@ -377,6 +378,12 @@ per `architecture`, address width, and register width may set it. A
 function whose signature the entry cannot place keeps its normal ABI.
 x86-64 ignores the property.
 
+`natural_alignment_limit`, a power of two, is the largest alignment in bytes
+that a scalar type has by its size in compilations with the entry as their
+ABI; records, arrays, and alignment requests follow from it. Without it the
+target's applies: 8 on MIPS and 16 on x86-64. The shipped `n64` and `x64`
+set 16, so `i128` and `u128` have the 16-byte alignment of GCC's `__int128`.
+
 On MIPS, every entry with 64-bit addresses, shipped or user-defined, produces
 ELF64 objects as described in [targets.md](targets.md#mips).
 
@@ -421,6 +428,7 @@ Rules match a value by its kind:
 - `"floating"`: `f32`, `f64`, `f80`, `f128`, and `fptr`;
 - `"pointer"`: pointers, including function pointers, and `label` values;
 - `"aggregate"`: structures and unions;
+- `"structure"` and `"union"`: structures only and unions only;
 - `"array"`: arrays;
 - `"vector"`: vector types;
 - `"zero"`: values without bits, such as `void`;
@@ -457,6 +465,9 @@ A `rule` block places values:
 | `stack_alignment` | integer | `0` | no |
 | `stack_size` | integer | `0` | no |
 | `merge_banks` | list | `[]` | no |
+| `member_banks` | list | `[]` | no |
+| `members` | text | `"any"` | no |
+| `padding_bank` | text | none | no |
 | `require_natural_alignment` | boolean | `false` | no |
 
 Rules are tried in order. The first rule whose filters all match and whose
@@ -475,8 +486,12 @@ The filters are:
   and the unnamed arguments of a variadic call are variadic;
 - `min_bits` and `max_bits`: inclusive limits on the value's width, where a
   `max_bits` of `0` sets no limit;
-- `max_elements`: the largest element count of an `"array"` value; it does
-  not filter other kinds;
+- `max_elements`: the largest element count of an `"array"` value, and the
+  largest member count of a structure or union; it does not filter other
+  kinds;
+- `members`: `"only"` limits the rule to the fields and elements that a
+  `"flatten"` rule places, `"none"` to whole values, and the default
+  `"any"` matches both;
 - `argument_limit`: when nonzero, only arguments whose zero-based position
   in the parameter list is below it;
 - `requires_unused_banks`: banks that no earlier argument and no hidden
@@ -547,9 +562,9 @@ cursor; a value that needs more is an error. Without them, a value starts at
 the next position and uses one position per register. The shipped `o32`
 entry aligns its arguments to the value, so 64-bit scalars and records with
 8-byte alignment start at an even slot and an `f64` in floating-point
-registers takes two positions; `eabi32` aligns its 64-bit values to two
-positions, and so its `f32` values on an FPU without odd single-precision
-registers.
+registers takes two positions; `eabi32` aligns its 64-bit values and its
+128-bit integers to two positions, and so its `f32` values on an FPU without
+odd single-precision registers.
 
 `stack_alignment`, a power of two, and `stack_size`, both in bytes,
 override the alignment and the minimum size of a value that the rule places
@@ -557,17 +572,24 @@ on the stack. The outgoing argument area is aligned to the largest of the
 entry's `stack_alignment` and the alignments of the values on the stack,
 and its size is rounded up to that alignment.
 
-A `"flatten"` rule may set `require_natural_alignment` and `merge_banks`.
-With `require_natural_alignment = true`, the rule does not apply unless
+A `"flatten"` rule may set `require_natural_alignment`, `member_banks`,
+`merge_banks`, and `padding_bank`. With `require_natural_alignment = true`, the rule does not
+apply unless
 every field offset and array stride meets the alignment of the nested
 value. `merge_banks`, which requires `unit_bits`, divides the value into
 `unit_bits` chunks and places each chunk in one register of the first bank
 in the list that a field in the chunk uses, as when the System V ABI passes
 a chunk that holds an `i32` and an `f32` in an integer register. A field
 whose bank is not in the list makes the rule not apply, so a later rule such
-as `"indirect"` or `"stack"` handles the value. A field that by itself fits
-one register of a listed bank, such as a 128-bit vector, stays in one
-register.
+as `"indirect"` or `"stack"` handles the value. A chunk that no field
+overlaps takes no register, as in the System V ABI, unless `padding_bank`
+names the bank whose register carries it, as GCC's n64 ABI does with every
+64-bit word of a structure. A field that by itself fits one register of a
+listed bank, such as a 128-bit vector, stays in one register. `member_banks` lets the rule apply only when every field and
+element takes one of the listed banks, and keeps one piece for each, as when
+GCC's n64 ABI returns a structure of two `f32` members in `f0` and `f2`. A
+`"flatten"` value's cursors are those of the banks its pieces use; its
+`cursor_alignment` and `cursor_advance` apply to each of them.
 
 Loading checks each ABI entry against its architecture, whatever the
 selected target: register names, classes, and widths; feature names; the

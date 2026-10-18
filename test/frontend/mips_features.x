@@ -1,8 +1,8 @@
 // Copyright (C) 2026 Cross contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#if $::has_feature($::feature::integer128)
-#error MIPS must not advertise unavailable integer128 lowering
+#if !$::has_feature($::feature::integer128)
+#error MIPS lowers 128-bit integers to inline sequences
 #endif
 #if $::has_feature($::feature::binary128_storage)
 #error MIPS must not advertise unavailable binary128 storage

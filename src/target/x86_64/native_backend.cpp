@@ -429,6 +429,7 @@ AbiValue abi_value_for(const hir::Module& module, hir::TypeId id,
         const auto& record = module.record(*type.record);
         result.mode = ScalarMode::aggregate(
             static_cast<std::uint16_t>(record.size * 8U));
+        result.union_value = record.is_union;
         result.elements.reserve(record.members.size());
         result.element_offsets_bits.reserve(record.members.size());
         std::optional<std::pair<std::uint64_t, unsigned>> bit_field_unit;

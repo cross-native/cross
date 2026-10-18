@@ -1,0 +1,392 @@
+// Copyright (C) 2026 Cross contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// 128-bit integer kernels: every kernel is u32 k(in u32 a, in u32 b, in u32
+// c). They avoid undefined behavior: signed arithmetic that may overflow is
+// done in u128, shift counts stay below 128, divisors are not zero and never
+// -1 with a minimal dividend, and floating values convert within range.
+// Helpers without an ABI attribute use the private convention, or with
+// -fno-private-abi the compilation's ABI; @ABI@ helpers use the platform C
+// ABI under test.
+
+union bits64 {
+    f64 value;
+    u64 word;
+};
+
+union bits32 {
+    f32 value;
+    u32 word;
+};
+
+static u32 fold(in u128 x) {
+    u32 h = (u32)x;
+    h = h * 0x9e3779b1u32 + (u32)(x >> 32u32);
+    h = h * 0x9e3779b1u32 + (u32)(x >> 64u32);
+    h = h * 0x9e3779b1u32 + (u32)(x >> 96u32);
+    return h;
+}
+
+static u128 spread(in u32 a, in u32 b, in u32 c) {
+    u128 x = (u128)a << 96u32;
+    x = x | ((u128)(b ^ 0x5a5a5a5au32) << 64u32);
+    x = x | ((u128)(a + c) << 32u32);
+    return x | (u128)(b * 3u32 + c);
+}
+
+static u32 fbits64(in f64 x) {
+    union bits64 u;
+    u.value = x;
+    return (u32)u.word ^ (u32)(u.word >> 32u32);
+}
+
+static u32 fbits32(in f32 x) {
+    union bits32 u;
+    u.value = x;
+    return u.word;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_w_addsub(in u32 a, in u32 b, in u32 c) {
+    u128 x = spread(a, b, c);
+    u128 y = spread(c, a, b);
+    u128 s = x + y;
+    u128 d = x - y;
+    u128 e = y - x;
+    u128 carry = (u128)0xffffffffffffffffu64 + (u128)(a | 1u32);
+    i128 n = ((i128)x >> 1u32) - ((i128)y >> 1u32);
+    return fold(s) ^ fold(d) * 3u32 ^ fold(e) * 5u32 ^ fold(carry) * 7u32 ^
+           fold((u128)n) * 11u32;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_w_mul(in u32 a, in u32 b, in u32 c) {
+    u128 x = spread(a, b, c);
+    u128 y = spread(b, c, a);
+    u128 p = x * y;
+    u128 q = x * (u128)(c | 1u32);
+    u64 w = ((u64)a << 32u32) | b;
+    u64 v = ((u64)c << 32u32) | (a ^ b);
+    u128 full = (u128)w * (u128)v;
+    i128 sp = (i128)(i64)w * (i128)(i32)c;
+    return fold(p) ^ fold(q) * 3u32 ^ fold(full) * 5u32 ^ fold((u128)sp) * 7u32;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_w_mulhigh(in u32 a, in u32 b, in u32 c) {
+    u64 w = ((u64)a << 32u32) | b;
+    u64 v = ((u64)c << 32u32) | (a + b);
+    u64 high = (u64)(((u128)w * (u128)v) >> 64u32);
+    i64 sw = (i64)w;
+    i64 sv = (i64)v;
+    i64 shigh = (i64)(((i128)sw * (i128)sv) >> 64u32);
+    return (u32)high ^ (u32)(high >> 32u32) ^ (u32)shigh * 3u32 ^
+           (u32)((u64)shigh >> 32u32) * 5u32;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_w_udiv(in u32 a, in u32 b, in u32 c) {
+    u128 x = spread(a, b, c);
+    u128 small = (u128)((b & 0xffffu32) | 1u32);
+    u128 middle = ((u128)(c | 1u32) << 40u32) | a;
+    u128 large = ((u128)(a | 0x80000000u32) << 80u32) | ((u128)b << 20u32) | 1u32;
+    u32 h = fold(x / small) ^ fold(x % small) * 3u32;
+    h = h ^ fold(x / middle) * 5u32 ^ fold(x % middle) * 7u32;
+    h = h ^ fold(x / large) * 11u32 ^ fold(x % large) * 13u32;
+    h = h ^ fold(small / large) * 17u32 ^ fold(small % large) * 19u32;
+    h = h ^ fold(x / 10u128) * 23u32 ^ fold(x % 10u128) * 29u32;
+    h = h ^ fold(x / ((u128)1u32 << 70u32)) * 31u32 ^
+        fold(x % ((u128)1u32 << 70u32)) * 37u32;
+    u128 wide64 = (u128)(((u64)a << 32u32) | b);
+    u128 narrow64 = (u128)((u64)c | 1u64);
+    h = h ^ fold(wide64 / narrow64) * 41u32 ^ fold(wide64 % narrow64) * 43u32;
+    return h;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_w_sdiv(in u32 a, in u32 b, in u32 c) {
+    i128 x = (i128)spread(a, b, c);
+    i128 y = (i128)(spread(c, b, a) >> (c & 63u32)) | 1i128;
+    i128 z = -(i128)((b & 0xffffu32) | 1u32);
+    u32 h = fold((u128)(x / y)) ^ fold((u128)(x % y)) * 3u32;
+    h = h ^ fold((u128)(x / z)) * 5u32 ^ fold((u128)(x % z)) * 7u32;
+    h = h ^ fold((u128)(z / 7i128)) * 11u32 ^ fold((u128)(z % 7i128)) * 13u32;
+    h = h ^ fold((u128)(x / 16i128)) * 17u32 ^ fold((u128)(x % 16i128)) * 19u32;
+    h = h ^ fold((u128)(x / -3i128)) * 23u32 ^ fold((u128)(x % -3i128)) * 29u32;
+    return h;
+}
+
+global u128 w_divisors[2] = {7u128, 0x100000000000000000003u128};
+
+// Divisions in a loop and on one arm of a branch, with memory accesses
+// around them in their blocks.
+[[abi("@ABI@"), noinline]]
+global u32 k_w_divloop(in u32 a, in u32 b, in u32 c) {
+    u128 x = spread(a, b, c);
+    u128 sum = 0u128;
+    for (u32 index = 0u32; index < (c & 3u32) + 2u32; index = index + 1u32) {
+        w_divisors[0] = w_divisors[0] + 2u128;
+        u128 q = x / (w_divisors[index & 1u32] + (u128)index);
+        sum = sum + q + w_divisors[1];
+        x = x ^ (q << 7u32);
+    }
+    u128 r = (b & 1u32) != 0u32 ? x % ((u128)c | 1u128) : x / ((u128)a | 3u128);
+    i128 s = (a & 2u32) != 0u32 ? (i128)x / -5i128 : (i128)x % 11i128;
+    w_divisors[0] = 7u128;
+    return fold(sum) ^ fold(r) * 3u32 ^ fold((u128)s) * 5u32;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_w_shift(in u32 a, in u32 b, in u32 c) {
+    u128 x = spread(a, b, c);
+    i128 s = (i128)x;
+    u32 h = 0u32;
+    u32 n = c & 7u32;
+    while (n < 128u32) {
+        h = h * 31u32 + fold(x << n) ^ fold(x >> n) * 3u32 ^
+            fold((u128)(s >> n)) * 5u32;
+        n = n + 9u32;
+    }
+    return h;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_w_shift_const(in u32 a, in u32 b, in u32 c) {
+    u128 x = spread(a, b, c);
+    i128 s = (i128)x;
+    u32 h = fold(x << 1u32) ^ fold(x << 31u32) * 3u32 ^ fold(x << 32u32) * 5u32;
+    h = h ^ fold(x << 63u32) * 7u32 ^ fold(x << 64u32) * 11u32 ^
+        fold(x << 65u32) * 13u32 ^ fold(x << 127u32) * 17u32;
+    h = h ^ fold(x >> 1u32) * 19u32 ^ fold(x >> 33u32) * 23u32 ^
+        fold(x >> 64u32) * 29u32 ^ fold(x >> 100u32) * 31u32;
+    h = h ^ fold((u128)(s >> 1u32)) * 37u32 ^ fold((u128)(s >> 64u32)) * 41u32 ^
+        fold((u128)(s >> 77u32)) * 43u32 ^ fold((u128)(s >> 127u32)) * 47u32;
+    return h;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_w_rotate(in u32 a, in u32 b, in u32 c) {
+    u128 x = spread(a, b, c);
+    u32 h = fold($::rotl(x, c)) ^ fold($::rotr(x, b)) * 3u32;
+    h = h ^ fold($::rotl(x, 64u32)) * 5u32 ^ fold($::rotr(x, 3u32)) * 7u32;
+    h = h ^ fold($::rotl(x, 100u32)) * 11u32 ^ fold($::rotr(x, 0u32)) * 13u32;
+    return h;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_w_compare(in u32 a, in u32 b, in u32 c) {
+    u128 x = spread(a, b, c);
+    u128 y = spread(a, c, b);
+    u128 z = (x & ~(u128)0xffffffffffffffffu64) | (u128)c;
+    u32 bits = 0u32;
+    u32 shift = 0u32;
+    for (u32 round = 0u32; round < 3u32; round = round + 1u32) {
+        u128 l = round == 0u32 ? x : round == 1u32 ? y : z;
+        u128 r = round == 0u32 ? y : round == 1u32 ? z : x;
+        i128 sl = (i128)l;
+        i128 sr = (i128)r;
+        if (l == r) bits = bits | (1u32 << shift);
+        if (l != r) bits = bits | (2u32 << shift);
+        if (l < r) bits = bits | (4u32 << shift);
+        if (l <= r) bits = bits | (8u32 << shift);
+        if (l > r) bits = bits | (16u32 << shift);
+        if (l >= r) bits = bits | (32u32 << shift);
+        if (sl < sr) bits = bits | (64u32 << shift);
+        if (sl <= sr) bits = bits | (128u32 << shift);
+        if (sl > sr) bits = bits | (256u32 << shift);
+        if (sl >= sr) bits = bits | (512u32 << shift);
+        shift = shift + 10u32;
+    }
+    return bits;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_w_bitwise(in u32 a, in u32 b, in u32 c) {
+    u128 x = spread(a, b, c);
+    u128 y = spread(c, b, a);
+    i128 n = -(i128)(x >> 1u32);
+    return fold(x & y) ^ fold(x | y) * 3u32 ^ fold(x ^ y) * 5u32 ^
+           fold(~x) * 7u32 ^ fold((u128)n) * 11u32 ^ fold(-y) * 13u32 ^
+           (x == 0u128 ? 17u32 : 19u32);
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_w_convert(in u32 a, in u32 b, in u32 c) {
+    u128 x = spread(a, b, c);
+    i128 s = (i128)x;
+    u8 t8 = (u8)x;
+    i16 t16 = (i16)s;
+    u32 t32 = (u32)(x >> 7u32);
+    i64 t64 = (i64)(s >> 3u32);
+    i128 e8 = (i128)(i8)a;
+    i128 e16 = (i128)(i16)b;
+    i128 e32 = (i128)(i32)c;
+    i128 e64 = (i128)(i64)(((u64)a << 32u32) | b);
+    u128 z32 = (u128)c;
+    u128 z64 = (u128)(((u64)c << 32u32) | a);
+    u128 zb = (u128)(a > b);
+    u32 h = (u32)t8 ^ (u32)(i32)t16 * 3u32 ^ t32 * 5u32 ^ (u32)t64 * 7u32;
+    h = h ^ fold((u128)e8) * 11u32 ^ fold((u128)e16) * 13u32 ^
+        fold((u128)e32) * 17u32 ^ fold((u128)e64) * 19u32;
+    h = h ^ fold(z32) * 23u32 ^ fold(z64) * 29u32 ^ fold(zb) * 31u32;
+    return h;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_w_to_float(in u32 a, in u32 b, in u32 c) {
+    u128 x = spread(a, b, c);
+    i128 s = (i128)x;
+    u128 small = (u128)(c & 0xfffu32);
+    u128 mid = x >> ((c & 63u32) | 1u32);
+    f64 d1 = (f64)x;
+    f64 d2 = (f64)s;
+    f64 d3 = (f64)small;
+    f64 d4 = (f64)mid;
+    f64 d5 = (f64)(-(i128)mid);
+    f32 f1 = (f32)x;
+    f32 f2 = (f32)s;
+    f32 f3 = (f32)small;
+    f32 f4 = (f32)(i128)mid;
+    f32 f5 = (f32)(~0u128 >> 1u32);
+    return fbits64(d1) ^ fbits64(d2) * 3u32 ^ fbits64(d3) * 5u32 ^
+           fbits64(d4) * 7u32 ^ fbits64(d5) * 11u32 ^ fbits32(f1) * 13u32 ^
+           fbits32(f2) * 17u32 ^ fbits32(f3) * 19u32 ^ fbits32(f4) * 23u32 ^
+           fbits32(f5) * 29u32;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_w_from_float(in u32 a, in u32 b, in u32 c) {
+    f64 base = (f64)a * 4294967296.0f64 + (f64)b;
+    f64 big = base * 1152921504606846976.0f64;
+    f64 negative = -base * 1099511627776.0f64;
+    f64 fraction = (f64)(c & 0xffffu32) / 7.0f64;
+    f32 single = (f32)(a >> 8u32) * 1099511627776.0f32;
+    u128 u1 = (u128)big;
+    i128 s1 = (i128)negative;
+    u128 u2 = (u128)fraction;
+    i128 s2 = (i128)-fraction;
+    u128 u3 = (u128)single;
+    i128 s3 = (i128)-single;
+    u128 u4 = (u128)base;
+    return fold(u1) ^ fold((u128)s1) * 3u32 ^ fold(u2) * 5u32 ^
+           fold((u128)s2) * 7u32 ^ fold(u3) * 11u32 ^ fold((u128)s3) * 13u32 ^
+           fold(u4) * 17u32;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_w_bits(in u32 a, in u32 b, in u32 c) {
+    u128 x = spread(a, b, c);
+    u128 low = (u128)(c & 0xffffu32);
+    u128 high = (u128)(a | 1u32) << 100u32;
+    u32 h = $::clz(x) ^ $::ctz(x) * 3u32 ^ $::popcount(x) * 5u32;
+    h = h ^ $::clz(low) * 7u32 ^ $::ctz(low) * 11u32 ^ $::popcount(low) * 13u32;
+    h = h ^ $::clz(high) * 17u32 ^ $::ctz(high) * 19u32 ^ $::popcount(high) * 23u32;
+    h = h ^ $::clz(0u128) * 29u32 ^ $::ctz(0u128) * 31u32;
+    h = h ^ fold($::bswap(x)) * 37u32 ^ fold($::bswap(high)) * 41u32;
+    return h;
+}
+
+struct mixed {
+    u32 tag;
+    u128 value;
+    u64 extra;
+};
+
+global u128 w_table[4];
+global volatile u128 w_volatile;
+
+[[abi("@ABI@"), noinline]]
+global u32 k_w_memory(in u32 a, in u32 b, in u32 c) {
+    u128 local[6];
+    for (u32 index = 0u32; index < 6u32; index = index + 1u32) {
+        local[index] = spread(a + index, b, c ^ index);
+    }
+    struct mixed m;
+    m.tag = a;
+    m.value = local[c % 6u32] * 3u128;
+    m.extra = (u64)b;
+    w_table[a & 3u32] = m.value + local[1];
+    w_volatile = local[2] ^ m.value;
+    u128 *p = &local[b % 6u32];
+    u128 sum = 0u128;
+    for (u32 index = 0u32; index < 6u32; index = index + 1u32) sum = sum + local[index];
+    return fold(sum) ^ fold(*p) * 3u32 ^ fold(m.value) * 5u32 ^
+           fold(w_table[a & 3u32]) * 7u32 ^ fold(w_volatile) * 11u32 ^
+           (u32)m.extra * 13u32 ^ m.tag;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_w_loop(in u32 a, in u32 b, in u32 c) {
+    u128 x = spread(a, b, c);
+    u128 m = 0x2360ed051fc65da44385df649fccf645u128;
+    u128 low = x;
+    u128 best = x;
+    for (u32 index = 0u32; index < (c & 15u32) + 3u32; index = index + 1u32) {
+        x = x * m + 0x5851f42d4c957f2du128;
+        low = x < low ? x : low;
+        if ((i128)x > (i128)best) best = x;
+    }
+    return fold(x) ^ fold(low) * 3u32 ^ fold(best) * 5u32;
+}
+
+[[noinline]]
+static u128 w_private(in u32 p1, in u128 p2, in u64 p3, in u128 p4, in u128 p5,
+                      in u32 p6, in u128 p7) {
+    return p2 * (u128)p1 + p4 - (p5 >> 3u32) + ((u128)p3 << 50u32) +
+           (u128)p6 + (p7 ^ p2);
+}
+
+[[noinline]]
+static i128 w_private_signed(in i128 x, in i8 y, in i128 z) {
+    return x / ((i128)y | 1i128) + z % 1000i128;
+}
+
+[[abi("@ABI@"), noinline]]
+static u128 w_platform(in u32 p1, in u128 p2, in u32 p3, in u128 p4, in u64 p5,
+                       in u128 p6) {
+    return (p2 + p4) * (u128)(p1 | 1u32) - (u128)p3 + ((u128)p5 << 64u32) +
+           (p6 >> 17u32);
+}
+
+[[abi("@ABI@"), noinline]]
+static u128 w_platform_many(in u128 p1, in u128 p2, in u128 p3, in u128 p4,
+                            in u128 p5) {
+    return p1 + p2 * 3u128 + p3 * 5u128 + p4 * 7u128 + p5 * 11u128;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_w_calls(in u32 a, in u32 b, in u32 c) {
+    u128 x = spread(a, b, c);
+    u128 y = spread(c, a, b);
+    u128 r1 = w_private(a, x, ((u64)b << 32u32) | c, y, x ^ y, c, y + 1u128);
+    i128 r2 = w_private_signed((i128)x, (i8)b, (i128)y);
+    u128 r3 = w_platform(b, y, c, x, (u64)a, x * y);
+    u128 r4 = w_platform_many(x, y, x + y, x - y, x * 3u128);
+    return fold(r1) ^ fold((u128)r2) * 3u32 ^ fold(r3) * 5u32 ^ fold(r4) * 7u32;
+}
+
+[[noinline]]
+static u128 w_recurse(in u128 x, in u32 depth) {
+    if (depth == 0u32) return x;
+    return w_recurse(x * 5u128 + (u128)depth, depth - 1u32) ^ (x >> 7u32);
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_w_recursion(in u32 a, in u32 b, in u32 c) {
+    return fold(w_recurse(spread(a, b, c), (c & 7u32) + 1u32));
+}
+
+const u128 w_constants[3] = {
+    0x0123456789abcdeffedcba9876543210u128,
+    (u128)0xffffffffffffffffu64 * 0x10000000000000001u128,
+    (u128)-12345i128 * 1000000007u128,
+};
+
+[[abi("@ABI@"), noinline]]
+global u32 k_w_constants(in u32 a, in u32 b, in u32 c) {
+    const u128 folded = (0xfedcba9876543210u128 << 64u32) / 7u128 +
+                        (u128)(-(i128)99) % 1000u128;
+    u32 index = (a ^ b ^ c) % 3u32;
+    return fold(w_constants[index]) ^ fold(folded) * 3u32 ^
+           fold(w_constants[0] + w_constants[1] + w_constants[2]) * 5u32;
+}

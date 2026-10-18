@@ -275,6 +275,31 @@ pointer. The Cross ABIs are not compatible with the C ABIs. Across calls,
 boundaries, per declaration with `[[abi("n64")]]` or for the whole
 compilation with `-mabi=n64`.
 
+A 128-bit integer has 16-byte alignment under `n64` and `x64`, as GCC's
+`__int128` under n64, and 8-byte alignment under the other ABIs. It travels
+as two 64-bit pieces under `x64` and `n64` and as
+four 32-bit pieces under `x32`, `o32`, and `eabi32`, its most significant
+piece first on big-endian targets and its least significant piece first on
+little-endian ones. `n64` passes it as GCC passes `__int128`: from an even
+argument register (`$4`, `$6`, `$8`, or `$10`), or on the stack from a
+16-byte boundary, and returns it in `v0` and `v1`. `o32` passes it like a
+64-bit integer, from an even argument slot and partly on the stack when the
+slots run out, `eabi32` from an even argument register, and both return it
+in `v0`, `v1`, `a0`, and `a1`. `x32` and `x64` pass it in the next argument
+registers and return it in `v0`, `v1`, `a0`, and `a1` or in `v0` and `v1`.
+Its operations are inline sequences on 64-bit halves, which are word pairs
+before MIPS III; a division or remainder by a divisor other than a power of
+two is a loop of 128 steps, and a conversion from `f32` or `f64` uses only
+integer instructions, so it works on MIPS I too.
+
+`n64` passes a structure or union of any size as GCC does: in the remaining
+argument registers and then on the stack, a 64-bit chunk of a named
+structure that holds an `f64` member in the floating-point register of its
+position and every other chunk, unions and unnamed arguments included, in a
+general register. A structure of one or two floating members returns them
+in `f0` and `f2`, another record of up to 16 bytes returns in `v0` and `v1`,
+and a larger one through a hidden pointer.
+
 `-march=` and `-mtune=` name `cpu` model entries
 ([models.md](models.md#cpu-entries)); `cc --print-cpus` lists the loaded
 entries. `model/mips.xm` ships `generic`, the ISA names `mips1` to `mips5`,
@@ -388,10 +413,10 @@ they keep a NaN operand's payload and raise no exception. `$::fmin` and
 when the first is a NaN, and copy the selected operand.
 
 Supported: integer and pointer operations, 64-bit integers on 32-bit CPUs,
-hard-float `f32` and `f64`, structures and unions by value under every ABI,
-function pointers, variable-length arrays, computed goto, `$::patch` values,
-LL/SC atomics, variadic functions, the machine-instruction built-ins below,
-and naked functions. Not supported: vectors, integers wider than 64 bits,
+128-bit integers, hard-float `f32` and `f64`, structures and unions by value
+under every ABI, function pointers, variable-length arrays, computed goto,
+`$::patch` values, LL/SC atomics, variadic functions, the machine-instruction
+built-ins below, and naked functions. Not supported: vectors,
 register locations outside naked functions, position-independent code
 (`-mabicalls`), thread-local storage, MIPS16, microMIPS, and the Allegrex
 VFPU. They are diagnosed when used. A `[[musttail]]` call passes every
@@ -602,11 +627,13 @@ The inline sequences use neither branches nor data tables:
 
 8- and 16-bit operands use the 32-bit form on their zero-extended value or
 the sequence at their own width, whichever is cheaper. An operand wider than
-a general register (64 bits on MIPS I, MIPS II, MIPS32, and Allegrex, 128
-bits on x86-64) combines its halves: a count of the half on the counted side,
-plus that of the other half when the first is zero, the sum of the halves'
-population counts, and the swapped halves exchanged; a 128-bit rotation uses
-128-bit shifts. Allegrex's `clz`, `clo`, `wsbh`, `wsbw`, `rotr`, and `rotrv`
+a general register (64 and 128 bits on MIPS I, MIPS II, MIPS32, and
+Allegrex, 128 bits on x86-64 and on MIPS III and later) combines its halves:
+a count of the half on the counted side, plus that of the other half when
+the first is zero, the sum of the halves' population counts, and the swapped
+halves exchanged. A 128-bit rotation uses 128-bit shifts on x86-64; on MIPS
+it exchanges the halves when the count modulo 128 is 64 or more and then
+shifts each half, filling it with bits of the other. Allegrex's `clz`, `clo`, `wsbh`, `wsbw`, `rotr`, and `rotrv`
 appear as `.word` directives with the instruction in a comment; its `clz`
 and `clo` are SPECIAL functions 0x16 and 0x17, not the MIPS32 encodings.
 

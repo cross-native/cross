@@ -811,9 +811,170 @@ bool validate_shipped_abis() {
 
 } // namespace
 
+// 128-bit integers under every shipped MIPS ABI, and records under n64,
+// which follows GCC's mips_function_arg and mips_function_value.
+bool validate_mips_wide_values() {
+    const auto* o32 = model_registry().find_abi("mips", "o32", {});
+    const auto* eabi32 = model_registry().find_abi("mips", "eabi32", {});
+    const auto* x32 = model_registry().find_abi("mips", "x32", {});
+    const auto* n64 = model_registry().find_abi("mips", "n64", {});
+    const auto* x64 =
+        model_registry().find_abi("mips", "x64", "mips64-unknown-elf");
+    if (!o32 || !eabi32 || !x32 || !n64 || !x64) return false;
+    const std::array<std::string, 4> features{"mips1", "mips2", "mips3",
+                                              "hard-float"};
+    const auto i32 = scalar(ScalarMode::integer(32));
+    const auto i64 = scalar(ScalarMode::integer(64));
+    const auto f32 = scalar(ScalarMode::floating(32));
+    const auto f64 = scalar(ScalarMode::floating(64));
+    const auto i128 = scalar(ScalarMode::integer(128));
+    const auto all_registers = [](const auto& value,
+                                  std::initializer_list<std::string_view> names) {
+        std::size_t index = 0;
+        for (const auto name : names) {
+            if (!register_is(value, index++, name)) return false;
+        }
+        return value.pieces.size() == names.size();
+    };
+
+    // o32 and eabi32 pass a 128-bit integer like a 64-bit one, in words from
+    // an even slot, and return it in v0, v1, a0, and a1, as x32 does.
+    const auto o32_arguments =
+        classify_call_arguments(*o32, std::array{i32, i128}, features);
+    const auto eabi32_arguments = classify_call_arguments(
+        *eabi32, std::array{i32, i32, i32, i128}, features);
+    const auto x32_arguments =
+        classify_call_arguments(*x32, std::array{i32, i128}, features);
+    for (const auto* abi : {o32, eabi32, x32}) {
+        const auto result = classify_return(*abi, i128, features);
+        if (!result || result.indirect ||
+            !all_registers(result, {"v0", "v1", "a0", "a1"})) {
+            std::cerr << abi->canonical_name << " 128-bit result mismatch\n";
+            return false;
+        }
+    }
+    if (!o32_arguments ||
+        !register_is(o32_arguments.layout.arguments[1], 0, "a2") ||
+        !register_is(o32_arguments.layout.arguments[1], 1, "a3") ||
+        !stack_is(o32_arguments.layout.arguments[1], 2, 16) ||
+        !stack_is(o32_arguments.layout.arguments[1], 3, 20) ||
+        !eabi32_arguments ||
+        !all_registers(eabi32_arguments.layout.arguments[3],
+                       {"t0", "t1", "t2", "t3"}) ||
+        !x32_arguments ||
+        !all_registers(x32_arguments.layout.arguments[1],
+                       {"a1", "a2", "a3", "t0"})) {
+        std::cerr << "32-bit MIPS 128-bit argument mismatch\n";
+        return false;
+    }
+
+    // n64 starts a 128-bit integer at an even register and an even stack
+    // slot and returns it in v0 and v1; x64 does not align it.
+    const auto n64_arguments = classify_call_arguments(
+        *n64, std::array{i32, i128, i64, i64, i64, i64, i64, i128}, features);
+    const auto n64_result = classify_return(*n64, i128, features);
+    const auto x64_arguments =
+        classify_call_arguments(*x64, std::array{i32, i128}, features);
+    if (!n64_arguments ||
+        !all_registers(n64_arguments.layout.arguments[1], {"a2", "a3"}) ||
+        !register_is(n64_arguments.layout.arguments[5], 0, "t3") ||
+        !stack_is(n64_arguments.layout.arguments[6], 0, 0) ||
+        !stack_is(n64_arguments.layout.arguments[7], 0, 16) ||
+        !stack_is(n64_arguments.layout.arguments[7], 1, 24) || !n64_result ||
+        !all_registers(n64_result, {"v0", "v1"}) || !x64_arguments ||
+        !all_registers(x64_arguments.layout.arguments[1], {"a1", "a2"})) {
+        std::cerr << "64-bit MIPS 128-bit integer mismatch\n";
+        return false;
+    }
+
+    // n64 records of any size take the remaining registers and then the
+    // stack; only a chunk with a double member of a structure goes to an FPR.
+    const auto big = aggregate(192, {i64, i64, i64});
+    auto doubles = aggregate(320, {f64, i64, f64, i64, f64});
+    doubles.element_offsets_bits = {0, 64, 128, 192, 256};
+    const auto in_registers =
+        classify_call_arguments(*n64, std::array{big, i64}, features);
+    const auto straddling = classify_call_arguments(
+        *n64, std::array{i64, i64, i64, i64, i64, i64, big, i64},
+        features);
+    const auto mixed =
+        classify_call_arguments(*n64, std::array{i64, doubles}, features);
+    if (!in_registers ||
+        !all_registers(in_registers.layout.arguments[0], {"a0", "a1", "a2"}) ||
+        !register_is(in_registers.layout.arguments[1], 0, "a3") ||
+        !straddling ||
+        !register_is(straddling.layout.arguments[6], 0, "t2") ||
+        !register_is(straddling.layout.arguments[6], 1, "t3") ||
+        !stack_is(straddling.layout.arguments[6], 2, 0) ||
+        !stack_is(straddling.layout.arguments[7], 0, 8) || !mixed ||
+        !all_registers(mixed.layout.arguments[1],
+                       {"f13", "a2", "f15", "t0", "f17"})) {
+        std::cerr << "n64 large record mismatch\n";
+        return false;
+    }
+    auto singles = aggregate(64, {f32, f32});
+    singles.element_offsets_bits = {0, 32};
+    auto single_double = aggregate(128, {f32, f64});
+    single_double.element_offsets_bits = {0, 64};
+    auto double_long = aggregate(128, {f64, i64});
+    double_long.element_offsets_bits = {0, 64};
+    auto both = aggregate(64, {f64, i64});
+    both.union_value = true;
+    both.element_offsets_bits = {0, 0};
+    auto nested = aggregate(128, {aggregate(64, {f64}), i64});
+    nested.element_offsets_bits = {0, 64};
+    const auto shapes = classify_call_arguments(
+        *n64, std::array{singles, single_double, double_long, both, nested},
+        features);
+    // A 16-byte-aligned structure starts at an even register, and its
+    // padding chunk takes a register too.
+    auto quad = aggregate(256, {i64, i128});
+    quad.alignment_bits = 128;
+    quad.element_offsets_bits = {0, 128};
+    const auto aligned =
+        classify_call_arguments(*n64, std::array{i64, quad}, features);
+    if (!aligned || !all_registers(aligned.layout.arguments[1],
+                                   {"a2", "a3", "t0", "t1"})) {
+        std::cerr << "n64 aligned record mismatch\n";
+        return false;
+    }
+    const auto unnamed = classify_variadic_call_arguments(
+        *n64, std::array{i32, double_long}, 1, features);
+    if (!shapes || !register_is(shapes.layout.arguments[0], 0, "a0") ||
+        !all_registers(shapes.layout.arguments[1], {"a1", "f14"}) ||
+        !all_registers(shapes.layout.arguments[2], {"f15", "t0"}) ||
+        !register_is(shapes.layout.arguments[3], 0, "t1") ||
+        !all_registers(shapes.layout.arguments[4], {"t2", "t3"}) || !unnamed ||
+        !all_registers(unnamed.layout.arguments[1], {"a1", "a2"})) {
+        std::cerr << "n64 record member classification mismatch\n";
+        return false;
+    }
+    // Results: one or two floating members in f0 and f2, other records
+    // through 128 bits in v0 and v1, larger ones through memory.
+    const auto singles_result = classify_return(*n64, singles, features);
+    const auto single_double_result =
+        classify_return(*n64, single_double, features);
+    const auto double_long_result = classify_return(*n64, double_long, features);
+    const auto nested_result = classify_return(*n64, nested, features);
+    const auto big_result = classify_return(*n64, big, features);
+    if (!singles_result || !all_registers(singles_result, {"f0", "f2"}) ||
+        !single_double_result ||
+        !all_registers(single_double_result, {"f0", "f2"}) ||
+        !double_long_result || !all_registers(double_long_result, {"v0", "v1"}) ||
+        !nested_result || !all_registers(nested_result, {"v0", "v1"}) ||
+        !big_result || !big_result.indirect) {
+        std::cerr << "n64 record result mismatch\n";
+        return false;
+    }
+    return true;
+}
+
 int main(int argc, char** argv) {
     if (!validate_shipped_abis()) {
         return fail("shipped ABI programs changed behavior");
+    }
+    if (!validate_mips_wide_values()) {
+        return fail("MIPS 128-bit integer or n64 record classification");
     }
     if (argc != 2) return fail("expected one ABI model path");
 

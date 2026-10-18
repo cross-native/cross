@@ -483,6 +483,7 @@ AbiValue abi_value_for(const hir::Module& module, hir::TypeId id,
     const auto& type = module.type(id);
     if (type.kind == hir::Type::Kind::Record && type.record) {
         const auto& record = module.record(*type.record);
+        result.union_value = record.is_union;
         result.elements.reserve(record.members.size());
         result.element_offsets_bits.reserve(record.members.size());
         std::optional<std::pair<std::uint64_t, unsigned>> bit_field_unit;
@@ -1099,8 +1100,27 @@ private:
 
     void create_registers(const mir::ManagedFunction& source) {
         value_registers_.assign(source.values.size(), std::nullopt);
+        wide_registers_.clear();
+        zero_registers_.clear();
         for (const auto& value : source.values) {
             if (!has_result(value)) continue;
+            // A 128-bit integer, which MIR keeps only at ABI boundaries, is
+            // its two 64-bit halves.
+            if (wide_integer(value.type)) {
+                const auto half = [&] {
+                    const machine::VirtualRegisterId id{static_cast<std::uint32_t>(
+                        current_.virtual_registers.size())};
+                    current_.virtual_registers.push_back(machine::i64);
+                    current_.virtual_register_assignments.push_back(std::nullopt);
+                    current_.rematerialized_immediates.push_back(std::nullopt);
+                    current_.virtual_register_classes.push_back(
+                        machine::VirtualRegisterClass::Integer);
+                    return machine::Register::virtual_register(id, machine::i64);
+                };
+                const auto low = half();
+                wide_registers_.emplace(value.id.value, std::pair{low, half()});
+                continue;
+            }
             if (is_aggregate(hir_, value.type) &&
                 type_bits(hir_, value.type) >
                     std::numeric_limits<std::uint16_t>::max()) {
@@ -1346,8 +1366,441 @@ private:
                                                    : unsigned_opcode;
     }
 
+    bool wide_integer(hir::TypeId id) const {
+        const auto& type = hir_.type(id);
+        return type.kind == hir::Type::Kind::Builtin &&
+               (type.builtin == BuiltinType::I128 ||
+                type.builtin == BuiltinType::U128);
+    }
+
+    using WidePair = std::pair<machine::Register, machine::Register>;
+
+    WidePair wide_halves(mir::ValueId id, SourceLocation location) {
+        if (const auto found = wide_registers_.find(id.value);
+            found != wide_registers_.end()) {
+            return found->second;
+        }
+        diagnostics_.error(location,
+                           "MIPS selection met a 128-bit value without halves");
+        const auto stand_in = create_integer_temporary(current_, machine::i64,
+                                                       location, "wide");
+        return {stand_in, stand_in};
+    }
+
+    // A copy that copy propagation removes.
+    machine::Instruction copy_instruction(machine::Register to,
+                                          machine::Register from,
+                                          SourceLocation location) const {
+        return register_instruction(Opcode::Reinterpret, to, {from}, location);
+    }
+
+    machine::Instruction constant_instruction(machine::Register to,
+                                              std::uint64_t bits,
+                                              SourceLocation location) {
+        if (bits == 0) zero_registers_.insert(to.id);
+        auto result = target_instruction(Opcode::Constant, location);
+        result.operands.push_back(immediate_operand(bits, 0, to.mode));
+        result.defs.push_back(to);
+        return result;
+    }
+
+    machine::Instruction register_instruction(
+        machine::TargetOpcodeId opcode, machine::Register to,
+        std::initializer_list<machine::Register> from,
+        SourceLocation location) const {
+        auto result = target_instruction(opcode, location);
+        for (const auto source : from) {
+            result.operands.push_back(register_operand(source));
+            result.uses.push_back(source);
+        }
+        result.defs.push_back(to);
+        return result;
+    }
+
+    machine::Instruction shift_instruction(machine::TargetOpcodeId opcode,
+                                           machine::Register to,
+                                           machine::Register from,
+                                           unsigned amount,
+                                           SourceLocation location) const {
+        auto result = target_instruction(opcode, location);
+        result.operands = {register_operand(from),
+                           immediate_operand(amount, 0, machine::i32)};
+        result.uses = {from};
+        result.defs = {to};
+        return result;
+    }
+
+    // The value bits of one ABI piece of a 128-bit value, from its halves.
+    machine::Register wide_piece(const WidePair& halves, const ValuePiece& piece,
+                                 SourceLocation location,
+                                 std::vector<machine::Instruction>& code) {
+        const auto offset = effective_piece_offset(
+            piece, 128, subtarget_.target().data_layout.byte_order);
+        if (piece.value_bits == 0 || piece.value_bits > 64 ||
+            offset % 64 + piece.value_bits > 64) {
+            diagnostics_.error(location,
+                               "MIPS carries a 128-bit integer only in pieces "
+                               "within its 64-bit halves");
+            return halves.first;
+        }
+        auto source = offset < 64 ? halves.first : halves.second;
+        if (offset % 64 != 0) {
+            const auto shifted = create_integer_temporary(
+                current_, machine::i64, location, "wide.piece");
+            code.push_back(shift_instruction(Opcode::ShrU, shifted, source,
+                                             offset % 64, location));
+            source = shifted;
+        }
+        if (piece.value_bits == 64) return source;
+        const auto narrow = create_integer_temporary(
+            current_, {piece.value_bits}, location, "wide.piece");
+        code.push_back(register_instruction(Opcode::Trunc, narrow, {source},
+                                            location));
+        return narrow;
+    }
+
+    // The halves of a 128-bit value from registers holding its ABI pieces.
+    void compose_wide(const WidePair& halves,
+                      const std::vector<std::pair<machine::Register,
+                                                  const ValuePiece*>>& pieces,
+                      SourceLocation location,
+                      std::vector<machine::Instruction>& code) {
+        const auto order = subtarget_.target().data_layout.byte_order;
+        for (const unsigned half : {0U, 1U}) {
+            const auto target = half == 0 ? halves.first : halves.second;
+            std::optional<machine::Register> value;
+            for (const auto& [source, piece] : pieces) {
+                const auto offset = effective_piece_offset(*piece, 128, order);
+                if (offset / 64 != half) continue;
+                auto part = source;
+                if (part.mode.bits != 64) {
+                    const auto wide = create_integer_temporary(
+                        current_, machine::i64, location, "wide.part");
+                    code.push_back(register_instruction(Opcode::Zext, wide,
+                                                        {part}, location));
+                    part = wide;
+                }
+                if (offset % 64 != 0) {
+                    const auto shifted = create_integer_temporary(
+                        current_, machine::i64, location, "wide.part");
+                    code.push_back(shift_instruction(Opcode::Shl, shifted, part,
+                                                     offset % 64, location));
+                    part = shifted;
+                }
+                if (value) {
+                    const auto merged = create_integer_temporary(
+                        current_, machine::i64, location, "wide.part");
+                    code.push_back(register_instruction(Opcode::Or, merged,
+                                                        {*value, part}, location));
+                    part = merged;
+                }
+                value = part;
+            }
+            code.push_back(value ? copy_instruction(target, *value, location)
+                                 : constant_instruction(target, 0, location));
+        }
+    }
+
+    // Whether a transport of a 128-bit integer has direct pieces only.
+    bool direct_wide_pieces(const std::vector<ValuePiece>& pieces, bool indirect,
+                            SourceLocation location) {
+        if (!indirect && pieces.size() >= 2) return true;
+        diagnostics_.error(location,
+                           "MIPS passes and returns 128-bit integers only as "
+                           "register or stack pieces");
+        return false;
+    }
+
+    // A call with 128-bit arguments or result passes each such argument as
+    // one operand per ABI piece and defines one register per result piece,
+    // from which the result's halves are composed after the call.
+    void lower_wide_call(const mir::ManagedValue& value,
+                         machine::Instruction& call) {
+        const auto location = value.location;
+        const auto site = classify_call_site(hir_, subtarget_, options_, call);
+        if (!site || site->second.call.arguments.size() !=
+                         value.call_arguments.size()) {
+            diagnostics_.error(location,
+                               "MIPS cannot classify a call with 128-bit "
+                               "integers");
+            return;
+        }
+        const auto& layout = site->second;
+        std::vector<machine::Operand> operands{call.operands.front()};
+        std::vector<std::uint16_t> counts;
+        std::vector<machine::Instruction> code;
+        for (std::size_t index = 0; index < value.call_arguments.size(); ++index) {
+            const auto& argument = value.call_arguments[index];
+            const auto& operand = call.operands[index + 1];
+            if (!argument.value ||
+                !wide_integer(source_->values[argument.value->value].type)) {
+                operands.push_back(operand);
+                counts.push_back(1);
+                continue;
+            }
+            const auto& assignment = layout.call.arguments[index];
+            if (!direct_wide_pieces(assignment.pieces, assignment.indirect,
+                                    location)) {
+                return;
+            }
+            const auto halves = wide_halves(*argument.value, location);
+            for (const auto& piece : assignment.pieces) {
+                operands.push_back(
+                    register_operand(wide_piece(halves, piece, location, code)));
+            }
+            counts.push_back(static_cast<std::uint16_t>(assignment.pieces.size()));
+        }
+        call.operands = std::move(operands);
+        call.uses.clear();
+        for (const auto& operand : call.operands) {
+            if (const auto* source = std::get_if<machine::RegisterOperand>(&operand))
+                call.uses.push_back(source->value);
+        }
+        call.call_argument_pieces = std::move(counts);
+        for (auto& instruction : code) prelude_.push_back(std::move(instruction));
+        if (!has_result(value)) return;
+        if (!wide_integer(value.type)) {
+            call.defs.push_back(reg(value.id));
+            return;
+        }
+        if (layout.results.size() != 1 ||
+            !direct_wide_pieces(layout.results.front().pieces,
+                                layout.results.front().indirect, location)) {
+            return;
+        }
+        std::vector<std::pair<machine::Register, const ValuePiece*>> pieces;
+        for (const auto& piece : layout.results.front().pieces) {
+            const auto target = create_integer_temporary(
+                current_, {piece.value_bits}, location, "call.result.piece");
+            call.defs.push_back(target);
+            pieces.emplace_back(target, &piece);
+        }
+        call.result_composition = machine::ResultComposition::Pieces;
+        std::vector<machine::Instruction> composition;
+        compose_wide(wide_halves(value.id, location), pieces, location,
+                     composition);
+        for (auto& instruction : composition)
+            postlude_.push_back(std::move(instruction));
+    }
+
+    // An ABI boundary or one of the forms that join and split 128-bit values
+    // around it: everything else MIR has split into halves.
+    machine::Instruction lower_wide(const mir::ManagedValue& value) {
+        using mir::ValueKind;
+        std::vector<machine::Instruction> code;
+        const auto location = value.location;
+        const auto halves = [&](mir::ValueId id) { return wide_halves(id, location); };
+        const auto unexpanded = [&] {
+            diagnostics_.error(location,
+                               "MIPS selection met an unexpanded 128-bit integer "
+                               "operation");
+        };
+        switch (value.kind) {
+        case ValueKind::Parameter: {
+            const auto layout = own_interface_layout(current_);
+            const auto* assignment =
+                layout && value.parameter_index < layout->call.arguments.size()
+                    ? &layout->call.arguments[value.parameter_index]
+                    : nullptr;
+            if (!assignment ||
+                !direct_wide_pieces(assignment->pieces, assignment->indirect,
+                                    location)) {
+                break;
+            }
+            std::vector<std::pair<machine::Register, const ValuePiece*>> pieces;
+            for (const auto& piece : assignment->pieces) {
+                const auto target = create_integer_temporary(
+                    current_, {piece.value_bits}, location, "parameter.piece");
+                auto capture = target_instruction(Opcode::Parameter, location);
+                capture.operands.push_back(immediate_operand(
+                    value.parameter_index, 0, machine::i32));
+                capture.defs.push_back(target);
+                capture.input_projection = machine::ValueProjection{
+                    static_cast<std::uint16_t>(effective_piece_offset(
+                        piece, 128, subtarget_.target().data_layout.byte_order)),
+                    piece.value_bits};
+                code.push_back(std::move(capture));
+                pieces.emplace_back(target, &piece);
+            }
+            compose_wide(halves(value.id), pieces, location, code);
+            break;
+        }
+        case ValueKind::ConstantInteger: {
+            const auto [low, high] = halves(value.id);
+            code.push_back(constant_instruction(low, value.integer, location));
+            code.push_back(constant_instruction(high, value.integer_high, location));
+            break;
+        }
+        case ValueKind::Cast: {
+            const auto source_id = value.operands.front();
+            const bool from_wide = wide_integer(source_->values[source_id.value].type);
+            if (value.cast == mir::CastOperation::Truncate && from_wide) {
+                const auto low = halves(source_id).first;
+                const auto target = reg(value.id);
+                code.push_back(target.mode.bits == 64
+                                   ? copy_instruction(target, low, location)
+                                   : register_instruction(Opcode::Trunc, target,
+                                                          {low}, location));
+            } else if (value.cast == mir::CastOperation::Reinterpret && from_wide) {
+                const auto [low, high] = halves(source_id);
+                const auto [to_low, to_high] = halves(value.id);
+                code.push_back(copy_instruction(to_low, low, location));
+                code.push_back(copy_instruction(to_high, high, location));
+            } else if ((value.cast == mir::CastOperation::ZeroExtend ||
+                        value.cast == mir::CastOperation::SignExtend) &&
+                       !from_wide) {
+                const auto source = reg(source_id);
+                const auto [low, high] = halves(value.id);
+                const bool sign = value.cast == mir::CastOperation::SignExtend;
+                code.push_back(source.mode.bits == 64
+                                   ? copy_instruction(low, source, location)
+                                   : register_instruction(sign ? Opcode::Sext
+                                                               : Opcode::Zext,
+                                                          low, {source}, location));
+                code.push_back(sign ? shift_instruction(Opcode::ShrS, high, low, 63,
+                                                        location)
+                                    : constant_instruction(high, 0, location));
+            } else {
+                unexpanded();
+            }
+            break;
+        }
+        case ValueKind::Binary: {
+            const auto [left_low, left_high] = halves(value.operands[0]);
+            const auto [low, high] = halves(value.id);
+            if (value.binary == mir::BinaryOperation::BitAnd ||
+                value.binary == mir::BinaryOperation::BitOr ||
+                value.binary == mir::BinaryOperation::BitXor) {
+                const auto [right_low, right_high] = halves(value.operands[1]);
+                const auto opcode = integer_binary_opcode(value.binary);
+                // A zero half, as joining halves makes, needs no operation.
+                const auto half = [&](machine::Register target,
+                                      machine::Register left,
+                                      machine::Register right) {
+                    const bool left_zero = zero_registers_.contains(left.id);
+                    const bool right_zero = zero_registers_.contains(right.id);
+                    if ((left_zero || right_zero) &&
+                        value.binary == mir::BinaryOperation::BitAnd) {
+                        code.push_back(constant_instruction(target, 0, location));
+                    } else if (left_zero || right_zero) {
+                        code.push_back(copy_instruction(
+                            target, left_zero ? right : left, location));
+                    } else {
+                        code.push_back(register_instruction(
+                            opcode, target, {left, right}, location));
+                    }
+                };
+                half(low, left_low, right_low);
+                half(high, left_high, right_high);
+                break;
+            }
+            const auto& count = source_->values[value.operands[1].value];
+            if (count.kind != ValueKind::ConstantInteger ||
+                (value.binary != mir::BinaryOperation::ShiftLeft &&
+                 value.binary != mir::BinaryOperation::ShiftRightLogical &&
+                 value.binary != mir::BinaryOperation::ShiftRightArithmetic)) {
+                unexpanded();
+                break;
+            }
+            const auto amount = static_cast<unsigned>(count.integer % 128U);
+            const bool left = value.binary == mir::BinaryOperation::ShiftLeft;
+            const auto opcode = left ? Opcode::Shl
+                : value.binary == mir::BinaryOperation::ShiftRightLogical
+                    ? Opcode::ShrU : Opcode::ShrS;
+            // The half that keeps bits, and the one they leave.
+            const auto from = left ? left_low : left_high;
+            const auto other = left ? left_high : left_low;
+            const auto near = left ? high : low;
+            const auto far = left ? low : high;
+            if (amount == 0) {
+                code.push_back(copy_instruction(low, left_low, location));
+                code.push_back(copy_instruction(high, left_high, location));
+            } else if (amount >= 64) {
+                code.push_back(amount == 64
+                                   ? copy_instruction(near, from, location)
+                                   : shift_instruction(opcode, near, from,
+                                                       amount - 64, location));
+                code.push_back(opcode == Opcode::ShrS
+                                   ? shift_instruction(Opcode::ShrS, far, from, 63,
+                                                       location)
+                                   : constant_instruction(far, 0, location));
+            } else {
+                const auto moved = create_integer_temporary(
+                    current_, machine::i64, location, "wide.shift");
+                const auto kept = create_integer_temporary(
+                    current_, machine::i64, location, "wide.shift");
+                code.push_back(shift_instruction(left ? Opcode::ShrU : Opcode::Shl,
+                                                 moved, from, 64 - amount,
+                                                 location));
+                code.push_back(shift_instruction(left ? Opcode::Shl : Opcode::ShrU,
+                                                 kept, other, amount, location));
+                code.push_back(register_instruction(Opcode::Or, near,
+                                                    {kept, moved}, location));
+                code.push_back(shift_instruction(opcode, far, from, amount,
+                                                 location));
+            }
+            break;
+        }
+        case ValueKind::Phi:
+            for (const bool high : {false, true}) {
+                auto result = target_instruction(Opcode::Phi, location);
+                for (const auto& incoming : value.incoming) {
+                    const auto pair = halves(incoming.value);
+                    const auto source = high ? pair.second : pair.first;
+                    result.operands.push_back(
+                        block_operand({incoming.predecessor.value}));
+                    result.operands.push_back(register_operand(source));
+                    result.uses.push_back(source);
+                }
+                const auto target = halves(value.id);
+                result.defs.push_back(high ? target.second : target.first);
+                code.push_back(std::move(result));
+            }
+            break;
+        case ValueKind::Select: {
+            const auto condition = reg(value.operands[0]);
+            const auto truth = halves(value.operands[1]);
+            const auto falsity = halves(value.operands[2]);
+            const auto target = halves(value.id);
+            code.push_back(register_instruction(Opcode::Select, target.first,
+                                                {condition, truth.first,
+                                                 falsity.first},
+                                                location));
+            code.push_back(register_instruction(Opcode::Select, target.second,
+                                                {condition, truth.second,
+                                                 falsity.second},
+                                                location));
+            break;
+        }
+        default:
+            unexpanded();
+            break;
+        }
+        if (code.empty()) {
+            auto invalid = target_instruction(Opcode::Invalid, location);
+            return invalid;
+        }
+        for (std::size_t index = 0; index + 1 < code.size(); ++index)
+            prelude_.push_back(std::move(code[index]));
+        return std::move(code.back());
+    }
+
     machine::Instruction lower_value(const mir::ManagedValue& value) {
         using mir::ValueKind;
+        if (value.kind != ValueKind::Call &&
+            (wide_integer(value.type) ||
+             std::any_of(value.operands.begin(), value.operands.end(),
+                         [&](mir::ValueId operand) {
+                             return wide_integer(
+                                 source_->values[operand.value].type);
+                         }) ||
+             std::any_of(value.incoming.begin(), value.incoming.end(),
+                         [&](const mir::PhiIncoming& incoming) {
+                             return wide_integer(
+                                 source_->values[incoming.value.value].type);
+                         }))) {
+            return lower_wide(value);
+        }
         const bool aggregate_load = is_aggregate(hir_, value.type) &&
                                     (value.kind == ValueKind::Load ||
                                      value.kind == ValueKind::PointerLoad ||
@@ -1752,9 +2205,16 @@ private:
             // MIR keeps in a cell for its manual location, in a register.
             const bool naked_callee =
                 value.callee && hir_.function(*value.callee).naked;
+            const auto wide_argument = [&](const mir::CallArgument& argument) {
+                return argument.value &&
+                       wide_integer(source_->values[argument.value->value].type);
+            };
             for (const auto& argument : value.call_arguments) {
                 result.call_argument_types.push_back(argument.type);
-                if (argument.value) {
+                if (wide_argument(argument)) {
+                    // Its pieces follow once the call is classified.
+                    result.operands.push_back(immediate_operand(0, 0, machine::i64));
+                } else if (argument.value) {
                     const auto source = reg(*argument.value);
                     result.operands.push_back(register_operand(source));
                     result.uses.push_back(source);
@@ -1769,7 +2229,15 @@ private:
                         {static_cast<std::uint16_t>(hir_.address_bits)}));
                 }
             }
-            if (has_result(value)) result.defs.push_back(reg(value.id));
+            const bool wide_result =
+                has_result(value) && wide_integer(value.type);
+            if (wide_result ||
+                std::any_of(value.call_arguments.begin(),
+                            value.call_arguments.end(), wide_argument)) {
+                lower_wide_call(value, result);
+            } else if (has_result(value)) {
+                result.defs.push_back(reg(value.id));
+            }
             // A data base's register holds its base across every call, and
             // writes to $zero are discarded.
             const auto append_clobbers =
@@ -2165,6 +2633,29 @@ private:
         switch (terminator.kind) {
         case mir::TerminatorKind::Return:
             result.kind = machine::InstructionKind::Return;
+            if (terminator.value &&
+                wide_integer(source_->values[terminator.value->value].type)) {
+                // One value per ABI piece, from the halves.
+                const auto layout = own_interface_layout(current_);
+                if (!layout || layout->results.size() != 1 ||
+                    !direct_wide_pieces(layout->results.front().pieces,
+                                        layout->results.front().indirect,
+                                        terminator.location)) {
+                    break;
+                }
+                const auto halves =
+                    wide_halves(*terminator.value, terminator.location);
+                std::vector<machine::Instruction> code;
+                for (const auto& piece : layout->results.front().pieces) {
+                    const auto source =
+                        wide_piece(halves, piece, terminator.location, code);
+                    result.operands.push_back(register_operand(source));
+                    result.uses.push_back(source);
+                }
+                result.result_composition = machine::ResultComposition::Pieces;
+                for (auto& instruction : code) prelude_.push_back(std::move(instruction));
+                break;
+            }
             if (terminator.value) {
                 auto source_id = *terminator.value;
                 const auto& returned = source_->values[source_id.value];
@@ -2275,8 +2766,19 @@ private:
                 }
                 instruction.inline_site = managed_value.inline_site;
                 target.instructions.push_back(std::move(instruction));
+                for (auto& after : postlude_) {
+                    after.inline_site = managed_value.inline_site;
+                    target.instructions.push_back(std::move(after));
+                }
+                postlude_.clear();
             }
-            target.instructions.push_back(lower_terminator(block.terminator));
+            auto terminator = lower_terminator(block.terminator);
+            for (auto& before : prelude_) {
+                before.inline_site = block.terminator.inline_site;
+                target.instructions.push_back(std::move(before));
+            }
+            prelude_.clear();
+            target.instructions.push_back(std::move(terminator));
             target.instructions.back().inline_site = block.terminator.inline_site;
             current_.blocks.push_back(std::move(target));
             current_.layout.push_back({block.id.value});
@@ -5001,7 +5503,7 @@ private:
                     std::get_if<machine::ImmediateOperand>(
                         &parameter.operands.front());
                 const auto source = parameter.defs.front();
-                if (!parameter_index ||
+                if (!parameter_index || parameter.input_projection ||
                     parameter_index->value >= entity.parameters.size() ||
                     entity.parameters[parameter_index->value].mode !=
                         ParameterMode::In ||
@@ -9722,6 +10224,10 @@ private:
     machine::Function current_;
     const mir::ManagedFunction* source_{};
     std::vector<std::optional<machine::VirtualRegisterId>> value_registers_;
+    // The low and high halves of each 128-bit value, and the halves that
+    // selection defined as zero.
+    std::unordered_map<std::uint32_t, WidePair> wide_registers_;
+    std::unordered_set<std::uint32_t> zero_registers_;
     std::unordered_map<std::uint32_t,
                        std::vector<machine::PhysicalRegisterId>>
         private_clobbers_;
@@ -9733,8 +10239,10 @@ private:
     bool scratch_colors_{};
     // The function's values may take odd FPRs (permits_odd_fpr_colors).
     bool odd_fpr_colors_{};
-    // Instructions that the instruction being selected needs before it.
+    // Instructions that the instruction being selected needs before it,
+    // and after it.
     std::vector<machine::Instruction> prelude_;
+    std::vector<machine::Instruction> postlude_;
     // Speed-goal load-latency schedules; see schedule_instructions.
     bool latency_schedules_{};
     bool ordered_stores_{};
@@ -11549,6 +12057,23 @@ private:
         const auto bits = pointer
             ? hir_.address_bits
             : type_bits(hir_, entity.parameters[index].type);
+        // A 128-bit parameter's captures each move one piece.
+        if (bits > 64) {
+            for (const auto& block : function.blocks) {
+                for (const auto& instruction : block.instructions) {
+                    const auto* operand = instruction.opcode == Opcode::Parameter &&
+                            !instruction.operands.empty()
+                        ? std::get_if<machine::ImmediateOperand>(
+                              &instruction.operands.front())
+                        : nullptr;
+                    if (operand && operand->value == index &&
+                        !instruction.input_projection) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
         return assignment.pieces.size() == 1 ||
             (subtarget_.has_feature(Feature::Mips3) && bits <= 64);
     }

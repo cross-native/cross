@@ -1141,7 +1141,9 @@ int cc_main(int argc, char** argv) {
     program.evaluation_layout = {
         target->data_layout.byte_order == ByteOrder::Big
             ? EvaluationByteOrder::Big : EvaluationByteOrder::Little,
-        target->data_layout.natural_alignment_limit,
+        subtarget->abi_info().natural_alignment_limit != 0
+            ? subtarget->abi_info().natural_alignment_limit
+            : target->data_layout.natural_alignment_limit,
         target->data_layout.f80_storage_bytes,
         target->data_layout.f80_alignment,
         target->data_layout.code_addresses,

@@ -1469,6 +1469,8 @@ private:
             {"array", AbiValueKind::Array},
             {"vector", AbiValueKind::Vector},
             {"zero", AbiValueKind::Zero},
+            {"structure", AbiValueKind::Structure},
+            {"union", AbiValueKind::Union},
         };
         const auto found = std::find_if(
             std::begin(kinds), std::end(kinds),
@@ -1526,6 +1528,7 @@ private:
                  "llvm_calling_convention", "gcc_calling_attribute",
                  "compilation_selectable", "function_selectable",
                  "elf_abi_tag", "features", "private_carrier_bits",
+                 "natural_alignment_limit",
                  "call_clobbers", "argument_register_failure",
                  "result_register_failure", "stack_layout",
                  "argument_stack_base", "stack_alignment",
@@ -1611,6 +1614,14 @@ private:
                 return std::nullopt;
             }
             result.private_carrier_bits = *value;
+        }
+        if (const auto value =
+                unsigned_property(properties, "natural_alignment_limit")) {
+            if (*value == 0 || (*value & (*value - 1U)) != 0) {
+                fail(line, "ABI natural_alignment_limit must be a power of two");
+                return std::nullopt;
+            }
+            result.natural_alignment_limit = *value;
         }
         if (const auto value = list_property(properties, "call_clobbers")) {
             result.call_clobbers = *value;
@@ -1791,7 +1802,8 @@ private:
                      "argument_limit", "requires_unused_banks",
                      "stack_alignment", "stack_size", "applies_to",
                      "register_failure", "requires_features",
-                     "forbids_features", "merge_banks",
+                     "forbids_features", "merge_banks", "member_banks",
+                     "members", "padding_bank",
                      "require_natural_alignment"})) {
                 return std::nullopt;
             }
@@ -1889,6 +1901,24 @@ private:
             if (const auto value =
                     list_property(block.properties, "merge_banks")) {
                 rule.merge_banks = *value;
+            }
+            if (const auto value =
+                    list_property(block.properties, "member_banks")) {
+                rule.member_banks = *value;
+            }
+            rule.padding_bank =
+                text_property(block.properties, "padding_bank").value_or("");
+            if (const auto value =
+                    text_property(block.properties, "members")) {
+                if (*value == "only") {
+                    rule.members = AbiMemberScope::Only;
+                } else if (*value == "none") {
+                    rule.members = AbiMemberScope::None;
+                } else if (*value != "any") {
+                    fail(block.line,
+                         "ABI rule members must be 'any', 'only', or 'none'");
+                    return std::nullopt;
+                }
             }
             if (const auto value = bool_property(
                     block.properties, "require_natural_alignment")) {
@@ -2168,8 +2198,13 @@ private:
         for (std::size_t index = 0; index < abi.variadic_states.size();
              ++index) {
             const auto& state = abi.variadic_states[index];
+            auto data_layout = target.data_layout;
+            if (abi.natural_alignment_limit != 0) {
+                data_layout.natural_alignment_limit =
+                    abi.natural_alignment_limit;
+            }
             const auto layout = variadic_state_layout(
-                state.type, abi.address_bits, target.data_layout);
+                state.type, abi.address_bits, data_layout);
             if (!layout) {
                 fail(blocks.variadic_states[index].line,
                      "ABI variadic-state type '" + state.type +
@@ -2396,7 +2431,7 @@ private:
                                              "or bank register_bits");
                 return false;
             }
-            if ((!rule.merge_banks.empty() ||
+            if ((!rule.merge_banks.empty() || !rule.member_banks.empty() ||
                  rule.require_natural_alignment) &&
                 rule.action != AbiRuleAction::Flatten) {
                 fail(rule_line,
@@ -2404,9 +2439,34 @@ private:
                          " uses flatten-only merge/alignment properties");
                 return false;
             }
+            std::unordered_set<std::string_view> member_names;
+            for (const auto& member_name : rule.member_banks) {
+                if (member_name.empty() ||
+                    std::none_of(abi.banks.begin(), abi.banks.end(),
+                                 [&](const AbiRegisterBank& candidate) {
+                                     return candidate.canonical_name ==
+                                            member_name;
+                                 }) ||
+                    !member_names.insert(member_name).second) {
+                    fail(rule_line, rule_model + " has an empty, duplicate, "
+                                                 "or unknown member bank");
+                    return false;
+                }
+            }
             if (!rule.merge_banks.empty() && rule.unit_bits == 0) {
                 fail(rule_line, rule_model + " requires nonzero unit_bits "
                                              "when merge_banks is present");
+                return false;
+            }
+            if (!rule.padding_bank.empty() &&
+                (rule.merge_banks.empty() ||
+                 std::none_of(abi.banks.begin(), abi.banks.end(),
+                              [&](const AbiRegisterBank& candidate) {
+                                  return candidate.canonical_name ==
+                                         rule.padding_bank;
+                              }))) {
+                fail(rule_line, rule_model + " names a padding bank without "
+                                             "merge_banks or an unknown one");
                 return false;
             }
             std::unordered_set<std::string_view> merge_names;
@@ -2438,7 +2498,7 @@ private:
             }
             if ((rule.cursor_alignment != 1 || rule.cursor_alignment_value ||
                  rule.cursor_advance != 0) &&
-                !needs_bank) {
+                !needs_bank && rule.action != AbiRuleAction::Flatten) {
                 fail(rule_line, rule_model + " uses cursor policy without a "
                                              "register bank");
                 return false;

@@ -220,6 +220,7 @@ std::optional<AbiValue> abi_value(const hir::Module& module,
         const auto& record = module.record(*item.record);
         result.mode = ScalarMode::aggregate(
             static_cast<std::uint16_t>(bits));
+        result.union_value = record.is_union;
         result.elements.reserve(record.members.size());
         result.element_offsets_bits.reserve(record.members.size());
         std::optional<std::pair<std::uint64_t, unsigned>> bit_field_unit;

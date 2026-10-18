@@ -201,6 +201,110 @@ abi "a" {
     rule "integer" { match = ["integer"]; action = "direct"; bank = "integer"; }
 }
 ]=])
+# Member properties of rules.
+expect_rejected(abi-member-banks-coerce 7
+    "ABI model 'a' rule 'records' uses flatten-only merge/alignment properties" [=[
+abi "a" {
+    architecture = "x86-64";
+    address_bits = 64;
+    stack_alignment = 16;
+    stack_slot_bytes = 8;
+    bank "integer" { class = "integer"; register_bits = 64; arguments = ["rdi"]; results = ["rax"]; }
+    rule "records" {
+        match = ["structure"];
+        action = "coerce";
+        bank = "integer";
+        member_banks = ["integer"];
+    }
+}
+]=])
+expect_rejected(abi-member-bank 7
+    "ABI model 'a' rule 'records' has an empty, duplicate, or unknown member bank" [=[
+abi "a" {
+    architecture = "x86-64";
+    address_bits = 64;
+    stack_alignment = 16;
+    stack_slot_bytes = 8;
+    bank "integer" { class = "integer"; register_bits = 64; arguments = ["rdi"]; results = ["rax"]; }
+    rule "records" {
+        match = ["structure"];
+        action = "flatten";
+        member_banks = ["simd"];
+    }
+}
+]=])
+expect_rejected(abi-members 7 "ABI rule members must be 'any', 'only', or 'none'" [=[
+abi "a" {
+    architecture = "x86-64";
+    address_bits = 64;
+    stack_alignment = 16;
+    stack_slot_bytes = 8;
+    bank "integer" { class = "integer"; register_bits = 64; arguments = ["rdi"]; results = ["rax"]; }
+    rule "records" {
+        match = ["union"];
+        action = "flatten";
+        members = "nested";
+    }
+}
+]=])
+expect_rejected(abi-padding-bank 7
+    "ABI model 'a' rule 'records' names a padding bank without merge_banks or an unknown one" [=[
+abi "a" {
+    architecture = "x86-64";
+    address_bits = 64;
+    stack_alignment = 16;
+    stack_slot_bytes = 8;
+    bank "integer" { class = "integer"; register_bits = 64; arguments = ["rdi"]; results = ["rax"]; }
+    rule "records" {
+        match = ["structure"];
+        action = "flatten";
+        padding_bank = "integer";
+    }
+}
+]=])
+expect_rejected(abi-alignment-limit 1
+    "ABI natural_alignment_limit must be a power of two" [=[
+abi "a" {
+    architecture = "x86-64";
+    address_bits = 64;
+    natural_alignment_limit = 12;
+    stack_alignment = 16;
+    stack_slot_bytes = 8;
+    bank "integer" { class = "integer"; register_bits = 64; arguments = ["rdi"]; results = ["rax"]; }
+    rule "integer" { match = ["integer"]; action = "direct"; bank = "integer"; }
+}
+]=])
+expect_accepted(abi-member-rules [=[
+abi "a" {
+    architecture = "x86-64";
+    address_bits = 64;
+    stack_alignment = 16;
+    stack_slot_bytes = 8;
+    bank "integer" { class = "integer"; register_bits = 64; arguments = ["rdi", "rsi"]; results = ["rax", "rdx"]; }
+    rule "members" {
+        match = ["union", "array"];
+        action = "coerce";
+        bank = "integer";
+        members = "only";
+    }
+    rule "records" {
+        match = ["structure"];
+        action = "flatten";
+        max_elements = 2;
+        member_banks = ["integer"];
+        cursor_alignment = "value";
+        members = "none";
+    }
+    rule "chunks" {
+        match = ["aggregate"];
+        action = "flatten";
+        unit_bits = 64;
+        merge_banks = ["integer"];
+        padding_bank = "integer";
+    }
+    rule "integer" { match = ["integer"]; action = "direct"; bank = "integer"; }
+}
+]=])
 expect_rejected(abi-feature 7
     "ABI model 'a' rule 'integer' names unknown x86-64 feature 'avx-typo'" [=[
 abi "a" {

@@ -78,6 +78,14 @@ canonicalize_bitwise_operations(ManagedFunction& function,
                                         const hir::Module& hir_module,
                                         const Subtarget& subtarget);
 
+// Splits each integer twice as wide as the target's `selected_integer_bits`
+// into operations on its two halves, as inline sequences: division and
+// remainder become a loop. Parameters and call results stay wide and are
+// split after their definitions, and call arguments and returned values are
+// joined before their uses, so only those boundary forms stay wide.
+bool expand_wide_integers(ManagedFunction& function, hir::Module& hir_module,
+                          const Subtarget& subtarget, Diagnostics& diagnostics);
+
 // Value replacements collected by one sweep and applied to every use at once,
 // instead of rescanning the function per replaced value. Chains resolve to
 // their final value. A sweep that inspects operands rewrites each value with
