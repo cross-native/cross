@@ -4,12 +4,15 @@
 
 #include "target/target.hpp"
 
+#include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace cross {
@@ -146,12 +149,156 @@ struct DebugEntry {
     bool types{true};
 };
 
-// One `instruction` block of a cpu entry.
+// One `instruction` block of a cpu entry. `instruction` is valid once the
+// loaded models are complete.
 struct CpuInstructionEntry {
+    std::string name;
+    unsigned line{};
     InstructionCostId instruction;
     std::optional<unsigned> latency;
     std::optional<unsigned> issue;
     std::optional<bool> available;
+};
+
+// An operand of an `instruction` entry: a named operand of a target
+// operand type, or a literal register.
+struct ModelOperand {
+    std::string spelling;  // as the entry lists it
+    std::string name;      // empty for a literal register
+    std::string type_name;
+    OperandType type;
+    std::optional<std::int64_t> default_value;
+    std::optional<unsigned> default_operand;
+    unsigned literal_number{};
+};
+
+// A term of an encoding field or a constraint: an operand's value, or the
+// base (part 1) or offset (part 2) of a memory operand.
+struct ModelTerm {
+    unsigned operand{};
+    unsigned part{};
+    bool negative{};
+};
+
+// A field of an instruction word: the sum of its terms and constant, or a
+// register's number, from bit `low` of that value up, at bit `shift`.
+struct ModelField {
+    unsigned shift{};
+    unsigned width{};
+    std::vector<ModelTerm> terms;
+    std::int64_t constant{};
+    unsigned low{};
+    std::optional<unsigned> register_number;
+    std::string_view register_class{};
+};
+
+// An item of `reads` or `writes`.
+struct ModelEffect {
+    enum class Kind : std::uint8_t { Operand, Register, Resource };
+    Kind kind{};
+    unsigned operand{};
+    std::string name;  // the register or resource
+};
+
+// A line of `expands` or `otherwise`: an instruction and its operands,
+// each an operand of the macro entry, its negation, or a register.
+struct ModelExpansion {
+    struct Operand {
+        enum class Kind : std::uint8_t { Operand, Negated, Register };
+        Kind kind{};
+        unsigned operand{};
+        std::string register_name;
+        unsigned register_number{};
+    };
+    std::string mnemonic;
+    std::vector<Operand> operands;
+    // The entry it emits, once the table is complete.
+    std::size_t entry{};
+};
+
+struct ModelConstraint {
+    enum class Comparison : std::uint8_t {
+        LessEqual, Less, GreaterEqual, Greater, Equal, NotEqual,
+    };
+    std::vector<ModelTerm> terms;
+    std::int64_t constant{};
+    Comparison comparison{};
+    std::int64_t bound{};
+    std::string text;
+
+    // Whether `sum`, of the terms and the constant, satisfies the constraint.
+    [[nodiscard]] bool holds(std::int64_t sum) const {
+        switch (comparison) {
+        case Comparison::LessEqual: return sum <= bound;
+        case Comparison::Less: return sum < bound;
+        case Comparison::GreaterEqual: return sum >= bound;
+        case Comparison::Greater: return sum > bound;
+        case Comparison::Equal: return sum == bound;
+        case Comparison::NotEqual: return sum != bound;
+        }
+        return false;
+    }
+};
+
+// One `instruction` entry: a form of a machine instruction.
+struct ModelInstruction {
+    std::string name;
+    std::string mnemonic;
+    std::string architecture;
+    std::string origin;  // the model file
+    unsigned line{};
+    bool shipped{};
+    std::vector<ModelOperand> operands;
+    std::uint64_t fixed_bits{};
+    std::vector<ModelField> fields;
+    bool encoded{};
+    std::vector<std::string> features;
+    std::vector<std::string> excludes;
+    std::vector<ModelEffect> reads;
+    std::vector<ModelEffect> writes;
+    std::vector<std::string> hazards;
+    InstructionControlEffect control{InstructionControlEffect::None};
+    InstructionBranchCondition branch_condition{InstructionBranchCondition::None};
+    bool delay_slot{};
+    bool likely{};
+    bool privileged{};
+    bool volatile_effect{};
+    // HazardFact::resource refers to `hazard_resources`.
+    std::vector<std::string> hazard_resources;
+    std::vector<HazardFact> hazard_uses;
+    std::vector<HazardFact> hazard_writes;
+    std::optional<unsigned> latency;
+    std::optional<unsigned> issue;
+    std::string builtin;  // "$::_NAME" or empty
+    std::string alias;
+    std::size_t alias_entry{};
+    std::string macro;
+    std::vector<ModelExpansion> expands;
+    std::vector<ModelExpansion> otherwise;
+    std::vector<ModelConstraint> constraints;
+    // The lines of the entry's properties, for checks of the whole table.
+    std::vector<std::pair<std::string, unsigned>> property_lines;
+
+    // "file:line" of `property`, or of the entry.
+    [[nodiscard]] std::string position(std::string_view property = {}) const;
+    // The entry that an alias re-spells, or the entry itself.
+    [[nodiscard]] bool is_alias() const { return !alias.empty(); }
+};
+
+// The instruction table of an architecture, from its `instruction`
+// entries, and what it gives the target.
+struct InstructionTable {
+    std::string architecture;
+    std::vector<ModelInstruction> entries;
+    // The forms of each mnemonic, in table order.
+    std::unordered_map<std::string_view, std::vector<std::size_t>> forms;
+    // The target's instruction costs, registry forms, and their costs.
+    std::vector<InstructionCostEntry> costs;
+    std::vector<InstructionCostId> cost_listing;
+    std::vector<InstructionEntry> builtins;
+    std::vector<InstructionCostId> builtin_costs;
+    // The entry of each registry form.
+    std::vector<std::size_t> builtin_entries;
 };
 
 struct CpuEntry {
@@ -191,9 +338,10 @@ struct ResolvedCpu {
     std::vector<InstructionCost> instructions;
 };
 
+// A shipped model file's text, in pieces short enough for string literals.
 struct ShippedModelSource {
     std::string_view name;
-    std::string_view text;
+    std::span<const std::string_view> text;
 };
 
 std::span<const ShippedModelSource> shipped_model_sources();
@@ -223,6 +371,19 @@ public:
         std::string_view name) const;
     [[nodiscard]] ResolvedCpu resolve_cpu(const TargetInfo& target,
                                           const CpuEntry& entry) const;
+    // The instruction table of an architecture whose instructions come from
+    // models, or none.
+    [[nodiscard]] const InstructionTable* instruction_table(
+        std::string_view architecture) const;
+    // The instructions that cpu entries of the target describe.
+    [[nodiscard]] std::span<const InstructionCostEntry> instruction_costs(
+        const TargetInfo& target) const;
+    // Checks the instruction entries of every loaded file as a whole and
+    // builds the instruction tables, then resolves the instructions that
+    // cpu entries describe; returns false after a diagnostic.
+    bool complete_instructions(Diagnostics& diagnostics);
+    // Gives each target the instruction table that the models built.
+    void install_instruction_tables() const;
     // The f.* and m.* settings of a preset with its bases applied, by name.
     [[nodiscard]] std::vector<OptionAssignment> resolve_optimization(
         const OptimizationEntry& entry) const;
@@ -265,6 +426,9 @@ private:
     std::vector<DebugEntry> debugs_;
     std::vector<CpuEntry> cpus_;
     std::vector<DataBaseEntry> data_bases_;
+    std::vector<InstructionTable> instruction_tables_;
+    // Instruction entries arrived since the tables were completed.
+    bool instructions_pending_{};
     std::vector<std::string> origins_;
     std::unordered_set<std::string> loaded_files_;
 };

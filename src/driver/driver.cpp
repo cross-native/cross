@@ -382,11 +382,17 @@ bool print_costs(const CompilerOptions& options, Diagnostics& diagnostics) {
     if (!subtarget) return false;
     std::cout << "cpu: " << subtarget->cpu() << "  tune: " << subtarget->tune()
               << "  issue_width: " << subtarget->issue_width() << '\n';
-    for (std::size_t index = 0; index < target->instruction_costs.size();
-         ++index) {
-        const auto& cost = subtarget->instruction_cost(
-            InstructionCostId{static_cast<std::uint16_t>(index)});
-        std::cout << target->instruction_costs[index].name
+    std::vector<InstructionCostId> listing = target->cost_listing;
+    if (listing.empty()) {
+        for (std::size_t index = 0; index < target->instruction_costs.size();
+             ++index) {
+            listing.push_back(
+                InstructionCostId{static_cast<std::uint16_t>(index)});
+        }
+    }
+    for (const auto instruction : listing) {
+        const auto& cost = subtarget->instruction_cost(instruction);
+        std::cout << target->instruction_costs[instruction.value].name
                   << "  latency: " << cost.latency
                   << "  issue: " << cost.issue
                   << "  available: " << (cost.available ? "yes" : "no")
@@ -546,10 +552,40 @@ void print_builtins(const CompilerOptions& options) {
     print_target_instructions(*target);
 }
 
+// Each instruction form of a table that models give: its mnemonic and
+// operands, the features of which it needs any, and what defines it.
+void print_model_instructions(const TargetInfo& target) {
+    const auto* table = model_registry().instruction_table(target.architecture);
+    if (!table) return;
+    for (const auto& entry : table->entries) {
+        const auto& form = entry.is_alias() ? table->entries[entry.alias_entry] : entry;
+        std::cout << entry.mnemonic;
+        for (std::size_t index = 0; index < form.operands.size(); ++index) {
+            std::cout << (index == 0 ? " " : ", ") << form.operands[index].spelling;
+        }
+        std::cout << "  [";
+        if (form.features.empty()) std::cout << target.architecture;
+        for (std::size_t index = 0; index < form.features.size(); ++index) {
+            std::cout << (index == 0 ? "" : "|") << form.features[index];
+        }
+        for (const auto& feature : form.excludes) std::cout << ",!" << feature;
+        std::cout << ']';
+        if (entry.is_alias()) {
+            std::cout << "  alias of " << entry.alias;
+        } else if (!entry.encoded) {
+            std::cout << "  macro";
+        } else if (!entry.builtin.empty()) {
+            std::cout << "  " << entry.builtin;
+        }
+        std::cout << "  source: " << entry.position() << '\n';
+    }
+}
+
 void print_instructions(const CompilerOptions& options) {
     const auto* target = target_for_triple(options.target);
     if (!target) return;
     print_target_instructions(*target);
+    print_model_instructions(*target);
 }
 
 void print_features(const CompilerOptions& options) {

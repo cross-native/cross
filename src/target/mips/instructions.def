@@ -1,273 +1,335 @@
-// name, assembler spelling, default latency, operand syntax, encoding with
-// zero operand fields, ISA levels
-X(Addu, "addu", 1, RdRsRt, 0x00000021, I1)
-X(Addiu, "addiu", 1, RtRsSimm, 0x24000000, I1)
-X(Daddu, "daddu", 1, RdRsRt, 0x0000002d, I3)
-X(Daddiu, "daddiu", 1, RtRsSimm, 0x64000000, I3)
-X(Subu, "subu", 1, RdRsRt, 0x00000023, I1)
-X(Dsubu, "dsubu", 1, RdRsRt, 0x0000002f, I3)
-X(And, "and", 1, RdRsRt, 0x00000024, I1)
-X(Andi, "andi", 1, RtRsUimm, 0x30000000, I1)
-X(Or, "or", 1, RdRsRt, 0x00000025, I1)
-X(Ori, "ori", 1, RtRsUimm, 0x34000000, I1)
-X(Xor, "xor", 1, RdRsRt, 0x00000026, I1)
-X(Xori, "xori", 1, RtRsUimm, 0x38000000, I1)
-X(Nor, "nor", 1, RdRsRt, 0x00000027, I1)
-X(Lui, "lui", 1, RtUimm, 0x3c000000, I1)
-X(Li, "li", 1, LoadImmediate, 0x00000000, I1)
-X(Move, "move", 1, MoveMacro, 0x00000025, I1)
-X(Slt, "slt", 1, RdRsRt, 0x0000002a, I1)
-X(Slti, "slti", 1, RtRsSimm, 0x28000000, I1)
-X(Sltu, "sltu", 1, RdRsRt, 0x0000002b, I1)
-X(Sltiu, "sltiu", 1, RtRsSimm, 0x2c000000, I1)
-X(Sll, "sll", 1, RdRtSa, 0x00000000, I1)
-X(Srl, "srl", 1, RdRtSa, 0x00000002, I1)
-X(Sra, "sra", 1, RdRtSa, 0x00000003, I1)
-X(Sllv, "sllv", 1, RdRtRs, 0x00000004, I1)
-X(Srlv, "srlv", 1, RdRtRs, 0x00000006, I1)
-X(Srav, "srav", 1, RdRtRs, 0x00000007, I1)
-X(Dsll, "dsll", 1, RdRtSa, 0x00000038, I3)
-X(Dsrl, "dsrl", 1, RdRtSa, 0x0000003a, I3)
-X(Dsra, "dsra", 1, RdRtSa, 0x0000003b, I3)
-X(Dsll32, "dsll32", 1, RdRtSa, 0x0000003c, I3)
-X(Dsrl32, "dsrl32", 1, RdRtSa, 0x0000003e, I3)
-X(Dsra32, "dsra32", 1, RdRtSa, 0x0000003f, I3)
-X(Dsllv, "dsllv", 1, RdRtRs, 0x00000014, I3)
-X(Dsrlv, "dsrlv", 1, RdRtRs, 0x00000016, I3)
-X(Dsrav, "dsrav", 1, RdRtRs, 0x00000017, I3)
-X(Rotrv, "rotrv", 1, RdRtRs, 0x00000046, I33 | ALX)
-X(Rotr, "rotr", 1, RdRtSa, 0x00200002, I33 | ALX)
-X(Clz, "clz", 1, RdRsCount, 0x70000020, I32)
-X(Clo, "clo", 1, RdRsCount, 0x70000021, I32)
-X(Dclz, "dclz", 1, RdRsCount, 0x70000024, I64)
-X(Dclo, "dclo", 1, RdRsCount, 0x70000025, I64)
-X(Wsbh, "wsbh", 1, RdRt, 0x7c0000a0, I33 | ALX)
-X(Wsbw, "wsbw", 1, RdRt, 0x7c0000e0, ALX)
-X(Movn, "movn", 1, RdRsRt, 0x0000000b, I4_32)
-X(Mult, "mult", 7, RsRt, 0x00000018, I1)
-X(Multu, "multu", 7, RsRt, 0x00000019, I1)
-X(Dmult, "dmult", 7, RsRt, 0x0000001c, I3)
-X(Dmultu, "dmultu", 7, RsRt, 0x0000001d, I3)
-X(Div, "div", 35, Divide, 0x0000001a, I1)
-X(Divu, "divu", 35, Divide, 0x0000001b, I1)
-X(Ddiv, "ddiv", 35, Divide, 0x0000001e, I3)
-X(Ddivu, "ddivu", 35, Divide, 0x0000001f, I3)
-X(Mfhi, "mfhi", 1, Rd, 0x00000010, I1)
-X(Mflo, "mflo", 1, Rd, 0x00000012, I1)
-X(Mthi, "mthi", 1, Rs, 0x00000011, I1)
-X(Mtlo, "mtlo", 1, Rs, 0x00000013, I1)
-X(Lb, "lb", 3, RtMemory, 0x80000000, I1)
-X(Lbu, "lbu", 3, RtMemory, 0x90000000, I1)
-X(Lh, "lh", 3, RtMemory, 0x84000000, I1)
-X(Lhu, "lhu", 3, RtMemory, 0x94000000, I1)
-X(Lw, "lw", 3, RtMemory, 0x8c000000, I1)
-X(Lwu, "lwu", 3, RtMemory, 0x9c000000, I3)
-X(Ld, "ld", 3, RtMemory, 0xdc000000, I3)
-X(Lwl, "lwl", 3, RtMemory, 0x88000000, I1)
-X(Lwr, "lwr", 3, RtMemory, 0x98000000, I1)
-X(Ldl, "ldl", 3, RtMemory, 0x68000000, I3)
-X(Ldr, "ldr", 3, RtMemory, 0x6c000000, I3)
-X(Lwc1, "lwc1", 3, FtMemory, 0xc4000000, I1)
-X(Ldc1, "ldc1", 3, FtMemory, 0xd4000000, I2)
-X(Ll, "ll", 3, RtMemory, 0xc0000000, I2)
-X(Lld, "lld", 3, RtMemory, 0xd0000000, I3)
-X(Sb, "sb", 1, RtMemory, 0xa0000000, I1)
-X(Sh, "sh", 1, RtMemory, 0xa4000000, I1)
-X(Sw, "sw", 1, RtMemory, 0xac000000, I1)
-X(Sd, "sd", 1, RtMemory, 0xfc000000, I3)
-X(Swl, "swl", 1, RtMemory, 0xa8000000, I1)
-X(Swr, "swr", 1, RtMemory, 0xb8000000, I1)
-X(Sdl, "sdl", 1, RtMemory, 0xb0000000, I3)
-X(Sdr, "sdr", 1, RtMemory, 0xb4000000, I3)
-X(Swc1, "swc1", 1, FtMemory, 0xe4000000, I1)
-X(Sdc1, "sdc1", 1, FtMemory, 0xf4000000, I2)
-X(Sc, "sc", 1, RtMemory, 0xe0000000, I2)
-X(Scd, "scd", 1, RtMemory, 0xf0000000, I3)
-X(B, "b", 1, BranchAlways, 0x10000000, I1)
-X(Bal, "bal", 1, BranchAlways, 0x04110000, I1)
-X(Beq, "beq", 1, RsRtBranch, 0x10000000, I1)
-X(Bne, "bne", 1, RsRtBranch, 0x14000000, I1)
-X(Beqz, "beqz", 1, RsBranch, 0x10000000, I1)
-X(Bnez, "bnez", 1, RsBranch, 0x14000000, I1)
-X(Bltz, "bltz", 1, RsBranch, 0x04000000, I1)
-X(Bgez, "bgez", 1, RsBranch, 0x04010000, I1)
-X(Blez, "blez", 1, RsBranch, 0x18000000, I1)
-X(Bgtz, "bgtz", 1, RsBranch, 0x1c000000, I1)
-X(Bltzal, "bltzal", 1, RsBranch, 0x04100000, I1)
-X(Bgezal, "bgezal", 1, RsBranch, 0x04110000, I1)
-X(Bc1t, "bc1t", 1, CcBranch, 0x45010000, I1)
-X(Bc1f, "bc1f", 1, CcBranch, 0x45000000, I1)
-X(Beql, "beql", 1, RsRtBranch, 0x50000000, I2)
-X(Bnel, "bnel", 1, RsRtBranch, 0x54000000, I2)
-X(Beqzl, "beqzl", 1, RsBranch, 0x50000000, I2)
-X(Bnezl, "bnezl", 1, RsBranch, 0x54000000, I2)
-X(Bltzl, "bltzl", 1, RsBranch, 0x04020000, I2)
-X(Bgezl, "bgezl", 1, RsBranch, 0x04030000, I2)
-X(Blezl, "blezl", 1, RsBranch, 0x58000000, I2)
-X(Bgtzl, "bgtzl", 1, RsBranch, 0x5c000000, I2)
-X(Bc1tl, "bc1tl", 1, CcBranch, 0x45030000, I2)
-X(Bc1fl, "bc1fl", 1, CcBranch, 0x45020000, I2)
-X(J, "j", 1, Jump, 0x08000000, I1)
-X(Jal, "jal", 1, Jump, 0x0c000000, I1)
-X(Jr, "jr", 1, JumpRegister, 0x00000008, I1)
-X(Jalr, "jalr", 1, JumpLinkRegister, 0x00000009, I1)
-X(AddS, "add.s", 4, FdFsFt, 0x46000000, I1)
-X(AddD, "add.d", 4, FdFsFt, 0x46200000, I1)
-X(SubS, "sub.s", 4, FdFsFt, 0x46000001, I1)
-X(SubD, "sub.d", 4, FdFsFt, 0x46200001, I1)
-X(MulS, "mul.s", 4, FdFsFt, 0x46000002, I1)
-X(MulD, "mul.d", 7, FdFsFt, 0x46200002, I1)
-X(DivS, "div.s", 20, FdFsFt, 0x46000003, I1)
-X(DivD, "div.d", 36, FdFsFt, 0x46200003, I1)
-X(SqrtS, "sqrt.s", 1, FdFs, 0x46000004, I2)
-X(SqrtD, "sqrt.d", 1, FdFs, 0x46200004, I2)
-X(AbsS, "abs.s", 1, FdFs, 0x46000005, I1)
-X(AbsD, "abs.d", 1, FdFs, 0x46200005, I1)
-X(NegS, "neg.s", 1, FdFs, 0x46000007, I1)
-X(NegD, "neg.d", 1, FdFs, 0x46200007, I1)
-X(MovS, "mov.s", 1, FdFs, 0x46000006, I1)
-X(MovD, "mov.d", 1, FdFs, 0x46200006, I1)
-X(CvtSD, "cvt.s.d", 5, FdFs, 0x46200020, I1)
-X(CvtDS, "cvt.d.s", 5, FdFs, 0x46000021, I1)
-X(CvtSW, "cvt.s.w", 5, FdFs, 0x46800020, I1)
-X(CvtDW, "cvt.d.w", 5, FdFs, 0x46800021, I1)
-X(CvtSL, "cvt.s.l", 5, FdFs, 0x46a00020, I3_33)
-X(CvtDL, "cvt.d.l", 5, FdFs, 0x46a00021, I3_33)
-X(TruncWS, "trunc.w.s", 5, FdFs, 0x4600000d, I2)
-X(TruncWD, "trunc.w.d", 5, FdFs, 0x4620000d, I2)
-X(TruncLS, "trunc.l.s", 5, FdFs, 0x46000009, I3_33)
-X(TruncLD, "trunc.l.d", 5, FdFs, 0x46200009, I3_33)
-X(CEqS, "c.eq.s", 1, FsFt, 0x46000032, I1)
-X(CEqD, "c.eq.d", 1, FsFt, 0x46200032, I1)
-X(CLtS, "c.lt.s", 1, FsFt, 0x4600003c, I1)
-X(CLtD, "c.lt.d", 1, FsFt, 0x4620003c, I1)
-X(CLeS, "c.le.s", 1, FsFt, 0x4600003e, I1)
-X(CLeD, "c.le.d", 1, FsFt, 0x4620003e, I1)
-X(COltS, "c.olt.s", 1, FsFt, 0x46000034, I1)
-X(COltD, "c.olt.d", 1, FsFt, 0x46200034, I1)
-X(CUnS, "c.un.s", 1, FsFt, 0x46000031, I1)
-X(CUnD, "c.un.d", 1, FsFt, 0x46200031, I1)
-X(Mfc1, "mfc1", 1, RtFs, 0x44000000, I1)
-X(Mtc1, "mtc1", 1, RtFs, 0x44800000, I1)
-X(Dmfc1, "dmfc1", 1, RtFs, 0x44200000, I3)
-X(Dmtc1, "dmtc1", 1, RtFs, 0x44a00000, I3)
-X(Mfhc1, "mfhc1", 1, RtFs, 0x44600000, I33)
-X(Mthc1, "mthc1", 1, RtFs, 0x44e00000, I33)
-X(Cfc1, "cfc1", 1, RtControl, 0x44400000, I1)
-X(Ctc1, "ctc1", 1, RtControl, 0x44c00000, I1)
-X(Nop, "nop", 1, NoOperands, 0x00000000, I1)
-X(Sync, "sync", 1, SyncType, 0x0000000f, I2)
-X(Break, "break", 1, BreakCode, 0x0000000d, I1)
-X(Syscall, "syscall", 1, SyscallCode, 0x0000000c, I1)
-X(Ehb, "ehb", 1, NoOperands, 0x000000c0, I1)
-X(Eret, "eret", 1, NoOperands, 0x42000018, I3_32 | ALX)
-X(Cache, "cache", 1, CacheMemory, 0xbc000000, I3_32 | ALX)
-X(Mfc0, "mfc0", 1, RtCoprocessor, 0x40000000, I1)
-X(Mtc0, "mtc0", 1, RtCoprocessor, 0x40800000, I1)
-X(Dmfc0, "dmfc0", 1, RtCoprocessor, 0x40200000, I3)
-X(Dmtc0, "dmtc0", 1, RtCoprocessor, 0x40a00000, I3)
-X(Tlbp, "tlbp", 1, NoOperands, 0x42000008, I1)
-X(Tlbr, "tlbr", 1, NoOperands, 0x42000001, I1)
-X(Tlbwi, "tlbwi", 1, NoOperands, 0x42000002, I1)
-X(Tlbwr, "tlbwr", 1, NoOperands, 0x42000006, I1)
-X(Rfe, "rfe", 1, NoOperands, 0x42000010, I12)
-X(MovnS, "movn.s", 1, FdFsRt, 0x46000013, I4_32)
-X(MovnD, "movn.d", 1, FdFsRt, 0x46200013, I4_32)
-X(MovzS, "movz.s", 1, FdFsRt, 0x46000012, I4_32)
-X(MovzD, "movz.d", 1, FdFsRt, 0x46200012, I4_32)
-X(MovtS, "movt.s", 1, FdFsCc, 0x46010011, I4_32)
-X(MovtD, "movt.d", 1, FdFsCc, 0x46210011, I4_32)
-X(MovfS, "movf.s", 1, FdFsCc, 0x46000011, I4_32)
-X(MovfD, "movf.d", 1, FdFsCc, 0x46200011, I4_32)
-// Assembled but not costed by the backend.
-X(Movz, "movz", 1, RdRsRt, 0x0000000a, I4_32)
-X(Movf, "movf", 1, RdRsCc, 0x00000001, I4_32)
-X(Movt, "movt", 1, RdRsCc, 0x00010001, I4_32)
-X(Add, "add", 1, RdRsRt, 0x00000020, I1)
-X(Addi, "addi", 1, RtRsSimm, 0x20000000, I1)
-X(Sub, "sub", 1, RdRsRt, 0x00000022, I1)
-X(Dadd, "dadd", 1, RdRsRt, 0x0000002c, I3)
-X(Daddi, "daddi", 1, RtRsSimm, 0x60000000, I3)
-X(Dsub, "dsub", 1, RdRsRt, 0x0000002e, I3)
-X(Negu, "negu", 1, Negate, 0x00000023, I1)
-X(Neg, "neg", 1, Negate, 0x00000022, I1)
-X(Not, "not", 1, NotMacro, 0x00000027, I1)
-X(Dli, "dli", 1, LoadImmediate64, 0x00000000, I3)
-X(Ssnop, "ssnop", 1, NoOperands, 0x00000040, I1)
-X(Wait, "wait", 1, NoOperands, 0x42000020, I3_32)
-X(Teq, "teq", 1, TrapRegister, 0x00000034, I2 | NOT_ALX)
-X(Tne, "tne", 1, TrapRegister, 0x00000036, I2 | NOT_ALX)
-X(Tge, "tge", 1, TrapRegister, 0x00000030, I2 | NOT_ALX)
-X(Tgeu, "tgeu", 1, TrapRegister, 0x00000031, I2 | NOT_ALX)
-X(Tlt, "tlt", 1, TrapRegister, 0x00000032, I2 | NOT_ALX)
-X(Tltu, "tltu", 1, TrapRegister, 0x00000033, I2 | NOT_ALX)
-X(Teqi, "teqi", 1, TrapImmediate, 0x040c0000, I2 | NOT_ALX)
-X(Tnei, "tnei", 1, TrapImmediate, 0x040e0000, I2 | NOT_ALX)
-X(Tgei, "tgei", 1, TrapImmediate, 0x04080000, I2 | NOT_ALX)
-X(Tgeiu, "tgeiu", 1, TrapImmediate, 0x04090000, I2 | NOT_ALX)
-X(Tlti, "tlti", 1, TrapImmediate, 0x040a0000, I2 | NOT_ALX)
-X(Tltiu, "tltiu", 1, TrapImmediate, 0x040b0000, I2 | NOT_ALX)
-X(Mul, "mul", 7, RdRsRt, 0x70000002, I32)
-X(Madd, "madd", 1, RsRt, 0x70000000, I32)
-X(Maddu, "maddu", 1, RsRt, 0x70000001, I32)
-X(Msub, "msub", 1, RsRt, 0x70000004, I32)
-X(Msubu, "msubu", 1, RsRt, 0x70000005, I32)
-X(Ext, "ext", 1, Extract, 0x7c000000, I33 | ALX)
-X(Ins, "ins", 1, Insert, 0x7c000004, I33 | ALX)
-X(Seb, "seb", 1, RdRt, 0x7c000420, I33 | ALX)
-X(Seh, "seh", 1, RdRt, 0x7c000620, I33 | ALX)
-X(Pref, "pref", 1, CacheMemory, 0xcc000000, I4_32)
-X(Max, "max", 1, RdRsRt, 0x0000002c, ALX)
-X(Min, "min", 1, RdRsRt, 0x0000002d, ALX)
-X(Bitrev, "bitrev", 1, RdRt, 0x7c000520, ALX)
-X(Mfic, "mfic", 1, RtCoprocessor, 0x70000024, ALX)
-X(Mtic, "mtic", 1, RtCoprocessor, 0x70000026, ALX)
-X(CvtWS, "cvt.w.s", 5, FdFs, 0x46000024, I1)
-X(CvtWD, "cvt.w.d", 5, FdFs, 0x46200024, I1)
-X(CvtLS, "cvt.l.s", 5, FdFs, 0x46000025, I3_33)
-X(CvtLD, "cvt.l.d", 5, FdFs, 0x46200025, I3_33)
-X(RoundWS, "round.w.s", 5, FdFs, 0x4600000c, I2)
-X(RoundWD, "round.w.d", 5, FdFs, 0x4620000c, I2)
-X(CeilWS, "ceil.w.s", 5, FdFs, 0x4600000e, I2)
-X(CeilWD, "ceil.w.d", 5, FdFs, 0x4620000e, I2)
-X(FloorWS, "floor.w.s", 5, FdFs, 0x4600000f, I2)
-X(FloorWD, "floor.w.d", 5, FdFs, 0x4620000f, I2)
-X(RoundLS, "round.l.s", 5, FdFs, 0x46000008, I3_33)
-X(RoundLD, "round.l.d", 5, FdFs, 0x46200008, I3_33)
-X(CeilLS, "ceil.l.s", 5, FdFs, 0x4600000a, I3_33)
-X(CeilLD, "ceil.l.d", 5, FdFs, 0x4620000a, I3_33)
-X(FloorLS, "floor.l.s", 5, FdFs, 0x4600000b, I3_33)
-X(FloorLD, "floor.l.d", 5, FdFs, 0x4620000b, I3_33)
-X(CFS, "c.f.s", 1, FsFt, 0x46000030, I1)
-X(CFD, "c.f.d", 1, FsFt, 0x46200030, I1)
-X(CUeqS, "c.ueq.s", 1, FsFt, 0x46000033, I1)
-X(CUeqD, "c.ueq.d", 1, FsFt, 0x46200033, I1)
-X(CUltS, "c.ult.s", 1, FsFt, 0x46000035, I1)
-X(CUltD, "c.ult.d", 1, FsFt, 0x46200035, I1)
-X(COleS, "c.ole.s", 1, FsFt, 0x46000036, I1)
-X(COleD, "c.ole.d", 1, FsFt, 0x46200036, I1)
-X(CUleS, "c.ule.s", 1, FsFt, 0x46000037, I1)
-X(CUleD, "c.ule.d", 1, FsFt, 0x46200037, I1)
-X(CSfS, "c.sf.s", 1, FsFt, 0x46000038, I1)
-X(CSfD, "c.sf.d", 1, FsFt, 0x46200038, I1)
-X(CNgleS, "c.ngle.s", 1, FsFt, 0x46000039, I1)
-X(CNgleD, "c.ngle.d", 1, FsFt, 0x46200039, I1)
-X(CSeqS, "c.seq.s", 1, FsFt, 0x4600003a, I1)
-X(CSeqD, "c.seq.d", 1, FsFt, 0x4620003a, I1)
-X(CNglS, "c.ngl.s", 1, FsFt, 0x4600003b, I1)
-X(CNglD, "c.ngl.d", 1, FsFt, 0x4620003b, I1)
-X(CNgeS, "c.nge.s", 1, FsFt, 0x4600003d, I1)
-X(CNgeD, "c.nge.d", 1, FsFt, 0x4620003d, I1)
-X(CNgtS, "c.ngt.s", 1, FsFt, 0x4600003f, I1)
-X(CNgtD, "c.ngt.d", 1, FsFt, 0x4620003f, I1)
-X(Dsbh, "dsbh", 1, RdRt, 0x7c0000a4, isa_mips64r2)
-X(Dshd, "dshd", 1, RdRt, 0x7c000164, isa_mips64r2)
-X(Drotr, "drotr", 1, RdRtSa, 0x0020003a, isa_mips64r2)
-X(Drotr32, "drotr32", 1, RdRtSa, 0x0020003e, isa_mips64r2)
-X(Drotrv, "drotrv", 1, RdRtRs, 0x00000056, isa_mips64r2)
-X(Dext, "dext", 1, DoubleExtract, 0x7c000003, isa_mips64r2)
-X(Dextm, "dextm", 1, DoubleExtract, 0x7c000001, isa_mips64r2)
-X(Dextu, "dextu", 1, DoubleExtract, 0x7c000002, isa_mips64r2)
-X(Dins, "dins", 1, DoubleInsert, 0x7c000007, isa_mips64r2)
-X(Dinsm, "dinsm", 1, DoubleInsert, 0x7c000005, isa_mips64r2)
-X(Dinsu, "dinsu", 1, DoubleInsert, 0x7c000006, isa_mips64r2)
+// The instructions the MIPS backend selects, in the order of the
+// instructions that cpu entries cost: the enumerator, the mnemonic, and
+// each form the backend emits as "OPERANDS | EFFECTS" in the spelling
+// of instruction entries. Loading checks that the shipped instruction
+// table defines them so and that no other model adds forms to them.
+X(Addu, "addu",
+  "rd:gpr32, rs:gpr32, rt:gpr32 | reads=rs,rt writes=rd")
+X(Addiu, "addiu",
+  "rt:gpr32, rs:gpr32, imm:simm16 | reads=rs writes=rt")
+X(Daddu, "daddu",
+  "rd:gpr64, rs:gpr64, rt:gpr64 | reads=rs,rt writes=rd")
+X(Daddiu, "daddiu",
+  "rt:gpr64, rs:gpr64, imm:simm16 | reads=rs writes=rt")
+X(Subu, "subu",
+  "rd:gpr32, rs:gpr32, rt:gpr32 | reads=rs,rt writes=rd")
+X(Dsubu, "dsubu",
+  "rd:gpr64, rs:gpr64, rt:gpr64 | reads=rs,rt writes=rd")
+X(And, "and",
+  "rd:gpr, rs:gpr, rt:gpr | reads=rs,rt writes=rd")
+X(Andi, "andi",
+  "rt:gpr, rs:gpr, imm:uimm16 | reads=rs writes=rt")
+X(Or, "or",
+  "rd:gpr, rs:gpr, rt:gpr | reads=rs,rt writes=rd")
+X(Ori, "ori",
+  "rt:gpr, rs:gpr, imm:uimm16 | reads=rs writes=rt")
+X(Xor, "xor",
+  "rd:gpr, rs:gpr, rt:gpr | reads=rs,rt writes=rd")
+X(Xori, "xori",
+  "rt:gpr, rs:gpr, imm:uimm16 | reads=rs writes=rt")
+X(Nor, "nor",
+  "rd:gpr, rs:gpr, rt:gpr | reads=rs,rt writes=rd")
+X(Lui, "lui",
+  "rt:gpr32, imm:uimm16 | writes=rt")
+X(Li, "li",
+  "rt:gpr32, value:imm")
+X(Move, "move",
+  "rd:gpr, rs:gpr | reads=rs writes=rd")
+X(Slt, "slt",
+  "rd:gpr, rs:gpr, rt:gpr | reads=rs,rt writes=rd")
+X(Slti, "slti",
+  "rt:gpr, rs:gpr, imm:simm16 | reads=rs writes=rt")
+X(Sltu, "sltu",
+  "rd:gpr, rs:gpr, rt:gpr | reads=rs,rt writes=rd")
+X(Sltiu, "sltiu",
+  "rt:gpr, rs:gpr, imm:simm16 | reads=rs writes=rt")
+X(Sll, "sll",
+  "rd:gpr32, rt:gpr32, sa:uimm5 | reads=rt writes=rd")
+X(Srl, "srl",
+  "rd:gpr32, rt:gpr32, sa:uimm5 | reads=rt writes=rd")
+X(Sra, "sra",
+  "rd:gpr32, rt:gpr32, sa:uimm5 | reads=rt writes=rd")
+X(Sllv, "sllv",
+  "rd:gpr32, rt:gpr32, rs:gpr32 | reads=rt,rs writes=rd")
+X(Srlv, "srlv",
+  "rd:gpr32, rt:gpr32, rs:gpr32 | reads=rt,rs writes=rd")
+X(Srav, "srav",
+  "rd:gpr32, rt:gpr32, rs:gpr32 | reads=rt,rs writes=rd")
+X(Dsll, "dsll",
+  "rd:gpr64, rt:gpr64, sa:uimm6 | reads=rt writes=rd")
+X(Dsrl, "dsrl",
+  "rd:gpr64, rt:gpr64, sa:uimm6 | reads=rt writes=rd")
+X(Dsra, "dsra",
+  "rd:gpr64, rt:gpr64, sa:uimm6 | reads=rt writes=rd")
+X(Dsll32, "dsll32",
+  "rd:gpr64, rt:gpr64, sa:uimm5 | reads=rt writes=rd")
+X(Dsrl32, "dsrl32",
+  "rd:gpr64, rt:gpr64, sa:uimm5 | reads=rt writes=rd")
+X(Dsra32, "dsra32",
+  "rd:gpr64, rt:gpr64, sa:uimm5 | reads=rt writes=rd")
+X(Dsllv, "dsllv",
+  "rd:gpr64, rt:gpr64, rs:gpr64 | reads=rt,rs writes=rd")
+X(Dsrlv, "dsrlv",
+  "rd:gpr64, rt:gpr64, rs:gpr64 | reads=rt,rs writes=rd")
+X(Dsrav, "dsrav",
+  "rd:gpr64, rt:gpr64, rs:gpr64 | reads=rt,rs writes=rd")
+X(Rotrv, "rotrv",
+  "rd:gpr32, rt:gpr32, rs:gpr32 | reads=rt,rs writes=rd")
+X(Rotr, "rotr",
+  "rd:gpr32, rt:gpr32, sa:uimm5 | reads=rt writes=rd")
+X(Clz, "clz",
+  "rd:gpr32, rs:gpr32 | reads=rs writes=rd")
+X(Clo, "clo",
+  "rd:gpr32, rs:gpr32 | reads=rs writes=rd")
+X(Dclz, "dclz",
+  "rd:gpr64, rs:gpr64 | reads=rs writes=rd")
+X(Dclo, "dclo",
+  "rd:gpr64, rs:gpr64 | reads=rs writes=rd")
+X(Wsbh, "wsbh",
+  "rd:gpr32, rt:gpr32 | reads=rt writes=rd")
+X(Wsbw, "wsbw",
+  "rd:gpr32, rt:gpr32 | reads=rt writes=rd")
+X(Movn, "movn",
+  "rd:gpr, rs:gpr, rt:gpr | reads=rs,rt writes=rd")
+X(Mult, "mult",
+  "rs:gpr32, rt:gpr32 | reads=rs,rt writes=hi,lo")
+X(Multu, "multu",
+  "rs:gpr32, rt:gpr32 | reads=rs,rt writes=hi,lo")
+X(Dmult, "dmult",
+  "rs:gpr64, rt:gpr64 | reads=rs,rt writes=hi,lo")
+X(Dmultu, "dmultu",
+  "rs:gpr64, rt:gpr64 | reads=rs,rt writes=hi,lo")
+X(Div, "div",
+  "$zero, rs:gpr32, rt:gpr32 | reads=rs,rt writes=hi,lo")
+X(Divu, "divu",
+  "$zero, rs:gpr32, rt:gpr32 | reads=rs,rt writes=hi,lo")
+X(Ddiv, "ddiv",
+  "$zero, rs:gpr64, rt:gpr64 | reads=rs,rt writes=hi,lo")
+X(Ddivu, "ddivu",
+  "$zero, rs:gpr64, rt:gpr64 | reads=rs,rt writes=hi,lo")
+X(Mfhi, "mfhi",
+  "rd:gpr | reads=hi writes=rd")
+X(Mflo, "mflo",
+  "rd:gpr | reads=lo writes=rd")
+X(Lb, "lb",
+  "rt:gpr32, address:mem8 | reads=memory writes=rt hazards=load")
+X(Lbu, "lbu",
+  "rt:gpr32, address:mem8 | reads=memory writes=rt hazards=load")
+X(Lh, "lh",
+  "rt:gpr32, address:mem16 | reads=memory writes=rt hazards=load")
+X(Lhu, "lhu",
+  "rt:gpr32, address:mem16 | reads=memory writes=rt hazards=load")
+X(Lw, "lw",
+  "rt:gpr32, address:mem32 | reads=memory writes=rt hazards=load")
+X(Ld, "ld",
+  "rt:gpr64, address:mem64 | reads=memory writes=rt hazards=load")
+X(Lwl, "lwl",
+  "rt:gpr32, address:mem32 | reads=memory writes=rt hazards=load")
+X(Ldl, "ldl",
+  "rt:gpr64, address:mem64 | reads=memory writes=rt hazards=load")
+X(Lwc1, "lwc1",
+  "ft:cpr, address:mem32 | reads=memory writes=ft hazards=load,coprocessor-load")
+X(Ldc1, "ldc1",
+  "ft:cpr64, address:mem64 | reads=memory writes=ft hazards=load,coprocessor-load")
+X(Ll, "ll",
+  "rt:gpr32, address:mem32 | reads=memory writes=rt hazards=load")
+X(Sb, "sb",
+  "rt:gpr32, address:mem8 | reads=rt writes=memory")
+X(Sh, "sh",
+  "rt:gpr32, address:mem16 | reads=rt writes=memory")
+X(Sw, "sw",
+  "rt:gpr32, address:mem32 | reads=rt writes=memory")
+X(Sd, "sd",
+  "rt:gpr64, address:mem64 | reads=rt writes=memory")
+X(Swc1, "swc1",
+  "ft:cpr, address:mem32 | reads=ft writes=memory")
+X(Sdc1, "sdc1",
+  "ft:cpr64, address:mem64 | reads=ft writes=memory")
+X(Sc, "sc",
+  "rt:gpr32, address:mem32 | reads=rt,memory writes=rt,memory")
+X(B, "b",
+  "target:branch | control=jump delay_slot")
+X(Beq, "beq",
+  "rs:gpr, rt:gpr, target:branch | reads=rs,rt control=branch condition=equal delay_slot")
+X(Bne, "bne",
+  "rs:gpr, rt:gpr, target:branch | reads=rs,rt control=branch condition=not-equal delay_slot")
+X(Beqz, "beqz",
+  "rs:gpr, target:branch | reads=rs control=branch condition=equal delay_slot")
+X(Bnez, "bnez",
+  "rs:gpr, target:branch | reads=rs control=branch condition=not-equal delay_slot")
+X(Bltz, "bltz",
+  "rs:gpr, target:branch | reads=rs control=branch condition=less-than-zero delay_slot")
+X(Bgez, "bgez",
+  "rs:gpr, target:branch | reads=rs control=branch condition=greater-equal-zero delay_slot")
+X(Blez, "blez",
+  "rs:gpr, target:branch | reads=rs control=branch condition=less-equal-zero delay_slot")
+X(Bgtz, "bgtz",
+  "rs:gpr, target:branch | reads=rs control=branch condition=greater-than-zero delay_slot")
+X(Bc1t, "bc1t",
+  "target:branch | reads=fcsr hazards=condition-read control=branch delay_slot")
+X(Bc1f, "bc1f",
+  "target:branch | reads=fcsr hazards=condition-read control=branch delay_slot")
+X(Beql, "beql",
+  "rs:gpr, rt:gpr, target:branch | reads=rs,rt control=branch delay_slot likely")
+X(Bnel, "bnel",
+  "rs:gpr, rt:gpr, target:branch | reads=rs,rt control=branch delay_slot likely")
+X(Beqzl, "beqzl",
+  "rs:gpr, target:branch | reads=rs control=branch delay_slot likely")
+X(Bnezl, "bnezl",
+  "rs:gpr, target:branch | reads=rs control=branch delay_slot likely")
+X(Bltzl, "bltzl",
+  "rs:gpr, target:branch | reads=rs control=branch delay_slot likely")
+X(Bgezl, "bgezl",
+  "rs:gpr, target:branch | reads=rs control=branch delay_slot likely")
+X(Blezl, "blezl",
+  "rs:gpr, target:branch | reads=rs control=branch delay_slot likely")
+X(Bgtzl, "bgtzl",
+  "rs:gpr, target:branch | reads=rs control=branch delay_slot likely")
+X(Bc1tl, "bc1tl",
+  "target:branch | reads=fcsr hazards=condition-read control=branch delay_slot likely")
+X(Bc1fl, "bc1fl",
+  "target:branch | reads=fcsr hazards=condition-read control=branch delay_slot likely")
+X(J, "j",
+  "target:jump | control=jump delay_slot")
+X(Jal, "jal",
+  "target:jump | writes=ra control=jump delay_slot")
+X(Jr, "jr",
+  "rs:gpr | reads=rs control=exit delay_slot")
+X(Jalr, "jalr",
+  "rs:gpr | reads=rs writes=ra control=jump delay_slot")
+X(AddS, "add.s",
+  "fd:fpr32, fs:fpr32, ft:fpr32 | reads=fs,ft writes=fd")
+X(AddD, "add.d",
+  "fd:fpr64, fs:fpr64, ft:fpr64 | reads=fs,ft writes=fd")
+X(SubS, "sub.s",
+  "fd:fpr32, fs:fpr32, ft:fpr32 | reads=fs,ft writes=fd")
+X(SubD, "sub.d",
+  "fd:fpr64, fs:fpr64, ft:fpr64 | reads=fs,ft writes=fd")
+X(MulS, "mul.s",
+  "fd:fpr32, fs:fpr32, ft:fpr32 | reads=fs,ft writes=fd")
+X(MulD, "mul.d",
+  "fd:fpr64, fs:fpr64, ft:fpr64 | reads=fs,ft writes=fd")
+X(DivS, "div.s",
+  "fd:fpr32, fs:fpr32, ft:fpr32 | reads=fs,ft writes=fd")
+X(DivD, "div.d",
+  "fd:fpr64, fs:fpr64, ft:fpr64 | reads=fs,ft writes=fd")
+X(AbsS, "abs.s",
+  "fd:fpr32, fs:fpr32 | reads=fs writes=fd")
+X(AbsD, "abs.d",
+  "fd:fpr64, fs:fpr64 | reads=fs writes=fd")
+X(NegS, "neg.s",
+  "fd:fpr32, fs:fpr32 | reads=fs writes=fd")
+X(NegD, "neg.d",
+  "fd:fpr64, fs:fpr64 | reads=fs writes=fd")
+X(MovS, "mov.s",
+  "fd:fpr32, fs:fpr32 | reads=fs writes=fd")
+X(MovD, "mov.d",
+  "fd:fpr64, fs:fpr64 | reads=fs writes=fd")
+X(CvtSD, "cvt.s.d",
+  "fd:fpr32, fs:fpr64 | reads=fs writes=fd")
+X(CvtDS, "cvt.d.s",
+  "fd:fpr64, fs:fpr32 | reads=fs writes=fd")
+X(CvtSW, "cvt.s.w",
+  "fd:fpr32, fs:fpr32 | reads=fs writes=fd")
+X(CvtDW, "cvt.d.w",
+  "fd:fpr64, fs:fpr32 | reads=fs writes=fd")
+X(TruncWS, "trunc.w.s",
+  "fd:fpr32, fs:fpr32 | reads=fs writes=fd")
+X(TruncWD, "trunc.w.d",
+  "fd:fpr32, fs:fpr64 | reads=fs writes=fd")
+X(CEqS, "c.eq.s",
+  "fs:fpr32, ft:fpr32 | reads=fs,ft writes=fcsr hazards=condition-write")
+X(CEqD, "c.eq.d",
+  "fs:fpr64, ft:fpr64 | reads=fs,ft writes=fcsr hazards=condition-write")
+X(CLtS, "c.lt.s",
+  "fs:fpr32, ft:fpr32 | reads=fs,ft writes=fcsr hazards=condition-write")
+X(CLtD, "c.lt.d",
+  "fs:fpr64, ft:fpr64 | reads=fs,ft writes=fcsr hazards=condition-write")
+X(CLeS, "c.le.s",
+  "fs:fpr32, ft:fpr32 | reads=fs,ft writes=fcsr hazards=condition-write")
+X(CLeD, "c.le.d",
+  "fs:fpr64, ft:fpr64 | reads=fs,ft writes=fcsr hazards=condition-write")
+X(COltS, "c.olt.s",
+  "fs:fpr32, ft:fpr32 | reads=fs,ft writes=fcsr hazards=condition-write")
+X(COltD, "c.olt.d",
+  "fs:fpr64, ft:fpr64 | reads=fs,ft writes=fcsr hazards=condition-write")
+X(CUnS, "c.un.s",
+  "fs:fpr32, ft:fpr32 | reads=fs,ft writes=fcsr hazards=condition-write")
+X(CUnD, "c.un.d",
+  "fs:fpr64, ft:fpr64 | reads=fs,ft writes=fcsr hazards=condition-write")
+X(Mfc1, "mfc1",
+  "rt:gpr32, fs:cpr | reads=fs writes=rt hazards=from-coprocessor")
+X(Mtc1, "mtc1",
+  "rt:gpr32, fs:cpr | reads=rt writes=fs hazards=to-coprocessor")
+X(Dmfc1, "dmfc1",
+  "rt:gpr64, fs:cpr64 | reads=fs writes=rt hazards=from-coprocessor")
+X(Dmtc1, "dmtc1",
+  "rt:gpr64, fs:cpr64 | reads=rt writes=fs hazards=to-coprocessor")
+X(Mfhc1, "mfhc1",
+  "rt:gpr32, fs:cpr64 | reads=fs writes=rt hazards=from-coprocessor")
+X(Mthc1, "mthc1",
+  "rt:gpr32, fs:cpr64 | reads=rt writes=fs hazards=to-coprocessor")
+X(Nop, "nop",
+  " | ")
+X(Sync, "sync",
+  " | reads=memory writes=memory hazards=no-delay-slot")
+X(Break, "break",
+  "code:uimm10=0, code2:uimm10=0 | reads=memory writes=memory hazards=no-delay-slot")
+X(Ehb, "ehb",
+  " | ")
+X(Rfe, "rfe",
+  " | reads=cp0 writes=cp0")
+X(MovnS, "movn.s",
+  "fd:fpr32, fs:fpr32, rt:gpr | reads=fs,rt writes=fd")
+X(MovnD, "movn.d",
+  "fd:fpr64, fs:fpr64, rt:gpr | reads=fs,rt writes=fd")
+X(MovzS, "movz.s",
+  "fd:fpr32, fs:fpr32, rt:gpr | reads=fs,rt writes=fd")
+X(MovzD, "movz.d",
+  "fd:fpr64, fs:fpr64, rt:gpr | reads=fs,rt writes=fd")
+X(MovtS, "movt.s",
+  "fd:fpr32, fs:fpr32, cc:fcc | reads=fs,fcsr writes=fd hazards=condition-read")
+X(MovtD, "movt.d",
+  "fd:fpr64, fs:fpr64, cc:fcc | reads=fs,fcsr writes=fd hazards=condition-read")
+X(MovfS, "movf.s",
+  "fd:fpr32, fs:fpr32, cc:fcc | reads=fs,fcsr writes=fd hazards=condition-read")
+X(MovfD, "movf.d",
+  "fd:fpr64, fs:fpr64, cc:fcc | reads=fs,fcsr writes=fd hazards=condition-read")
+X(Movz, "movz",
+  "rd:gpr, rs:gpr, rt:gpr | reads=rs,rt writes=rd")
+X(Movf, "movf",
+  "rd:gpr, rs:gpr, cc:fcc | reads=rs,fcsr writes=rd hazards=condition-read")
+X(Movt, "movt",
+  "rd:gpr, rs:gpr, cc:fcc | reads=rs,fcsr writes=rd hazards=condition-read")
+X(Mul, "mul",
+  "rd:gpr32, rs:gpr32, rt:gpr32 | reads=rs,rt writes=rd,hi,lo")
+X(Ext, "ext",
+  "rt:gpr32, rs:gpr32, pos:0..31, size:1..32 | reads=rs writes=rt")
+X(Ins, "ins",
+  "rt:gpr32, rs:gpr32, pos:0..31, size:1..32 | reads=rt,rs writes=rt")
+X(Seb, "seb",
+  "rd:gpr32, rt:gpr32 | reads=rt writes=rd")
+X(Seh, "seh",
+  "rd:gpr32, rt:gpr32 | reads=rt writes=rd")
+X(Dsbh, "dsbh",
+  "rd:gpr64, rt:gpr64 | reads=rt writes=rd")
+X(Dshd, "dshd",
+  "rd:gpr64, rt:gpr64 | reads=rt writes=rd")
+X(Drotr, "drotr",
+  "rd:gpr64, rt:gpr64, sa:uimm6 | reads=rt writes=rd")
+X(Drotr32, "drotr32",
+  "rd:gpr64, rt:gpr64, sa:uimm5 | reads=rt writes=rd")
+X(Drotrv, "drotrv",
+  "rd:gpr64, rt:gpr64, rs:gpr64 | reads=rt,rs writes=rd")
+X(Dext, "dext",
+  "rt:gpr64, rs:gpr64, pos:0..31, size:1..32 | reads=rs writes=rt")
+X(Dextm, "dextm",
+  "rt:gpr64, rs:gpr64, pos:0..31, size:33..64 | reads=rs writes=rt")
+X(Dextu, "dextu",
+  "rt:gpr64, rs:gpr64, pos:32..63, size:1..32 | reads=rs writes=rt")
+X(Dins, "dins",
+  "rt:gpr64, rs:gpr64, pos:0..31, size:1..32 | reads=rt,rs writes=rt")
+X(Dinsm, "dinsm",
+  "rt:gpr64, rs:gpr64, pos:0..31, size:2..64 | reads=rt,rs writes=rt")
+X(Dinsu, "dinsu",
+  "rt:gpr64, rs:gpr64, pos:32..63, size:1..32 | reads=rt,rs writes=rt")

@@ -10399,8 +10399,7 @@ private:
         instruction(form.assembly_mnemonic, operands);
         // A raw jump has a delay slot, which RFE fills in the exception
         // return of MIPS I and II; ERET has none.
-        if (form.control != InstructionControlEffect::None &&
-            form.assembly_mnemonic != "eret") {
+        if (form.control != InstructionControlEffect::None && form.delay_slot) {
             instruction(form.name == "$::_rfe" ? "rfe" : "nop");
         }
         if (output && output->kind == machine::RegisterKind::Virtual) {

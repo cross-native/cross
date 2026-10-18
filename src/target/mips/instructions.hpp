@@ -6,12 +6,30 @@
 
 namespace cross::mips {
 
-// The instructions the MIPS backend emits and costs and the assembler
-// encodes, in the order of `TargetInfo::instruction_costs`.
+// The instructions the MIPS backend selects, which name the first entries
+// of `TargetInfo::instruction_costs`.
 enum class Instruction : std::uint16_t {
-#define X(name, spelling, latency, ...) name,
+#define X(name, mnemonic, ...) name,
 #include "target/mips/instructions.def"
 #undef X
+};
+
+// The operand types of MIPS `instruction` model entries, by
+// OperandType::id.
+enum class OperandTypeId : std::uint16_t {
+    Gpr,
+    Fpr32,
+    Fpr64,
+    Cpr,
+    Cpr64,
+    Fcc,
+    Cp0,
+    Fcr,
+    Immediate,
+    Expression,
+    Memory,
+    Branch,
+    Jump,
 };
 
 } // namespace cross::mips

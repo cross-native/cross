@@ -1,6 +1,7 @@
 // Copyright (C) 2026 Cross contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "model/model.hpp"
+#include "model/model_syntax.hpp"
 
 #include "common/builtin_type.hpp"
 #include "common/diagnostic.hpp"
@@ -167,32 +168,6 @@ private:
     unsigned line_{1};
 };
 
-struct ModelValue {
-    enum class Kind { Text, Integer, Boolean, List } kind{Kind::Text};
-    std::string text;
-    // The magnitude of an integer; `negative` gives its sign.
-    std::uint64_t integer{};
-    bool negative{};
-    bool boolean{};
-    std::vector<std::string> list;
-};
-
-struct ModelProperty {
-    ModelValue value;
-    unsigned line{};
-};
-
-using ModelProperties = std::unordered_map<std::string, ModelProperty>;
-
-// The compiled-in target of an architecture name that `cc --print-targets`
-// prints.
-const TargetInfo* architecture_target(std::string_view architecture) {
-    for (const auto* target : all_targets()) {
-        if (target->architecture == architecture) return target;
-    }
-    return nullptr;
-}
-
 // The address widths of the objects that the triples of `architecture`
 // produce, in increasing order.
 std::vector<unsigned> triple_address_widths(std::string_view architecture) {
@@ -301,6 +276,7 @@ struct ModelDocument {
     std::vector<DebugEntry> debugs;
     std::vector<CpuEntry> cpus;
     std::vector<DataBaseEntry> data_bases;
+    std::vector<ModelInstruction> instructions;
 };
 
 // Instruction costs are cycle counts that cost sums must not overflow.
@@ -317,7 +293,7 @@ public:
             if (current_.kind != ModelTokenKind::Identifier) {
                 fail(current_.line,
                      "expected model domain: abi, mangling, optimization, "
-                     "profile, debug, cpu, or data_base");
+                     "profile, debug, cpu, data_base, or instruction");
                 break;
             }
             const auto domain = current_.text;
@@ -326,7 +302,7 @@ public:
             if (domain != "abi" && domain != "mangling" &&
                 domain != "optimization" && domain != "profile" &&
                 domain != "debug" && domain != "cpu" &&
-                domain != "data_base") {
+                domain != "data_base" && domain != "instruction") {
                 fail(line, "unknown model domain '" + domain + "'");
                 break;
             }
@@ -379,6 +355,14 @@ public:
                 if (auto entry = make_data_base(name, *properties, line)) {
                     entry->source = position(line);
                     result.data_bases.push_back(std::move(*entry));
+                }
+            } else if (domain == "instruction") {
+                ModelProblem problem;
+                if (auto entry = make_instruction(name, line, origin_, *properties,
+                                                  problem)) {
+                    result.instructions.push_back(std::move(*entry));
+                } else {
+                    fail(problem.line, problem.message);
                 }
             } else if (auto entry = make_profile(name, *properties, line)) {
                 entry->source = position(line);
@@ -2921,16 +2905,10 @@ private:
             return std::nullopt;
         }
         for (const auto& block : blocks) {
-            const auto instruction = find_instruction_cost(*target, block.name);
-            if (!instruction) {
-                fail(block.line, "unknown " + *architecture +
-                                     " instruction '" + block.name + "'");
-                return std::nullopt;
-            }
             if (std::any_of(result.instructions.begin(),
                             result.instructions.end(),
                             [&](const CpuInstructionEntry& entry) {
-                                return entry.instruction == *instruction;
+                                return entry.name == block.name;
                             })) {
                 fail(block.line,
                      "duplicate instruction '" + block.name + "'");
@@ -2941,7 +2919,8 @@ private:
                 return std::nullopt;
             }
             result.instructions.push_back(
-                {*instruction, cost_property(block.properties, "latency", 0),
+                {block.name, block.line, {},
+                 cost_property(block.properties, "latency", 0),
                  cost_property(block.properties, "issue", 1),
                  bool_property(block.properties, "available")});
         }
@@ -3092,10 +3071,10 @@ std::optional<std::string> inheritance_conflict(
     return std::nullopt;
 }
 
-// The costs of an instruction block; omitted properties have the target's.
-InstructionCost block_cost(const TargetInfo& target,
+// The costs of an instruction block; omitted properties have the table's.
+InstructionCost block_cost(std::span<const InstructionCostEntry> costs,
                            const CpuInstructionEntry& block) {
-    const auto& defaults = target.instruction_costs[block.instruction.value];
+    const auto& defaults = costs[block.instruction.value];
     return {block.latency.value_or(defaults.latency),
             block.issue.value_or(defaults.issue),
             block.available.value_or(true)};
@@ -3140,11 +3119,23 @@ ModelRegistry::ModelRegistry() {
     std::ostringstream errors;
     Diagnostics diagnostics(errors);
     for (const auto& source : shipped_model_sources()) {
-        if (!load_text(source.text, std::string(source.name), diagnostics)) {
+        std::string text;
+        for (const auto piece : source.text) text += piece;
+        if (!load_text(text, std::string(source.name), diagnostics)) {
             throw std::logic_error("invalid shipped Cross model: " +
                                    errors.str());
         }
     }
+    if (!complete_instructions(diagnostics)) {
+        throw std::logic_error("invalid shipped Cross model: " + errors.str());
+    }
+}
+
+const TargetInfo* architecture_target(std::string_view architecture) {
+    for (const auto* target : all_targets()) {
+        if (target->architecture == architecture) return target;
+    }
+    return nullptr;
 }
 
 bool ModelRegistry::load_text(std::string_view text, std::string origin,
@@ -3307,6 +3298,22 @@ bool ModelRegistry::load_text(std::string_view text, std::string origin,
     }
     for (auto& entry : document->data_bases) {
         data_bases_.push_back(std::move(entry));
+    }
+    for (auto& entry : document->instructions) {
+        auto table = std::find_if(instruction_tables_.begin(),
+                                  instruction_tables_.end(),
+                                  [&](const InstructionTable& item) {
+                                      return item.architecture ==
+                                             entry.architecture;
+                                  });
+        if (table == instruction_tables_.end()) {
+            InstructionTable added;
+            added.architecture = entry.architecture;
+            instruction_tables_.push_back(std::move(added));
+            table = std::prev(instruction_tables_.end());
+        }
+        table->entries.push_back(std::move(entry));
+        instructions_pending_ = true;
     }
     origins_.push_back(std::move(origin));
     return true;
@@ -3485,7 +3492,8 @@ ResolvedCpu ModelRegistry::resolve_cpu(const TargetInfo& target,
         }
     };
     collect(collect, entry);
-    for (const auto& instruction : target.instruction_costs) {
+    const auto costs = instruction_costs(target);
+    for (const auto& instruction : costs) {
         result.instructions.push_back(
             {instruction.latency, instruction.issue, true});
     }
@@ -3500,7 +3508,7 @@ ResolvedCpu ModelRegistry::resolve_cpu(const TargetInfo& target,
         }
         for (const auto& block : cpu.instructions) {
             result.instructions[block.instruction.value] =
-                block_cost(target, block);
+                block_cost(costs, block);
         }
     }
     return result;
@@ -3527,6 +3535,8 @@ std::vector<OptionAssignment> ModelRegistry::resolve_optimization(
 
 ModelRegistry& model_registry() {
     static ModelRegistry registry;
+    static const bool installed = (registry.install_instruction_tables(), true);
+    (void)installed;
     return registry;
 }
 
@@ -3780,18 +3790,15 @@ bool check_entries(const ModelRegistry& registry, Diagnostics& diagnostics) {
             return result;
         });
         if (!problem) {
+            const auto costs = registry.instruction_costs(target);
             problem = inheritance_conflict(graph, [&](const CpuEntry& entry) {
                 std::map<std::string, std::tuple<unsigned, unsigned, bool>>
                     result;
                 for (const auto& block : entry.instructions) {
-                    const auto cost = block_cost(target, block);
-                    result.emplace(
-                        "instruction '" +
-                            std::string(target.instruction_costs
-                                            [block.instruction.value]
-                                                .name) +
-                            "'",
-                        std::tuple{cost.latency, cost.issue, cost.available});
+                    const auto cost = block_cost(costs, block);
+                    result.emplace("instruction '" + block.name + "'",
+                                   std::tuple{cost.latency, cost.issue,
+                                              cost.available});
                 }
                 return result;
             });
@@ -3915,6 +3922,10 @@ bool configure_models(CompilerOptions& options, Diagnostics& diagnostics) {
             return false;
         }
         if (!registry.load_file(*resolved, diagnostics)) return false;
+    }
+    if (!options.model_files.empty()) {
+        if (!registry.complete_instructions(diagnostics)) return false;
+        registry.install_instruction_tables();
     }
     if (!check_entries(registry, diagnostics)) return false;
 

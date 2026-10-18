@@ -70,12 +70,20 @@ expect(li error "        li $2, 0x100000000"
 expect(dli error ".set mips2|        dli $2, 5" "dli.s:2:9: error: instruction 'dli' is not available in mips2" ${o32})
 expect(numeric error "        .word 1b" "numeric.s:1:15: error: no previous definition of local label '1'" ${o32})
 expect(div error "        div $2, $3, $4"
-       "div.s:1:13: error: the 'div' macro is not supported; write 'div [$]zero, rs, rt'" ${o32})
+       "div.s:1:13: error: 'div' takes '[$]zero' as operand 1" ${o32})
 expect(cfi error ".cfi_offset 31, -4"
        "cfi.s:1:1: error: this directive must appear between .cfi_startproc and .cfi_endproc" ${o32})
 expect(frame error ".cfi_startproc|        nop" "frame.s:1:1: error: missing .cfi_endproc" ${o32})
 expect(redefined error "x:|x:" "redefined.s:2:1: error: symbol 'x' is already defined" ${o32})
-expect(sync error ".set mips2|        sync 4" "sync.s:2:9: error: a sync type needs MIPS32 or MIPS64" ${o32})
+expect(sync error ".set mips2|        sync 4"
+       "sync.s:2:9: error: instruction 'sync' with these operands is not available in mips2" ${o32})
+# A field that no form of dext takes; one that dinsm does not take.
+expect(bit-field error "        dext $2, $3, 40, 40"
+       "bit-field.s:1:22: error: immediate 40 is out of range \\[0, 31\\]"
+       -target mips64-unknown-elf -march=mips64r2)
+expect(bit-field-form error "        dinsm $2, $3, 4, 8"
+       "bit-field-form.s:1:26: error: the operands of 'dinsm' must satisfy pos[+]size > 32"
+       -target mips64-unknown-elf -march=mips64r2)
 expect(byte error "        .byte 300" "byte.s:1:15: error: value 300 does not fit in 1 byte" ${o32})
 expect(quad error "        .8byte symbol"
        "quad.s:1:16: error: an eight-byte symbolic value needs a 64-bit object" ${o32})

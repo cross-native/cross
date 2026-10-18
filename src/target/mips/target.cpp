@@ -16,10 +16,10 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <charconv>
 #include <cstdint>
 #include <limits>
 #include <string_view>
-#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -86,64 +86,13 @@ std::vector<RegisterEntry> target_registers() {
     return result;
 }
 
-InstructionOperandEntry gpr_operand(InstructionOperandRole role,
-                                    unsigned value_bits) {
-    InstructionOperandEntry result;
-    result.role = role;
-    result.allow_register = true;
-    result.register_bits = 64;
-    result.register_class = "integer";
-    result.value_bits = value_bits;
-    return result;
-}
-
-InstructionOperandEntry fpr_operand(InstructionOperandRole role,
-                                    unsigned value_bits) {
-    auto result = gpr_operand(role, value_bits);
-    result.register_class = "floating";
-    return result;
-}
-
-InstructionOperandEntry immediate_field(unsigned bits,
-                                        bool register_number = false) {
-    InstructionOperandEntry result;
-    result.allow_immediate = true;
-    result.immediate_bits = bits;
-    result.assembly_register_number = register_number;
-    return result;
-}
-
-// An address-only operand: a cache operation names the line holding any
-// complete object.
-InstructionOperandEntry address_operand() {
-    InstructionOperandEntry result;
-    result.allow_memory = true;
-    return result;
-}
-
-InstructionOperandEntry label_operand() {
-    InstructionOperandEntry result;
-    result.allow_label = true;
-    result.label_scope = InstructionLabelScope::SameFunction;
-    return result;
-}
-
 // Coprocessor 0 register numbers.
-constexpr unsigned cp0_index = 0;
-constexpr unsigned cp0_random = 1;
-constexpr unsigned cp0_entry_lo0 = 2;
-constexpr unsigned cp0_entry_lo1 = 3;
-constexpr unsigned cp0_page_mask = 5;
 constexpr unsigned cp0_entry_hi = 10;
 constexpr unsigned cp0_status = 12;
 constexpr unsigned cp0_cause = 13;
-constexpr unsigned cp0_epc = 14;
 constexpr unsigned cp0_config = 16;
 constexpr unsigned cp0_watch_lo = 18;
 constexpr unsigned cp0_watch_hi = 19;
-constexpr unsigned cp0_tag_lo = 28;
-constexpr unsigned cp0_tag_hi = 29;
-constexpr unsigned cp0_error_epc = 30;
 
 // Resource names are static strings because registry entries hold views.
 constexpr std::string_view cp0_resource(unsigned number) {
@@ -161,221 +110,8 @@ HazardFact cp0_fact(unsigned number, unsigned stage) {
 }
 
 // Pipeline stages follow the R4000 coprocessor 0 hazard table, which the
-// VR4300 keeps: CP0 data written by MTC0 is available at stage 7, TLB
-// writes at stage 8, and MFC0 reads at stage 4.
-std::vector<InstructionEntry> target_instructions() {
-    using Role = InstructionOperandRole;
-    using Control = InstructionControlEffect;
-    std::vector<InstructionEntry> result;
-    const auto add = [&](std::string_view name, std::string_view feature,
-                         std::string_view mnemonic,
-                         std::vector<InstructionOperandEntry> operands,
-                         std::vector<std::string_view> reads,
-                         std::vector<std::string_view> writes,
-                         Control control = Control::None)
-        -> InstructionEntry& {
-        result.emplace_back(name, feature, mnemonic, std::move(operands),
-                            std::move(reads), std::move(writes), 0, control);
-        return result.back();
-    };
-    const auto system = [](InstructionEntry& entry) -> InstructionEntry& {
-        entry.privileged = true;
-        entry.volatile_effect = true;
-        return entry;
-    };
-
-    add("$::_nop", "mips", "nop", {}, {}, {});
-
-    // Coprocessor 0 moves, and from MIPS32 and MIPS64 on the forms with a
-    // register select. Reads are volatile: Count, Random, Cause, EPC, and
-    // BadVAddr change without a program write.
-    for (const auto& [move_from, move_to, feature, bits, select] :
-         {std::tuple{std::string_view{"mfc0"}, std::string_view{"mtc0"},
-                     std::string_view{"mips"}, 32U, false},
-          std::tuple{std::string_view{"dmfc0"}, std::string_view{"dmtc0"},
-                     std::string_view{"mips3"}, 64U, false},
-          std::tuple{std::string_view{"mfc0"}, std::string_view{"mtc0"},
-                     std::string_view{"mips32"}, 32U, true},
-          std::tuple{std::string_view{"dmfc0"}, std::string_view{"dmtc0"},
-                     std::string_view{"mips64"}, 64U, true}}) {
-        std::vector<InstructionOperandEntry> read_operands{
-            gpr_operand(Role::Output, bits), immediate_field(5, true)};
-        std::vector<InstructionOperandEntry> write_operands{
-            gpr_operand(Role::Input, bits), immediate_field(5, true)};
-        if (select) {
-            read_operands.push_back(immediate_field(3));
-            write_operands.push_back(immediate_field(3));
-        }
-        auto& read = system(add(
-            move_from == "mfc0" ? "$::_mfc0" : "$::_dmfc0", feature,
-            move_from, std::move(read_operands), {"cp0"}, {}));
-        read.hazard_uses = {{"cp0", 4, 1}};
-        auto& write = system(add(
-            move_to == "mtc0" ? "$::_mtc0" : "$::_dmtc0", feature, move_to,
-            std::move(write_operands), {}, {"cp0"}));
-        write.hazard_writes = {{"cp0", 7, 1}};
-    }
-
-    // TLB maintenance.
-    auto& probe = system(add("$::_tlbp", "mips", "tlbp", {},
-                             {"cp0", "tlb"}, {"cp0"}));
-    probe.hazard_uses = {cp0_fact(cp0_page_mask, 3),
-                         cp0_fact(cp0_entry_hi, 3), {"tlb", 4}};
-    probe.hazard_writes = {cp0_fact(cp0_index, 7)};
-    auto& read = system(add("$::_tlbr", "mips", "tlbr", {},
-                            {"cp0", "tlb"}, {"cp0"}));
-    read.hazard_uses = {cp0_fact(cp0_index, 5), {"tlb", 5}};
-    read.hazard_writes = {cp0_fact(cp0_page_mask, 8),
-                          cp0_fact(cp0_entry_hi, 8),
-                          cp0_fact(cp0_entry_lo0, 8),
-                          cp0_fact(cp0_entry_lo1, 8)};
-    for (const auto& [name, mnemonic, selector] :
-         {std::tuple{std::string_view{"$::_tlbwi"}, std::string_view{"tlbwi"},
-                     cp0_index},
-          std::tuple{std::string_view{"$::_tlbwr"}, std::string_view{"tlbwr"},
-                     cp0_random}}) {
-        auto& write = system(add(name, "mips", mnemonic, {}, {"cp0"},
-                                 {"tlb"}));
-        write.hazard_uses = {cp0_fact(selector, 5),
-                             cp0_fact(cp0_page_mask, 5),
-                             cp0_fact(cp0_entry_hi, 5),
-                             cp0_fact(cp0_entry_lo0, 5),
-                             cp0_fact(cp0_entry_lo1, 5)};
-        write.hazard_writes = {{"tlb", 8}};
-    }
-
-    // Exception return, cache maintenance, and memory ordering. A cache
-    // operation translates its address like a load; Index Load Tag
-    // (operations 4-7) writes TagLo/TagHi. A store to the same line needs
-    // two non-load, non-cache instructions before the cache operation.
-    const auto index_load_tag = [](unsigned number) {
-        return HazardFact{cp0_resource(number), 8, std::nullopt, 0,
-                          {4, 5, 6, 7}};
-    };
-    for (const auto feature : {std::string_view{"mips3"},
-                               std::string_view{"mips32"}}) {
-        auto& exception_return = system(add(
-            "$::_eret", feature, "eret", {}, {"cp0", "tlb"}, {"cp0"},
-            Control::RawReturn));
-        exception_return.hazard_uses = {cp0_fact(cp0_epc, 4),
-                                        cp0_fact(cp0_error_epc, 4),
-                                        {"tlb", 4},
-                                        cp0_fact(cp0_status, 3)};
-        auto& cache = system(add(
-            "$::_cache", feature, "cache",
-            {immediate_field(5), address_operand()},
-            {"memory", "cp0", "tlb"}, {"memory", "cp0"}));
-        cache.hazard_uses = {{"tlb", 4}, {"dcache.line", 3}};
-        cache.hazard_writes = {index_load_tag(cp0_tag_lo),
-                               index_load_tag(cp0_tag_hi)};
-    }
-    auto& barrier = add("$::_sync", "mips2", "sync", {}, {"memory"},
-                        {"memory"});
-    barrier.volatile_effect = true;
-
-    // Exceptions that resume at the next instruction, with an optional code,
-    // and the MIPS32 wait for an interrupt.
-    for (const bool coded : {false, true}) {
-        auto& call = add("$::_syscall", "mips", "syscall",
-                         coded ? std::vector{immediate_field(20)}
-                               : std::vector<InstructionOperandEntry>{},
-                         {"memory"}, {"memory"});
-        call.volatile_effect = true;
-        auto& stop = add("$::_break", "mips", "break",
-                         coded ? std::vector{immediate_field(10)}
-                               : std::vector<InstructionOperandEntry>{},
-                         {"memory"}, {"memory"});
-        stop.volatile_effect = true;
-    }
-    system(add("$::_wait", "mips32", "wait", {}, {"memory"}, {"memory"}));
-
-    // Floating-point control and status.
-    auto& control_read = add(
-        "$::_cfc1", "hard-float", "cfc1",
-        {gpr_operand(Role::Output, 32), immediate_field(5, true)},
-        {"fcsr"}, {});
-    control_read.volatile_effect = true;
-    auto& control_write = add(
-        "$::_ctc1", "hard-float", "ctc1",
-        {gpr_operand(Role::Input, 32), immediate_field(5, true)},
-        {}, {"fcsr"});
-    control_write.volatile_effect = true;
-
-    // Pure floating forms; `.d` needs a double-precision FPU.
-    for (const auto& [name, mnemonic, feature] :
-         {std::tuple{std::string_view{"$::_sqrt"}, std::string_view{"sqrt"},
-                     std::string_view{"mips2"}},
-          std::tuple{std::string_view{"$::_abs"}, std::string_view{"abs"},
-                     std::string_view{"hard-float"}},
-          std::tuple{std::string_view{"$::_neg"}, std::string_view{"neg"},
-                     std::string_view{"hard-float"}}}) {
-        for (const auto bits : {32U, 64U}) {
-            auto& entry = add(
-                name, feature,
-                mnemonic == "sqrt" ? (bits == 32 ? "sqrt.s" : "sqrt.d")
-                : mnemonic == "abs" ? (bits == 32 ? "abs.s" : "abs.d")
-                                    : (bits == 32 ? "neg.s" : "neg.d"),
-                {fpr_operand(Role::Output, bits),
-                 fpr_operand(Role::Input, bits)},
-                {}, {});
-            if (feature != "hard-float") {
-                entry.required_features = {"hard-float"};
-            }
-            if (bits == 64) entry.forbidden_features = {"single-float"};
-        }
-    }
-
-    // Control transfers that leave a naked function. Before MIPS III an
-    // exception handler returns with RFE in the delay slot of its jump,
-    // which restores the status stack as the jump leaves.
-    for (const auto& [feature, bits] :
-         {std::pair{std::string_view{"mips"}, 32U},
-          std::pair{std::string_view{"mips3"}, 64U}}) {
-        add("$::_jr", feature, "jr", {gpr_operand(Role::Input, bits)}, {},
-            {}, Control::RawReturn);
-    }
-    auto& restore = system(add("$::_rfe", "mips", "jr",
-                               {gpr_operand(Role::Input, 32)}, {"cp0"},
-                               {"cp0"}, Control::RawReturn));
-    restore.forbidden_features = {"mips3", "mips32"};
-
-    // Branches within a naked function: to a label, and on a comparison of
-    // two general registers or of one with zero. The compiler fills their
-    // delay slots.
-    add("$::_b", "mips", "b", {label_operand()}, {}, {},
-        Control::UnconditionalBranch);
-    using Condition = InstructionBranchCondition;
-    for (const auto& [name, mnemonic, condition, registers] :
-         {std::tuple{std::string_view{"$::_beq"}, std::string_view{"beq"},
-                     Condition::Equal, 2U},
-          std::tuple{std::string_view{"$::_bne"}, std::string_view{"bne"},
-                     Condition::NotEqual, 2U},
-          std::tuple{std::string_view{"$::_beqz"}, std::string_view{"beqz"},
-                     Condition::Equal, 1U},
-          std::tuple{std::string_view{"$::_bnez"}, std::string_view{"bnez"},
-                     Condition::NotEqual, 1U},
-          std::tuple{std::string_view{"$::_bltz"}, std::string_view{"bltz"},
-                     Condition::LessThanZero, 1U},
-          std::tuple{std::string_view{"$::_bgez"}, std::string_view{"bgez"},
-                     Condition::GreaterEqualZero, 1U},
-          std::tuple{std::string_view{"$::_blez"}, std::string_view{"blez"},
-                     Condition::LessEqualZero, 1U},
-          std::tuple{std::string_view{"$::_bgtz"}, std::string_view{"bgtz"},
-                     Condition::GreaterThanZero, 1U}}) {
-        for (const auto& [feature, bits] :
-             {std::pair{std::string_view{"mips"}, 32U},
-              std::pair{std::string_view{"mips3"}, 64U}}) {
-            std::vector<InstructionOperandEntry> operands(
-                registers, gpr_operand(Role::Input, bits));
-            operands.push_back(label_operand());
-            auto& branch = add(name, feature, mnemonic, std::move(operands),
-                               {}, {}, Control::ConditionalBranch);
-            branch.branch_condition = condition;
-        }
-    }
-    return result;
-}
-
+// VR4300 keeps; the instruction table states those of the coprocessor 0
+// instructions.
 std::vector<HazardEventEntry> target_hazard_events() {
     std::vector<HazardEventEntry> result;
     // Loads and stores translate through the TLB with the current ASID,
@@ -651,13 +387,136 @@ std::vector<OptionDefinition> target_options() {
     return result;
 }
 
-std::vector<InstructionCostEntry> declared_instructions() {
-    return {
-#define X(name, spelling, latency, ...) {spelling, latency},
+// The operand type that MIPS instruction entries name `name`.
+std::optional<OperandType> operand_type(std::string_view name) {
+    using Id = mips::OperandTypeId;
+    const auto id = [](Id value) { return static_cast<std::uint16_t>(value); };
+    const auto gpr = [&](std::vector<OperandWidth> widths) {
+        OperandType result{OperandKind::Register, "integer", 0, 31};
+        result.exposable = true;
+        result.widths = std::move(widths);
+        result.id = id(Id::Gpr);
+        return result;
+    };
+    const auto fpr = [&](Id type, unsigned bits) {
+        OperandType result{OperandKind::Register, "floating", 0, 31};
+        result.exposable = true;
+        result.widths = {{bits}};
+        result.required_features = {"hard-float"};
+        if (bits == 64) result.forbidden_features = {"single-float"};
+        result.id = id(type);
+        return result;
+    };
+    const auto number = [&](Id type, std::int64_t maximum) {
+        OperandType result{OperandKind::Immediate, {}, 0, maximum};
+        result.id = id(type);
+        return result;
+    };
+    // 64-bit values in general registers need MIPS III.
+    if (name == "gpr") return gpr({{32}, {64, "mips3"}});
+    if (name == "gpr32") return gpr({{32}});
+    if (name == "gpr64") return gpr({{64, "mips3"}});
+    if (name == "fpr32") return fpr(Id::Fpr32, 32);
+    if (name == "fpr64") return fpr(Id::Fpr64, 64);
+    if (name == "cpr") return fpr(Id::Cpr, 32);
+    if (name == "cpr64") return fpr(Id::Cpr64, 64);
+    if (name == "fcc") return number(Id::Fcc, 7);
+    if (name == "cp0" || name == "fcr") {
+        auto result = number(name == "cp0" ? Id::Cp0 : Id::Fcr, 31);
+        result.exposable = true;
+        result.register_syntax = true;
+        if (name == "fcr") result.required_features = {"hard-float"};
+        return result;
+    }
+    if (name == "imm") {
+        OperandType result{OperandKind::Expression, {}, std::numeric_limits<std::int64_t>::min(),
+                           std::numeric_limits<std::int64_t>::max()};
+        result.id = id(Id::Expression);
+        return result;
+    }
+    if (name == "branch" || name == "jump") {
+        OperandType result{OperandKind::Label};
+        result.relocated_bits = name == "branch" ? 16 : 26;
+        // A branch built-in takes a label of its function.
+        result.exposable = name == "branch";
+        result.id = id(name == "branch" ? Id::Branch : Id::Jump);
+        return result;
+    }
+    const auto parse = [](std::string_view text) -> std::optional<std::int64_t> {
+        std::int64_t value{};
+        const auto* end = text.data() + text.size();
+        const auto parsed = std::from_chars(text.data(), end, value);
+        if (text.empty() || parsed.ec != std::errc{} || parsed.ptr != end) return std::nullopt;
+        return value;
+    };
+    // memN: a GPR base and a signed 16-bit offset, for an N-bit access.
+    if (name.starts_with("mem")) {
+        const auto bits = name.size() == 3 ? std::optional<std::int64_t>(0) : parse(name.substr(3));
+        if (!bits || (*bits != 0 && *bits != 8 && *bits != 16 && *bits != 32 && *bits != 64)) {
+            return std::nullopt;
+        }
+        OperandType result{OperandKind::Memory, "integer", 0, 31, 16, -32768, 32767,
+                           static_cast<unsigned>(*bits)};
+        result.exposable = true;
+        result.id = id(Id::Memory);
+        return result;
+    }
+    // uimmN and simmN, and LO..HI; 16-bit fields take relocations.
+    OperandType result{OperandKind::Immediate};
+    result.exposable = true;
+    result.id = id(Id::Immediate);
+    if (const auto dots = name.find(".."); dots != std::string_view::npos) {
+        const auto low = parse(name.substr(0, dots));
+        const auto high = parse(name.substr(dots + 2));
+        if (!low || !high || *low > *high) return std::nullopt;
+        result.minimum = *low;
+        result.maximum = *high;
+        return result;
+    }
+    const bool is_signed = name.starts_with("simm");
+    if (!is_signed && !name.starts_with("uimm")) return std::nullopt;
+    const auto bits = parse(name.substr(4));
+    if (!bits || *bits < 1 || *bits > 32) return std::nullopt;
+    result.minimum = is_signed ? -(std::int64_t{1} << (*bits - 1)) : 0;
+    result.maximum = is_signed ? (std::int64_t{1} << (*bits - 1)) - 1
+                               : (std::int64_t{1} << *bits) - 1;
+    result.relocated_bits = *bits == 16 ? 16 : 0;
+    return result;
+}
+
+// The number of a general or floating register, from its storage.
+std::optional<unsigned> register_number(std::string_view name) {
+    static const auto registers = target_registers();
+    for (const auto& reg : registers) {
+        if (reg.name != name) continue;
+        const auto storage = reg.storage;
+        if (storage.size() < 2 || (storage[0] != 'r' && storage[0] != 'f')) return std::nullopt;
+        unsigned value{};
+        const auto parsed =
+            std::from_chars(storage.data() + 1, storage.data() + storage.size(), value);
+        if (parsed.ec != std::errc{}) return std::nullopt;
+        return value;
+    }
+    return std::nullopt;
+}
+
+const InstructionModel instruction_model{
+    32,
+    operand_type,
+    register_number,
+    {"load", "coprocessor-load", "from-coprocessor", "to-coprocessor", "coprocessor",
+     "condition-read", "condition-write", "no-delay-slot"},
+    {{"li", {OperandKind::Register, OperandKind::Expression},
+      {"addiu", "ori", "lui", "dsll", "dsrl32"}},
+     {"dli", {OperandKind::Register, OperandKind::Expression},
+      {"addiu", "ori", "lui", "dsll", "dsrl32"}}},
+    "at",
+    {
+#define X(name, mnemonic, ...) SelectedInstruction{mnemonic, {__VA_ARGS__}},
 #include "target/mips/instructions.def"
 #undef X
-    };
-}
+    },
+};
 
 TargetInfo make_target(ByteOrder order, std::vector<TriplePrefix> prefixes) {
     TargetInfo result{
@@ -698,7 +557,7 @@ TargetInfo make_target(ByteOrder order, std::vector<TriplePrefix> prefixes) {
             {"iptr", 32, "mips1", PatchAddressRepresentation::FlatUptr, false, true},
             {"uptr", 32, "mips1", PatchAddressRepresentation::FlatUptr, false, true},
         },
-        target_instructions(),
+        {},
         {{32, "llsc"}},
         {},
         target_options(),
@@ -717,7 +576,8 @@ TargetInfo make_target(ByteOrder order, std::vector<TriplePrefix> prefixes) {
         NakedLowering::Constrained,
         {{"$::sqrt", "$::_sqrt"}},
     };
-    set_instruction_costs(result, declared_instructions());
+    // The models give the instruction table.
+    result.instruction_model = &instruction_model;
     // %gp_rel offsets are relative to _gp, which $gp holds.
     result.data_base_registers = {"gp"};
     result.integrated_assembler = &mips::assemble;
@@ -726,10 +586,11 @@ TargetInfo make_target(ByteOrder order, std::vector<TriplePrefix> prefixes) {
     return result;
 }
 
-// mips64 triples produce ELF64 objects with 64-bit addresses.
-const TargetInfo big_endian = make_target(
+// mips64 triples produce ELF64 objects with 64-bit addresses. Not const:
+// loading the models installs their instruction table.
+TargetInfo big_endian = make_target(
     ByteOrder::Big, {{"mipsallegrex", 32}, {"mips64", 64}, {"mips", 32}});
-const TargetInfo little_endian = make_target(
+TargetInfo little_endian = make_target(
     ByteOrder::Little,
     {{"mipsallegrexel", 32}, {"mips64el", 64}, {"mipsel", 32}});
 

@@ -419,6 +419,8 @@ struct InstructionEntry {
     // The condition of a ConditionalBranch form, when it has one.
     InstructionBranchCondition branch_condition{
         InstructionBranchCondition::None};
+    // The instruction after a control transfer executes before it.
+    bool delay_slot{};
 
     InstructionEntry() = default;
 
@@ -724,6 +726,79 @@ struct IntrinsicFormEntry {
     std::string_view instruction;
 };
 
+// The kinds of operands that `instruction` model entries describe.
+enum class OperandKind : std::uint8_t {
+    Register,    // a register of `register_class`, encoded by its number
+    Immediate,   // an integer from `minimum` to `maximum`
+    Memory,      // a base register and a signed offset
+    Label,       // a code address
+    Expression,  // a value that only a macro consumes
+};
+
+// A width of register values that a machine instruction built-in accepts
+// for an operand, with the feature that the width needs.
+struct OperandWidth {
+    unsigned bits{};
+    std::string_view feature{};
+};
+
+// An operand type that a target's `instruction` entries may name.
+struct OperandType {
+    OperandKind kind{};
+    std::string_view register_class{};
+    // The field values: register numbers or immediates.
+    std::int64_t minimum{};
+    std::int64_t maximum{};
+    // A value that a relocation operator gives or layout settles goes into
+    // the low `relocated_bits` bits of the word.
+    unsigned relocated_bits{};
+    // Memory: the range of offsets and the accessed width, 0 for any.
+    std::int64_t offset_minimum{};
+    std::int64_t offset_maximum{};
+    unsigned memory_bits{};
+    // As an operand of a machine instruction built-in, which the type cannot
+    // be unless `exposable`: register value widths, one form each; features
+    // the operand needs or excludes; and immediates in register syntax.
+    bool exposable{};
+    std::vector<OperandWidth> widths{};
+    std::vector<std::string_view> required_features{};
+    std::vector<std::string_view> forbidden_features{};
+    bool register_syntax{};
+    // The target's identity of the type.
+    std::uint16_t id{};
+};
+
+// A macro of the target's assembler that an entry's `macro` names, the
+// operand kinds it takes, and the entries its expansion emits.
+struct InstructionMacro {
+    std::string_view name;
+    std::vector<OperandKind> operands;
+    std::vector<std::string_view> uses;
+};
+
+// An instruction that the backend selects, with each form it emits as
+// "OPERANDS | EFFECTS", in the spelling of the entry's properties.
+struct SelectedInstruction {
+    std::string_view mnemonic;
+    std::vector<std::string_view> forms;
+};
+
+// The facts by which models give a target whose instructions have one
+// width its instruction table.
+struct InstructionModel {
+    unsigned instruction_bits{};
+    std::optional<OperandType> (*operand_type)(std::string_view name){};
+    // The number that encodes a register; none for one without.
+    std::optional<unsigned> (*register_number)(std::string_view name){};
+    std::vector<std::string_view> hazard_classes;
+    std::vector<InstructionMacro> macros;
+    // The register that macro expansions use as scratch.
+    std::string_view macro_register;
+    // The first entries of `TargetInfo::instruction_costs`, in the order of
+    // the target's instruction enumeration.
+    std::vector<SelectedInstruction> selected;
+};
+
 // A target-triple prefix and the address width of the objects its triples
 // produce, such as ELF32 for 32 and ELF64 for 64.
 struct TriplePrefix {
@@ -762,6 +837,13 @@ struct TargetInfo {
     std::vector<InstructionCostEntry> instruction_costs{};
     // The instruction of each registry form, by InstructionFormId.
     std::vector<InstructionCostId> form_instructions{};
+    // The order in which `--print-costs` lists `instruction_costs`; empty
+    // lists them in table order.
+    std::vector<InstructionCostId> cost_listing{};
+    // How models give the target its instruction table, which then fills
+    // `instructions`, `instruction_costs`, and `form_instructions`; none
+    // when the target's table is compiled in.
+    const InstructionModel* instruction_model{};
     // The registers that can hold the base of `data_base` model entries;
     // none when the target has no base-relative data addressing.
     std::vector<std::string_view> data_base_registers{};

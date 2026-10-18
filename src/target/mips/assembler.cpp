@@ -6,6 +6,7 @@
 #include "model/model.hpp"
 #include "target/mips/elf.hpp"
 #include "target/mips/features.hpp"
+#include "target/mips/instructions.hpp"
 #include "target/subtarget.hpp"
 #include "target/target.hpp"
 
@@ -30,7 +31,7 @@ using assembler::Statement;
 using assembler::SymbolId;
 namespace elf = assembler::elf;
 
-// ISA levels as bits; each instruction lists the levels that have it.
+// ISA levels as bits, for the ELF header and .MIPS.abiflags.
 enum : std::uint16_t {
     isa_mips1 = 1U << 0,
     isa_mips2 = 1U << 1,
@@ -41,24 +42,9 @@ enum : std::uint16_t {
     isa_mips32r2 = 1U << 6,
     isa_mips64 = 1U << 7,
     isa_mips64r2 = 1U << 8,
-    // CPU facts rather than levels: the Allegrex extension, and an
-    // instruction of the listed levels that the Allegrex lacks.
-    isa_allegrex = 1U << 9,
-    isa_not_allegrex = 1U << 10,
 };
-constexpr std::uint16_t I1 = 0x1ff;
-constexpr std::uint16_t I2 = I1 & ~isa_mips1;
-constexpr std::uint16_t I12 = isa_mips1 | isa_mips2;
-constexpr std::uint16_t I3 = isa_mips3 | isa_mips4 | isa_mips5 | isa_mips64 | isa_mips64r2;
-constexpr std::uint16_t I4 = isa_mips4 | isa_mips5 | isa_mips64 | isa_mips64r2;
-constexpr std::uint16_t I32 = isa_mips32 | isa_mips32r2 | isa_mips64 | isa_mips64r2;
-constexpr std::uint16_t I33 = isa_mips32r2 | isa_mips64r2;
-constexpr std::uint16_t I64 = isa_mips64 | isa_mips64r2;
-constexpr std::uint16_t I3_32 = I3 | I32;
-constexpr std::uint16_t I4_32 = I4 | I32;
-constexpr std::uint16_t I3_33 = I3 | I33;
-constexpr std::uint16_t ALX = isa_allegrex;
-constexpr std::uint16_t NOT_ALX = isa_not_allegrex;
+// The levels with 64-bit general registers.
+constexpr std::uint16_t isa_64bit = isa_mips3 | isa_mips4 | isa_mips5 | isa_mips64 | isa_mips64r2;
 
 struct IsaLevel {
     std::string_view name;
@@ -87,71 +73,6 @@ const IsaLevel& isa_level(std::uint16_t bit) {
     return isa_levels.front();
 }
 
-enum class Syntax : std::uint8_t {
-    RdRsRt, RdRtRs, RdRtSa, RtRsSimm, RtRsUimm, RtUimm, RdRsCount, RdRs, RdRt,
-    RdRsCc, RsRt, Divide, Rd, Rs, RtMemory, FtMemory, CacheMemory,
-    RsRtBranch, RsBranch, BranchAlways, CcBranch, Jump, JumpRegister,
-    JumpLinkRegister, FdFsFt, FdFs, FsFt, FdFsRt, FdFsCc, RtFs, RtControl,
-    RtCoprocessor, NoOperands, SyncType, BreakCode, SyscallCode,
-    TrapRegister, TrapImmediate, Extract, Insert,
-    LoadImmediate, LoadImmediate64, MoveMacro, Negate, NotMacro,
-    DoubleExtract, DoubleInsert,
-};
-
-struct Description {
-    std::string_view mnemonic;
-    Syntax syntax;
-    std::uint32_t word;
-    std::uint16_t isa;
-};
-
-constexpr Description descriptions[] = {
-#define X(name, spelling, latency, syntax, word, isa) \
-    {spelling, Syntax::syntax, word, isa},
-#include "target/mips/instructions.def"
-#undef X
-};
-
-// Encodings that share a spelling with a table entry on other CPUs, and
-// spellings that only alias one.
-constexpr Description alternate_forms[] = {
-    {"clz", Syntax::RdRs, 0x00000016, ALX},
-    {"clo", Syntax::RdRs, 0x00000017, ALX},
-    {"madd", Syntax::RsRt, 0x0000001c, ALX},
-    {"maddu", Syntax::RsRt, 0x0000001d, ALX},
-    {"msub", Syntax::RsRt, 0x0000002e, ALX},
-    {"msubu", Syntax::RsRt, 0x0000002f, ALX},
-    {"ror", Syntax::RdRtSa, 0x00200002, I33 | ALX},
-    {"rorv", Syntax::RdRtRs, 0x00000046, I33 | ALX},
-};
-
-// GNU as gives a three-register operation whose last operand is a constant
-// the immediate instruction when the constant fits it, and otherwise loads
-// the constant into $at. A word of 0 has no immediate instruction.
-enum class ImmediateRange : std::uint8_t { Signed, Unsigned, Negated };
-struct ImmediateForm {
-    std::string_view mnemonic;
-    std::uint32_t word;
-    ImmediateRange range;
-};
-constexpr ImmediateForm immediate_forms[] = {
-    {"add", 0x20000000, ImmediateRange::Signed},
-    {"addu", 0x24000000, ImmediateRange::Signed},
-    {"dadd", 0x60000000, ImmediateRange::Signed},
-    {"daddu", 0x64000000, ImmediateRange::Signed},
-    {"sub", 0x20000000, ImmediateRange::Negated},
-    {"subu", 0x24000000, ImmediateRange::Negated},
-    {"dsub", 0x60000000, ImmediateRange::Negated},
-    {"dsubu", 0x64000000, ImmediateRange::Negated},
-    {"and", 0x30000000, ImmediateRange::Unsigned},
-    {"or", 0x34000000, ImmediateRange::Unsigned},
-    {"xor", 0x38000000, ImmediateRange::Unsigned},
-    {"nor", 0x34000000, ImmediateRange::Unsigned},
-    {"slt", 0x28000000, ImmediateRange::Signed},
-    {"sltu", 0x2c000000, ImmediateRange::Signed},
-    {"mul", 0, ImmediateRange::Signed},
-};
-
 enum : std::uint16_t {
     fixup_hi16 = FixupKind::target_base,
     fixup_lo16,
@@ -177,18 +98,60 @@ struct Interlocks {
     bool hilo{};      // a HI/LO read and a following write
 };
 
-// What `.set mipsN`, `.set arch=`, and `.module arch=` select.
+// Features as bits by mips::Feature, the order of the target's feature
+// table.
+using FeatureBits = std::uint64_t;
+static_assert(static_cast<unsigned>(Feature::Count) <= 64);
+
+constexpr FeatureBits bit(Feature feature) {
+    return FeatureBits{1} << static_cast<unsigned>(feature);
+}
+
+constexpr FeatureBits level_features =
+    bit(Feature::Mips1) | bit(Feature::Mips2) | bit(Feature::Mips3) | bit(Feature::Mips4) |
+    bit(Feature::Mips5) | bit(Feature::Mips32) | bit(Feature::Mips32r2) |
+    bit(Feature::Mips64) | bit(Feature::Mips64r2);
+
+// The bit of the feature named `name`; 0 for none.
+FeatureBits feature_bit(const SubtargetTable& table, std::string_view name) {
+    for (std::size_t index = 0; index < table.features.size(); ++index) {
+        if (table.features[index].name == name) return FeatureBits{1} << index;
+    }
+    return 0;
+}
+
+// The features with the features they imply.
+FeatureBits with_prerequisites(const SubtargetTable& table, FeatureBits bits) {
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (std::size_t index = 0; index < table.features.size(); ++index) {
+            if ((bits & (FeatureBits{1} << index)) == 0) continue;
+            for (const auto name : table.features[index].prerequisites) {
+                const auto implied = feature_bit(table, name);
+                if ((bits & implied) == 0) {
+                    bits |= implied;
+                    changed = true;
+                }
+            }
+        }
+    }
+    return bits;
+}
+
+// What `.set mipsN`, `.set arch=`, and `.module arch=` select: the
+// features that decide which instructions are accepted, and the ISA level,
+// odd single-precision registers, and interlocks they give.
 struct Architecture {
+    FeatureBits features{bit(Feature::Mips1)};
     std::uint16_t isa{isa_mips1};
-    bool allegrex{};
-    // Odd single-precision registers exist.
     bool odd_single{};
     Interlocks interlocks{};
 };
 
-template <typename Has>
-Architecture architecture_from(Has has) {
+Architecture architecture_from(FeatureBits features) {
+    const auto has = [&](Feature feature) { return (features & bit(feature)) != 0; };
     Architecture result;
+    result.features = features;
     result.isa = has(Feature::Mips64r2)   ? isa_mips64r2
                  : has(Feature::Mips64)   ? isa_mips64
                  : has(Feature::Mips32r2) ? isa_mips32r2
@@ -198,11 +161,19 @@ Architecture architecture_from(Has has) {
                  : has(Feature::Mips3)    ? isa_mips3
                  : has(Feature::Mips2)    ? isa_mips2
                                           : isa_mips1;
-    result.allegrex = has(Feature::Allegrex);
     result.odd_single = has(Feature::OddSpreg);
     result.interlocks = {has(Feature::LoadInterlocks), has(Feature::FpuTransferInterlocks),
                          has(Feature::FpuCompareInterlocks), has(Feature::HiloInterlocks)};
     return result;
+}
+
+// `architecture` with the ISA level `level`, without CPU extensions such
+// as Allegrex's unless `extensions`.
+Architecture with_level(const SubtargetTable& table, const Architecture& architecture,
+                        std::string_view level, bool extensions) {
+    auto features = architecture.features & ~level_features;
+    if (!extensions) features &= ~bit(Feature::Allegrex);
+    return architecture_from(features | with_prerequisites(table, feature_bit(table, level)));
 }
 
 // The model CPU entry named `name`.
@@ -210,14 +181,15 @@ std::optional<Architecture> cpu_architecture(const Subtarget& subtarget, std::st
     const auto& registry = model_registry();
     const auto* entry = registry.find_cpu(subtarget.target().architecture, name);
     if (!entry) return std::nullopt;
-    const auto resolved = registry.resolve_cpu(subtarget.target(), *entry);
-    return architecture_from([&](Feature feature) {
-        return std::find(resolved.features.begin(), resolved.features.end(),
-                         feature_name(feature)) != resolved.features.end();
-    });
+    const auto& table = *subtarget.target().subtargets;
+    FeatureBits features{};
+    for (const auto& feature : registry.resolve_cpu(subtarget.target(), *entry).features) {
+        features |= feature_bit(table, feature);
+    }
+    return architecture_from(with_prerequisites(table, features));
 }
 
-bool has_64bit_registers(std::uint16_t isa) { return (isa & I3) != 0; }
+bool has_64bit_registers(std::uint16_t isa) { return (isa & isa_64bit) != 0; }
 
 // The file-level floating-point convention.
 enum class FprMode : std::uint8_t { Fp32, Fpxx, Fp64 };
@@ -291,7 +263,11 @@ Model model_for(const Subtarget& subtarget, bool compiler_output) {
     model.abi = model.elf64 ? Abi::N64
                 : subtarget.abi_info().elf_abi_tag == "eabi32" ? Abi::Eabi32
                                                                : Abi::O32;
-    model.architecture = architecture_from(has);
+    FeatureBits features{};
+    for (unsigned index = 0; index < static_cast<unsigned>(Feature::Count); ++index) {
+        if (has(static_cast<Feature>(index))) features |= FeatureBits{1} << index;
+    }
+    model.architecture = architecture_from(features);
     model.isa64 = has(Feature::Mips3);
     model.nan2008 = has(Feature::Nan2008);
     model.soft_float = has(Feature::SoftFloat);
@@ -421,236 +397,6 @@ struct Effects {
     std::uint32_t flags{};
 };
 
-// The effects of an instruction word. With 32-bit FPRs, an instruction on
-// doubles or longs names both registers of each pair.
-Effects decode_effects(std::uint32_t word, bool fpr_pairs) {
-    using namespace effect;
-    const unsigned op = word >> 26U;
-    const unsigned rs = (word >> 21U) & 31U;
-    const unsigned rt = (word >> 16U) & 31U;
-    const unsigned rd = (word >> 11U) & 31U;
-    const unsigned sa = (word >> 6U) & 31U;
-    const unsigned function = word & 63U;
-    Effects e;
-    bool wide = false;
-    const auto read = [&](unsigned number) { e.gpr_read |= (1U << number) & ~1U; };
-    const auto write = [&](unsigned number) { e.gpr_write |= (1U << number) & ~1U; };
-    const auto fread = [&](unsigned number) { e.fpr_read |= 1U << number; };
-    const auto fwrite = [&](unsigned number) { e.fpr_write |= 1U << number; };
-    const auto branch = [&](bool is_likely) { e.flags |= delayed | (is_likely ? likely : 0U); };
-    switch (op) {
-    case 0x00:
-        switch (function) {
-        case 0x00: case 0x02: case 0x03: case 0x38: case 0x3a: case 0x3b:
-        case 0x3c: case 0x3e: case 0x3f:
-            write(rd);
-            read(rt);
-            break;
-        case 0x01:  // movf, movt
-            write(rd);
-            read(rs);
-            e.flags |= read_condition;
-            break;
-        case 0x08:  // jr
-            read(rs);
-            e.flags |= delayed | unconditional;
-            break;
-        case 0x09:  // jalr
-            write(rd);
-            read(rs);
-            e.flags |= delayed | unconditional;
-            break;
-        case 0x0c: case 0x0d: case 0x0f:  // syscall, break, sync
-            e.flags |= no_delay_slot;
-            break;
-        case 0x10: write(rd); e.flags |= read_hi; break;
-        case 0x11: read(rs); e.flags |= write_hi; break;
-        case 0x12: write(rd); e.flags |= read_lo; break;
-        case 0x13: read(rs); e.flags |= write_lo; break;
-        case 0x18: case 0x19: case 0x1a: case 0x1b: case 0x1c: case 0x1d: case 0x1e:
-        case 0x1f:
-            read(rs);
-            read(rt);
-            e.flags |= write_hi | write_lo;
-            break;
-        case 0x30: case 0x31: case 0x32: case 0x33: case 0x34: case 0x36:
-            read(rs);
-            read(rt);
-            e.flags |= no_delay_slot;
-            break;
-        default:
-            // Variable shifts, conditional moves, and three-register
-            // arithmetic.
-            write(rd);
-            read(rs);
-            read(rt);
-            break;
-        }
-        break;
-    case 0x01:
-        if (rt <= 0x03) {
-            read(rs);
-            branch((rt & 2U) != 0);
-        } else if (rt >= 0x08 && rt <= 0x0e) {
-            read(rs);
-            e.flags |= no_delay_slot;
-        } else if (rt >= 0x10 && rt <= 0x13) {
-            read(rs);
-            write(31);
-            branch((rt & 2U) != 0);
-        }
-        break;
-    case 0x02: e.flags |= delayed | unconditional; break;
-    case 0x03: write(31); e.flags |= delayed | unconditional; break;
-    case 0x04: case 0x05: case 0x14: case 0x15:
-        read(rs);
-        read(rt);
-        branch(op >= 0x14);
-        break;
-    case 0x06: case 0x07: case 0x16: case 0x17:
-        read(rs);
-        branch(op >= 0x14);
-        break;
-    case 0x10:  // coprocessor 0
-        if (rs == 0x00 || rs == 0x01) {
-            write(rt);
-            e.flags |= load_coprocessor | coprocessor | cp0;
-        } else if (rs == 0x04 || rs == 0x05) {
-            read(rt);
-            e.flags |= coprocessor_move | write_condition | coprocessor | cp0;
-        } else if (function == 0x18) {
-            e.flags |= no_delay_slot;  // eret
-        }
-        break;
-    case 0x11:  // coprocessor 1
-        switch (rs) {
-        case 0x00: case 0x01: case 0x03:  // mfc1, dmfc1, mfhc1
-            write(rt);
-            fread(rd);
-            wide = rs != 0x00;
-            e.flags |= load_coprocessor;
-            break;
-        case 0x02:  // cfc1
-            write(rt);
-            e.flags |= load_coprocessor | coprocessor;
-            break;
-        case 0x04: case 0x05: case 0x07:  // mtc1, dmtc1, mthc1
-            read(rt);
-            fwrite(rd);
-            wide = rs != 0x04;
-            e.flags |= coprocessor_move;
-            break;
-        case 0x06:  // ctc1
-            read(rt);
-            e.flags |= coprocessor_move | write_condition;
-            break;
-        case 0x08:  // bc1f, bc1t, and their likely forms
-            e.flags |= read_condition;
-            branch((rt & 2U) != 0);
-            break;
-        default: {
-            const unsigned fd = sa;
-            const unsigned fs = rd;
-            const unsigned ft = rt;
-            // Doubles or longs in the source format or the result.
-            wide = rs == 0x11 || rs == 0x15 || function == 0x21 || function == 0x25 ||
-                   (function >= 0x08 && function <= 0x0b);
-            if (function >= 0x30) {
-                fread(fs);
-                fread(ft);
-                e.flags |= write_condition;
-            } else if (function <= 0x03) {
-                fwrite(fd);
-                fread(fs);
-                fread(ft);
-            } else {
-                fwrite(fd);
-                fread(fs);
-                if (function == 0x11) e.flags |= read_condition;
-                if (function == 0x12 || function == 0x13) read(ft);
-            }
-            break;
-        }
-        }
-        break;
-    case 0x08: case 0x09: case 0x0a: case 0x0b: case 0x0c: case 0x0d: case 0x0e:
-    case 0x18: case 0x19:
-        write(rt);
-        read(rs);
-        break;
-    case 0x0f: write(rt); break;
-    case 0x1c:  // SPECIAL2
-        if (function == 0x02) {  // mul
-            write(rd);
-            read(rs);
-            read(rt);
-            e.flags |= write_hi | write_lo;
-        } else if (function <= 0x05) {  // madd, maddu, msub, msubu
-            read(rs);
-            read(rt);
-            e.flags |= read_hi | read_lo | write_hi | write_lo;
-        } else if (function == 0x20 || function == 0x21 || function == 0x24 ||
-                   function == 0x25) {
-            write(rd);
-            read(rs);
-        } else if (function == 0x24 || function == 0x26) {
-            // Allegrex mfic, mtic.
-        }
-        break;
-    case 0x1f:  // SPECIAL3
-        if (function <= 0x03) {  // ext, dextm, dextu, dext
-            write(rt);
-            read(rs);
-        } else if (function <= 0x07) {  // ins, dinsm, dinsu, dins
-            write(rt);
-            read(rs);
-            read(rt);
-        } else if (function == 0x20 || function == 0x24) {
-            // wsbh, seb, seh, and the Allegrex forms; dsbh, dshd
-            write(rd);
-            read(rt);
-        }
-        break;
-    case 0x20: case 0x21: case 0x22: case 0x23: case 0x24: case 0x25: case 0x26:
-    case 0x27: case 0x1a: case 0x1b: case 0x30: case 0x34: case 0x37:
-        write(rt);
-        read(rs);
-        e.flags |= load_memory;
-        break;
-    case 0x28: case 0x29: case 0x2a: case 0x2b: case 0x2c: case 0x2d: case 0x2e:
-    case 0x3f:
-        read(rt);
-        read(rs);
-        break;
-    case 0x38: case 0x3c:  // sc, scd
-        read(rt);
-        write(rt);
-        read(rs);
-        break;
-    case 0x2f: case 0x33:  // cache, pref
-        read(rs);
-        break;
-    case 0x31: case 0x35:  // lwc1, ldc1
-        fwrite(rt);
-        read(rs);
-        wide = op == 0x35;
-        e.flags |= load_memory | coprocessor_load;
-        break;
-    case 0x39: case 0x3d:  // swc1, sdc1
-        fread(rt);
-        read(rs);
-        wide = op == 0x3d;
-        break;
-    default:
-        break;
-    }
-    if (wide && fpr_pairs) {
-        e.fpr_read |= e.fpr_read << 1U;
-        e.fpr_write |= e.fpr_write << 1U;
-    }
-    return e;
-}
-
 struct Immediate {
     std::optional<std::uint16_t> relocation;
     ExpressionId expression{};
@@ -663,6 +409,117 @@ struct PendingFixup {
     SourceLocation location;
 };
 
+// The registers and flags of an instruction's effects, by operand.
+struct EffectPlan {
+    std::vector<unsigned> gpr_reads;
+    std::vector<unsigned> gpr_writes;
+    std::vector<unsigned> fpr_reads;
+    std::vector<unsigned> fpr_writes;
+    // Memory operands, whose base the instruction reads.
+    std::vector<unsigned> bases;
+    std::uint32_t fixed_gpr_reads{};
+    std::uint32_t fixed_gpr_writes{};
+    std::uint32_t flags{};
+    // An operand holds a double or long, which names both registers of a
+    // pair with 32-bit FPRs.
+    bool wide{};
+};
+
+OperandTypeId type_id(const ModelOperand& operand) {
+    return static_cast<OperandTypeId>(operand.type.id);
+}
+
+bool floating_type(OperandTypeId id) {
+    return id == OperandTypeId::Fpr32 || id == OperandTypeId::Fpr64 ||
+           id == OperandTypeId::Cpr || id == OperandTypeId::Cpr64;
+}
+
+bool wide_type(OperandTypeId id) {
+    return id == OperandTypeId::Fpr64 || id == OperandTypeId::Cpr64;
+}
+
+EffectPlan effect_plan(const ModelInstruction& entry) {
+    using namespace effect;
+    EffectPlan plan;
+    const auto add = [&](const std::vector<ModelEffect>& effects, bool writes) {
+        for (const auto& item : effects) {
+            switch (item.kind) {
+            case ModelEffect::Kind::Operand: {
+                const auto id = type_id(entry.operands[item.operand]);
+                auto& list = floating_type(id) ? (writes ? plan.fpr_writes : plan.fpr_reads)
+                                               : (writes ? plan.gpr_writes : plan.gpr_reads);
+                list.push_back(item.operand);
+                break;
+            }
+            case ModelEffect::Kind::Register:
+                if (item.name == "hi") {
+                    plan.flags |= writes ? write_hi : read_hi;
+                } else if (item.name == "lo") {
+                    plan.flags |= writes ? write_lo : read_lo;
+                } else if (const auto number = gpr_number(item.name, false)) {
+                    (writes ? plan.fixed_gpr_writes : plan.fixed_gpr_reads) |=
+                        (1U << *number) & ~1U;
+                }
+                break;
+            case ModelEffect::Kind::Resource:
+                if (item.name == "cp0") plan.flags |= cp0;
+                break;
+            }
+        }
+    };
+    add(entry.reads, false);
+    add(entry.writes, true);
+    for (const auto& hazard : entry.hazards) {
+        plan.flags |= hazard == "load"               ? load_memory
+                      : hazard == "coprocessor-load" ? coprocessor_load
+                      : hazard == "from-coprocessor" ? load_coprocessor
+                      : hazard == "to-coprocessor"   ? coprocessor_move
+                      : hazard == "coprocessor"      ? coprocessor
+                      : hazard == "condition-read"   ? read_condition
+                      : hazard == "condition-write"  ? write_condition
+                                                     : no_delay_slot;
+    }
+    if (entry.delay_slot) {
+        plan.flags |= delayed;
+        if (entry.control == InstructionControlEffect::UnconditionalBranch ||
+            entry.control == InstructionControlEffect::RawReturn) {
+            plan.flags |= unconditional;
+        }
+    }
+    if (entry.likely) plan.flags |= likely;
+    for (unsigned index = 0; index < entry.operands.size(); ++index) {
+        const auto id = type_id(entry.operands[index]);
+        if (id == OperandTypeId::Memory) plan.bases.push_back(index);
+        plan.wide = plan.wide || wide_type(id);
+    }
+    return plan;
+}
+
+// A form of a mnemonic: the entry as spelled, and the entry that encodes
+// it, which is an alias's target.
+struct Form {
+    const ModelInstruction* spelled{};
+    const ModelInstruction* entry{};
+    // The CPU has the form with any of `features`, or always without any,
+    // unless it has one of `excludes`.
+    FeatureBits features{};
+    FeatureBits excludes{};
+    EffectPlan effects;
+};
+
+// An operand's value: a register number or an immediate, a memory
+// operand's base, or a value that a fixup gives.
+struct OperandValue {
+    std::int64_t value{};
+    std::int64_t base{};
+    // The value of a macro's expression operand.
+    ExpressionId expression{};
+    std::optional<PendingFixup> fixup;
+    // An FPR written as a coprocessor register number, `$N`.
+    bool numeric{};
+    SourceLocation location;
+};
+
 class MipsTarget final : public assembler::Target {
 public:
     MipsTarget(const Model& model, const Subtarget& subtarget, unsigned optimize)
@@ -672,10 +529,32 @@ public:
         file_.fpr = model.fpr_mode;
         file_.odd_spreg = model.odd_spreg;
         options_ = file_;
-        for (std::size_t index = 0; index < std::size(descriptions); ++index) {
-            mnemonics_.emplace(descriptions[index].mnemonic, &descriptions[index]);
+        // The forms of each mnemonic in the loaded instruction table.
+        const auto& table = *model_registry().instruction_table(subtarget.target().architecture);
+        const auto& features = *subtarget.target().subtargets;
+        std::vector<EffectPlan> plans;
+        plans.reserve(table.entries.size());
+        for (const auto& entry : table.entries) {
+            plans.push_back(entry.encoded ? effect_plan(entry) : EffectPlan{});
         }
-        for (const auto& form : alternate_forms) alternates_.emplace(form.mnemonic, &form);
+        for (const auto& [mnemonic, indices] : table.forms) {
+            auto& forms = forms_[mnemonic];
+            for (const auto index : indices) {
+                const auto& spelled = table.entries[index];
+                const auto encoded = spelled.is_alias() ? spelled.alias_entry : index;
+                const auto& entry = table.entries[encoded];
+                Form form{&spelled, &entry, 0, 0, plans[encoded]};
+                for (const auto& name : entry.features) form.features |= feature_bit(features, name);
+                for (const auto& name : entry.excludes) form.excludes |= feature_bit(features, name);
+                forms.push_back(std::move(form));
+            }
+        }
+        for (const auto& [mnemonic, forms] : forms_) {
+            for (const auto& form : forms) {
+                named_.emplace(form.spelled->name, &form);
+                if (form.spelled == form.entry) encoded_forms_.emplace(form.entry, &form);
+            }
+        }
         nan2008_ = model.nan2008;
     }
 
@@ -815,15 +694,17 @@ private:
     std::optional<unsigned> condition_code(Cursor& cursor);
     bool comma(Assembler& as, Cursor& cursor);
     std::optional<Immediate> immediate(Assembler& as, Cursor& cursor);
-    bool sixteen(Assembler& as, std::uint32_t& word, const Immediate& value, bool is_signed,
-                 std::optional<PendingFixup>& fixup);
+    // A 16-bit field's value: in range, or a fixup for a relocation
+    // operator or a value that layout settles.
+    bool sixteen(Assembler& as, const Immediate& value, std::int64_t minimum,
+                 std::int64_t maximum, OperandValue& result);
     std::optional<std::int64_t> absolute(Assembler& as, Cursor& cursor, std::int64_t low,
                                          std::int64_t high, std::string_view what);
 
     // Emission. `append` places an instruction as GNU as does in the
     // current reorder mode.
-    void append(Assembler& as, std::uint32_t word, const std::optional<PendingFixup>& fixup = {},
-                bool unconditional = false);
+    void append(Assembler& as, std::uint32_t word, const std::optional<PendingFixup>& fixup,
+                const Effects& effects);
     void emit_word(Assembler& as, std::uint32_t word, const std::optional<PendingFixup>& fixup,
                    Emitted& placed);
     void emit_nops(Assembler& as, unsigned count);
@@ -877,11 +758,37 @@ private:
                         SourceLocation location, bool warn = true);
     // Checks that a macro may use $at; false after a diagnostic.
     bool use_at(Assembler& as, SourceLocation location);
-    bool available(std::uint16_t isa) const {
-        if ((isa & NOT_ALX) != 0 && options_.architecture.allegrex) return false;
-        return (isa & options_.architecture.isa) != 0 ||
-               ((isa & ALX) != 0 && options_.architecture.allegrex);
+    // Whether the current architecture has the form.
+    [[nodiscard]] bool available(const Form& form) const {
+        const auto features = options_.architecture.features;
+        return (form.features == 0 || (form.features & features) != 0) &&
+               (form.excludes & features) == 0;
     }
+    // Whether operand texts, split at commas, have the shape of the form's
+    // operands: their number, and registers where it has registers.
+    [[nodiscard]] bool shape_matches(const ModelInstruction& entry,
+                                     const std::vector<std::string_view>& operands) const;
+    // Of several forms whose shape the operand texts have, the first whose
+    // immediate operands, where their values are known now, take them;
+    // otherwise the first. nullopt after a diagnostic.
+    std::optional<const Form*> fitting_form(Assembler& as, const Cursor& cursor,
+                                            const std::vector<const Form*>& candidates,
+                                            const std::vector<std::string_view>& operands);
+    // Parses the form's operands; nullopt after a diagnostic.
+    std::optional<std::vector<OperandValue>> parse_operands(Assembler& as, Cursor& cursor,
+                                                            const ModelInstruction& entry,
+                                                            std::string_view mnemonic);
+    bool parse_operand(Assembler& as, Cursor& cursor, const ModelInstruction& entry,
+                       std::size_t index, std::string_view mnemonic, OperandValue& value);
+    // Encodes and appends an instruction of the form; false after a
+    // diagnostic.
+    bool emit(Assembler& as, const Form& form, const std::vector<OperandValue>& values);
+    // The form of a shipped or model entry by name, as macros emit it.
+    const Form& named(std::string_view name) const { return *named_.at(name); }
+    // Expands an entry with `expands` or `otherwise`.
+    void expand(Assembler& as, const ModelInstruction& entry, const std::vector<OperandValue>& values,
+                SourceLocation location);
+    [[nodiscard]] Effects effects_of(const Form& form, const std::vector<OperandValue>& values) const;
     void set_directive(Assembler& as, Statement& statement);
     void module_directive(Assembler& as, Statement& statement);
     // The architecture `mipsN` or `arch=NAME` selects; nullopt after a
@@ -906,8 +813,10 @@ private:
     Settings file_;
     Settings options_;
     std::vector<Settings> stack_;
-    std::unordered_map<std::string_view, const Description*> mnemonics_;
-    std::unordered_multimap<std::string_view, const Description*> alternates_;
+    std::unordered_map<std::string_view, std::vector<Form>> forms_;
+    // Forms by entry name, and the form of each encoded entry.
+    std::unordered_map<std::string_view, const Form*> named_;
+    std::unordered_map<const ModelInstruction*, const Form*> encoded_forms_;
     bool noreorder_{};
     bool pic_{};
     bool nan2008_{};
@@ -1061,23 +970,24 @@ std::optional<Immediate> MipsTarget::immediate(Assembler& as, Cursor& cursor) {
     return result;
 }
 
-bool MipsTarget::sixteen(Assembler& as, std::uint32_t& word, const Immediate& value,
-                         bool is_signed, std::optional<PendingFixup>& fixup) {
+bool MipsTarget::sixteen(Assembler& as, const Immediate& value, std::int64_t minimum,
+                         std::int64_t maximum, OperandValue& result) {
     if (value.relocation) {
-        fixup = PendingFixup{*value.relocation, value.expression, value.location};
+        result.fixup = PendingFixup{*value.relocation, value.expression, value.location};
         return true;
     }
     if (const auto number = as.absolute_now(value.expression)) {
-        if (is_signed ? !is_int16(*number) : !is_uint16(*number)) {
-            as.error(value.location, "immediate " + std::to_string(*number) + " is out of range " +
-                                         (is_signed ? "[-32768, 32767]" : "[0, 65535]"));
+        if (*number < minimum || *number > maximum) {
+            as.error(value.location, "immediate " + std::to_string(*number) +
+                                         " is out of range [" + std::to_string(minimum) + ", " +
+                                         std::to_string(maximum) + "]");
             return false;
         }
-        word |= static_cast<std::uint32_t>(*number) & 0xffffU;
+        result.value = *number;
         return true;
     }
-    fixup = PendingFixup{is_signed ? fixup_signed16 : fixup_unsigned16, value.expression,
-                         value.location};
+    result.fixup = PendingFixup{minimum < 0 ? fixup_signed16 : fixup_unsigned16,
+                                value.expression, value.location};
     return true;
 }
 
@@ -1220,10 +1130,12 @@ bool MipsTarget::short_loop(Assembler& as, std::uint32_t word,
 // later SC within the last five instructions targets.
 void MipsTarget::fix_loongson3_llsc(Assembler& as, Sequence sequence) {
     const auto sync = [&] {
+        const auto& form = named("sync");
+        const auto word = static_cast<std::uint32_t>(form.entry->fixed_bits);
         Emitted entry;
-        entry.effects = decode_effects(0x0000000fU, false);
+        entry.effects = effects_of(form, {});
         entry.sequence = Sequence::Sync;
-        emit_word(as, 0x0000000fU, {}, entry);
+        emit_word(as, word, {}, entry);
         insert_history(0, 1, entry);
     };
     const auto exit_target = [&] {
@@ -1285,16 +1197,9 @@ void MipsTarget::emit_word(Assembler& as, std::uint32_t word,
 }
 
 void MipsTarget::append(Assembler& as, std::uint32_t word,
-                        const std::optional<PendingFixup>& fixup, bool unconditional) {
+                        const std::optional<PendingFixup>& fixup, const Effects& effects) {
     using namespace effect;
     started_ = true;
-    Effects effects = decode_effects(word, options_.fpr != FprMode::Fp64);
-    if (unconditional) effects.flags |= effect::unconditional;
-    if (numeric_fpr_) {
-        effects.fpr_read = 0;
-        effects.fpr_write = 0;
-        numeric_fpr_ = false;
-    }
     if (model_.gnu) {
         gpr_mask_ |= effects.gpr_read | effects.gpr_write;
         cpr_mask_[1] |= effects.fpr_read | effects.fpr_write;
@@ -1457,37 +1362,32 @@ bool MipsTarget::use_at(Assembler& as, SourceLocation location) {
 void MipsTarget::load_immediate(Assembler& as, unsigned target, std::int64_t value, bool wide,
                                 SourceLocation location, bool warn) {
     // LLVM MC's expansion of li and dli, which GNU as matches for every
-    // 32-bit value.
-    const auto rt = static_cast<std::uint32_t>(target) << 16U;
-    const auto rs_rt = (static_cast<std::uint32_t>(target) << 21U) | rt;
+    // 32-bit value, with the table's instructions.
     const auto start = emitted_;
+    const auto t = static_cast<std::int64_t>(target);
+    const auto put = [&](std::string_view name, std::initializer_list<std::int64_t> operands) {
+        std::vector<OperandValue> values;
+        for (const auto operand : operands) {
+            OperandValue item;
+            item.value = operand;
+            item.location = location;
+            values.push_back(item);
+        }
+        (void)emit(as, named(name), values);
+    };
     const auto addiu = [&](std::int64_t immediate) {
-        use_gpr(target);
-        use_gpr(0);
-        append(as, 0x24000000U | rt | (static_cast<std::uint32_t>(immediate) & 0xffffU));
+        put("addiu", {t, 0, static_cast<std::int16_t>(immediate & 0xffff)});
     };
     const auto ori_zero = [&](std::uint64_t immediate) {
-        use_gpr(target);
-        use_gpr(0);
-        append(as, 0x34000000U | rt | static_cast<std::uint32_t>(immediate & 0xffffU));
+        put("ori", {t, 0, static_cast<std::int64_t>(immediate & 0xffffU)});
     };
     const auto ori = [&](std::uint64_t immediate) {
-        use_gpr(target);
-        append(as, 0x34000000U | rs_rt | static_cast<std::uint32_t>(immediate & 0xffffU));
+        put("ori", {t, t, static_cast<std::int64_t>(immediate & 0xffffU)});
     };
     const auto lui = [&](std::uint64_t immediate) {
-        use_gpr(target);
-        append(as, 0x3c000000U | rt | static_cast<std::uint32_t>(immediate & 0xffffU));
+        put("lui", {t, static_cast<std::int64_t>(immediate & 0xffffU)});
     };
-    const auto shift = [&](std::uint32_t function, unsigned amount) {
-        use_gpr(target);
-        append(as, function | rt | (static_cast<std::uint32_t>(target) << 11U) |
-                       ((amount & 31U) << 6U));
-    };
-    const auto dsll = [&](unsigned amount) {
-        if (amount >= 32) shift(0x3c, amount - 32);
-        else shift(0x38, amount);
-    };
+    const auto dsll = [&](unsigned amount) { put("dsll", {t, t, amount}); };
     const std::function<void(std::int64_t, bool)> load = [&](std::int64_t number, bool word) {
         if (word) number = static_cast<std::int32_t>(static_cast<std::uint32_t>(number));
         const auto unsigned_number = static_cast<std::uint64_t>(number);
@@ -1507,7 +1407,7 @@ void MipsTarget::load_immediate(Assembler& as, unsigned target, std::int64_t val
             if (!word && !is_int32) {
                 if (unsigned_number == 0xffffffffU) {
                     lui(0xffff);
-                    shift(0x3e, 0); // dsrl32
+                    put("dsrl32", {t, t, 0});
                     return;
                 }
                 ori_zero(high);
@@ -1556,663 +1456,194 @@ void MipsTarget::load_immediate(Assembler& as, unsigned target, std::int64_t val
     }
 }
 
-void MipsTarget::instruction(Assembler& as, Statement& statement) {
-    const auto name = lower(statement.name);
-    auto& cursor = statement.operands;
-    const auto location = statement.location;
-    numeric_fpr_ = false;
-    // The table entry, else an encoding of the same spelling the current
-    // instruction set has.
-    const Description* chosen = nullptr;
-    if (const auto found = mnemonics_.find(name); found != mnemonics_.end()) {
-        chosen = found->second;
+// The operand texts of a statement, split at the commas outside
+// parentheses and quoted names.
+std::vector<std::string_view> split_operands(std::string_view text) {
+    const auto trim = [](std::string_view item) {
+        while (!item.empty() && (item.front() == ' ' || item.front() == '\t')) item.remove_prefix(1);
+        while (!item.empty() && (item.back() == ' ' || item.back() == '\t' || item.back() == '\r')) {
+            item.remove_suffix(1);
+        }
+        return item;
+    };
+    std::vector<std::string_view> result;
+    text = trim(text);
+    if (text.empty()) return result;
+    int depth = 0;
+    bool quoted = false;
+    std::size_t start = 0;
+    for (std::size_t index = 0; index < text.size(); ++index) {
+        const char c = text[index];
+        if (c == '"') quoted = !quoted;
+        else if (quoted) continue;
+        else if (c == '(') ++depth;
+        else if (c == ')') --depth;
+        else if (c == ',' && depth == 0) {
+            result.push_back(trim(text.substr(start, index - start)));
+            start = index + 1;
+        }
     }
-    if (!chosen || !available(chosen->isa)) {
-        const auto [first, last] = alternates_.equal_range(name);
-        for (auto each = first; each != last; ++each) {
-            if (available(each->second->isa)) {
-                chosen = each->second;
-                break;
+    result.push_back(trim(text.substr(start)));
+    return result;
+}
+
+bool MipsTarget::shape_matches(const ModelInstruction& entry,
+                               const std::vector<std::string_view>& operands) const {
+    std::size_t required = 0;
+    for (const auto& operand : entry.operands) {
+        if (!operand.default_value && !operand.default_operand) ++required;
+    }
+    if (operands.size() < required || operands.size() > entry.operands.size()) return false;
+    for (std::size_t index = 0; index < operands.size(); ++index) {
+        const auto& operand = entry.operands[index];
+        const auto text = operands[index];
+        if (operand.name.empty()) {
+            const auto number = text.starts_with('$') ? gpr_number(text.substr(1), model_.elf64)
+                                                      : std::nullopt;
+            if (!number || *number != operand.literal_number) return false;
+            continue;
+        }
+        switch (type_id(operand)) {
+        case OperandTypeId::Immediate:
+        case OperandTypeId::Expression:
+            if (text.starts_with('$')) return false;
+            break;
+        case OperandTypeId::Memory:
+        case OperandTypeId::Branch:
+        case OperandTypeId::Jump:
+            break;
+        default:
+            if (!text.starts_with('$')) return false;
+            break;
+        }
+    }
+    return true;
+}
+
+std::optional<const Form*> MipsTarget::fitting_form(Assembler& as, const Cursor& cursor,
+                                                    const std::vector<const Form*>& candidates,
+                                                    const std::vector<std::string_view>& operands) {
+    // The values of the operands that every candidate takes as immediates
+    // without relocations, where they are known now.
+    const auto rest = cursor.rest();
+    std::vector<std::optional<std::int64_t>> values(operands.size());
+    for (std::size_t index = 0; index < operands.size(); ++index) {
+        const bool immediate =
+            std::all_of(candidates.begin(), candidates.end(), [&](const Form* form) {
+                const auto& operand = form->entry->operands[index];
+                return !operand.name.empty() && type_id(operand) == OperandTypeId::Immediate &&
+                       operand.type.relocated_bits == 0;
+            });
+        if (!immediate) continue;
+        auto probe = cursor;
+        probe.set_position(cursor.position() +
+                           static_cast<std::size_t>(operands[index].data() - rest.data()));
+        const auto expression = as.parse_expression(probe);
+        if (!expression) return std::nullopt;
+        values[index] = as.absolute_now(*expression);
+    }
+    const auto accepts = [&](const ModelInstruction& entry) {
+        for (std::size_t index = 0; index < values.size(); ++index) {
+            const auto& type = entry.operands[index].type;
+            if (values[index] && (*values[index] < type.minimum || *values[index] > type.maximum)) {
+                return false;
             }
-            if (!chosen) chosen = each->second;
         }
-    }
-    if (!chosen) {
-        as.error(location, "unknown instruction '" + std::string(statement.name) + "'");
-        return;
-    }
-    const auto rs = [](unsigned number) { return static_cast<std::uint32_t>(number) << 21U; };
-    const auto rt = [](unsigned number) { return static_cast<std::uint32_t>(number) << 16U; };
-    const auto rd = [](unsigned number) { return static_cast<std::uint32_t>(number) << 11U; };
-    const auto sa = [](unsigned number) { return static_cast<std::uint32_t>(number) << 6U; };
-    // The third operand of a register operation is a register, rather than
-    // a constant or shift amount.
-    const auto third_is_register = [&]() {
-        auto probe = cursor;
-        for (int commas = 0; commas < 2; ++commas) {
-            const auto rest = probe.rest();
-            const auto next = rest.find(',');
-            if (next == std::string_view::npos) return false;
-            probe.set_position(probe.position() + next + 1);
-        }
-        probe.skip_space();
-        return probe.peek() == '$';
-    };
-    const auto second_is_register = [&]() {
-        auto probe = cursor;
-        const auto next = probe.rest().find(',');
-        if (next == std::string_view::npos) return true;
-        probe.set_position(probe.position() + next + 1);
-        probe.skip_space();
-        return probe.peek() == '$';
-    };
-    const auto immediate_form = std::find_if(std::begin(immediate_forms), std::end(immediate_forms),
-                                             [&](const ImmediateForm& form) {
-                                                 return form.mnemonic == name;
-                                             });
-    const bool macro_multiply = name == "mul" && !available(chosen->isa);
-    if (!macro_multiply && !available(chosen->isa)) {
-        as.error(location, "instruction '" + name + "' is not available in " +
-                               std::string(isa_level(options_.architecture.isa).name));
-        return;
-    }
-    const auto here = [&]() {
-        cursor.skip_space();
-        return cursor.location();
-    };
-    const auto finish = [&]() -> bool {
-        if (!cursor.at_end()) {
-            as.error(cursor.location(), "unexpected text after operands");
-            return false;
+        for (const auto& constraint : entry.constraints) {
+            std::int64_t sum = constraint.constant;
+            bool known = true;
+            for (const auto& term : constraint.terms) {
+                if (term.operand >= values.size() || !values[term.operand]) {
+                    known = false;
+                    break;
+                }
+                sum += term.negative ? -*values[term.operand] : *values[term.operand];
+            }
+            if (known && !constraint.holds(sum)) return false;
         }
         return true;
     };
+    for (const auto* form : candidates) {
+        if (accepts(*form->entry)) return form;
+    }
+    return candidates.front();
+}
 
-    // Three-register operations with a constant last operand.
-    if (immediate_form != std::end(immediate_forms) &&
-        (chosen->syntax == Syntax::RdRsRt || macro_multiply) && !third_is_register()) {
-        const auto d = gpr(as, cursor);
-        if (!d || !comma(as, cursor)) return;
-        const auto s = gpr(as, cursor);
-        if (!s || !comma(as, cursor)) return;
-        const auto value_location = here();
-        const auto value = as.parse_absolute(cursor);
-        if (!value || !finish()) return;
-        std::int64_t encoded = immediate_form->range == ImmediateRange::Negated ? -*value : *value;
-        const bool fits = immediate_form->word != 0 &&
-                          (immediate_form->range == ImmediateRange::Unsigned ? is_uint16(encoded)
-                                                                             : is_int16(encoded));
-        const auto word_of = [&](std::uint32_t base) {
-            return base | rt(*d) | rs(*s) | (static_cast<std::uint32_t>(encoded) & 0xffffU);
-        };
-        if (fits) {
-            append(as, word_of(immediate_form->word));
-            // `nor` with an immediate: ori, then nor with $zero.
-            if (name == "nor") append(as, 0x00000027U | rd(*d) | rs(*d));
-            return;
+bool MipsTarget::parse_operand(Assembler& as, Cursor& cursor, const ModelInstruction& entry,
+                               std::size_t index, std::string_view mnemonic,
+                               OperandValue& value) {
+    const auto& operand = entry.operands[index];
+    cursor.skip_space();
+    value.location = cursor.location();
+    if (operand.name.empty()) {
+        const auto number = gpr(as, cursor);
+        if (!number) return false;
+        if (*number != operand.literal_number) {
+            as.error(value.location, "'" + std::string(mnemonic) + "' takes '" +
+                                         operand.spelling + "' as operand " +
+                                         std::to_string(index + 1));
+            return false;
         }
-        if (!use_at(as, location)) return;
-        // The doubleword operations load a 64-bit constant; logical
-        // operations and comparisons one as wide as the GPRs.
-        const bool logical = immediate_form->range == ImmediateRange::Unsigned ||
-                             name.starts_with("slt");
-        load_immediate(as, 1, *value, name.starts_with("d") || (logical && options_.gp64),
-                       value_location, false);
-        if (name == "mul") {
-            append(as, 0x00000018U | rs(*s) | rt(1));  // mult
-            append(as, 0x00000012U | rd(*d));          // mflo
-            return;
+        value.value = *number;
+        return true;
+    }
+    const auto id = type_id(operand);
+    switch (id) {
+    case OperandTypeId::Gpr: {
+        const auto number = gpr(as, cursor);
+        if (!number) return false;
+        value.value = *number;
+        return true;
+    }
+    case OperandTypeId::Fpr32:
+    case OperandTypeId::Fpr64: {
+        const auto number = fpr(as, cursor);
+        if (!number || !check_operand(as, *number, id == OperandTypeId::Fpr64, value.location)) {
+            return false;
         }
-        append(as, chosen->word | rd(*d) | rs(*s) | rt(1));
-        return;
+        value.value = *number;
+        return true;
     }
-    // `mul` without the MIPS32 instruction: multu and mflo.
-    if (macro_multiply) {
-        const auto d = gpr(as, cursor);
-        if (!d || !comma(as, cursor)) return;
-        const auto s = gpr(as, cursor);
-        if (!s || !comma(as, cursor)) return;
-        const auto t = gpr(as, cursor);
-        if (!t || !finish()) return;
-        if (!options_.macro) {
-            as.warning(location, "macro instruction expanded into multiple instructions");
+    case OperandTypeId::Cpr:
+    case OperandTypeId::Cpr64: {
+        const auto number = fpr(as, cursor, true);
+        if (!number) return false;
+        value.numeric = numeric_fpr_;
+        numeric_fpr_ = false;
+        if (!value.numeric && id == OperandTypeId::Cpr64 &&
+            !check_double(as, *number, value.location)) {
+            return false;
         }
-        append(as, 0x00000019U | rs(*s) | rt(*t));
-        append(as, 0x00000012U | rd(*d));
-        return;
+        value.value = *number;
+        return true;
     }
-    // Traps with a constant: the immediate form, else through $at.
-    if (chosen->syntax == Syntax::TrapRegister && !second_is_register()) {
-        const auto s = gpr(as, cursor);
-        if (!s || !comma(as, cursor)) return;
-        const auto value_location = here();
-        const auto value = as.parse_absolute(cursor);
-        if (!value || !finish()) return;
-        static constexpr std::array<std::pair<std::uint32_t, std::uint32_t>, 6> immediate_traps{{
-            {0x34, 0x0c}, {0x36, 0x0e}, {0x30, 0x08}, {0x31, 0x09}, {0x32, 0x0a}, {0x33, 0x0b}}};
-        const auto function = chosen->word & 0x3fU;
-        const auto found = std::find_if(immediate_traps.begin(), immediate_traps.end(),
-                                        [&](const auto& entry) { return entry.first == function; });
-        if (is_int16(*value)) {
-            append(as, 0x04000000U | rs(*s) | rt(found->second) |
-                           (static_cast<std::uint32_t>(*value) & 0xffffU));
-            return;
-        }
-        if (!use_at(as, location)) return;
-        load_immediate(as, 1, *value, options_.gp64, value_location, false);
-        append(as, chosen->word | rs(*s) | rt(1));
-        return;
-    }
-    // Shifts by a register amount.
-    Description description = *chosen;
-    if (chosen->syntax == Syntax::RdRtSa && third_is_register()) {
-        static constexpr std::array<std::pair<std::uint32_t, std::uint32_t>, 7> variable{{
-            {0x00000000, 0x00000004}, {0x00000002, 0x00000006}, {0x00000003, 0x00000007},
-            {0x00000038, 0x00000014}, {0x0000003a, 0x00000016}, {0x0000003b, 0x00000017},
-            {0x00200002, 0x00000046}}};
-        const auto found = std::find_if(variable.begin(), variable.end(),
-                                        [&](const auto& entry) { return entry.first == chosen->word; });
-        if (found != variable.end()) {
-            description.syntax = Syntax::RdRtRs;
-            description.word = found->second;
-        }
-    }
-    // With 32-bit GPRs GNU as expands ld and sd into word pairs.
-    if (!options_.gp64 && (name == "ld" || name == "sd")) {
-        as.error(location, "'" + name + "' with 32-bit GPRs is a two-word macro that is not "
-                               "supported; select 64-bit GPRs with \".set gp=64\" or "
-                               "\".set mips3\"");
-        return;
-    }
-
-    std::uint32_t word = description.word;
-    std::optional<PendingFixup> fixup;
-    bool unconditional = false;
-    // Floating formats: S, D, W, L from the fmt field and the operation.
-    const auto format = (description.word >> 21U) & 0x1fU;
-    const bool source_double = format == 17 || format == 21;
-    const auto function = description.word & 0x3fU;
-    const auto destination_double = [&]() {
-        if (function == 0x20) return false;               // cvt.s
-        if (function == 0x21) return true;                // cvt.d
-        if (function == 0x24 || function == 0x0c || function == 0x0d ||
-            function == 0x0e || function == 0x0f) return false;  // to word
-        if (function == 0x25 || (function >= 0x08 && function <= 0x0b)) return true;  // to long
-        return source_double;
-    };
-
-    switch (description.syntax) {
-    case Syntax::RdRsRt:
-    case Syntax::RdRtRs: {
-        const auto d = gpr(as, cursor);
-        if (!d || !comma(as, cursor)) return;
-        const auto a = gpr(as, cursor);
-        if (!a || !comma(as, cursor)) return;
-        const auto b = gpr(as, cursor);
-        if (!b || !finish()) return;
-        word |= rd(*d) | (description.syntax == Syntax::RdRsRt ? rs(*a) | rt(*b) : rt(*a) | rs(*b));
-        use_gpr(*d);
-        use_gpr(*a);
-        use_gpr(*b);
-        break;
-    }
-    case Syntax::RdRtSa: {
-        const auto d = gpr(as, cursor);
-        if (!d || !comma(as, cursor)) return;
-        const auto t = gpr(as, cursor);
-        if (!t || !comma(as, cursor)) return;
-        const bool doubleword_shift =
-            name == "dsll" || name == "dsrl" || name == "dsra" || name == "drotr";
-        const auto amount = absolute(as, cursor, 0, doubleword_shift ? 63 : 31, "shift amount");
-        if (!amount || !finish()) return;
-        auto shift = static_cast<unsigned>(*amount);
-        if (shift >= 32) {
-            word += 4; // dsll/dsrl/dsra/drotr become their 32 forms
-            shift -= 32;
-        }
-        word |= rd(*d) | rt(*t) | sa(shift);
-        use_gpr(*d);
-        use_gpr(*t);
-        break;
-    }
-    case Syntax::RtRsSimm:
-    case Syntax::RtRsUimm: {
-        const auto t = gpr(as, cursor);
-        if (!t || !comma(as, cursor)) return;
-        const auto s = gpr(as, cursor);
-        if (!s || !comma(as, cursor)) return;
-        const auto value = immediate(as, cursor);
-        if (!value || !finish()) return;
-        if (!sixteen(as, word, *value, description.syntax == Syntax::RtRsSimm, fixup)) return;
-        word |= rt(*t) | rs(*s);
-        use_gpr(*t);
-        use_gpr(*s);
-        break;
-    }
-    case Syntax::RtUimm: {
-        const auto t = gpr(as, cursor);
-        if (!t || !comma(as, cursor)) return;
-        const auto value = immediate(as, cursor);
-        if (!value || !finish()) return;
-        if (!sixteen(as, word, *value, false, fixup)) return;
-        word |= rt(*t);
-        use_gpr(*t);
-        break;
-    }
-    case Syntax::RdRsCount: {
-        const auto d = gpr(as, cursor);
-        if (!d || !comma(as, cursor)) return;
-        const auto s = gpr(as, cursor);
-        if (!s || !finish()) return;
-        word |= rd(*d) | rt(*d) | rs(*s);
-        use_gpr(*d);
-        use_gpr(*s);
-        break;
-    }
-    case Syntax::RdRs: {
-        const auto d = gpr(as, cursor);
-        if (!d || !comma(as, cursor)) return;
-        const auto s = gpr(as, cursor);
-        if (!s || !finish()) return;
-        word |= rd(*d) | rs(*s);
-        use_gpr(*d);
-        use_gpr(*s);
-        break;
-    }
-    case Syntax::RdRt: {
-        const auto d = gpr(as, cursor);
-        if (!d || !comma(as, cursor)) return;
-        const auto t = gpr(as, cursor);
-        if (!t || !finish()) return;
-        word |= rd(*d) | rt(*t);
-        use_gpr(*d);
-        use_gpr(*t);
-        break;
-    }
-    case Syntax::RdRsCc: {
-        const auto d = gpr(as, cursor);
-        if (!d || !comma(as, cursor)) return;
-        const auto s = gpr(as, cursor);
-        if (!s || !comma(as, cursor)) return;
+    case OperandTypeId::Fcc: {
         const auto cc = condition_code(cursor);
         if (!cc) {
             as.error(cursor.location(), "expected a condition code register $fcc0-$fcc7");
-            return;
+            return false;
         }
-        if (!finish()) return;
-        word |= rd(*d) | rs(*s) | (static_cast<std::uint32_t>(*cc) << 18U);
-        use_gpr(*d);
-        use_gpr(*s);
-        break;
+        value.value = *cc;
+        return true;
     }
-    case Syntax::RsRt: {
-        const auto s = gpr(as, cursor);
-        if (!s || !comma(as, cursor)) return;
-        const auto t = gpr(as, cursor);
-        if (!t || !finish()) return;
-        word |= rs(*s) | rt(*t);
-        use_gpr(*s);
-        use_gpr(*t);
-        break;
-    }
-    case Syntax::TrapRegister: {
-        const auto s = gpr(as, cursor);
-        if (!s || !comma(as, cursor)) return;
-        const auto t = gpr(as, cursor);
-        if (!t) return;
-        if (cursor.consume(",")) {
-            const auto code = absolute(as, cursor, 0, 1023, "trap code");
-            if (!code) return;
-            word |= static_cast<std::uint32_t>(*code) << 6U;
+    case OperandTypeId::Cp0: {
+        const auto rest = cursor.rest();
+        std::optional<unsigned> number;
+        std::size_t end = 1;
+        if (rest.starts_with("$")) {
+            while (end < rest.size() && rest[end] >= '0' && rest[end] <= '9') ++end;
+            number = small_number(rest.substr(1, end - 1), 31);
         }
-        if (!finish()) return;
-        word |= rs(*s) | rt(*t);
-        use_gpr(*s);
-        use_gpr(*t);
-        break;
-    }
-    case Syntax::TrapImmediate: {
-        const auto s = gpr(as, cursor);
-        if (!s || !comma(as, cursor)) return;
-        const auto value = absolute(as, cursor, -32768, 32767, "immediate");
-        if (!value || !finish()) return;
-        word |= rs(*s) | (static_cast<std::uint32_t>(*value) & 0xffffU);
-        use_gpr(*s);
-        break;
-    }
-    case Syntax::Extract:
-    case Syntax::Insert: {
-        // ext: lsb and size-1; ins: lsb and lsb+size-1, in the sa and rd
-        // fields.
-        const auto t = gpr(as, cursor);
-        if (!t || !comma(as, cursor)) return;
-        const auto s = gpr(as, cursor);
-        if (!s || !comma(as, cursor)) return;
-        const auto position = absolute(as, cursor, 0, 31, "bit position");
-        if (!position || !comma(as, cursor)) return;
-        const auto size_location = here();
-        const auto size = absolute(as, cursor, 1, 32, "bit-field size");
-        if (!size || !finish()) return;
-        if (*position + *size > 32) {
-            as.error(size_location, "bit field " + std::to_string(*position) + "+" +
-                                        std::to_string(*size) + " does not fit in 32 bits");
-            return;
+        if (!number) {
+            as.error(value.location, "expected a coprocessor 0 register $0-$31");
+            return false;
         }
-        const auto high = description.syntax == Syntax::Extract ? *size - 1 : *position + *size - 1;
-        word |= rt(*t) | rs(*s) | rd(static_cast<unsigned>(high)) |
-                sa(static_cast<unsigned>(*position));
-        use_gpr(*t);
-        use_gpr(*s);
-        break;
+        cursor.set_position(cursor.position() + end);
+        value.value = *number;
+        return true;
     }
-    case Syntax::DoubleExtract:
-    case Syntax::DoubleInsert: {
-        // The base forms take a field below bit 32, the M forms one that
-        // ends above it, and the U forms one that starts above it; dext
-        // and dins choose the form the field needs, as GNU as and LLVM MC
-        // do. The sa field holds the position, the rd field the size less
-        // one (dext) or the last bit (dins), each modulo 32.
-        const bool insert = description.syntax == Syntax::DoubleInsert;
-        const auto t = gpr(as, cursor);
-        if (!t || !comma(as, cursor)) return;
-        const auto s = gpr(as, cursor);
-        if (!s || !comma(as, cursor)) return;
-        const auto position = absolute(as, cursor, 0, 63, "bit position");
-        if (!position || !comma(as, cursor)) return;
-        const auto size_location = here();
-        const auto size = absolute(as, cursor, 1, 64, "bit-field size");
-        if (!size || !finish()) return;
-        const auto end = *position + *size;
-        const unsigned base = insert ? 0x07 : 0x03;
-        const unsigned wide = insert ? 0x05 : 0x01;
-        const unsigned upper = insert ? 0x06 : 0x02;
-        const auto beyond = [&] { return insert ? end > 32 : *size > 32; };
-        auto form = word & 0x3fU;
-        if (form == base) form = *position >= 32 ? upper : beyond() ? wide : base;
-        const bool fits = end <= 64 &&
-                          (form == base   ? *position < 32 && !beyond()
-                           : form == wide ? *position < 32 && beyond()
-                                          : *position >= 32 && *size <= 32);
-        if (!fits) {
-            as.error(size_location, "bit field " + std::to_string(*position) + "+" +
-                                        std::to_string(*size) + " does not fit '" + name +
-                                        "'");
-            return;
-        }
-        const auto high = static_cast<unsigned>(insert ? end - 1 : *size - 1);
-        word = (word & ~0x3fU) | form;
-        word |= rt(*t) | rs(*s) | rd(high % 32U) |
-                sa(static_cast<unsigned>(*position) % 32U);
-        use_gpr(*t);
-        use_gpr(*s);
-        break;
-    }
-    case Syntax::Divide: {
-        // The machine instruction names $zero as its destination; GNU as
-        // and LLVM MC expand the other forms into checked macros.
-        const auto first_location = here();
-        const auto first = gpr(as, cursor);
-        if (!first || !comma(as, cursor)) return;
-        const auto s = gpr(as, cursor);
-        if (!s) return;
-        if (*first != 0 || !cursor.consume(",")) {
-            as.error(first_location, "the '" + name + "' macro is not supported; write '" + name +
-                                         " $zero, rs, rt' and read LO or HI");
-            return;
-        }
-        const auto t = gpr(as, cursor);
-        if (!t || !finish()) return;
-        word |= rs(*s) | rt(*t);
-        use_gpr(*s);
-        use_gpr(*t);
-        break;
-    }
-    case Syntax::Rd: {
-        const auto d = gpr(as, cursor);
-        if (!d || !finish()) return;
-        word |= rd(*d);
-        use_gpr(*d);
-        break;
-    }
-    case Syntax::Rs:
-    case Syntax::JumpRegister: {
-        const auto s = gpr(as, cursor);
-        if (!s || !finish()) return;
-        word |= rs(*s);
-        use_gpr(*s);
-        break;
-    }
-    case Syntax::JumpLinkRegister: {
-        const auto first = gpr(as, cursor);
-        if (!first) return;
-        unsigned d = 31;
-        unsigned s = *first;
-        if (cursor.consume(",")) {
-            const auto second = gpr(as, cursor);
-            if (!second) return;
-            d = *first;
-            s = *second;
-        }
-        if (!finish()) return;
-        word |= rd(d) | rs(s);
-        use_gpr(d);
-        use_gpr(s);
-        break;
-    }
-    case Syntax::RtMemory:
-    case Syntax::FtMemory:
-    case Syntax::CacheMemory: {
-        unsigned target = 0;
-        if (description.syntax == Syntax::RtMemory) {
-            const auto t = gpr(as, cursor);
-            if (!t) return;
-            target = *t;
-            use_gpr(target);
-        } else if (description.syntax == Syntax::FtMemory) {
-            const auto register_location = here();
-            const auto t = fpr(as, cursor, true);
-            if (!t) return;
-            target = *t;
-            const bool wide = name == "ldc1" || name == "sdc1";
-            if (!numeric_fpr_) {
-                if (wide && !check_double(as, target, register_location)) return;
-                use_fpr(target, wide);
-            }
-        } else {
-            const auto operation = absolute(as, cursor, 0, 31,
-                                            name == "pref" ? "prefetch hint" : "cache operation");
-            if (!operation) return;
-            target = static_cast<unsigned>(*operation);
-        }
-        if (!comma(as, cursor)) return;
-        cursor.skip_space();
-        unsigned base = 0;
-        if (cursor.rest().starts_with("($")) {
-            cursor.consume("(");
-        } else {
-            const auto offset = immediate(as, cursor);
-            if (!offset) return;
-            if (!sixteen(as, word, *offset, true, fixup)) return;
-            if (!cursor.consume("(")) {
-                if (!finish()) return;
-                if (fixup) {
-                    as.error(offset->location, "a memory operand with a symbol needs a base register");
-                    return;
-                }
-                word |= rt(target);
-                use_gpr(0);
-                break;
-            }
-        }
-        const auto b = gpr(as, cursor);
-        if (!b) return;
-        if (!cursor.consume(")")) {
-            as.error(cursor.location(), "expected ')'");
-            return;
-        }
-        if (!finish()) return;
-        base = *b;
-        word |= rt(target) | rs(base);
-        use_gpr(base);
-        break;
-    }
-    case Syntax::RsRtBranch:
-    case Syntax::RsBranch:
-    case Syntax::BranchAlways:
-    case Syntax::CcBranch:
-    case Syntax::Jump: {
-        if (description.syntax == Syntax::RsRtBranch) {
-            const auto s = gpr(as, cursor);
-            if (!s || !comma(as, cursor)) return;
-            const auto t = gpr(as, cursor);
-            if (!t || !comma(as, cursor)) return;
-            word |= rs(*s) | rt(*t);
-            use_gpr(*s);
-            use_gpr(*t);
-        } else if (description.syntax == Syntax::RsBranch) {
-            const auto s = gpr(as, cursor);
-            if (!s || !comma(as, cursor)) return;
-            word |= rs(*s);
-            use_gpr(*s);
-            // beqz and bnez compare with $zero.
-            if ((description.word >> 26U) == 4 || (description.word >> 26U) == 5 ||
-                (description.word >> 26U) == 20 || (description.word >> 26U) == 21) {
-                use_gpr(0);
-            }
-        } else if (description.syntax == Syntax::CcBranch) {
-            if (const auto cc = condition_code(cursor)) {
-                if (*cc != 0 && !available(I4_32)) {
-                    as.error(location, "condition codes other than $fcc0 need MIPS IV or MIPS32");
-                    return;
-                }
-                word |= static_cast<std::uint32_t>(*cc) << 18U;
-                if (!comma(as, cursor)) return;
-            }
-        } else if (description.syntax == Syntax::BranchAlways) {
-            use_gpr(0);
-            unconditional = true;
-        }
-        const auto target_location = here();
-        const auto target = as.parse_expression(cursor);
-        if (!target || !finish()) return;
-        fixup = PendingFixup{description.syntax == Syntax::Jump ? fixup_jump26 : fixup_branch16,
-                             *target, target_location};
-        break;
-    }
-    case Syntax::FdFsFt: {
-        const auto d_location = here();
-        const auto d = fpr(as, cursor);
-        if (!d || !comma(as, cursor)) return;
-        const auto s_location = here();
-        const auto s = fpr(as, cursor);
-        if (!s || !comma(as, cursor)) return;
-        const auto t_location = here();
-        const auto t = fpr(as, cursor);
-        if (!t || !finish()) return;
-        if (!check_operand(as, *d, source_double, d_location) ||
-            !check_operand(as, *s, source_double, s_location) ||
-            !check_operand(as, *t, source_double, t_location)) {
-            return;
-        }
-        word |= sa(*d) | rd(*s) | rt(*t);
-        use_fpr(*d, source_double);
-        use_fpr(*s, source_double);
-        use_fpr(*t, source_double);
-        break;
-    }
-    case Syntax::FdFs: {
-        const auto d_location = here();
-        const auto d = fpr(as, cursor);
-        if (!d || !comma(as, cursor)) return;
-        const auto s_location = here();
-        const auto s = fpr(as, cursor);
-        if (!s || !finish()) return;
-        const bool d_wide = destination_double();
-        if (!check_operand(as, *d, d_wide, d_location) ||
-            !check_operand(as, *s, source_double, s_location)) {
-            return;
-        }
-        word |= sa(*d) | rd(*s);
-        use_fpr(*d, d_wide);
-        use_fpr(*s, source_double);
-        break;
-    }
-    case Syntax::FsFt: {
-        if (const auto cc = condition_code(cursor)) {
-            if (*cc != 0 && !available(I4_32)) {
-                as.error(location, "condition codes other than $fcc0 need MIPS IV or MIPS32");
-                return;
-            }
-            word |= static_cast<std::uint32_t>(*cc) << 8U;
-            if (!comma(as, cursor)) return;
-        }
-        const auto s_location = here();
-        const auto s = fpr(as, cursor);
-        if (!s || !comma(as, cursor)) return;
-        const auto t_location = here();
-        const auto t = fpr(as, cursor);
-        if (!t || !finish()) return;
-        if (!check_operand(as, *s, source_double, s_location) ||
-            !check_operand(as, *t, source_double, t_location)) {
-            return;
-        }
-        word |= rd(*s) | rt(*t);
-        use_fpr(*s, source_double);
-        use_fpr(*t, source_double);
-        break;
-    }
-    case Syntax::FdFsRt:
-    case Syntax::FdFsCc: {
-        const auto d_location = here();
-        const auto d = fpr(as, cursor);
-        if (!d || !comma(as, cursor)) return;
-        const auto s_location = here();
-        const auto s = fpr(as, cursor);
-        if (!s || !comma(as, cursor)) return;
-        if (description.syntax == Syntax::FdFsRt) {
-            const auto t = gpr(as, cursor);
-            if (!t) return;
-            word |= rt(*t);
-            use_gpr(*t);
-        } else {
-            const auto cc = condition_code(cursor);
-            if (!cc) {
-                as.error(cursor.location(), "expected a condition code register $fcc0-$fcc7");
-                return;
-            }
-            word |= static_cast<std::uint32_t>(*cc) << 18U;
-        }
-        if (!finish()) return;
-        if (!check_operand(as, *d, source_double, d_location) ||
-            !check_operand(as, *s, source_double, s_location)) {
-            return;
-        }
-        word |= sa(*d) | rd(*s);
-        use_fpr(*d, source_double);
-        use_fpr(*s, source_double);
-        break;
-    }
-    case Syntax::RtFs: {
-        const auto t = gpr(as, cursor);
-        if (!t || !comma(as, cursor)) return;
-        const auto s_location = here();
-        const auto s = fpr(as, cursor, true);
-        if (!s || !finish()) return;
-        const bool high = name == "mfhc1" || name == "mthc1";
-        if (!numeric_fpr_) {
-            if (high && !check_double(as, *s, s_location)) return;
-            use_fpr(*s, high);
-        }
-        word |= rt(*t) | rd(*s);
-        use_gpr(*t);
-        break;
-    }
-    case Syntax::RtControl: {
-        const auto t = gpr(as, cursor);
-        if (!t || !comma(as, cursor)) return;
-        cursor.skip_space();
-        const auto control_location = here();
-        auto rest = cursor.rest();
+    case OperandTypeId::Fcr: {
+        const auto rest = cursor.rest();
         std::optional<unsigned> control;
         std::size_t length = 0;
         if (rest.starts_with("$")) {
@@ -2223,139 +1654,391 @@ void MipsTarget::instruction(Assembler& as, Statement& statement) {
             length = rest.size() - digits.size() + end;
         }
         if (!control) {
-            as.error(control_location, "expected a floating-point control register");
-            return;
+            as.error(value.location, "expected a floating-point control register");
+            return false;
         }
         cursor.set_position(cursor.position() + length);
-        if (!finish()) return;
-        word |= rt(*t) | rd(*control);
-        use_gpr(*t);
-        break;
+        value.value = *control;
+        return true;
     }
-    case Syntax::RtCoprocessor: {
-        const auto t = gpr(as, cursor);
-        if (!t || !comma(as, cursor)) return;
-        cursor.skip_space();
-        const auto register_location = here();
-        const auto rest = cursor.rest();
-        std::optional<unsigned> number;
-        std::size_t end = 1;
-        if (rest.starts_with("$")) {
-            while (end < rest.size() && rest[end] >= '0' && rest[end] <= '9') ++end;
-            number = small_number(rest.substr(1, end - 1), 31);
+    case OperandTypeId::Immediate: {
+        if (operand.type.relocated_bits != 0) {
+            const auto parsed = immediate(as, cursor);
+            return parsed && sixteen(as, *parsed, operand.type.minimum, operand.type.maximum, value);
         }
-        if (!number) {
-            as.error(register_location, "expected a coprocessor 0 register $0-$31");
-            return;
+        const auto parsed =
+            absolute(as, cursor, operand.type.minimum, operand.type.maximum, "immediate");
+        if (!parsed) return false;
+        value.value = *parsed;
+        return true;
+    }
+    case OperandTypeId::Expression: {
+        // A macro's value: an expansion needs it now, li may leave it to
+        // layout.
+        if (entry.macro.empty()) {
+            const auto parsed = as.parse_absolute(cursor);
+            if (!parsed) return false;
+            value.value = *parsed;
+            return true;
         }
-        cursor.set_position(cursor.position() + end);
-        unsigned select = 0;
-        if (cursor.consume(",")) {
-            const auto value = absolute(as, cursor, 0, 7, "register select");
-            if (!value) return;
-            select = static_cast<unsigned>(*value);
-            if (select != 0 && !available(name.starts_with("d") ? I64 : I32)) {
-                as.error(location, "a coprocessor 0 register select needs MIPS32 or MIPS64");
+        const auto parsed = as.parse_expression(cursor);
+        if (!parsed) return false;
+        value.expression = *parsed;
+        return true;
+    }
+    case OperandTypeId::Memory: {
+        if (cursor.rest().starts_with("($")) {
+            cursor.consume("(");
+        } else {
+            const auto offset = immediate(as, cursor);
+            if (!offset || !sixteen(as, *offset, operand.type.offset_minimum,
+                                    operand.type.offset_maximum, value)) {
+                return false;
+            }
+            if (!cursor.consume("(")) {
+                // Without a base, $zero: the offset is the address.
+                if (cursor.at_end() && value.fixup) {
+                    as.error(offset->location, "a memory operand with a symbol needs a base register");
+                    return false;
+                }
+                return true;
+            }
+        }
+        const auto base = gpr(as, cursor);
+        if (!base) return false;
+        if (!cursor.consume(")")) {
+            as.error(cursor.location(), "expected ')'");
+            return false;
+        }
+        value.base = *base;
+        return true;
+    }
+    case OperandTypeId::Branch:
+    case OperandTypeId::Jump: {
+        const auto target = as.parse_expression(cursor);
+        if (!target) return false;
+        value.fixup = PendingFixup{id == OperandTypeId::Jump ? fixup_jump26 : fixup_branch16,
+                                   *target, value.location};
+        return true;
+    }
+    }
+    return false;
+}
+
+std::optional<std::vector<OperandValue>> MipsTarget::parse_operands(
+    Assembler& as, Cursor& cursor, const ModelInstruction& entry, std::string_view mnemonic) {
+    std::vector<OperandValue> values(entry.operands.size());
+    for (std::size_t index = 0; index < entry.operands.size(); ++index) {
+        const auto& operand = entry.operands[index];
+        if (operand.default_value || operand.default_operand) {
+            const bool present = index == 0 ? !cursor.at_end() : cursor.consume(",");
+            if (!present) {
+                for (auto rest = index; rest < entry.operands.size(); ++rest) {
+                    const auto& omitted = entry.operands[rest];
+                    if (omitted.default_operand) {
+                        values[rest] = values[*omitted.default_operand];
+                    } else {
+                        values[rest].value = omitted.default_value.value_or(0);
+                    }
+                }
+                break;
+            }
+        } else if (index != 0 && !comma(as, cursor)) {
+            return std::nullopt;
+        }
+        if (!parse_operand(as, cursor, entry, index, mnemonic, values[index])) return std::nullopt;
+    }
+    if (!cursor.at_end()) {
+        as.error(cursor.location(), "unexpected text after operands");
+        return std::nullopt;
+    }
+    return values;
+}
+
+Effects MipsTarget::effects_of(const Form& form, const std::vector<OperandValue>& values) const {
+    const auto& plan = form.effects;
+    const auto gpr_bit = [](std::int64_t number) {
+        return (1U << (static_cast<unsigned>(number) & 31U)) & ~1U;
+    };
+    Effects result;
+    for (const auto index : plan.gpr_reads) result.gpr_read |= gpr_bit(values[index].value);
+    for (const auto index : plan.bases) result.gpr_read |= gpr_bit(values[index].base);
+    for (const auto index : plan.gpr_writes) result.gpr_write |= gpr_bit(values[index].value);
+    result.gpr_read |= plan.fixed_gpr_reads;
+    result.gpr_write |= plan.fixed_gpr_writes;
+    // An FPR written `$N` counts in no FPR mask, hazard, or pairing rule.
+    if (std::none_of(values.begin(), values.end(),
+                     [](const OperandValue& value) { return value.numeric; })) {
+        for (const auto index : plan.fpr_reads) {
+            result.fpr_read |= 1U << (static_cast<unsigned>(values[index].value) & 31U);
+        }
+        for (const auto index : plan.fpr_writes) {
+            result.fpr_write |= 1U << (static_cast<unsigned>(values[index].value) & 31U);
+        }
+        if (plan.wide && options_.fpr != FprMode::Fp64) {
+            result.fpr_read |= result.fpr_read << 1U;
+            result.fpr_write |= result.fpr_write << 1U;
+        }
+    }
+    result.flags = plan.flags;
+    return result;
+}
+
+bool MipsTarget::emit(Assembler& as, const Form& form, const std::vector<OperandValue>& values) {
+    const auto& entry = *form.entry;
+    auto word = static_cast<std::uint32_t>(entry.fixed_bits);
+    std::optional<PendingFixup> fixup;
+    for (const auto& field : entry.fields) {
+        std::int64_t value = field.register_number ? *field.register_number : field.constant;
+        for (const auto& term : field.terms) {
+            const auto& operand = values[term.operand];
+            if (operand.fixup && term.part != 1) fixup = operand.fixup;
+            const auto part = term.part == 1 ? operand.base : operand.value;
+            value += term.negative ? -part : part;
+        }
+        if (field.terms.size() > 1 &&
+            (value < 0 || value >= (std::int64_t{1} << std::min(field.width, 62U)))) {
+            as.error(values[field.terms.back().operand].location,
+                     "the operands of '" + entry.mnemonic + "' give the value " +
+                         std::to_string(value) + ", which its " + std::to_string(field.width) +
+                         "-bit field cannot hold");
+            return false;
+        }
+        const auto mask = field.width >= 32 ? 0xffffffffU : (1U << field.width) - 1U;
+        word |= (static_cast<std::uint32_t>(static_cast<std::uint64_t>(value) >> field.low) & mask)
+                << field.shift;
+    }
+    // Register masks for the object: every register the word names.
+    for (const auto& field : entry.fields) {
+        if (field.register_number) {
+            if (field.register_class == "integer") use_gpr(*field.register_number);
+            continue;
+        }
+        if (field.terms.size() != 1) continue;
+        const auto& term = field.terms.front();
+        const auto& operand = values[term.operand];
+        switch (type_id(entry.operands[term.operand])) {
+        case OperandTypeId::Gpr: use_gpr(static_cast<unsigned>(operand.value)); break;
+        case OperandTypeId::Memory:
+            if (term.part == 1) use_gpr(static_cast<unsigned>(operand.base));
+            break;
+        case OperandTypeId::Fpr32:
+        case OperandTypeId::Cpr:
+            if (!operand.numeric) use_fpr(static_cast<unsigned>(operand.value), false);
+            break;
+        case OperandTypeId::Fpr64:
+        case OperandTypeId::Cpr64:
+            if (!operand.numeric) use_fpr(static_cast<unsigned>(operand.value), true);
+            break;
+        case OperandTypeId::Cp0:
+            if (!model_.gnu) cpr_mask_[0] |= 1U << (static_cast<unsigned>(operand.value) & 31U);
+            break;
+        default: break;
+        }
+    }
+    append(as, word, fixup, effects_of(form, values));
+    return true;
+}
+
+void MipsTarget::expand(Assembler& as, const ModelInstruction& entry,
+                        const std::vector<OperandValue>& values, SourceLocation location) {
+    const auto& table = *model_registry().instruction_table(subtarget_.target().architecture);
+    using Kind = ModelExpansion::Operand::Kind;
+    const auto bind = [&](const ModelExpansion& line) {
+        std::vector<OperandValue> result;
+        for (const auto& operand : line.operands) {
+            OperandValue item;
+            if (operand.kind == Kind::Register) {
+                item.value = operand.register_number;
+                item.location = location;
+            } else {
+                item = values[operand.operand];
+                if (operand.kind == Kind::Negated) item.value = -item.value;
+            }
+            result.push_back(item);
+        }
+        // Optional operands that the line leaves out take their defaults.
+        const auto& target = table.entries[line.entry];
+        for (auto index = result.size(); index < target.operands.size(); ++index) {
+            const auto& omitted = target.operands[index];
+            OperandValue item;
+            item.location = location;
+            if (omitted.default_operand) item = result[*omitted.default_operand];
+            else item.value = omitted.default_value.value_or(0);
+            result.push_back(item);
+        }
+        return result;
+    };
+    // An immediate that its instruction cannot hold.
+    const auto misfit = [&](const ModelExpansion& line) -> std::optional<std::size_t> {
+        const auto& target = table.entries[line.entry];
+        const auto bound = bind(line);
+        for (std::size_t index = 0; index < line.operands.size(); ++index) {
+            const auto& type = target.operands[index].type;
+            if (line.operands[index].kind != Kind::Register && type.kind == OperandKind::Immediate &&
+                (bound[index].value < type.minimum || bound[index].value > type.maximum)) {
+                return index;
+            }
+        }
+        return std::nullopt;
+    };
+    const auto emit_lines = [&](const std::vector<ModelExpansion>& lines) {
+        for (const auto& line : lines) {
+            const auto& target = table.entries[line.entry];
+            const auto* form = encoded_forms_.at(&target);
+            if (!available(*form)) {
+                as.error(location, "macro '" + entry.mnemonic + "' needs instruction '" +
+                                       target.mnemonic + "', which " +
+                                       std::string(isa_level(options_.architecture.isa).name) +
+                                       " does not have");
+                return false;
+            }
+            if (!emit(as, *form, bind(line))) return false;
+        }
+        return true;
+    };
+    const auto start = emitted_;
+    if (!entry.expands.empty() &&
+        std::none_of(entry.expands.begin(), entry.expands.end(),
+                     [&](const ModelExpansion& line) { return misfit(line).has_value(); })) {
+        if (emit_lines(entry.expands) && !options_.macro && emitted_ - start > 1) {
+            as.warning(location, "macro instruction expanded into multiple instructions");
+        }
+        return;
+    }
+    if (entry.otherwise.empty()) {
+        for (const auto& line : entry.expands) {
+            if (const auto index = misfit(line)) {
+                const auto& type = table.entries[line.entry].operands[*index].type;
+                as.error(values[line.operands[*index].operand].location,
+                         "immediate " + std::to_string(bind(line)[*index].value) +
+                             " is out of range [" + std::to_string(type.minimum) + ", " +
+                             std::to_string(type.maximum) + "]");
                 return;
             }
         }
-        if (!finish()) return;
-        word |= rt(*t) | rd(*number) | select;
-        use_gpr(*t);
-        if (!model_.gnu) cpr_mask_[0] |= 1U << *number;
-        break;
+        return;
     }
-    case Syntax::NoOperands:
-        if (!finish()) return;
-        if (name == "nop") use_gpr(0);
-        break;
-    case Syntax::SyncType:
-        if (!cursor.at_end()) {
-            const auto type = absolute(as, cursor, 0, 31, "sync type");
-            if (!type) return;
-            if (*type != 0 && !available(I32)) {
-                as.error(location, "a sync type needs MIPS32 or MIPS64");
-                return;
-            }
-            word |= sa(static_cast<unsigned>(*type));
-        }
-        if (!finish()) return;
-        break;
-    case Syntax::BreakCode:
-        if (!cursor.at_end()) {
-            const auto code = absolute(as, cursor, 0, 1023, "break code");
-            if (!code) return;
-            word |= static_cast<std::uint32_t>(*code) << 16U;
-            if (cursor.consume(",")) {
-                const auto second = absolute(as, cursor, 0, 1023, "break code");
-                if (!second) return;
-                word |= static_cast<std::uint32_t>(*second) << 6U;
+    // Otherwise the value goes through $at, as wide as the operand that $at
+    // takes.
+    if (!use_at(as, location)) return;
+    const auto value = std::find_if(entry.operands.begin(), entry.operands.end(),
+                                    [](const ModelOperand& operand) {
+                                        return operand.type.kind == OperandKind::Expression;
+                                    });
+    const auto& operand_value = values[static_cast<std::size_t>(value - entry.operands.begin())];
+    const bool wide = [&] {
+        for (const auto& line : entry.otherwise) {
+            for (std::size_t index = 0; index < line.operands.size(); ++index) {
+                const auto& operand = line.operands[index];
+                if (operand.kind != Kind::Register || operand.register_number != 1) continue;
+                const auto& widths = table.entries[line.entry].operands[index].type.widths;
+                return widths.size() > 1 ? options_.gp64
+                                         : !widths.empty() && widths.front().bits == 64;
             }
         }
-        if (!finish()) return;
-        break;
-    case Syntax::SyscallCode:
-        if (!cursor.at_end()) {
-            const auto code = absolute(as, cursor, 0, 0xfffff, "syscall code");
-            if (!code) return;
-            word |= static_cast<std::uint32_t>(*code) << 6U;
+        return false;
+    }();
+    load_immediate(as, 1, operand_value.value, wide, operand_value.location, false);
+    (void)emit_lines(entry.otherwise);
+}
+
+void MipsTarget::instruction(Assembler& as, Statement& statement) {
+    const auto name = lower(statement.name);
+    auto& cursor = statement.operands;
+    const auto location = statement.location;
+    numeric_fpr_ = false;
+    const auto found = forms_.find(name);
+    if (found == forms_.end()) {
+        as.error(location, "unknown instruction '" + std::string(statement.name) + "'");
+        return;
+    }
+    const auto& forms = found->second;
+    // The first form the current ISA has whose operands the text has the
+    // shape of and whose immediates take their values; without one, the
+    // first form it has reports why the operands do not fit.
+    const auto operands = split_operands(cursor.rest());
+    std::vector<const Form*> candidates;
+    const Form* unavailable = nullptr;
+    for (const auto& form : forms) {
+        if (!shape_matches(*form.entry, operands)) continue;
+        if (available(form)) {
+            candidates.push_back(&form);
+        } else if (!unavailable) {
+            unavailable = &form;
         }
-        if (!finish()) return;
-        break;
-    case Syntax::LoadImmediate:
-    case Syntax::LoadImmediate64: {
-        const bool wide = description.syntax == Syntax::LoadImmediate64;
-        const auto t = gpr(as, cursor);
-        if (!t || !comma(as, cursor)) return;
-        cursor.skip_space();
-        const auto value_location = here();
-        const auto expression = as.parse_expression(cursor);
-        if (!expression || !finish()) return;
-        if (wide && !available(I3)) {
-            as.error(location, "dli needs 64-bit registers");
-            return;
+    }
+    const Form* chosen = candidates.empty() ? nullptr : candidates.front();
+    if (candidates.size() > 1) {
+        const auto fitting = fitting_form(as, cursor, candidates, operands);
+        if (!fitting) return;
+        chosen = *fitting;
+    }
+    if (!chosen && !unavailable) {
+        for (const auto& form : forms) {
+            if (available(form)) {
+                chosen = &form;
+                break;
+            }
         }
-        if (const auto value = as.absolute_now(*expression)) {
-            load_immediate(as, *t, *value, wide, value_location);
+    }
+    if (!chosen) {
+        const bool other = std::any_of(forms.begin(), forms.end(),
+                                       [&](const Form& form) { return available(form); });
+        as.error(location, "instruction '" + name + "'" + (other ? " with these operands" : "") +
+                               " is not available in " +
+                               std::string(isa_level(options_.architecture.isa).name));
+        return;
+    }
+    // With 32-bit GPRs GNU as expands ld and sd into word pairs.
+    if (!options_.gp64 && (name == "ld" || name == "sd")) {
+        as.error(location, "'" + name + "' with 32-bit GPRs is a two-word macro that is not "
+                               "supported; select 64-bit GPRs with \".set gp=64\" or "
+                               "\".set mips3\"");
+        return;
+    }
+    const auto& entry = *chosen->entry;
+    const auto values = parse_operands(as, cursor, entry, name);
+    if (!values) return;
+    if (!entry.macro.empty()) {
+        // li and dli.
+        const bool wide = entry.macro == "dli";
+        const auto target = static_cast<unsigned>((*values)[0].value);
+        const auto& value = (*values)[1];
+        if (const auto number = as.absolute_now(value.expression)) {
+            load_immediate(as, target, *number, wide, value.location);
             return;
         }
         if (wide) {
             (void)as.parse_absolute(cursor);
-            as.error(value_location, "dli needs a value known before layout");
+            as.error(value.location, "dli needs a value known before layout");
             return;
         }
         // A value only layout settles, such as a label difference: one addiu,
         // as GNU as assumes, whose immediate must then fit.
-        use_gpr(*t);
-        use_gpr(0);
-        append(as, 0x24000000U | rt(*t),
-               PendingFixup{fixup_signed16, *expression, value_location});
+        std::vector<OperandValue> addiu(3);
+        addiu[0].value = target;
+        addiu[2].fixup = PendingFixup{fixup_signed16, value.expression, value.location};
+        (void)emit(as, named("addiu"), addiu);
         return;
     }
-    case Syntax::MoveMacro:
-    case Syntax::Negate:
-    case Syntax::NotMacro: {
-        const auto d = gpr(as, cursor);
-        if (!d) return;
-        unsigned s = *d;
-        if (cursor.consume(",")) {
-            const auto source = gpr(as, cursor);
-            if (!source) return;
-            s = *source;
-        } else if (description.syntax == Syntax::MoveMacro) {
-            as.error(cursor.location(), "expected ','");
+    if (!entry.expands.empty() || !entry.otherwise.empty()) {
+        expand(as, entry, *values, location);
+        return;
+    }
+    for (const auto& constraint : entry.constraints) {
+        std::int64_t sum = constraint.constant;
+        for (const auto& term : constraint.terms) {
+            const auto part = (*values)[term.operand].value;
+            sum += term.negative ? -part : part;
+        }
+        if (!constraint.holds(sum)) {
+            as.error((*values)[constraint.terms.back().operand].location,
+                     "the operands of '" + name + "' must satisfy " + constraint.text);
             return;
         }
-        if (!finish()) return;
-        // move: or d,s,$zero; negu: subu d,$zero,s; not: nor d,s,$zero.
-        word |= rd(*d) | (description.syntax == Syntax::Negate ? rt(s) : rs(s));
-        use_gpr(*d);
-        use_gpr(s);
-        use_gpr(0);
-        break;
     }
-    }
-    append(as, word, fixup, unconditional);
+    (void)emit(as, *chosen, *values);
 }
 
 std::string_view trimmed(std::string_view text) {
@@ -2383,23 +2066,16 @@ std::optional<Architecture> MipsTarget::named_architecture(Assembler& as, std::s
     // For assembler input, `mipsN` is the model's CPU of that name with
     // exactly that level, as GNU as selects the ISA's generic CPU; the
     // compiler's `.set mipsN` changes only the level of its CPU.
+    const auto& table = *subtarget_.target().subtargets;
     if (!model_.gnu && level != isa_levels.end()) {
-        auto result = options_.architecture;
-        result.isa = level->bit;
-        return result;
+        return with_level(table, options_.architecture, level->name, true);
     }
     if (auto cpu = cpu_architecture(subtarget_, name)) {
-        if (level != isa_levels.end()) {
-            cpu->isa = level->bit;
-            cpu->allegrex = false;
-        }
+        if (level != isa_levels.end()) return with_level(table, *cpu, level->name, false);
         return cpu;
     }
     if (level != isa_levels.end()) {
-        auto result = options_.architecture;
-        result.isa = level->bit;
-        result.allegrex = false;
-        return result;
+        return with_level(table, options_.architecture, level->name, false);
     }
     as.error(location, "unknown CPU '" + std::string(name) + "'");
     return std::nullopt;

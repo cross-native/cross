@@ -122,13 +122,27 @@ cross_component(cross_linker)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
              "${CMAKE_CURRENT_SOURCE_DIR}/model/common.xm"
              "${CMAKE_CURRENT_SOURCE_DIR}/model/x86_64.xm"
-             "${CMAKE_CURRENT_SOURCE_DIR}/model/mips.xm")
-file(READ "${CMAKE_CURRENT_SOURCE_DIR}/model/common.xm"
-     CROSS_COMMON_MODEL)
-file(READ "${CMAKE_CURRENT_SOURCE_DIR}/model/x86_64.xm"
-     CROSS_X86_64_MODEL)
-file(READ "${CMAKE_CURRENT_SOURCE_DIR}/model/mips.xm"
-     CROSS_MIPS_MODEL)
+             "${CMAKE_CURRENT_SOURCE_DIR}/model/mips.xm"
+             "${CMAKE_CURRENT_SOURCE_DIR}/model/mips_instructions.xm")
+# A shipped model's text as raw string literals of at most 16000 bytes, the
+# length every C++ compiler accepts.
+function(cross_model_text variable path)
+    file(READ "${path}" text)
+    string(LENGTH "${text}" length)
+    set(pieces "")
+    set(offset 0)
+    while(offset LESS length)
+        string(SUBSTRING "${text}" ${offset} 16000 piece)
+        string(APPEND pieces "R\"cross_model(${piece})cross_model\",\n")
+        math(EXPR offset "${offset} + 16000")
+    endwhile()
+    set(${variable} "${pieces}" PARENT_SCOPE)
+endfunction()
+cross_model_text(CROSS_COMMON_MODEL "${CMAKE_CURRENT_SOURCE_DIR}/model/common.xm")
+cross_model_text(CROSS_X86_64_MODEL "${CMAKE_CURRENT_SOURCE_DIR}/model/x86_64.xm")
+cross_model_text(CROSS_MIPS_MODEL "${CMAKE_CURRENT_SOURCE_DIR}/model/mips.xm")
+cross_model_text(CROSS_MIPS_INSTRUCTIONS_MODEL
+                 "${CMAKE_CURRENT_SOURCE_DIR}/model/mips_instructions.xm")
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/src/model/shipped_models.cpp.in"
@@ -137,6 +151,7 @@ configure_file(
 )
 
 add_library(cross_targets
+    src/model/instructions.cpp
     src/model/model.cpp
     "${CMAKE_CURRENT_BINARY_DIR}/generated/shipped_models.cpp"
     src/target/abi_lowering.cpp
@@ -1720,7 +1735,7 @@ if(BUILD_TESTING)
         LABELS "check.compile;arch.mips;backend.native;endian.big;endian.little;feature.small_data;opt.O0;opt.O2")
     # The Cross assembler: encodings, relocations, DWARF tables, diagnostics,
     # the as tool, and linker acceptance of cc -c objects.
-    foreach(name encodings relocations directives dwarf)
+    foreach(name encodings relocations directives dwarf table)
         add_test(NAME cross_mips_assembler_${name}
             COMMAND "${CMAKE_COMMAND}"
                     -DAS=$<TARGET_FILE:cross_as>
@@ -2818,6 +2833,15 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/model/model_validation.cmake")
     set_tests_properties(cross_model_validation PROPERTIES
         LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;feature.model;feature.driver")
+    add_test(NAME cross_model_instruction_entries
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DAS=$<TARGET_FILE:cross_as>
+                -DFIXTURES=${CMAKE_SOURCE_DIR}/test/model/instruction_entries
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/model-instruction-entries
+                -P "${CMAKE_SOURCE_DIR}/test/model/instruction_entries.cmake")
+    set_tests_properties(cross_model_instruction_entries PROPERTIES
+        LABELS "check.compile;diagnostics;arch.mips;backend.native;feature.model;feature.assembler;feature.raw")
     add_test(NAME cross_model_debug_entries
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

@@ -19,24 +19,27 @@ A model file contains entries of these kinds:
 - `profile`: a named set of target, ABI, mangling, preset, and option
   defaults;
 - `debug`: the contents of debugging information;
+- `instruction`: a form of a machine instruction;
 - `cpu`: a processor's instruction set and instruction costs;
 - `data_base`: data reached through a base register; and
 - `address_space`: a pointer representation with a stored width, a base,
   and a byte order.
 
 Models cannot add keywords, expressions, functions, libraries, runtime
-helpers, macros, instructions, intrinsics, attributes, compiler options, or
-optimization passes; a `cpu` entry describes instructions the compiler
-already implements, and they cannot weaken diagnostics or reorder the
-compiler's work. Unknown entry kinds, properties, options, and entry names
-are errors.
+helpers, source macros, intrinsics, attributes, compiler options, or
+optimization passes. `instruction` entries add instructions that the
+assembler accepts and machine instruction built-ins expose, but the compiler
+emits only the instructions it selects itself, and models cannot weaken
+diagnostics or reorder the compiler's work. Unknown entry kinds,
+properties, options, and entry names are errors.
 
 ## Loading and selection
 
 The shipped models are built into `cc` and `cpp`, so no data files need to be
 installed. Their readable sources are `model/common.xm` (the optimization
-presets), `model/x86_64.xm`, and `model/mips.xm`. These options load more
-files:
+presets), `model/x86_64.xm`, `model/mips.xm`, and
+`model/mips_instructions.xm` (the MIPS instruction table). These options
+load more files:
 
 ```text
 --model=FILE          load one model file
@@ -101,8 +104,8 @@ kind "name" {
 }
 ```
 
-The kinds are `abi`, `mangling`, `optimization`, `profile`, `debug`, `cpu`,
-`data_base`, and `address_space`. Only `abi` entries (`bank`, `rule`, `variadic_state`, and
+The kinds are `abi`, `mangling`, `optimization`, `profile`, `debug`,
+`instruction`, `cpu`, `data_base`, and `address_space`. Only `abi` entries (`bank`, `rule`, `variadic_state`, and
 `variadic_shadow`) and `cpu` entries (`instruction`) contain blocks, and a
 block has no `;` after its closing brace. Every
 property and every mangling rule ends in `;`. `#` and `//` start comments
@@ -1086,14 +1089,232 @@ shipped `dwarf` when the profile names none; `-g0` emits nothing. The shipped
 `dwarf-lines` entry enables only `lines` and `frames`. A `debug` entry contains
 no block.
 
+## Instruction entries
+
+An `instruction` entry describes one form of a machine instruction: how the
+assembler, `as` and `cc -c` alike, parses and encodes it; the effects that
+the assembler's reordering and the compiler follow; its default costs; and
+whether a machine instruction built-in (`$::_NAME`,
+[spec.md](spec.md#machine-instruction-built-ins)) exposes it. The entries of
+an architecture form its instruction table, which the assembler, the
+built-ins, `cpu` entries, `cc --print-instructions`, and `cc --print-costs`
+share. Architectures whose instructions have one width take entries: MIPS,
+whose shipped table is `model/mips_instructions.xm`. The x86-64 table is
+built into the compiler, and an x86-64 entry is an error.
+
+```text
+instruction "addu" {
+    architecture = "mips";
+    operands = ["rd:gpr32", "rs:gpr32", "rt:gpr32"];
+    encoding = "000000 rs:5 rt:5 rd:5 00000 100001";
+    reads = ["rs", "rt"];
+    writes = ["rd"];
+}
+```
+
+| Property | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `architecture` | text | none | Required. |
+| `mnemonic` | text | the entry name | The assembler spelling: lower-case letters, digits, `.`, and `_`. |
+| `operands` | list | `[]` | The operands in assembler order ([Operands](#operands)). |
+| `encoding` | text | none | The instruction word ([Encodings](#encodings)); required unless the entry is an alias or a macro. |
+| `features` | list | `[]` | The form exists on a CPU with any one of these features, or on every CPU of the architecture without any. |
+| `excludes` | list | `[]` | A CPU with any one of these features lacks the form. |
+| `reads`, `writes` | list | `[]` | The operands, registers, and other resources that the form reads and writes ([Effects](#effects)). |
+| `hazards` | list | `[]` | The target's hazard classes of the form. |
+| `control` | text | none | A control transfer: `jump`, `branch`, `exit`, or `trap`. |
+| `condition` | text | none | The comparison of a `branch`: of its two register operands, or of its one with zero, as signed integers for an ordering: `equal`, `not-equal`, `less-than-zero`, `greater-equal-zero`, `less-equal-zero`, or `greater-than-zero`. |
+| `delay_slot` | bool | `false` | The next instruction executes before the transfer. |
+| `likely` | bool | `false` | A `branch` whose delay slot executes only when it is taken. |
+| `privileged` | bool | `false` | The form executes only in a privileged mode. |
+| `volatile` | bool | `false` | Every execution is observable: the compiler does not merge, remove, or reorder the form across another effect. |
+| `hazard_uses`, `hazard_writes` | list | `[]` | Pipeline facts of resources that the hardware does not interlock ([Effects](#effects)). |
+| `latency`, `issue` | integer | `1` | The default costs, from 0 and from 1 to 65535, that `cpu` entries replace. |
+| `constraints` | list | `[]` | Relations that immediate operands keep, such as `"pos+size <= 32"`: a sum of operands and integers compared with an integer by `<=`, `<`, `>=`, `>`, `==`, or `!=`. |
+| `builtin` | text | none | Exposes the form as the built-in `$::_NAME`. |
+| `alias` | text | none | Another entry, which this one spells under its own mnemonic ([Aliases and macros](#aliases-and-macros)). |
+| `macro` | text | none | A macro of the target's assembler that the form expands to. |
+| `expands`, `otherwise` | list | `[]` | The instructions that the form expands to. |
+
+Entry names are unique per architecture. The forms of a mnemonic are tried
+in table order: a statement assembles as the first form whose operands it
+has and that the current CPU has, and is an error, naming the ISA level,
+when the CPU has none of the forms whose operands it has. A file loaded
+later can add instructions and forms but cannot replace an entry. The
+instructions that the compiler itself emits keep the forms of the shipped
+table: after loading, the compiler checks that the table defines each of
+them with the operands and effects it expects, and an entry of another file
+that adds a form to one of their mnemonics is an error.
+
+### Operands
+
+An operand is `NAME:TYPE`. `NAME:TYPE=DEFAULT` makes the operand, and every
+operand after it, optional; the default is an integer or the name of an
+earlier register operand, whose value it takes. A literal register such as
+`$zero` is an operand that a statement spells as that register and that the
+encoding does not hold. The operand types are those that the architecture
+lists below; another type is an error.
+
+A statement separates its operands with commas. A form takes the statement
+when it has at least the form's required operands and at most all of them,
+a register where the form has a register operand, and no register where the
+form has an immediate. Of several such forms that the CPU has, the
+statement assembles as the first whose immediate operands, where their
+values are known when it is assembled, hold those values and satisfy its
+constraints; when none does, the first reports the values that do not fit.
+
+### Encodings
+
+An encoding lists the bits of the instruction word from the most significant
+down, in runs of `0` and `1` and in fields:
+
+- `EXPR:WIDTH`, the low `WIDTH` bits of `EXPR`: an operand name, a part of a
+  memory operand (`NAME.base`, `NAME.offset`), or a sum of names and
+  integers with `+` and `-`, such as `size-1` or `pos+size-1`;
+- `NAME[HIGH:LOW]` or `NAME[BIT]`, those bits of an operand's value; and
+- `REGISTER:WIDTH`, the number of a register, such as `zero:5`, which counts
+  as a register that the instruction uses.
+
+Spaces separate the runs and fields, whose widths add up to the
+architecture's instruction width. Each operand other than a literal register
+appears in a field. A field of one operand holds each value of the operand,
+a signed one in two's complement, and the slices of an operand hold each bit
+of its values once; a field of several operands must hold their value when
+an instruction is assembled. A value that a relocation gives or layout
+settles goes into a field of its own in the low bits that the architecture
+names. Fields cannot overlap.
+
+### Effects
+
+`reads` and `writes` name register operands, registers as
+`cc --print-registers` lists them, and other resources: any other name,
+such as `memory` or a coprocessor's state. A memory operand's base register
+is read. A `clobber` attribute ([spec.md](spec.md)) may name a resource that
+the entry of a built-in names.
+
+`control` makes the form a control transfer: `jump` transfers
+unconditionally, calls included, and `branch` conditionally; `exit` leaves
+the function, as a return or a jump through a register does; and `trap` has
+no next instruction. The built-in of a control transfer is usable only in a
+naked function: a `jump` to a label and a `branch` with a `condition` branch
+within it, and an `exit` or `trap` form leaves it.
+
+`hazard_uses` and `hazard_writes` list facts `RESOURCE@STAGE`. A form that
+writes a resource makes it available at its stage, and a form that uses it
+reads it at its stage; a use needs the writer's stage minus the user's stage
+minus one instructions after the write. `RESOURCE[OPERAND]@STAGE` names the
+resource with an immediate operand's value: `cp0[rd]@7` names `cp0.12` for
+`rd` 12. A fact followed by ` if OPERAND=V|V...` applies only while the
+operand has one of those values.
+
+### Aliases and macros
+
+An entry with `alias` names an entry that is not an alias and takes only
+`architecture` and `mnemonic`: it spells that entry, with its operands,
+encoding, features, effects, and costs, under its own mnemonic.
+
+An entry with `macro` names a macro of the target's assembler, and its
+operands suit the macro. An entry with `expands` or `otherwise` lists the
+lines it expands to: a mnemonic and operands, each an operand of the entry,
+an immediate operand negated (`-value`), or a register (`$zero`). A line
+emits the first form of its mnemonic that takes those operands, and may
+leave out optional operands. The lines of `expands` apply when every
+immediate fits the operand that takes it, and those of `otherwise` apply
+otherwise: before them, the assembler loads the entry's one `imm` operand
+into the target's scratch register, as wide as the operand of `otherwise`
+that the register takes. Macro entries have no encoding and no effects of
+their own; their instructions have theirs.
+
+### Costs
+
+`cpu` entries and `cc --print-costs` name instructions by mnemonic, in table
+order, aliases aside. The first form of a mnemonic gives its default costs;
+a later form cannot state costs.
+
+### Machine instruction built-ins
+
+`builtin = "NAME"` exposes a form as `$::_NAME`, whose operands are the
+form's operands in order: a register operand that the form writes is an
+output, one it reads and writes is both, and the others are inputs;
+immediate operands are constants, memory operands lvalues, and label
+operands labels of the function. Entries can give one built-in forms that
+differ in their operand types. A form of the built-in exists for each
+feature in `features`, for each register width that its operand types take,
+one width for all of them, with the features those types need, and for each
+number of its optional operands. A form whose
+operand types cannot be built-in operands, or that has a literal register,
+cannot have `builtin`, and neither can a macro.
+
+### MIPS instructions
+
+MIPS instructions have 32 bits. The operand types:
+
+| Type | Assembler operand | Field value | As a built-in operand |
+| --- | --- | --- | --- |
+| `gpr`, `gpr32`, `gpr64` | A general register, such as `$4` or `$a0`. | Its number. | A general register of 32 or 64 bits, 32 bits, or 64 bits; 64 bits need `mips3`. |
+| `fpr32`, `fpr64` | `$f0` to `$f31`. An odd register holds a 32-bit value only where odd single-precision registers exist, and a 64-bit value only with 64-bit FPRs. | Its number. | A floating register of 32 or 64 bits; needs `hard-float`, and for 64 bits not `single-float`. |
+| `cpr`, `cpr64` | As `fpr32` and `fpr64`, or a coprocessor register `$0` to `$31`, which counts in no register mask and no hazard. | Its number. | As `fpr32` and `fpr64`. |
+| `fcc` | `$fcc0` to `$fcc7`. | Its number. | None. |
+| `cp0`, `fcr` | A coprocessor 0 register `$0` to `$31`; an FPU control register `$0` to `$31` or `$f0` to `$f31`. | Its number. | A constant written in register syntax; `fcr` needs `hard-float`. |
+| `uimmN`, `simmN` | An unsigned or signed integer of `N` bits, from 1 to 32. | The value. | A constant of `N` bits. |
+| `LOW..HIGH` | An integer from `LOW` to `HIGH`. | The value. | A constant. |
+| `imm` | An integer of up to 64 bits. | Macros only. | None. |
+| `mem`, `mem8`, `mem16`, `mem32`, `mem64` | `offset(base)`, `(base)`, or an absolute `offset`, whose base is `$zero`; the offset is signed 16 bits. | Parts `.base` and `.offset`. | An lvalue of any width, or of that width. |
+| `branch`, `jump` | A label, reached PC-relative in 16 bits, or in the current 256 MB region in 26. | The relocated value. | For `branch`, a label of the function; none for `jump`. |
+
+`simm16`, `uimm16`, and memory offsets also take `%hi`, `%lo`, `%gp_rel`,
+`%higher`, and `%highest` and values that only layout settles; their field
+is bits 15-0, that of a `branch` too, and that of a `jump` bits 25-0.
+
+The hazard classes are those of GNU as's reordering in `.set reorder` code.
+`load`: a load's register is ready one instruction late without
+`load-interlocks`. `coprocessor-load`: so is a loaded coprocessor register.
+`from-coprocessor` and `to-coprocessor`: so is the destination of a transfer
+to or from a coprocessor without `fpu-transfer-interlocks`, or for
+coprocessor 0 `load-interlocks`. `coprocessor`: a coprocessor instruction
+that waits one instruction after such a transfer that writes no FPR.
+`condition-read` and `condition-write`: the coprocessor condition, which a
+reader uses two instructions after a transfer that writes it and one after a
+compare without `fpu-compare-interlocks`. `no-delay-slot`: never moved into
+a delay slot. Without `hilo-interlocks`, a write of `hi` or `lo` follows a
+read of it by two instructions. The resource `cp0` marks a coprocessor 0
+instruction.
+
+The shipped `dext` and `dins` also spell `dextm` and `dextu`, and `dinsm`
+and `dinsu`, so that a field that ends or starts above bit 31 assembles as
+the instruction that takes it, as in GNU as. The macros `li` and `dli` take
+a register and an `imm` operand and expand to the table's `addiu`, `ori`,
+`lui`, `dsll`, and `dsrl32` as GNU as expands 32- and 64-bit constants. The
+scratch register of `otherwise` is `$at`, which a macro under `.set noat`
+cannot use. Under `.set nomacro` a statement that expands to several
+instructions draws a warning.
+
+This user model adds a coprocessor 2 instruction that `as` assembles, and
+that a naked function calls as `$::_vmix(d, a, b)`:
+
+```text
+instruction "vmix" {
+    architecture = "mips";
+    operands = ["rd:gpr32", "rs:gpr32", "rt:gpr32"];
+    encoding = "010010 1 0000 rs:5 rt:5 rd:5 000000";
+    reads = ["rs", "rt", "cop2"];
+    writes = ["rd"];
+    volatile = true;
+    latency = 4;
+    builtin = "vmix";
+}
+```
+
 ## CPU entries
 
 A `cpu` entry describes a processor: the instruction-set features it
 implements, which decide what the compiler may emit, and the cost of its
 instructions, which guides the compiler's choice among correct instruction
-sequences and their order. The compiler implements every instruction and
-inline sequence it uses; an entry states which of them a processor has and
-what they cost. This entry describes part of the VR4300:
+sequences and their order. An entry states which of the architecture's
+instructions, those of its instruction table
+([Instruction entries](#instruction-entries)) or on x86-64 those the
+compiler implements, a processor has and what they cost. This entry
+describes part of the VR4300:
 
 ```text
 cpu "vr4300" {
@@ -1138,9 +1359,9 @@ An `instruction "NAME"` block describes one instruction, named as
 | `issue` | integer | the target's | Cycles, from 1 to 65535, before the processor can start another instruction of the same kind. |
 | `available` | bool | `true` | `false` removes an instruction that the features would allow. |
 
-The target gives each instruction a default latency and issue cost, 1 unless
-it states otherwise; an instruction that neither the entry nor a base
-describes, or a property that its block omits, has the default. `cc --print-costs` shows
+The instruction table gives each instruction a default latency and issue
+cost, 1 unless it states otherwise; an instruction that neither the entry
+nor a base describes, or a property that its block omits, has the default. `cc --print-costs` shows
 the costs in effect.
 
 `-march=NAME` (`m.arch`) selects the entry whose `features` and `available`
@@ -1267,6 +1488,10 @@ These options list what the loaded models define:
   bases and features, and `--print-costs` prints the latency, issue cost,
   and availability of every instruction for the selected `-march` and
   `-mtune`.
+- `--print-instructions` lists the selected target's machine instruction
+  built-ins, then each form of an instruction table that models give, with
+  its operands, the features of which it needs one and those it excludes,
+  whether it is an alias or a macro, and the file and line of its entry.
 - `--print-data-bases` lists the `data_base` entries.
 - `--print-options[=all|optimization|common|target]` lists each option
   with its value for the compilation, its origin (`default`, `preset`,

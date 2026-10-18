@@ -400,21 +400,23 @@ that binds variadic state, and neither function may have `out` or `inout`
 parameters.
 
 Machine-instruction built-ins (`--print-instructions` lists each form with
-its feature gates and whether it is privileged or volatile):
+its feature gates and whether it is privileged or volatile). The entries of
+the instruction table `model/mips_instructions.xm` give them, and a model
+can add others ([models.md](models.md#instruction-entries)):
 
 | Built-in | Instruction | Needs |
 | --- | --- | --- |
 | `$::_mfc0(out u32 value, n)`, `$::_mtc0(in u32 value, n)` | `mfc0`, `mtc0` of coprocessor 0 register `n` | |
-| `$::_mfc0(out u32 value, n, sel)`, `$::_mtc0(in u32 value, n, sel)` | `mfc0`, `mtc0` of register `n` with select `sel` | MIPS32 |
+| `$::_mfc0(out u32 value, n, sel)`, `$::_mtc0(in u32 value, n, sel)` | `mfc0`, `mtc0` of register `n` with select `sel` | MIPS32 or MIPS64 |
 | `$::_dmfc0`, `$::_dmtc0` with `u64` | `dmfc0`, `dmtc0`, with an optional select | MIPS III; with a select MIPS64 |
 | `$::_tlbp()`, `$::_tlbr()`, `$::_tlbwi()`, `$::_tlbwr()` | TLB probe, read, and writes | |
-| `$::_cache(operation, object)` | `cache operation` on the line that holds `object` (`*pointer` or `pointer[index]`) | MIPS III or MIPS32 |
+| `$::_cache(operation, object)` | `cache operation` on the line that holds `object` (`*pointer` or `pointer[index]`) | MIPS III, MIPS32, or Allegrex |
 | `$::_sync()` | `sync` | MIPS II |
-| `$::_syscall()`, `$::_syscall(code)`, `$::_break()`, `$::_break(code)` | `syscall` with a 20-bit code, `break` with a 10-bit code | |
-| `$::_wait()` | `wait` | MIPS32 |
+| `$::_syscall()`, `$::_syscall(code)`, `$::_break()`, `$::_break(code)`, `$::_break(code, code2)` | `syscall` with a 20-bit code, `break` with one or two 10-bit codes | |
+| `$::_wait()` | `wait` | MIPS32 or MIPS64 |
 | `$::_cfc1(out u32 value, n)`, `$::_ctc1(in u32 value, n)` | FPU control register `n`; 31 is the FCSR | hard float |
 | `$::_sqrt`, `$::_abs`, `$::_neg` with `f32` or `f64` operands | `sqrt.s`/`.d`, `abs.s`/`.d`, `neg.s`/`.d` | hard float; `sqrt` MIPS II; `f64` not with `-msingle-float` |
-| `$::_eret()` | `eret`; naked functions only | MIPS III or MIPS32 |
+| `$::_eret()` | `eret`; naked functions only | MIPS III, MIPS32, or Allegrex |
 | `$::_rfe(in u32 value)` | `jr` through a register with `rfe` in its delay slot; naked functions only | MIPS I and II |
 | `$::_jr(in value)` | `jr` through a register; naked functions only | |
 | `$::_b(label)` | branch to a label of the function; naked functions only | |

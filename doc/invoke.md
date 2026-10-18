@@ -232,24 +232,30 @@ directives are `.set` (`push`, `pop`, `reorder`, `noreorder`, `at`, `noat`,
 CPU of that name, dropping a CPU extension such as Allegrex's, and also sets
 64-bit general and floating-point registers for a 64-bit ISA.
 
-The instructions are the integer, multiply and divide, load and store,
-branch, jump, FPU, FPU control, CP0, TLB, cache, and `sync` instructions of
-MIPS I-V, MIPS32, and MIPS64 Release 1 and 2, with multiply-accumulate,
-`mul`, `ext`, `ins`, `seb`, `seh`, traps, `pref`, every rounding conversion
-and FPU comparison, and the Allegrex instructions (`clz`, `clo`, `max`, `min`,
-`bitrev`, `wsbw`, `mfic`, `mtic`, and its own multiply-accumulate encodings),
-each accepted where the current ISA and CPU have it; coprocessor 2, MIPS16,
-and microMIPS are not. A floating-point register may be written `$N` in a
-load, store, or move (`lwc1 $4, 0($5)`, `mtc1 $2, $6`), where it counts in no
-register mask, but not in arithmetic. The relocation operators are `%hi`,
-`%lo`, `%gp_rel`, `%higher`, and `%highest`. The macros are `li` and `dli`,
-expanded as GNU as expands 32-bit values (a `li` value that only layout
-settles becomes one `addiu`, whose immediate must then fit), `move`, `b`,
-`bal`, `beqz`, `bnez`, `beqzl`, `bnezl`, `negu`, `neg`, `not`, `mul` without
-the MIPS32 instruction (`multu` and `mflo`), shifts and rotates by a register
-written with the immediate mnemonic, and three-register operations and traps
-whose last operand is a constant: the immediate instruction when it fits,
-otherwise the constant loaded into `$at`.
+The instructions are those of the loaded MIPS instruction table
+([models.md](models.md#instruction-entries)), each accepted where the
+current ISA and CPU have it, and `cc --print-instructions` lists them. The
+shipped table has the integer, multiply and divide, load and store, branch,
+jump, FPU, FPU control, CP0, TLB, cache, and `sync` instructions of MIPS
+I-V, MIPS32, and MIPS64 Release 1 and 2, with multiply-accumulate, `mul`,
+`ext`, `ins`, `seb`, `seh`, traps, `pref`, every rounding conversion and FPU
+comparison, and the Allegrex instructions (`clz`, `clo`, `max`, `min`,
+`bitrev`, `wsbw`, `mfic`, `mtic`, and its own multiply-accumulate
+encodings); coprocessor 2, MIPS16, and microMIPS are not in it, and a model
+may add instructions. As in GNU as, a condition code operand, `$fcc0` too,
+needs MIPS IV or MIPS32, and a `sync` type or a coprocessor 0 register
+select MIPS32 or MIPS64. A floating-point register may be written `$N` in a
+load, store, or move (`lwc1 $4, 0($5)`, `mtc1 $2, $6`), where it counts in
+no register mask, but not in arithmetic. The relocation operators are
+`%hi`, `%lo`, `%gp_rel`, `%higher`, and `%highest`. The shipped macros are
+`li` and `dli`, expanded as GNU as expands 32-bit values (a `li` value that
+only layout settles becomes one `addiu`, whose immediate must then fit),
+`move`, `b`, `bal`, `beqz`, `bnez`, `beqzl`, `bnezl`, `negu`, `neg`, `not`,
+`mul` without the MIPS32 instruction (`multu` and `mflo`), shifts and
+rotates by a register written with the immediate mnemonic, and
+three-register operations and traps whose last operand is a constant: the
+immediate instruction when it fits, otherwise the constant loaded into
+`$at`.
 
 In `.set reorder` code, `as` separates each pair of instructions with the
 `nop`s the CPU needs unless the CPU model has the interlock: after a load or
@@ -591,7 +597,8 @@ with `-target`, `-march`, or `-mprofile` to inspect another configuration.
 | `--print-data-bases` | The `data_base` entries: one `NAME  base: REGISTER  sections: LIST  max_size: N  kinds: LIST  source: FILE:LINE` line each. |
 | `--print-options[=all\|optimization\|common\|target]` | Options, values, and origins. |
 | `--print-keywords`, `--print-builtins`, `--print-attributes` | The language surface. |
-| `--print-features`, `--print-instructions`, `--print-registers` | Target feature queries, machine instructions, and register names. |
+| `--print-features`, `--print-registers` | Target feature queries and register names. |
+| `--print-instructions` | The machine-instruction built-ins with their feature gates and whether they are privileged or volatile, then, for a target whose instruction table models give, each instruction form: `MNEMONIC OPERANDS  [FEATURES]` (the features of which the form needs one, then `!NAME` for each it excludes), `alias of NAME` or `macro` where it is one, its built-in, and `source: FILE:LINE`. |
 
 ## Diagnostics
 
