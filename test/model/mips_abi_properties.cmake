@@ -297,6 +297,22 @@ if(NOT status EQUAL 0 OR
     message(FATAL_ERROR "user_fpxx does not report its features\n${stdout}\n${stderr}")
 endif()
 
+# The features apply in order: one may provide another's prerequisite.
+string(REPLACE "user_follow\" {"
+       "user_hard\" {\n    features = [\"hard-float\", \"fp32\"];"
+       hard_text "${follow_text}")
+set(hard_model "${OUTPUT}/hard.y")
+file(WRITE "${hard_model}" "${hard_text}")
+execute_process(
+    COMMAND "${CC}" "--model=${hard_model}" -target mips-unknown-elf
+            -march=r5900 -mabi=user_hard --print-options=target
+    RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+if(NOT status EQUAL 0 OR
+   NOT stdout MATCHES "\nm[.]hard-float  type: boolean  value: on  " OR
+   NOT stdout MATCHES "\nm[.]fp32  type: boolean  value: on  [^\n]*source: abi=user_hard\n")
+    message(FATAL_ERROR "user_hard does not enable fp32 after hard-float\n${stdout}\n${stderr}")
+endif()
+
 expect_model_error(unknown-feature
     "unknown-feature[.]y:6: error: unknown mips feature 'fp128'"
     unknown_feature 32 "features = [\"fp128\"];")

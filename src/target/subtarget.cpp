@@ -232,29 +232,33 @@ bool normalize_subtarget_options(const TargetInfo& target,
             std::string(reason) +
             "; the CPU baseline cannot be disabled with -m overrides");
     };
-    // The ABI's features replace the CPU's conflicting ones where the CPU
-    // has their prerequisites, which the features it lists imply.
+    // The ABI's features, in order, replace the CPU's conflicting ones
+    // where the features enabled so far imply their prerequisites.
     const auto* abi =
         model_registry().find_abi(target.architecture, options.abi,
                                   options.target);
-    std::unordered_set<std::string> implied;
-    std::vector<std::string_view> pending;
-    for (const auto& [name, enabled] : states) {
-        if (enabled) pending.push_back(name);
-    }
-    while (!pending.empty()) {
-        const auto name = std::string(pending.back());
-        pending.pop_back();
-        if (!implied.insert(name).second) continue;
-        const auto& required = find_feature(*table, name)->prerequisites;
-        pending.insert(pending.end(), required.begin(), required.end());
-    }
+    const auto implied = [&] {
+        std::unordered_set<std::string> result;
+        std::vector<std::string_view> pending;
+        for (const auto& [name, enabled] : states) {
+            if (enabled) pending.push_back(name);
+        }
+        while (!pending.empty()) {
+            const auto name = std::string(pending.back());
+            pending.pop_back();
+            if (!result.insert(name).second) continue;
+            const auto& required = find_feature(*table, name)->prerequisites;
+            pending.insert(pending.end(), required.begin(), required.end());
+        }
+        return result;
+    };
     std::unordered_set<std::string> abi_features;
     for (const auto& name : abi ? abi->features : std::vector<std::string>{}) {
         const auto* feature = find_feature(*table, name);
+        const auto available = implied();
         if (!std::ranges::all_of(feature->prerequisites,
                                  [&](std::string_view required) {
-                                     return implied.contains(
+                                     return available.contains(
                                          std::string(required));
                                  })) {
             continue;
