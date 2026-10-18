@@ -9,6 +9,7 @@
 #include "target/subtarget.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <charconv>
 #include <cctype>
 #include <fstream>
@@ -2865,8 +2866,9 @@ private:
     std::optional<CpuEntry> make_cpu(
         std::string name, const ModelProperties& properties,
         const std::vector<AbiNestedBlock>& blocks, unsigned line) {
-        if (!known_properties(properties, {"architecture", "inherits",
-                                           "features", "issue_width"})) {
+        if (!known_properties(properties,
+                              {"architecture", "inherits", "features",
+                               "issue_width", "function_alignment"})) {
             return std::nullopt;
         }
         CpuEntry result;
@@ -2890,6 +2892,17 @@ private:
             result.features = std::move(*features);
         }
         result.issue_width = cost_property(properties, "issue_width", 1);
+        result.function_alignment =
+            unsigned_property(properties, "function_alignment");
+        if (result.function_alignment &&
+            (*result.function_alignment == 0 ||
+             *result.function_alignment > 65536 ||
+             !std::has_single_bit(*result.function_alignment))) {
+            fail(properties.at("function_alignment").line,
+                 "model property 'function_alignment' must be a power of two "
+                 "from 1 to 65536");
+            return std::nullopt;
+        }
         for (const auto& block : blocks) {
             const auto instruction = find_instruction_cost(*target, block.name);
             if (!instruction) {
@@ -3465,6 +3478,9 @@ ResolvedCpu ModelRegistry::resolve_cpu(const TargetInfo& target,
     for (auto item = graph.rbegin(); item != graph.rend(); ++item) {
         const auto& cpu = *item->first;
         if (cpu.issue_width) result.issue_width = *cpu.issue_width;
+        if (cpu.function_alignment) {
+            result.function_alignment = cpu.function_alignment;
+        }
         for (const auto& block : cpu.instructions) {
             result.instructions[block.instruction.value] =
                 block_cost(target, block);
@@ -3731,9 +3747,9 @@ bool check_entries(const ModelRegistry& registry, Diagnostics& diagnostics) {
             return false;
         }
     }
-    // The nearest bases that set issue_width or describe an instruction
-    // agree unless the entry sets it, and the union of the bases' features
-    // is consistent.
+    // The nearest bases that set issue_width or function_alignment or
+    // describe an instruction agree unless the entry sets it, and the union
+    // of the bases' features is consistent.
     for (const auto& cpu : registry.cpus()) {
         if (cpu.inherits.empty()) continue;
         const auto& target = *architecture_target(cpu.architecture);
@@ -3741,6 +3757,9 @@ bool check_entries(const ModelRegistry& registry, Diagnostics& diagnostics) {
         auto problem = inheritance_conflict(graph, [](const CpuEntry& entry) {
             std::map<std::string, unsigned> result;
             if (entry.issue_width) result.emplace("'issue_width'", *entry.issue_width);
+            if (entry.function_alignment) {
+                result.emplace("'function_alignment'", *entry.function_alignment);
+            }
             return result;
         });
         if (!problem) {

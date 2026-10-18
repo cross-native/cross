@@ -120,10 +120,14 @@ and `pentium4`, are not available, and neither is `native`. The entries set
 features only, so their instructions have the target's default costs
 (`cc --print-costs`). A CPU that adds features to the CPU it inherits takes
 them from an entry named `ext-` and the CPU's name; `intel`, a tuning name,
-selects the `x86-64` baseline. Extensions that `--print-options=target` does
-not list, such as TSX, SGX, CET, AMX, APX, AVX-VNNI, SSE4a, XOP, FMA4, and
-the AVX-512 IFMA, BF16, FP16, and VP2INTERSECT subsets, are not modeled, so
-no CPU enables them.
+selects the `x86-64` baseline. When `-mtune` names `skylake`,
+`skylake-avx512`, `znver3`, or a CPU that inherits one of them, such as
+`cascadelake`, `sapphirerapids`, or `znver4`, functions compiled for speed
+align to 32 bytes, and otherwise to 16 bytes; size goals align them less,
+and `-falign-functions` gives the alignment itself. Extensions that
+`--print-options=target` does not list, such as TSX, SGX, CET, AMX, APX,
+AVX-VNNI, SSE4a, XOP, FMA4, and the AVX-512 IFMA, BF16, FP16, and
+VP2INTERSECT subsets, are not modeled, so no CPU enables them.
 
 Disabling a feature also disables the features that depend on it, so
 `-mno-avx` disables AVX2 and AVX-512 too. 128-bit integers, `f80`, vectors,
@@ -280,19 +284,50 @@ for these levels, from `r2000`, `r3900`, and `r4650` to `vr5500`, `24kf`,
 `m5100`, `sb1`, `loongson3a`, and `octeon3`, with the other spellings they
 accept, such as `r4300` for `vr4300` and `r10k` for `r10000`. Not shipped
 are the Release 6 CPUs (`mips32r6`, `mips64r6`, `i6400`, `i6500`, `p6600`),
-whose instruction encodings Cross does not implement, the R5900, whose
-short-loop erratum Cross does not work around, and the `r4k`, `4000`, and
-`4k` spellings of the R4000. Entries named `isa-` hold an ISA level's
-instructions and pipeline interlocks without an FPU, `fpu-` entries an FPU,
-and the ISA names and CPUs combine them. CPUs without an FPU, such as the
-VR4100 series, the R3900, the 4K, M4K, M14K, 24Kc, 34Kc, 74Kc, and 5Kc
+whose instruction encodings Cross does not implement. Entries named `isa-`
+hold an ISA level's instructions and pipeline interlocks without an FPU,
+`fpu-` entries an FPU, and `errata-` entries the workarounds of a CPU's
+errata; the ISA names and CPUs combine them. CPUs without an FPU, such as
+the VR4100 series, the R3900, the 4K, M4K, M14K, 24Kc, 34Kc, 74Kc, and 5Kc
 cores, the XLR, and the Octeon before Octeon III, use `-msoft-float`; the
-R4650 has a single-precision FPU, and the VR4100 series has no LL/SC.
-Extensions that `--print-options=target` does not list, such as DSP, MT,
-MIPS-3D, MSA, SmartMIPS, and the Octeon and Loongson instructions, are not
-modeled, and Release 3 and 5 CPUs produce Release 2 code and objects. Cross
-does not work around the R4400 and R10000 errata that GCC works around by
-default for those CPUs.
+R4650 has a single-precision FPU, and the VR4100 series has no LL/SC. The
+`r5900` entry (the PlayStation 2's Emotion Engine) has no LL/SC and no
+doubleword multiply or divide, so code that needs them is rejected, and no
+FPU: the R5900's single-precision FPU, which has no infinities, NaNs, or
+denormals and rounds toward zero, is not modeled. Extensions that
+`--print-options=target` does not list, such as DSP, MT, MIPS-3D, MSA,
+SmartMIPS, and the Octeon and Loongson instructions, are not modeled, and
+Release 3 and 5 CPUs produce Release 2 code and objects.
+
+CPUs whose errata compiled code can avoid, and their other spellings,
+enable the workarounds, as GCC does for an explicit `-march` (and, for the
+Loongson 3, as Linux does on Loongson 3 systems); `-mfix-NAME` and
+`-mno-fix-NAME` select them for any CPU, and tuning for a CPU does not:
+
+| Option | CPUs | Effect |
+| --- | --- | --- |
+| `-mfix-r4000` | `r4000` | An extended or variable shift may misexecute while a multiply runs: each multiply's `mflo` follows it at once, so none runs in the multiply's shadow. |
+| `-mfix-r4400` | `r4400` | A doubleword or variable shift may misexecute right after a divide starts. Divides are always followed by the `mflo` or `mfhi` that reads them and never fill a delay slot, which also avoids the R4000's divide errata. |
+| `-mfix-r10000` | `r10000` | LL/SC sequences retry with `beql`; requires branch-likely instructions. |
+| `-mfix-loongson3-llsc` | `gs464`, `loongson3a`, `gs464e`, `gs264e` | Every attempt of an LL/SC sequence starts with `sync`, and the exit that a compare-exchange takes between `ll` and `sc` starts with `sync`. |
+| `-mfix-r5900` | `r5900` | A loop of six instructions or fewer whose only branch ends it runs only once or twice unless that branch has a `nop` in its delay slot: such a branch keeps its slot empty. |
+| `-mfix4300` | (the `n64` profile) | Separate consecutive floating-point multiplies affected by the VR4300 erratum. |
+
+`as` applies `-mfix-r5900` and `-mfix-loongson3-llsc` as GNU as does
+([invoke.md](invoke.md)). Assemble `cc -S` output for a Loongson 3 without
+GNU as's `-mfix-loongson3-llsc`: the compiler places the SYNCs itself, and
+GNU as, which compares label names by their first 15 characters, also puts
+SYNCs between the `ll` and the `sc` of a compare-exchange.
+
+MIPS32 and MIPS64 Release 2 CPUs sign-extend bytes and halfwords with `seb`
+and `seh`, extract and insert bit fields with `ext` and `ins`, and swap
+bytes with `wsbh`; MIPS64 Release 2 CPUs also extract and insert doubleword
+fields with `dext`, `dins`, and their `m` and `u` forms, swap doubleword
+bytes with `dsbh` and `dshd`, and rotate doublewords with `drotr`,
+`drotr32`, and `drotrv`; MIPS32 and MIPS64 CPUs multiply words with `mul`;
+and Allegrex code uses its `seb`, `seh`, `ext`, and `ins` words. Each
+replaces the sequence it shortens only where the `-mtune` latencies are no
+higher.
 
 The `r2000`, `r3000`, `r6000`, `r4000`, `r4400`, `r4600`, and `vr4300`
 entries give those CPUs' multiply and divide cycle counts, all but `r4000`
@@ -309,7 +344,7 @@ options adjust them:
 | `-mfp32`, `-mfpxx`, `-mfp64` | FPU register model. |
 | `-modd-spreg` | The FPU has odd-numbered single-precision registers; the MIPS32 and MIPS64 CPUs with an FPU other than the GS464, and `allegrex`, enable it. A single-precision FPU and a 64-bit-register FPU (`-mfp64`) then keep values in all 32 registers; under `-mfp32`, where an `f64` occupies an even/odd pair, a function without `f64` values keeps its `f32` values in all 32 registers and others keep floating values in even registers. `-mfpxx` code and FPUs without them use even registers only. |
 | `-mllsc` | 32-bit LL/SC atomics. |
-| `-mfix4300` | Separate consecutive floating-point multiplies affected by the VR4300 erratum. |
+| `-mfix-NAME` | The errata workarounds above. |
 | `-mnan2008` | Use the IEEE 754-2008 NaN encoding of MIPS32 Release 2 FPUs; the output declares it with `.nan 2008`. |
 | `-mbranch-likely`, `-mcond-move`, `-mrotate` | Allow branch-likely, conditional-move, and rotate instructions. |
 | `-mcmodel=large` | Materialize full 64-bit addresses and call through registers. |
@@ -406,11 +441,12 @@ interrupts are sampled against them, and four from a Status write to a
 coprocessor instruction such as ERET; one to three between writes of the TLB
 registers, TLB operations, and their reads; and three from `tlbwi` or `tlbwr`
 to a load or store. Instructions already scheduled between them count, and
-NOPs fill the rest, or one EHB on MIPS32 Release 2. Every distance is complete
-before a branch, jump, call, or return. A store and a `cache` operation are
-separated by two instructions that are not loads or cache operations. MIPS I
-`mfc0` results have a load delay. Instruction-fetch hazards are not tracked:
-code is assumed to run unmapped or through an unchanged mapping.
+NOPs fill the rest, or one EHB on MIPS32 and MIPS64 Release 2. Every distance
+is complete before a branch, jump, call, or return. A store and a `cache`
+operation are separated by two instructions that are not loads or cache
+operations. MIPS I `mfc0` results have a load delay. Instruction-fetch
+hazards are not tracked: code is assumed to run unmapped or through an
+unchanged mapping.
 
 A `[[naked]]` function names a register for each parameter and its result,
 binds every local object to a register, and leaves through `$::_jr`,
@@ -545,8 +581,8 @@ or raises its `latency` therefore selects the sequence
 | `$::clz` | `lzcnt` with LZCNT; otherwise `bsr`, `cmovne`, and `xor` | `clz` on MIPS32, MIPS64, and Allegrex, or `clo` for a complement `~x`; `dclz` or `dclo` for 64 bits on MIPS64 |
 | `$::ctz` | `tzcnt` with BMI; otherwise `bsf` and `cmovne` | the width less the leading ones of `x \| -x` (`clo`) where `clz` exists |
 | `$::popcount` | `popcnt` with POPCNT | none |
-| `$::bswap` | `bswap`, or `rolw $8` for 16 bits | `wsbh` and `rotr` on MIPS32 Release 2, `wsbw` on Allegrex; `wsbh` and `andi` for 16 bits |
-| `$::rotl`, `$::rotr` | `rol`, `ror` | `rotr` or `rotrv` with `-mrotate`; otherwise two shifts and `or` |
+| `$::bswap` | `bswap`, or `rolw $8` for 16 bits | `wsbh` and `rotr` on MIPS32 and MIPS64 Release 2, `wsbw` on Allegrex; `wsbh` and `andi` for 16 bits; `dsbh` and `dshd` for 64 bits on MIPS64 Release 2 |
+| `$::rotl`, `$::rotr` | `rol`, `ror` | `rotr` or `rotrv` with `-mrotate`, and for 64 bits `drotr`, `drotr32`, or `drotrv` on MIPS64 Release 2; otherwise two shifts and `or` |
 
 The inline sequences use neither branches nor data tables:
 

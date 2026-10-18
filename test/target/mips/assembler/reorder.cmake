@@ -83,6 +83,36 @@ reorder_case(mips32 "-target mips-unknown-elf -march=mips32" "-EB -march=mips32 
              "mfhi $2|jr $31|mflo $3|mult $4, $5"
              "03e00008;00001010;00001812;00850018")
 
+# -mfix-r5900, which -march=r5900 enables: a conditional branch back over at
+# most five instructions, none a branch, keeps a nop in its delay slot; a
+# loop of six instructions, one with another branch, and an unconditional
+# branch still take the instruction before them.
+set(r5900_loops "1:|addiu \$4, \$4, -1|addiu \$2, \$2, 1|bne \$4, \$5, 1b|2:|addiu \$5, \$5, 1|addiu \$6, \$6, 1|addiu \$7, \$7, 1|addiu \$8, \$8, 1|addiu \$9, \$9, 1|bne \$5, \$6, 2b|3:|addiu \$5, \$5, 1|addiu \$6, \$6, 1|addiu \$7, \$7, 1|addiu \$8, \$8, 1|addiu \$9, \$9, 1|addiu \$10, \$10, 1|bne \$5, \$6, 3b|4:|addiu \$5, \$5, 1|beq \$5, \$7, 5f|addiu \$7, \$7, 1|bne \$5, \$6, 4b|5:|addiu \$10, \$10, 1|b 5b")
+set(r5900_fixed "2484ffff;24420001;1485fffd;00000000;24a50001;24c60001;24e70001;25080001;25290001;14a6fffa;00000000;24a50001;24c60001;24e70001;25080001;25290001;14a6fffa;254a0001;24a50001;10a70003;00000000;14a6fffc;24e70001;1000ffff;254a0001")
+set(r5900_unfixed "2484ffff;1485fffe;24420001;24a50001;24c60001;24e70001;25080001;14a6fffb;25290001;24a50001;24c60001;24e70001;25080001;25290001;14a6fffa;254a0001;24a50001;10a70003;00000000;14a6fffc;24e70001;1000ffff;254a0001")
+# GNU as records extension facts for the R5900 and the Loongson 3 that the
+# Cross model does not, so it is compared on MIPS III with the options.
+reorder_case(r5900 "-target mips-unknown-elf -march=r5900" "" "${r5900_loops}" "${r5900_fixed}")
+reorder_case(r5900-off "-target mips-unknown-elf -march=r5900 -mno-fix-r5900" ""
+             "${r5900_loops}" "${r5900_unfixed}")
+reorder_case(fix-r5900 "-target mips-unknown-elf -march=mips3 -mfix-r5900"
+             "-EB -march=mips3 -mfix-r5900 -mabi=32" "${r5900_loops}" "${r5900_fixed}")
+reorder_case(no-fix-r5900 "-target mips-unknown-elf -march=mips3" "-EB -march=mips3 -mabi=32"
+             "${r5900_loops}" "${r5900_unfixed}")
+# -mfix-loongson3-llsc, which the Loongson 3 CPUs enable: a SYNC before an
+# LL or LLD that does not follow one, and at a local label that a branch
+# between an LL and the SC after it targets, in either reorder mode.
+set(llsc ".set noreorder|1:|ll \$2, 0(\$4)|bne \$2, \$5, 2f|move \$3, \$6|sc \$3, 0(\$4)|beqz \$3, 1b|nop|2:|jr \$31|nop|.set reorder|sync|3:|ll \$2, 0(\$4)|addu \$3, \$2, \$5|sc \$3, 0(\$4)|beqz \$3, 3b|lld \$3, 0(\$4)|.Lexit:|ll \$2, 0(\$4)|bne \$2, \$5, .Lout|sc \$3, 0(\$4)|.Lout:|addu \$3, \$3, \$3|jr \$31")
+set(llsc_fixed "0000000f;c0820000;14450004;00c01825;e0830000;1060fffa;00000000;0000000f;03e00008;00000000;0000000f;c0820000;00451821;e0830000;1060fffc;00000000;0000000f;d0830000;0000000f;c0820000;14450002;00000000;e0830000;0000000f;03e00008;00631821")
+set(llsc_unfixed "c0820000;14450004;00c01825;e0830000;1060fffb;00000000;03e00008;00000000;0000000f;c0820000;00451821;e0830000;1060fffc;00000000;d0830000;c0820000;14450002;00000000;e0830000;03e00008;00631821")
+reorder_case(loongson3 "-target mips-unknown-elf -march=gs464" "" "${llsc}" "${llsc_fixed}")
+reorder_case(loongson3-off "-target mips-unknown-elf -march=gs464 -mno-fix-loongson3-llsc" ""
+             "${llsc}" "${llsc_unfixed}")
+reorder_case(fix-loongson3 "-target mips-unknown-elf -march=mips3 -mfix-loongson3-llsc"
+             "-EB -march=mips3 -mfix-loongson3-llsc -mabi=32" "${llsc}" "${llsc_fixed}")
+reorder_case(no-fix-loongson3 "-target mips-unknown-elf -march=mips3" "-EB -march=mips3 -mabi=32"
+             "${llsc}" "${llsc_unfixed}")
+
 # A label before an instruction that needs hazard nops moves past them.
 set(source "${OUTPUT}.label.s")
 file(WRITE "${source}" "        .text\n        lw $2, 0($4)\nafter:\n        addu $3, $2, $2\n")

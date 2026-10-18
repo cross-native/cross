@@ -137,6 +137,11 @@ X(Fmax, "mips.fmax")
 X(Clz, "mips.clz")
 X(Clo, "mips.clo")
 X(Bswap, "mips.bswap")
+// Release 2 bit fields: EXT or DEXT of operand 0's bits from a position of
+// a size, and INS or DINS of operand 1's low bits into operand 0; the
+// position and size are immediate operands.
+X(Extract, "mips.extract")
+X(Insert, "mips.insert")
 // A registry instruction form. Operand 0 is the form ID; the form's
 // operands follow, with a memory operand as base register and displacement.
 X(Machine, "mips.machine")

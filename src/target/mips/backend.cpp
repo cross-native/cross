@@ -190,13 +190,12 @@ public:
                 "' ABI is defined on a 64-bit FPU; -msingle-float is not a "
                 "supported combination");
         }
-        if (subtarget.cpu() == "allegrex" &&
-            (!subtarget.has_feature(Feature::Allegrex) ||
-             !subtarget.has_feature(Feature::Mips2) ||
-             !subtarget.has_feature(Feature::HardFloat) ||
-             !subtarget.has_feature(Feature::SingleFloat))) {
+        // The R10000 workaround retries LL/SC loops with branch-likely
+        // forms, which an option that removes them would silently drop.
+        if (subtarget.has_feature(Feature::FixR10000) &&
+            !subtarget.has_feature(Feature::BranchLikely)) {
             diagnostics.command_error(
-                "Allegrex requires MIPS II and its hard single-precision FPU; the CPU baseline cannot be disabled with -mno-* overrides");
+                "-mfix-r10000 requires branch-likely instructions");
         }
         if (options.position_independent || options.pie ||
             subtarget.has_feature(Feature::AbiCalls)) {

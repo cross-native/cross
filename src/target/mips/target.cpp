@@ -454,8 +454,9 @@ unsigned mips64_constant_materialization_cost(std::uint64_t value) {
 }
 
 // The multiply and divide unit: MULT/MULTU and DIV/DIVU, their D forms from
-// MIPS III, and the MFLO or MFHI that reads the result. Before MIPS III a
-// doubleword operation is a pair-legalized sequence.
+// MIPS III, and the MFLO or MFHI that reads the result, or the MIPS32 and
+// MIPS64 MUL where it pays. Before MIPS III a doubleword operation is a
+// pair-legalized sequence.
 std::vector<InstructionCostId> integer_operation_instructions(
     const Subtarget& subtarget, CostedIntegerOperation operation,
     const IntegerOperationCostQuery& query) {
@@ -472,6 +473,9 @@ std::vector<InstructionCostId> integer_operation_instructions(
     switch (operation) {
     case CostedIntegerOperation::Multiply:
         if (query.bits > 64) return {};
+        if (!wide && mips::selects_three_operand_multiply(subtarget)) {
+            return {Instruction::Mul};
+        }
         return {wide ? Instruction::Dmult : Instruction::Mult,
                 Instruction::Mflo};
     case CostedIntegerOperation::MultiplyHigh:
@@ -559,6 +563,12 @@ const SubtargetTable subtargets{
         // FCSR.NAN2008: Release 2 FPUs may implement the IEEE 754-2008 NaN
         // encoding; earlier ones have only the legacy encoding.
         {"nan2008", false, true, {"mips32r2"}, {}},
+        // Errata workarounds, which the entries of the affected CPUs enable.
+        {"fix-r4000", false, true, {"mips1"}, {}},
+        {"fix-r4400", false, true, {"mips1"}, {}},
+        {"fix-r10000", false, true, {"mips1"}, {}},
+        {"fix-r5900", false, true, {"mips1"}, {}},
+        {"fix-loongson3-llsc", false, true, {"mips1"}, {}},
     },
 };
 
@@ -610,6 +620,17 @@ std::vector<OptionDefinition> target_options() {
     boolean("llsc", false, "enable load-linked/store-conditional atomics");
     boolean("branch-likely", false, "enable branch-likely instructions");
     boolean("fix4300", false, "work around the early VR4300 FP multiply erratum");
+    boolean("fix-r4000", false,
+            "work around the R4000 multiply and divide errata");
+    boolean("fix-r4400", false, "work around the R4400 divide erratum");
+    boolean("fix-r10000", false,
+            "work around the R10000 LL/SC erratum with branch-likely retries");
+    boolean("fix-r5900", false,
+            "keep a NOP in the delay slot of a branch that ends a loop of "
+            "six instructions or fewer (R5900 erratum)");
+    boolean("fix-loongson3-llsc", false,
+            "work around the Loongson 3 LL/SC erratum with SYNC before LL "
+            "and at LL/SC exits");
     boolean("nan2008", false,
             "use the IEEE 754-2008 NaN encoding instead of the legacy one");
     boolean("long-calls", false,

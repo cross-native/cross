@@ -1101,6 +1101,7 @@ cpu "vr4300" {
 | `inherits` | text or list | none | no |
 | `features` | list | `[]` | no |
 | `issue_width` | integer | `1` | no |
+| `function_alignment` | integer | the target's | no |
 
 `architecture` names a compiled-in architecture as `cc --print-targets`
 prints it; CPU names are unique per architecture. `inherits` names the
@@ -1112,7 +1113,10 @@ features the processor implements by the names of the `-m` feature options
 (`cc --print-options=target`); each is enabled as its option would enable it,
 and two features that conflict, directly or through what they enable, are an
 error. `issue_width`, from 1 to 65535, is the number of instructions the
-processor starts per cycle.
+processor starts per cycle. `function_alignment`, a power of two from 1 to
+65536, is the alignment in bytes that functions compiled for speed get when
+the entry is the `-mtune` CPU; `-falign-functions` overrides it, and size
+goals keep the target's smaller alignments.
 
 An `instruction "NAME"` block describes one instruction, named as
 `cc --print-costs` lists the target's instructions:

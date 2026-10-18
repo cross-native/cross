@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 # The shipped CPU catalog: every -march name that GCC, LLVM, or GNU as
-# accepts for MIPS and x86-64, except Release 6 MIPS, the R5900, the other
-# spellings of the R4000, and 32-bit x86 CPUs; other spellings that resolve
-# to their CPU; the features of the CPUs that the catalog composes; the
-# costs that composition keeps; and `.set arch=` with MIPS64 Release 2 CPUs.
+# accepts for MIPS and x86-64, except Release 6 MIPS and 32-bit x86 CPUs;
+# other spellings that resolve to their CPU; the features of the CPUs that
+# the catalog composes; the costs that composition keeps; and `.set arch=`
+# with MIPS64 Release 2 CPUs.
 foreach(required CC AS OUTPUT)
     if(NOT DEFINED ${required} OR "${${required}}" STREQUAL "")
         message(FATAL_ERROR "${required} must name a path")
@@ -33,9 +33,9 @@ set(mips_present
     r20kc sb1 sb1a sr71000 sr71k xlr loongson3a gs464 gs464e gs264e octeon
     octeon+ octeon2 octeon3 xlp generic mips5 r4010 4010 vr4181 4181 r4181
     rm5200 5200 r5200 rm5230 5230 r5230 rm5231 5231 r5231 rm5261 5261 r5261
-    rm5721 5721 r5721 m4kp interaptiv-mr2 25kf r25kf)
+    rm5721 5721 r5721 m4kp interaptiv-mr2 25kf r25kf r4k 4000 4k r5900 5900)
 set(mips_absent
-    mips32r6 mips64r6 r4k 4000 4k r5900 5900 i6400 i6500 p6600)
+    mips32r6 mips64r6 i6400 i6500 p6600)
 set(x86_present
     nocona core2 nehalem corei7 westmere sandybridge corei7-avx ivybridge
     core-avx-i haswell core-avx2 broadwell skylake skylake-avx512 cannonlake
@@ -75,7 +75,8 @@ set(mips_spellings
     r1004kf2_1=1004kf2_1 r1004kf=1004kf r1004kf1_1=1004kf1_1 r5kc=5kc r5kf=5kf
     r20kc=20kc sr71k=sr71000 4010=r4010 4181=vr4181 r4181=vr4181 5200=rm5200
     r5200=rm5200 5230=rm5230 r5230=rm5230 5231=rm5231 r5231=rm5231 5261=rm5261
-    r5261=rm5261 5721=rm5721 r5721=rm5721 r25kf=25kf)
+    r5261=rm5261 5721=rm5721 r5721=rm5721 r25kf=25kf r4k=r4000 4000=r4000
+    4k=r4000 5900=r5900)
 set(x86_aliases
     intel=generic corei7=nehalem corei7-avx=sandybridge core-avx-i=ivybridge
     core-avx2=haswell skx=skylake-avx512 emeraldrapids=sapphirerapids
@@ -98,7 +99,7 @@ function(load arch triple)
     string(REPLACE "\n" ";" lines "${text}")
     set(names)
     foreach(line IN LISTS lines)
-        if(NOT line MATCHES "^([^ ]+)  (inherits: ([^ ]+(, [^ ]+)*)  )?features: ([^ ]+)  issue_width: ([0-9]+)  source: shipped:")
+        if(NOT line MATCHES "^([^ ]+)  (inherits: ([^ ]+(, [^ ]+)*)  )?features: ([^ ]+)  issue_width: ([0-9]+)  (function_alignment: [0-9]+  )?source: shipped:")
             message(FATAL_ERROR "malformed --print-cpus line '${line}'")
         endif()
         set(name "${CMAKE_MATCH_1}")
@@ -127,7 +128,7 @@ foreach(arch mips x86)
 endforeach()
 foreach(case "x86_64-unknown-linux-gnu;i686;unknown x86-64 architecture CPU 'i686'"
              "mips-unknown-elf;i6400;unknown mips architecture CPU 'i6400'"
-             "mips-unknown-elf;r4k;unknown mips architecture CPU 'r4k'")
+             "mips-unknown-elf;mips64r6;unknown mips architecture CPU 'mips64r6'")
     list(GET case 0 triple)
     list(GET case 1 cpu)
     list(GET case 2 message)
@@ -189,9 +190,9 @@ expect_features(mips mips32r2 branch-likely cond-move fp32
 expect_features(mips mips3 branch-likely fp32 hard-float llsc load-interlocks
     mips3)
 expect_features(mips r4000 branch-likely fp32 hard-float llsc load-interlocks
-    mips3)
+    mips3 fix-r4000)
 expect_features(mips r4400 branch-likely fp32 hard-float llsc load-interlocks
-    mips3)
+    mips3 fix-r4400)
 expect_features(mips r4600 branch-likely fp32 hard-float llsc load-interlocks
     mips3)
 expect_features(mips vr4300 branch-likely fp32 hard-float llsc load-interlocks
@@ -255,7 +256,10 @@ lacks(mips vr4100 llsc hard-float)
 has(mips vr4181 mips3 soft-float)
 has(mips r4650 mips3 single-float llsc)
 has(mips loongson2f mips3 cond-move hilo-interlocks fpu-compare-interlocks)
-has(mips r10000 mips4 fp64 cond-move)
+has(mips r10000 mips4 fp64 cond-move fix-r10000)
+lacks(mips r12000 fix-r10000)
+has(mips r5900 mips3 soft-float branch-likely cond-move hilo-interlocks fix-r5900)
+lacks(mips r5900 llsc hard-float)
 has(mips vr5400 mips4 cond-move rotate)
 has(mips vr5500 mips4 rotate hilo-interlocks)
 lacks(mips vr5500 cond-move)
@@ -269,8 +273,10 @@ has(mips m5101 mips32r2 soft-float)
 has(mips 5kc mips64 soft-float)
 has(mips sr71000 mips64 fp64 rotate)
 has(mips mips64r2 mips64r2 fp64 odd-spreg rotate)
-has(mips gs464 mips64r2 fp64)
+has(mips gs464 mips64r2 fp64 fix-loongson3-llsc)
 lacks(mips gs464 odd-spreg)
+has(mips gs464e mips64r2 fix-loongson3-llsc)
+lacks(mips octeon3 fix-loongson3-llsc)
 has(mips octeon+ mips64r2 soft-float)
 has(mips octeon2 mips64r2 soft-float)
 has(mips octeon3 mips64r2 hard-float)

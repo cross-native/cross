@@ -367,8 +367,11 @@ void print_cpus(const CompilerOptions& options) {
              ++index) {
             std::cout << (index == 0 ? "" : ",") << resolved.features[index];
         }
-        std::cout << "  issue_width: " << resolved.issue_width
-                  << "  source: " << cpu.source << '\n';
+        std::cout << "  issue_width: " << resolved.issue_width;
+        if (resolved.function_alignment) {
+            std::cout << "  function_alignment: " << *resolved.function_alignment;
+        }
+        std::cout << "  source: " << cpu.source << '\n';
     }
 }
 

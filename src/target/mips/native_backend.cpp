@@ -100,6 +100,7 @@ enum class LoweringPass : std::uint16_t {
     AllocateRegisters,
     DuplicateBranchBlocks,
     ElideUnusedSpillSlots,
+    SelectBitFields,
 };
 
 // Physical GPR identities use the architectural register numbers.  Machine
@@ -5483,6 +5484,229 @@ private:
         bool sign{};
     };
 
+    // Release 2 bit fields (-fmachine-combine): a mask of a right shift, a
+    // right shift of a left shift, or a mask too wide for ANDI becomes an
+    // Extract (EXT, DEXT); an OR of a base whose field a mask clears with a
+    // value shifted into exactly that field becomes an Insert (INS, DINS).
+    // Masks, shifts, and constants that only the combined operation read
+    // die.
+    bool select_bit_fields(machine::Function& function) {
+        if (!options_.machine_combine || naked_) return false;
+        const bool words = selects_bit_fields(subtarget_, 32);
+        const bool doublewords = selects_bit_fields(subtarget_, 64);
+        if (!words && !doublewords) return false;
+        const auto count = function.virtual_registers.size();
+        std::vector<const machine::Instruction*> definitions(count);
+        std::vector<unsigned> uses(count);
+        for (const auto& block : function.blocks) {
+            for (const auto& instruction : block.instructions) {
+                for (const auto definition : instruction.defs) {
+                    if (definition.kind == machine::RegisterKind::Virtual &&
+                        definition.id < count) {
+                        definitions[definition.id] = &instruction;
+                    }
+                }
+                for (const auto use : instruction.uses) {
+                    if (use.kind == machine::RegisterKind::Virtual &&
+                        use.id < count) {
+                        ++uses[use.id];
+                    }
+                }
+                for (const auto live : instruction.live_across_call) {
+                    if (live.kind == machine::RegisterKind::Virtual &&
+                        live.id < count) {
+                        ++uses[live.id];
+                    }
+                }
+            }
+        }
+        const auto integer = [&](machine::Register value, unsigned bits) {
+            return value.kind == machine::RegisterKind::Virtual &&
+                value.id < count && value.mode.bits == bits &&
+                function.virtual_register_classes[value.id] ==
+                    machine::VirtualRegisterClass::Integer;
+        };
+        const auto low_mask = [](unsigned width) {
+            return width >= 64 ? ~std::uint64_t{0}
+                               : (std::uint64_t{1} << width) - 1U;
+        };
+        // The defining operation of a value that only one reader reads.
+        const auto single = [&](machine::Register value, Opcode opcode,
+                                unsigned bits) -> const machine::Instruction* {
+            if (!integer(value, bits) || uses[value.id] != 1) return nullptr;
+            const auto* found = definitions[value.id];
+            return found && found->kind == machine::InstructionKind::Target &&
+                    found->defs.size() == 1 && !found->patch &&
+                    decode_opcode(found->opcode) == opcode
+                ? found : nullptr;
+        };
+        const auto amount_of = [&](const machine::Instruction& value,
+                                   unsigned bits) -> std::optional<unsigned> {
+            const auto* amount = value.operands.size() == 2
+                ? std::get_if<machine::ImmediateOperand>(&value.operands[1])
+                : nullptr;
+            if (!amount || value.uses.size() != 1 || amount->high != 0 ||
+                amount->value == 0 || amount->value >= bits) {
+                return std::nullopt;
+            }
+            return static_cast<unsigned>(amount->value);
+        };
+        // The source and mask of an AND with a constant, which a register
+        // holds when ANDI cannot encode it; `constant` names that register.
+        struct Masked {
+            machine::Register source;
+            std::uint64_t mask{};
+            std::optional<machine::Register> constant;
+        };
+        const auto masked = [&](const machine::Instruction& value,
+                                unsigned bits) -> std::optional<Masked> {
+            if (decode_opcode(value.opcode) != Opcode::And) return std::nullopt;
+            if (value.uses.size() == 1 && value.operands.size() == 2) {
+                const auto* immediate =
+                    std::get_if<machine::ImmediateOperand>(&value.operands[1]);
+                if (!immediate) return std::nullopt;
+                return Masked{value.uses[0], immediate->value & low_mask(bits),
+                              std::nullopt};
+            }
+            if (value.uses.size() != 2) return std::nullopt;
+            for (unsigned side = 0; side < 2; ++side) {
+                const auto constant = value.uses[side];
+                if (!integer(constant, bits)) continue;
+                const auto* definition = definitions[constant.id];
+                if (!definition ||
+                    decode_opcode(definition->opcode) != Opcode::Constant ||
+                    definition->operands.size() != 1) {
+                    continue;
+                }
+                const auto* immediate = std::get_if<machine::ImmediateOperand>(
+                    &definition->operands.front());
+                if (!immediate || immediate->high != 0) continue;
+                return Masked{value.uses[1 - side],
+                              immediate->value & low_mask(bits), constant};
+            }
+            return std::nullopt;
+        };
+        const auto field_operands = [](unsigned position, unsigned size) {
+            const auto immediate = [](unsigned value) {
+                return machine::ImmediateOperand{value, 0, machine::i32, false};
+            };
+            return std::pair{immediate(position), immediate(size)};
+        };
+        // Inserts first, so the masks that clear their fields stay masks.
+        bool changed = false;
+        for (const bool inserts : {true, false}) {
+            for (auto& block : function.blocks) {
+                for (auto& instruction : block.instructions) {
+                    if (instruction.kind != machine::InstructionKind::Target ||
+                        instruction.defs.size() != 1 || instruction.patch) {
+                        continue;
+                    }
+                    const auto result = instruction.defs.front();
+                    const unsigned bits = result.mode.bits;
+                    if (!integer(result, bits) ||
+                        !(bits == 32 ? words : bits == 64 && doublewords)) {
+                        continue;
+                    }
+                    const auto opcode = decode_opcode(instruction.opcode);
+                    if (inserts != (opcode == Opcode::Or)) continue;
+                    const auto extract = [&](machine::Register source,
+                                             unsigned position, unsigned size) {
+                        const auto [first, second] = field_operands(position, size);
+                        instruction.opcode = Opcode::Extract;
+                        instruction.uses = {source};
+                        instruction.operands = {machine::RegisterOperand{source},
+                                                first, second};
+                        changed = true;
+                    };
+                    if (opcode == Opcode::And) {
+                        const auto mask = masked(instruction, bits);
+                        if (!mask || mask->mask == 0 ||
+                            (mask->mask & (mask->mask + 1U)) != 0 ||
+                            mask->mask == low_mask(bits)) {
+                            continue;
+                        }
+                        const auto size =
+                            static_cast<unsigned>(std::popcount(mask->mask));
+                        if (const auto* shift =
+                                single(mask->source, Opcode::ShrU, bits)) {
+                            if (const auto position = amount_of(*shift, bits)) {
+                                extract(shift->uses.front(), *position,
+                                        std::min(size, bits - *position));
+                                continue;
+                            }
+                        }
+                        // ANDI takes a mask of 16 bits.
+                        if (size > 16) extract(mask->source, 0, size);
+                        continue;
+                    }
+                    if (opcode == Opcode::ShrU) {
+                        const auto right = amount_of(instruction, bits);
+                        const auto* shift =
+                            single(instruction.uses.front(), Opcode::Shl, bits);
+                        const auto left = shift ? amount_of(*shift, bits)
+                                                : std::nullopt;
+                        if (right && left && *right >= *left) {
+                            extract(shift->uses.front(), *right - *left,
+                                    bits - *right);
+                        }
+                        continue;
+                    }
+                    if (opcode != Opcode::Or || instruction.uses.size() != 2) {
+                        continue;
+                    }
+                    for (unsigned side = 0; side < 2; ++side) {
+                        const auto* clear =
+                            single(instruction.uses[side], Opcode::And, bits);
+                        const auto base_mask =
+                            clear ? masked(*clear, bits) : std::nullopt;
+                        if (!base_mask) continue;
+                        const auto field = ~base_mask->mask & low_mask(bits);
+                        if (field == 0) continue;
+                        // A field at bit 0 takes the value unshifted.
+                        const auto* shifted = single(instruction.uses[1 - side],
+                                                     Opcode::Shl, bits);
+                        const auto position = shifted
+                            ? amount_of(*shifted, bits)
+                            : std::optional<unsigned>{0};
+                        if (!position ||
+                            static_cast<unsigned>(std::countr_zero(field)) !=
+                                *position) {
+                            continue;
+                        }
+                        const auto run = field >> *position;
+                        if ((run & (run + 1U)) != 0) continue;
+                        const auto size =
+                            static_cast<unsigned>(std::popcount(run));
+                        // The shifted value's bits above the field must be
+                        // zero: the shift drops them, or a mask clears them.
+                        auto source = shifted ? shifted->uses.front()
+                                              : instruction.uses[1 - side];
+                        if (*position + size != bits) {
+                            const auto* low = single(source, Opcode::And, bits);
+                            const auto low_bits =
+                                low ? masked(*low, bits) : std::nullopt;
+                            if (!low_bits || low_bits->mask != low_mask(size)) {
+                                continue;
+                            }
+                            source = low_bits->source;
+                        }
+                        const auto base = base_mask->source;
+                        const auto [first, second] =
+                            field_operands(*position, size);
+                        instruction.opcode = Opcode::Insert;
+                        instruction.uses = {base, source};
+                        instruction.operands = {machine::RegisterOperand{base},
+                                                machine::RegisterOperand{source},
+                                                first, second};
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+        }
+        return changed;
+    }
+
     // A truncation reads a range of its source's bits: [c, c + w) when it
     // truncates a right shift by a constant c. The register that holds that
     // range may be a narrower value: the operand of an extension or of a
@@ -7074,6 +7298,10 @@ private:
         // A split multiply's MFLO waits as long as the whole multiply.
         case Opcode::Mul:
         case Opcode::MulStart:
+            if (!wide && opcode == Opcode::Mul &&
+                selects_three_operand_multiply(subtarget_)) {
+                return sum({I::Mul});
+            }
             return sum({wide ? I::Dmult : I::Mult, I::Mflo});
         case Opcode::Mulhs: return sum({wide ? I::Dmult : I::Mult, I::Mfhi});
         case Opcode::Mulhu:
@@ -7121,6 +7349,8 @@ private:
                         .value));
         case Opcode::Clo:
             return sum({instruction.uses.front().mode.bits > 32 ? I::Dclo : I::Clo});
+        case Opcode::Extract: return sum({wide ? I::Dext : I::Ext});
+        case Opcode::Insert: return sum({wide ? I::Dins : I::Ins});
         case Opcode::Clz:
         case Opcode::Bswap: {
             unsigned result{};
@@ -7184,19 +7414,17 @@ private:
             expanded.reserve(block.instructions.size());
             for (auto& instruction : block.instructions) {
                 const auto opcode = decode_opcode(instruction.opcode);
-                // Original R4000 silicon can misexecute extended or variable
-                // shifts while an integer multiply is in flight. Keep the
-                // producer/read atomic until that erratum has its own target
-                // hazard model; other MIPS-I--III CPUs interlock the result.
-                const bool r4000_multiply_erratum =
-                    subtarget_.cpu() == "r4000" ||
-                    subtarget_.tune() == "r4000";
+                // The R4000 can misexecute an extended or variable shift
+                // while an integer multiply is in flight (-mfix-r4000), so
+                // its MFLO, which waits for the product, follows at once.
+                // MUL computes a word product in one instruction.
                 const bool native_multiply =
                     opcode == Opcode::Mul && instruction.defs.size() == 1 &&
                     instruction.uses.size() >= 2 &&
-                    !r4000_multiply_erratum &&
-                    (instruction.defs.front().mode.bits <= 32 ||
-                     subtarget_.has_feature(Feature::Mips3));
+                    !subtarget_.has_feature(Feature::FixR4000) &&
+                    (instruction.defs.front().mode.bits <= 32
+                         ? !selects_three_operand_multiply(subtarget_)
+                         : subtarget_.has_feature(Feature::Mips3));
                 if (native_multiply) {
                     const auto result = instruction.defs.front();
                     const auto active = create_hilo_dependency(function);
@@ -8866,6 +9094,12 @@ private:
                 return fold_narrow_extensions(function);
             });
         passes.add(
+            {{LoweringPass::SelectBitFields},
+             Stage::InstructionCombining, "select-bit-fields"},
+            [this](machine::Function& function) {
+                return select_bit_fields(function);
+            });
+        passes.add(
             {{LoweringPass::FoldPointerOffsets},
               Stage::InstructionCombining, "fold-pointer-offsets"},
             [this](machine::Function& function) {
@@ -9561,6 +9795,7 @@ public:
         : module_(module), hir_(hir_module), subtarget_(subtarget), options_(options),
           diagnostics_(diagnostics), format_(subtarget.object_format()),
           debug_(debug && debug->active() ? debug : nullptr),
+          debug_frames_(debug_ && debug_->frames()),
           // Assemblers read the n32/n64 and EABI register names for a 64-bit
           // address model and for an EABI object tag: $t0-$t3 denote
           // registers 12-15 and 8-11 are $a4-$a7. Numeric GPR operands read
@@ -9627,7 +9862,14 @@ public:
             shared_literals_ = entity.section || !own_section(entity)
                 ? &unit_literals_[entity.unit_index] : nullptr;
             stack_usage_ = {};
+            if (!settle_short_loops(function)) continue;
             emit_function(function);
+            if (!short_loop_blocks_.empty()) {
+                diagnostics_.error(function.location,
+                                   "internal error: -mfix-r5900 left an "
+                                   "instruction in the delay slot of a "
+                                   "branch that ends a short loop");
+            }
             emit_literal_pools(function);
             result.functions.push_back({function.source, output_.str(), stack_usage_});
             output_.str({});
@@ -9640,6 +9882,57 @@ private:
         const AbiEntry* abi{};
         SignatureLayout layout;
     };
+
+    // -mfix-r5900: emits a function with a branch back to itself or an
+    // earlier block, without keeping the output, until no branch that ends
+    // a loop of six instructions or fewer has an instruction in its delay
+    // slot; the blocks of such branches keep their slots empty. False when
+    // emission reported an error.
+    bool settle_short_loops(machine::Function& function) {
+        unfilled_slots_.clear();
+        short_loop_blocks_.clear();
+        if (!subtarget_.has_feature(Feature::FixR5900)) return true;
+        std::unordered_map<std::uint32_t, std::size_t> position;
+        for (const auto block : function.layout) {
+            position.emplace(block.value, position.size());
+        }
+        const bool loops = std::ranges::any_of(
+            function.blocks, [&](const machine::Block& block) {
+                if (block.instructions.empty() ||
+                    block.instructions.back().kind !=
+                        machine::InstructionKind::ConditionalBranch) {
+                    return false;
+                }
+                const auto at = position.find(block.id.value);
+                return at != position.end() &&
+                       std::ranges::any_of(
+                           block.successors, [&](machine::BlockId successor) {
+                               const auto target = position.find(successor.value);
+                               return target != position.end() &&
+                                      target->second <= at->second;
+                           });
+            });
+        if (!loops) return true;
+        auto* const debug = std::exchange(debug_, nullptr);
+        const auto cells = emitted_patch_cells_;
+        const auto errors = diagnostics_.errors();
+        for (;;) {
+            short_loop_blocks_.clear();
+            emit_function(function);
+            output_.str({});
+            next_label_ = 0;
+            stack_usage_ = {};
+            emitted_patch_cells_ = cells;
+            if (diagnostics_.errors() != errors) break;
+            const auto before = unfilled_slots_.size();
+            unfilled_slots_.insert(short_loop_blocks_.begin(),
+                                   short_loop_blocks_.end());
+            if (unfilled_slots_.size() == before) break;
+        }
+        debug_ = debug;
+        short_loop_blocks_.clear();
+        return diagnostics_.errors() == errors;
+    }
 
     // `successor` holds the moved operation. An edge plan also records the
     // edge's own target, which differs when the edge passes through empty
@@ -9898,6 +10191,7 @@ private:
                          std::string_view operands = {}) {
         count_hazard_separation(opcode);
         audit_naked_write(opcode, operands);
+        watch_short_loops(opcode, operands);
         if (debug_) debug_->row(output_, pending_location_, pending_site_);
         output_ << '\t' << opcode;
         if (!operands.empty()) {
@@ -9912,7 +10206,8 @@ private:
     }
 
     static bool writes_hilo(std::string_view opcode) {
-        return opcode == "mult" || opcode == "multu" ||
+        // MUL leaves HI and LO unpredictable.
+        return opcode == "mul" || opcode == "mult" || opcode == "multu" ||
                opcode == "dmult" || opcode == "dmultu" ||
                opcode == "div" || opcode == "divu" ||
                opcode == "ddiv" || opcode == "ddivu" ||
@@ -10265,6 +10560,59 @@ private:
                opcode.starts_with('j') || opcode == "eret";
     }
 
+    // A branch on a condition, which may end an R5900 short loop.
+    static bool conditional_branch(std::string_view opcode) {
+        return opcode.starts_with('b') && opcode != "break" &&
+               opcode != "b" && opcode != "bal" && opcode != "bgezal" &&
+               opcode != "bltzal";
+    }
+
+    // Defines a label that a branch may target, where -mfix-r5900 measures
+    // the loops that end in a branch back to it.
+    void place_label(const std::string& name) {
+        output_ << name << ":\n";
+        if (subtarget_.has_feature(Feature::FixR5900)) {
+            label_words_[name] = emitted_words_;
+        }
+    }
+
+    // -mfix-r5900: notes the block of a conditional branch that goes back
+    // over at most four instructions, none a branch or jump, and gets an
+    // instruction other than NOP in its delay slot. Such a loop has six
+    // instructions or fewer, which the R5900 may run only once or twice.
+    void watch_short_loops(std::string_view opcode,
+                           std::string_view operands) {
+        if (!subtarget_.has_feature(Feature::FixR5900)) return;
+        if (short_loop_branch_) {
+            if (opcode != "nop") short_loop_blocks_.insert(*short_loop_branch_);
+            short_loop_branch_.reset();
+        }
+        if (conditional_branch(opcode)) {
+            const auto comma = operands.rfind(',');
+            const auto target = std::string(
+                comma == std::string_view::npos ? operands
+                                                : operands.substr(comma + 1));
+            const auto label = label_words_.find(target);
+            if (label != label_words_.end() &&
+                (!last_transfer_word_ ||
+                 *last_transfer_word_ < label->second) &&
+                emitted_words_ - label->second + 2 <= 6) {
+                short_loop_branch_ = emitting_block_;
+            }
+        }
+        if (control_transfer(opcode)) last_transfer_word_ = emitted_words_;
+        // LI of a word that neither 16-bit form takes is LUI and ORI.
+        unsigned words = 1;
+        if (opcode == "li") {
+            const auto comma = operands.rfind(',');
+            std::int64_t value{};
+            const auto text = operands.substr(comma + 1);
+            std::from_chars(text.data(), text.data() + text.size(), value);
+            words = word_instructions(static_cast<std::uint32_t>(value));
+        }
+        emitted_words_ += words;
+    }
+
     bool hazard_fact_applies(const HazardFact& fact) const {
         if (!fact.when_operand) return true;
         const auto value = *fact.when_operand < hazard_immediates_.size()
@@ -10364,7 +10712,8 @@ private:
                 }
             }
         }
-        if (execution != 0 && subtarget_.has_feature(Feature::Mips32r2)) {
+        // EHB clears execution hazards from Release 2 on.
+        if (execution != 0 && release2(subtarget_)) {
             raw_instruction("ehb");
             std::erase_if(pending_hazards_, [](const PendingHazard& pending) {
                 return !pending.class_write;
@@ -10613,6 +10962,7 @@ private:
             delayed_register_.reset();
         }
         count_hazard_separation({});
+        watch_short_loops({}, {});
         if (debug_) debug_->row(output_, pending_location_, pending_site_);
         output_ << "\t.word\t0x" << std::hex << std::setw(8)
                 << std::setfill('0') << word << std::dec << std::setfill(' ');
@@ -11271,6 +11621,8 @@ private:
             const auto& pieces =
                 active_signature_->layout.results.front().pieces;
             for (std::size_t index = 0; index < pieces.size(); ++index) {
+                const auto name = "$aggregate.sret." + std::to_string(index);
+                if (named_slot(function, name)) continue;
                 machine::StackSlot home;
                 home.id = {
                     static_cast<std::uint32_t>(function.stack_slots.size())};
@@ -11278,7 +11630,7 @@ private:
                 home.size = address_bytes();
                 home.alignment = home.size;
                 home.location = function.location;
-                home.name = "$aggregate.sret." + std::to_string(index);
+                home.name = name;
                 function.stack_slots.push_back(std::move(home));
             }
         }
@@ -11843,14 +12195,27 @@ private:
                                         std::string(amount));
             }
         };
+        // SEB and SEH, which Allegrex code gives as words.
+        const auto sign_extend = [&](std::uint32_t word,
+                                     std::string_view mnemonic) {
+            if (subtarget_.has_feature(Feature::Allegrex)) {
+                encoded(register_word(word, "zero", source, target),
+                        std::string(mnemonic) + " " + reg_name(target) + "," +
+                            reg_name(source));
+            } else {
+                instruction(mnemonic, reg_name(target) + "," + reg_name(source));
+            }
+        };
         if (bits == 32 && subtarget_.has_feature(Feature::Mips3)) {
             if (sign) shift("sll", {}, "0");
             else shift("dsll32", "dsrl32", "0");
         } else if (bits == 16) {
-            if (sign) shift("sll", "sra", "16");
+            if (sign && selects_sign_extension(subtarget_)) sign_extend(0x7c000620U, "seh");
+            else if (sign) shift("sll", "sra", "16");
             else shift("andi", {}, "65535");
         } else if (bits <= 8) {
-            if (sign) shift("sll", "sra", "24");
+            if (sign && selects_sign_extension(subtarget_)) sign_extend(0x7c000420U, "seb");
+            else if (sign) shift("sll", "sra", "24");
             else shift("andi", {}, "255");
         } else if (target != source) {
             instruction("move", reg_name(target) + "," + reg_name(source));
@@ -14869,6 +15234,8 @@ private:
             (opcode == Opcode::GlobalAddress && data_base)) {
             return true;
         }
+        // EXT and DEXT are one instruction.
+        if (opcode == Opcode::Extract) return true;
         // An unscaled indexed address is one add.
         if (opcode == Opcode::IndexedAddress) {
             const auto* scale = candidate.operands.empty()
@@ -15132,7 +15499,8 @@ private:
     std::optional<DelayPlan> delay_slot_plan(
         const machine::Function& function,
         const machine::Block& block) const {
-        if (!options_.schedule_insns2 || block.instructions.empty()) {
+        if (!options_.schedule_insns2 || block.instructions.empty() ||
+            unfilled_slots_.contains(block.id.value)) {
             return std::nullopt;
         }
         const auto terminator_index = block.instructions.size() - 1;
@@ -15318,6 +15686,7 @@ private:
         for (const auto& block : function.blocks) {
             if (block.instructions.empty() || block.id == function.entry ||
                 block.predecessors.size() != 1 ||
+                unfilled_slots_.contains(block.id.value) ||
                 function.frame.prologue_block == block.id ||
                 block.instructions.back().kind ==
                     machine::InstructionKind::Return ||
@@ -15609,7 +15978,8 @@ private:
         case Opcode::Xor:
         case Opcode::Shl:
         case Opcode::ShrS:
-        case Opcode::ShrU: return true;
+        case Opcode::ShrU:
+        case Opcode::Extract: return true;
         default: {
             const auto opcode = decode_opcode(candidate.opcode);
             return opcode >= Opcode::CmpEq && opcode <= Opcode::CmpUge;
@@ -15630,6 +16000,7 @@ private:
         for (const auto& block : function.blocks) {
             if (block.instructions.empty() ||
                 skipped_layout_.contains(block.id.value) ||
+                unfilled_slots_.contains(block.id.value) ||
                 delay_slot_plan(function, block) ||
                 cross_block_delays_.contains(block.id.value)) {
                 continue;
@@ -15917,6 +16288,7 @@ private:
             const auto* arm = arm_id ? find_block(function, *arm_id) : nullptr;
             if (!source || !arm || source->instructions.empty() ||
                 cross_block_delays_.contains(source->id.value) ||
+                unfilled_slots_.contains(source->id.value) ||
                 arm->predecessors.size() != 1 ||
                 framed_[source->id.value] != framed_[arm->id.value]) {
                 continue;
@@ -16173,6 +16545,9 @@ private:
                 fallthrough_delays_.contains(source.id.value)) {
                 continue;
             }
+            // Only the secondary jump of a branch whose slot stays empty
+            // may run an operation.
+            const bool unfilled = unfilled_slots_.contains(source.id.value);
             const bool yes_copies =
                 edge_has_phi_copies(function, source.id, yes->target);
             const bool no_copies =
@@ -16188,14 +16563,16 @@ private:
                 // operation a branch-likely slot can run.
                 if (!yes_copies && !no_copies) {
                     plan_edge(source, no->target, true, true);
-                    if (selects_branch_likely()) {
+                    if (selects_branch_likely() && !unfilled) {
                         plan_edge(source, yes->target, false);
                     }
-                } else if (selects_branch_likely() &&
+                } else if (selects_branch_likely() && !unfilled &&
                            yes_copies != no_copies) {
                     plan_edge(source, yes_copies ? no->target : yes->target,
                               false);
                 }
+            } else if (unfilled) {
+                continue;
             } else if (selects_branch_likely()) {
                 // A branch-likely annuls its delay slot on the fallthrough
                 // edge. This makes the first target operation edge-specific
@@ -16316,6 +16693,8 @@ private:
     ObjectFormat format_;
     // Null without -g.
     native::DebugInfo* debug_{};
+    // -g describes frames; debug_ is null while -mfix-r5900 measures.
+    bool debug_frames_{};
     // The source position of the instructions being printed, and the
     // innermost inlined call they come from.
     SourceLocation pending_location_;
@@ -16431,6 +16810,18 @@ private:
     };
     std::unordered_map<std::uint32_t, FallthroughDelay> fallthrough_delays_;
     std::unordered_map<std::uint32_t, std::size_t> lent_delays_;
+    // -mfix-r5900: the blocks whose branch keeps a NOP in its delay slot;
+    // and, while a function is emitted, its instruction words so far, the
+    // word each branch target label precedes, the word of the last branch
+    // or jump, the block being emitted, the block of a branch whose delay
+    // slot comes next if it ends a short loop, and the blocks found so.
+    std::unordered_set<std::uint32_t> unfilled_slots_;
+    std::size_t emitted_words_{};
+    std::unordered_map<std::string, std::size_t> label_words_;
+    std::optional<std::size_t> last_transfer_word_;
+    std::uint32_t emitting_block_{};
+    std::optional<std::uint32_t> short_loop_branch_;
+    std::unordered_set<std::uint32_t> short_loop_blocks_;
 };
 
 void AssemblyEmitter::emit_integer_pair_binary(
@@ -16970,6 +17361,10 @@ void AssemblyEmitter::emit_integer_binary(
                                   target_gpr),
                     "rotr " + reg_name(target_gpr) + "," + reg_name(left_gpr) +
                         "," + std::to_string(rightward));
+        } else if (wide && selects_doubleword_rotate(subtarget_)) {
+            instruction(rightward >= 32 ? "drotr32" : "drotr",
+                        reg_name(target_gpr) + "," + reg_name(left_gpr) + "," +
+                            std::to_string(rightward % 32U));
         } else {
             const auto fixed = [&](bool left_shift, std::string_view destination,
                                    unsigned count) {
@@ -17000,6 +17395,10 @@ void AssemblyEmitter::emit_integer_binary(
         instruction(wide ? "dsubu" : "subu", binary_operands());
         break;
     case Opcode::Mul:
+        if (!wide && selects_three_operand_multiply(subtarget_)) {
+            instruction("mul", binary_operands());
+            break;
+        }
         instruction(wide ? "dmult" : "mult",
                     reg_name(left_gpr) + "," + reg_name(right_gpr));
         instruction("mflo", reg_name(target_gpr));
@@ -17072,6 +17471,10 @@ void AssemblyEmitter::emit_integer_binary(
             encoded(register_word(0x00000046U, "t3", left_gpr, target_gpr),
                     "rotrv " + reg_name(target_gpr) + "," + reg_name(left_gpr) +
                         ",$t3");
+        } else if (wide && selects_doubleword_rotate(subtarget_)) {
+            instruction("dsubu", "$t3,$zero," + reg_name(right_gpr));
+            instruction("drotrv", reg_name(target_gpr) + "," +
+                                      reg_name(left_gpr) + ",$t3");
         } else {
             instruction(wide ? "dsubu" : "subu",
                         "$t3,$zero," + reg_name(right_gpr));
@@ -17093,6 +17496,8 @@ void AssemblyEmitter::emit_integer_binary(
             encoded(register_word(0x00000046U, right_gpr, left_gpr, target_gpr),
                     "rotrv " + reg_name(target_gpr) + "," + reg_name(left_gpr) +
                         "," + reg_name(right_gpr));
+        } else if (wide && selects_doubleword_rotate(subtarget_)) {
+            instruction("drotrv", binary_operands());
         } else {
             instruction(wide ? "dsubu" : "subu",
                         "$t3,$zero," + reg_name(right_gpr));
@@ -17247,6 +17652,9 @@ void AssemblyEmitter::emit_bit_operation(const machine::Function& function,
         } else {
             instruction(ones ? "clo" : "clz", operands);
         }
+    } else if (bits > 32) {
+        instruction("dsbh", operands);
+        instruction("dshd", reg_name(output) + "," + reg_name(output));
     } else if (bits == 16 || !allegrex) {
         if (allegrex) {
             encoded(register_word(0x7c0000a0U, "zero", input, output),
@@ -17588,6 +17996,18 @@ void AssemblyEmitter::emit_atomic(const machine::Function& function,
         instruction("sync");
         return;
     }
+    // The loop starts at the SYNC before its LL when every attempt needs one
+    // (-mfix-loongson3-llsc), and retries with a branch-likely form under
+    // -mfix-r10000.
+    const bool sync_each_attempt =
+        subtarget_.has_feature(Feature::FixLoongson3Llsc);
+    const auto retry_branch =
+        subtarget_.has_feature(Feature::FixR10000) ? "beql" : "beq";
+    const auto start_attempts = [&](const std::string& retry) {
+        if (sync_each_attempt) output_ << retry << ":\n";
+        instruction("sync");
+        if (!sync_each_attempt) output_ << retry << ":\n";
+    };
     if (opcode == Opcode::AtomicCompareExchange) {
         if (value.uses.size() < 3 || value.defs.empty()) return;
         load_vreg(function, value.uses[1], "t3", value.location);
@@ -17596,18 +18016,20 @@ void AssemblyEmitter::emit_atomic(const machine::Function& function,
         const auto retry = local_label(function);
         const auto failed = local_label(function);
         const auto done = local_label(function);
-        instruction("sync");
-        output_ << retry << ":\n";
+        start_attempts(retry);
         instruction("ll", "$t1,0($t0)");
         instruction("bne", "$t1,$t4," + failed);
         instruction("move", "$t2,$t5");
         instruction("sc", "$t2,0($t0)");
-        instruction("beq", "$t2,$zero," + retry);
+        instruction(retry_branch, "$t2,$zero," + retry);
         instruction("nop");
         instruction("li", "$t2,1");
         instruction("b", done);
         instruction("nop");
         output_ << failed << ":\n";
+        // A branch that leaves the sequence between LL and SC reaches a
+        // SYNC before any other memory access.
+        if (sync_each_attempt) instruction("sync");
         instruction("sw", "$t1,0($t3)");
         instruction("move", "$t2,$zero");
         output_ << done << ":\n";
@@ -17618,8 +18040,7 @@ void AssemblyEmitter::emit_atomic(const machine::Function& function,
     if (value.uses.size() < 2 || value.defs.empty()) return;
     load_bits(value.uses[1], "t3");
     const auto retry = local_label(function);
-    instruction("sync");
-    output_ << retry << ":\n";
+    start_attempts(retry);
     instruction("ll", "$t1,0($t0)");
     switch (opcode) {
     case Opcode::AtomicExchange: instruction("move", "$t2,$t3"); break;
@@ -17674,7 +18095,7 @@ void AssemblyEmitter::emit_atomic(const machine::Function& function,
         return;
     }
     instruction("sc", "$t2,0($t0)");
-    instruction("beq", "$t2,$zero," + retry);
+    instruction(retry_branch, "$t2,$zero," + retry);
     instruction("nop");
     instruction("sync");
     store_bits(value.defs.front(), "t1");
@@ -18657,6 +19078,58 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
         emit_bit_operation(function, value);
         return;
     }
+    if (opcode == Opcode::Extract || opcode == Opcode::Insert) {
+        // EXT and INS, which Allegrex code gives as words; DEXT and DINS in
+        // the form that the field's position and end need.
+        const bool insert = opcode == Opcode::Insert;
+        const auto position = static_cast<unsigned>(
+            std::get<machine::ImmediateOperand>(
+                value.operands[value.operands.size() - 2]).value);
+        const auto size = static_cast<unsigned>(
+            std::get<machine::ImmediateOperand>(value.operands.back()).value);
+        const auto target = value.defs.front();
+        const bool wide = target.mode.bits > 32;
+        const auto end = position + size;
+        const auto source = input_gpr(function, value.uses.back(),
+                                      insert ? "t1" : "t0", value.location);
+        auto output = output_gpr(function, target, "t2");
+        std::string_view work = output;
+        if (insert) {
+            // INS writes its target in place; a target that holds the field
+            // works in a scratch.
+            const auto base = input_gpr(function, value.uses.front(), "t0",
+                                        value.location);
+            if (output == source && output != base) work = "t3";
+            if (work != base) {
+                instruction("move", reg_name(work) + "," + reg_name(base));
+            }
+        }
+        const auto high = insert ? end - 1 : size - 1;
+        if (!wide && subtarget_.has_feature(Feature::Allegrex)) {
+            encoded(register_word((insert ? 0x7c000004U : 0x7c000000U) |
+                                      (high << 11U) | (position << 6U),
+                                  source, work, "zero"),
+                    std::string(insert ? "ins " : "ext ") + reg_name(work) +
+                        "," + reg_name(source) + "," +
+                        std::to_string(position) + "," + std::to_string(size));
+        } else {
+            std::string mnemonic = insert ? "ins" : "ext";
+            if (wide) {
+                const bool upper = position >= 32;
+                const bool beyond = insert ? end > 32 : size > 32;
+                mnemonic = std::string(insert ? "dins" : "dext") +
+                           (upper ? "u" : beyond ? "m" : "");
+            }
+            instruction(mnemonic, reg_name(work) + "," + reg_name(source) +
+                                      "," + std::to_string(position) + "," +
+                                      std::to_string(size));
+        }
+        if (work != output) {
+            instruction("move", reg_name(output) + "," + reg_name(work));
+        }
+        commit_gpr(function, target, output, value.location);
+        return;
+    }
     if (opcode == Opcode::MulStart) {
         if (value.uses.size() < 2) {
             diagnostics_.error(value.location,
@@ -19164,7 +19637,7 @@ void AssemblyEmitter::emit_terminator(
                         emit_fused_order_compare(function, value);
                     if (!truth_on_nonzero) return false;
                     if (!resume_after_compare.empty()) {
-                        output_ << resume_after_compare << ":\n";
+                        place_label(std::string(resume_after_compare));
                     }
                     auto branch = branch_on_truth == *truth_on_nonzero
                         ? std::string{"bne"} : std::string{"beq"};
@@ -19280,7 +19753,8 @@ void AssemblyEmitter::emit_terminator(
                 return;
             }
             if (options_.schedule_insns2 &&
-                selects_branch_likely()) {
+                selects_branch_likely() &&
+                !unfilled_slots_.contains(predecessor.value)) {
                 if (next == yes && !yes_copies) {
                     if (const auto copy = single_assigned_gpr_phi_copy(
                             function, predecessor, no)) {
@@ -19403,7 +19877,8 @@ void AssemblyEmitter::emit_terminator(
         // the annulled slot.  This removes both edge stubs without executing
         // the copy on the fallthrough path.
         if (options_.schedule_insns2 &&
-            selects_branch_likely()) {
+            selects_branch_likely() &&
+            !unfilled_slots_.contains(predecessor.value)) {
             const auto condition_gpr = input_gpr(
                 function, condition, "t0", value.location);
             if (next == yes && !yes_copies) {
@@ -19551,6 +20026,10 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
     fpu_multiply_pending_ = false;
     delayed_register_.reset();
     fcsr_transfer_pending_ = false;
+    emitted_words_ = 0;
+    label_words_.clear();
+    last_transfer_word_.reset();
+    short_loop_branch_.reset();
     pending_hazards_.clear();
     call_return_countdown_ = 0;
     hazard_forms_.clear();
@@ -19632,7 +20111,8 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
     // ISA directives are scoped to the function, so an assembler's own ISA
     // and floating-point options apply again after it.
     output_ << ".set push\n.set noreorder\n.set noat\n.option pic0\n";
-    if (subtarget_.has_feature(Feature::Mips64)) output_ << ".set mips64\n";
+    if (subtarget_.has_feature(Feature::Mips64r2)) output_ << ".set mips64r2\n";
+    else if (subtarget_.has_feature(Feature::Mips64)) output_ << ".set mips64\n";
     else if (subtarget_.has_feature(Feature::Mips5)) output_ << ".set mips5\n";
     else if (subtarget_.has_feature(Feature::Mips4)) output_ << ".set mips4\n";
     else if (subtarget_.has_feature(Feature::Mips3)) output_ << ".set mips3\n";
@@ -19647,6 +20127,14 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
     if (options_.function_alignment != 0) {
         alignment_power = static_cast<unsigned>(
             std::countr_zero(options_.function_alignment));
+    } else if (const auto preferred = subtarget_.function_alignment();
+               preferred &&
+               options_.optimize_for != OptimizationGoal::Size &&
+               options_.optimize_for != OptimizationGoal::MinimumSize) {
+        // The -mtune CPU's alignment for speed.
+        alignment_power = std::max(
+            alignment_power,
+            static_cast<unsigned>(std::countr_zero(*preferred)));
     }
     alignment_power = std::max(
         alignment_power,
@@ -19677,7 +20165,7 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
             << respell_registers("$ra") << '\n';
     // A naked function has no unwind description.
     cfi_ = (options_.unwind_tables || options_.asynchronous_unwind_tables ||
-            (debug_ && debug_->frames())) &&
+            debug_frames_) &&
            assembly_uses_dwarf_cfi(format_) && !entity.naked;
     const bool cfi = cfi_;
     cfi_state_ = frame_cfi().entry();
@@ -19798,7 +20286,8 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
             skipped_layout_.contains(found->id.value)) {
             continue;
         }
-        output_ << block_label(function, found->id) << ":\n";
+        emitting_block_ = found->id.value;
+        place_label(block_label(function, found->id));
         call_saved_homes_.clear();
         for (const auto& label : function.labels) {
             if (label.block == found->id) {
@@ -19885,7 +20374,7 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
                     !successor_delay->second.fused_compare &&
                     !successor_delay->second.forward;
                 if (resumes_here && successor_delay->second.elide_original) {
-                    output_ << successor_delay->second.resume_label << ":\n";
+                    place_label(successor_delay->second.resume_label);
                     continue;
                 }
                 if (options_.compare_select_fusion &&
@@ -19920,7 +20409,7 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
                 }
                 emit_target(function, value);
                 if (resumes_here) {
-                    output_ << successor_delay->second.resume_label << ":\n";
+                    place_label(successor_delay->second.resume_label);
                 }
             } else if (value.kind == machine::InstructionKind::Call) {
                 if (index + 1 < found->instructions.size() &&

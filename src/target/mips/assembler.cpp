@@ -95,6 +95,7 @@ enum class Syntax : std::uint8_t {
     RtCoprocessor, NoOperands, SyncType, BreakCode, SyscallCode,
     TrapRegister, TrapImmediate, Extract, Insert,
     LoadImmediate, LoadImmediate64, MoveMacro, Negate, NotMacro,
+    DoubleExtract, DoubleInsert,
 };
 
 struct Description {
@@ -597,14 +598,15 @@ Effects decode_effects(std::uint32_t word, bool fpr_pairs) {
         }
         break;
     case 0x1f:  // SPECIAL3
-        if (function == 0x00) {  // ext
+        if (function <= 0x03) {  // ext, dextm, dextu, dext
             write(rt);
             read(rs);
-        } else if (function == 0x04) {  // ins
+        } else if (function <= 0x07) {  // ins, dinsm, dinsu, dins
             write(rt);
             read(rs);
             read(rt);
-        } else if (function == 0x20) {  // wsbh, seb, seh, and the Allegrex forms
+        } else if (function == 0x20 || function == 0x24) {
+            // wsbh, seb, seh, and the Allegrex forms; dsbh, dshd
             write(rd);
             read(rt);
         }
@@ -785,6 +787,9 @@ private:
 
     // An instruction in the reorder history: its effects, whether it may
     // move into a delay slot, and where it is. A placeholder is a nop.
+    // The errata fixes also note GNU as's facts: whether an unconditional
+    // jump cleared the entry, an LL, SC, or SYNC, and a branch's target.
+    enum class Sequence : std::uint8_t { None, LoadLinked, StoreConditional, Sync };
     struct Emitted {
         Effects effects;
         bool fixed{true};
@@ -794,6 +799,9 @@ private:
         std::uint32_t fragment{};
         std::size_t offset{};
         bool has_fixup{};
+        bool cleared{};
+        Sequence sequence{};
+        std::optional<SymbolId> target;
     };
     static constexpr std::size_t history_size = 5;
     static constexpr std::size_t max_delay_nops = 2;
@@ -820,7 +828,8 @@ private:
                    Emitted& placed);
     void emit_nops(Assembler& as, unsigned count);
     void insert_history(std::size_t first, std::size_t count, const Emitted& entry);
-    void clear_history();
+    // `jumped`: after an unconditional jump, which GNU as marks.
+    void clear_history(bool jumped = false);
     void move_labels(Assembler& as);
     void start_noreorder(Assembler& as);
     void end_noreorder(Assembler& as);
@@ -830,7 +839,15 @@ private:
                                         const Effects& older, const Effects& newer) const;
     [[nodiscard]] int nops_for_target(std::size_t ignore, const Emitted* history,
                                       const Effects& next) const;
-    [[nodiscard]] bool can_swap(Assembler& as, const Effects& branch) const;
+    [[nodiscard]] bool can_swap(Assembler& as, const Effects& branch,
+                                std::uint32_t word,
+                                const std::optional<PendingFixup>& fixup) const;
+    // -mfix-r5900: whether `word` ends a loop of six instructions or fewer.
+    [[nodiscard]] bool short_loop(Assembler& as, std::uint32_t word,
+                                  const std::optional<PendingFixup>& fixup) const;
+    // -mfix-loongson3-llsc: the SYNC that GNU as puts before an
+    // instruction.
+    void fix_loongson3_llsc(Assembler& as, Sequence sequence);
 
     void use_gpr(unsigned number) {
         if (!model_.gnu) gpr_mask_ |= 1U << number;
@@ -1139,13 +1156,15 @@ int MipsTarget::nops_for_target(std::size_t ignore, const Emitted* history,
     return nops;
 }
 
-bool MipsTarget::can_swap(Assembler& as, const Effects& branch) const {
+bool MipsTarget::can_swap(Assembler& as, const Effects& branch, std::uint32_t word,
+                          const std::optional<PendingFixup>& fixup) const {
     using namespace effect;
     const auto& previous = history_[0];
     if (optimize_ < 2 || !options_.move || previous.fixed || history_[1].noreorder ||
         !labels_.empty() || !previous.placed) {
         return false;
     }
+    if (subtarget_.has_feature(Feature::FixR5900) && short_loop(as, word, fixup)) return false;
     // The previous instruction must end the current fragment.
     const auto& section = as.section(as.current_section());
     if (!(previous.section == as.current_section()) ||
@@ -1169,15 +1188,77 @@ bool MipsTarget::can_swap(Assembler& as, const Effects& branch) const {
     return true;
 }
 
+// GNU as's rule: a conditional branch back to a label of the same fragment
+// at most 20 bytes before it, with no branch and no history an unconditional
+// jump cleared in between, ends a short loop.
+bool MipsTarget::short_loop(Assembler& as, std::uint32_t word,
+                            const std::optional<PendingFixup>& fixup) const {
+    if (!fixup || fixup->kind != fixup_branch16) return false;
+    // beq $0,$0 and bgez $0 are b, bgezal $0 is bal.
+    const auto high = word & 0xffff0000U;
+    if (high == 0x10000000U || high == 0x04010000U || high == 0x04110000U) return false;
+    const auto& target = as.expression(fixup->expression);
+    if (target.kind != assembler::Expression::Kind::Symbol) return false;
+    const auto& symbol = as.symbol(target.symbol);
+    const auto& section = as.section(as.current_section());
+    if (!symbol.section || !(*symbol.section == as.current_section()) ||
+        symbol.fragment + 1 != section.fragments.size()) {
+        return false;
+    }
+    const auto distance = static_cast<std::int64_t>(section.fragments.back().bytes.size()) -
+                          static_cast<std::int64_t>(symbol.offset);
+    if (distance > 20) return false;
+    for (std::int64_t index = 0; index < distance / 4; ++index) {
+        const auto& entry = history_[static_cast<std::size_t>(index)];
+        if (entry.cleared || (entry.effects.flags & effect::delayed) != 0) return false;
+    }
+    return true;
+}
+
+// GNU as puts a SYNC before an LL or LLD that does not follow one, and at a
+// local label, unless a SYNC is there, that a branch between an LL and a
+// later SC within the last five instructions targets.
+void MipsTarget::fix_loongson3_llsc(Assembler& as, Sequence sequence) {
+    const auto sync = [&] {
+        Emitted entry;
+        entry.effects = decode_effects(0x0000000fU, false);
+        entry.sequence = Sequence::Sync;
+        emit_word(as, 0x0000000fU, {}, entry);
+        insert_history(0, 1, entry);
+    };
+    const auto exit_target = [&] {
+        if (labels_.empty() || !as.symbol(labels_.back()).temporary ||
+            sequence == Sequence::Sync) {
+            return false;
+        }
+        for (std::size_t store = 0; store < history_size; ++store) {
+            if (history_[store].sequence != Sequence::StoreConditional) continue;
+            for (std::size_t index = store + 1; index < history_size; ++index) {
+                const auto& entry = history_[index];
+                if (entry.sequence == Sequence::LoadLinked) break;
+                if ((entry.effects.flags & effect::delayed) != 0 && entry.target &&
+                    std::find(labels_.begin(), labels_.end(), *entry.target) != labels_.end()) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+    if (exit_target()) sync();
+    if (sequence == Sequence::LoadLinked && history_[0].sequence != Sequence::Sync) sync();
+}
+
 void MipsTarget::insert_history(std::size_t first, std::size_t count, const Emitted& entry) {
     for (std::size_t index = history_size; index-- > first;) {
         history_[index] = index >= first + count ? history_[index - count] : entry;
     }
 }
 
-void MipsTarget::clear_history() {
+void MipsTarget::clear_history(bool jumped) {
     tentative_.reset();
-    history_.fill(Emitted{});
+    Emitted placeholder;
+    placeholder.cleared = jumped;
+    history_.fill(placeholder);
     labels_.clear();
 }
 
@@ -1218,6 +1299,13 @@ void MipsTarget::append(Assembler& as, std::uint32_t word,
         gpr_mask_ |= effects.gpr_read | effects.gpr_write;
         cpr_mask_[1] |= effects.fpr_read | effects.fpr_write;
     }
+    const unsigned major = word >> 26U;
+    const auto sequence = major == 0x30 || major == 0x34   ? Sequence::LoadLinked
+                          : major == 0x38 || major == 0x3c ? Sequence::StoreConditional
+                          : (word & 0xfc00003fU) == 0x0000000fU ? Sequence::Sync
+                                                                : Sequence::None;
+    // GNU as applies the fix in either reorder mode.
+    if (subtarget_.has_feature(Feature::FixLoongson3Llsc)) fix_loongson3_llsc(as, sequence);
     if (!options_.noreorder) {
         const int nops = optimize_ == 0 ? nops_for(0, history_.data(), nullptr)
                                         : nops_for_target(0, history_.data(), effects);
@@ -1245,8 +1333,14 @@ void MipsTarget::append(Assembler& as, std::uint32_t word,
     entry.effects = effects;
     entry.fixed = options_.noreorder;
     entry.noreorder = options_.noreorder;
+    entry.sequence = sequence;
+    if (fixup && fixup->kind == fixup_branch16) {
+        const auto& target = as.expression(fixup->expression);
+        if (target.kind == assembler::Expression::Kind::Symbol) entry.target = target.symbol;
+    }
     const bool branch = (effects.flags & delayed) != 0;
-    if (!options_.noreorder && branch && (effects.flags & likely) == 0 && can_swap(as, effects)) {
+    if (!options_.noreorder && branch && (effects.flags & likely) == 0 &&
+        can_swap(as, effects, word, fixup)) {
         // The previous instruction moves into the delay slot, with its fixup.
         auto delay = history_[0];
         auto& fragment = as.section(as.current_section()).fragments.back();
@@ -1283,7 +1377,7 @@ void MipsTarget::append(Assembler& as, std::uint32_t word,
     // reaches the next instruction.
     if ((history_[1].effects.flags & delayed) != 0 &&
         (history_[1].effects.flags & effect::unconditional) != 0) {
-        clear_history();
+        clear_history(true);
     }
     labels_.clear();
 }
@@ -1667,12 +1761,13 @@ void MipsTarget::instruction(Assembler& as, Statement& statement) {
         if (!d || !comma(as, cursor)) return;
         const auto t = gpr(as, cursor);
         if (!t || !comma(as, cursor)) return;
-        const bool doubleword_shift = name == "dsll" || name == "dsrl" || name == "dsra";
+        const bool doubleword_shift =
+            name == "dsll" || name == "dsrl" || name == "dsra" || name == "drotr";
         const auto amount = absolute(as, cursor, 0, doubleword_shift ? 63 : 31, "shift amount");
         if (!amount || !finish()) return;
         auto shift = static_cast<unsigned>(*amount);
         if (shift >= 32) {
-            word += 4; // dsll/dsrl/dsra become their 32 forms
+            word += 4; // dsll/dsrl/dsra/drotr become their 32 forms
             shift -= 32;
         }
         word |= rd(*d) | rt(*t) | sa(shift);
@@ -1806,6 +1901,48 @@ void MipsTarget::instruction(Assembler& as, Statement& statement) {
         const auto high = description.syntax == Syntax::Extract ? *size - 1 : *position + *size - 1;
         word |= rt(*t) | rs(*s) | rd(static_cast<unsigned>(high)) |
                 sa(static_cast<unsigned>(*position));
+        use_gpr(*t);
+        use_gpr(*s);
+        break;
+    }
+    case Syntax::DoubleExtract:
+    case Syntax::DoubleInsert: {
+        // The base forms take a field below bit 32, the M forms one that
+        // ends above it, and the U forms one that starts above it; dext
+        // and dins choose the form the field needs, as GNU as and LLVM MC
+        // do. The sa field holds the position, the rd field the size less
+        // one (dext) or the last bit (dins), each modulo 32.
+        const bool insert = description.syntax == Syntax::DoubleInsert;
+        const auto t = gpr(as, cursor);
+        if (!t || !comma(as, cursor)) return;
+        const auto s = gpr(as, cursor);
+        if (!s || !comma(as, cursor)) return;
+        const auto position = absolute(as, cursor, 0, 63, "bit position");
+        if (!position || !comma(as, cursor)) return;
+        const auto size_location = here();
+        const auto size = absolute(as, cursor, 1, 64, "bit-field size");
+        if (!size || !finish()) return;
+        const auto end = *position + *size;
+        const unsigned base = insert ? 0x07 : 0x03;
+        const unsigned wide = insert ? 0x05 : 0x01;
+        const unsigned upper = insert ? 0x06 : 0x02;
+        const auto beyond = [&] { return insert ? end > 32 : *size > 32; };
+        auto form = word & 0x3fU;
+        if (form == base) form = *position >= 32 ? upper : beyond() ? wide : base;
+        const bool fits = end <= 64 &&
+                          (form == base   ? *position < 32 && !beyond()
+                           : form == wide ? *position < 32 && beyond()
+                                          : *position >= 32 && *size <= 32);
+        if (!fits) {
+            as.error(size_location, "bit field " + std::to_string(*position) + "+" +
+                                        std::to_string(*size) + " does not fit '" + name +
+                                        "'");
+            return;
+        }
+        const auto high = static_cast<unsigned>(insert ? end - 1 : *size - 1);
+        word = (word & ~0x3fU) | form;
+        word |= rt(*t) | rs(*s) | rd(high % 32U) |
+                sa(static_cast<unsigned>(*position) % 32U);
         use_gpr(*t);
         use_gpr(*s);
         break;

@@ -1148,6 +1148,9 @@ abi "ms_abi" {
 # CPUs. Their instructions keep the target's default costs, which
 # cc --print-costs shows. A CPU that adds features to a CPU it inherits
 # takes them from its ext- entry; another name of a CPU only inherits it.
+# Skylake, Skylake-AVX512, Zen 3, and the CPUs that inherit them align
+# functions to 32 bytes when they are the -mtune CPU of a speed goal; the
+# others use the target's 16.
 cpu "generic" {
     architecture = "x86-64";
     features = ["base"];
@@ -1298,6 +1301,7 @@ cpu "broadwell" {
 
 cpu "skylake" {
     architecture = "x86-64";
+    function_alignment = 32;
     features = ["base", "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "aes",
                 "pclmul", "avx", "f16c", "fma", "avx2", "bmi", "bmi2", "lzcnt",
                 "movbe", "adx", "rdrnd", "rdseed", "cx16", "xsave", "xsaveopt",
@@ -1307,6 +1311,7 @@ cpu "skylake" {
 
 cpu "skylake-avx512" {
     architecture = "x86-64";
+    function_alignment = 32;
     features = ["base", "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "aes",
                 "pclmul", "avx", "f16c", "fma", "avx2", "bmi", "bmi2", "lzcnt",
                 "movbe", "adx", "rdrnd", "rdseed", "avx512f", "avx512dq",
@@ -1725,6 +1730,7 @@ cpu "znver2" {
 
 cpu "znver3" {
     architecture = "x86-64";
+    function_alignment = 32;
     features = ["base", "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "aes",
                 "pclmul", "avx", "f16c", "fma", "avx2", "bmi", "bmi2", "lzcnt",
                 "movbe", "adx", "rdrnd", "rdseed", "sha", "vaes", "vpclmulqdq",

@@ -192,7 +192,7 @@ COFF/PE, or Mach-O as the triple names (`x86_64-unknown-linux-gnu`,
 | `-march=CPU`, `-mips1` ... `-mips64r2` | The CPU or ISA level whose instructions are accepted, until a `.set` directive changes it. |
 | `-mabi=NAME`, `-32`, `-64` | The ABI, which fixes the ELF class and ABI flags: `-mabi=32` and `-32` select o32, `-mabi=64` and `-64` n64 (also switching the triple to `mips64`), `-mabi=eabi` EABI32. An ABI without a fixed address width, such as `x64`, takes the ELF class of the triple. |
 | `-EB`, `-EL` | Big- or little-endian output. |
-| `-mFEATURE`, `-mno-FEATURE`, `-mnan=2008\|legacy` | Target features, such as `-msoft-float`, `-msingle-float`, `-mfp32`, `-mfpxx`, and `-mfp64`, which set the floating-point ABI that `.MIPS.abiflags` records. |
+| `-mFEATURE`, `-mno-FEATURE`, `-mnan=2008\|legacy` | Target features, such as `-msoft-float`, `-msingle-float`, `-mfp32`, `-mfpxx`, and `-mfp64`, which set the floating-point ABI that `.MIPS.abiflags` records, and the errata workarounds `-mfix-r5900` and `-mfix-loongson3-llsc`, which the `-march` CPU may enable ([targets.md](targets.md#mips)). |
 | `-mgp32`, `-mgp64` | MIPS: the width of the general registers that `.MIPS.abiflags` records and the macros assume, as `.module gp=32` or `gp=64` sets it; by default the narrower of the ISA's and the ABI's registers, 32 bits for o32. |
 | `-O0`, `-O1`, `-O2` | MIPS `.set reorder` code: keep every hazard `nop` the CPU might need, keep only the needed ones, or also fill delay slots (the default; `-O` is `-O1`). |
 | `-I DIR` | A further directory to search for `.include` and `.incbin` files. |
@@ -262,7 +262,12 @@ would create a hazard at either end; otherwise the delay slot gets a `nop`.
 Branch-likely instructions always get a `nop`. A label before an instruction
 that needs hazard `nop`s moves past them, and `.set noreorder` adds the `nop`s
 earlier instructions may need, keeping only those the instructions after it
-need.
+need. With `-mfix-r5900`, a conditional branch back to a label at most five
+instructions before it in the same section and fragment, with no branch or
+jump between, keeps its `nop`. With `-mfix-loongson3-llsc`, in either reorder
+mode, `as` puts a `sync` before every `ll` and `lld` that does not follow
+one, and before an instruction at a local label that a branch between an
+`ll` and the `sc` after it targets, within the last five instructions.
 
 The objects carry the MIPS ELF header flags, `.MIPS.abiflags`, `.reginfo`
 (ELF32) or `.MIPS.options` (ELF64), neither loaded into the image, `.pdr`
@@ -301,7 +306,10 @@ object. Unlike GNU as:
 - `-march` and `.set arch=` accept the CPUs that `cc --print-cpus` lists
   ([targets.md](targets.md#mips)), with the instructions of their ISA level
   and Allegrex's, but not the instructions that other CPUs add, such as the
-  Octeon and Loongson ones, and not the R5900 or Release 6 CPUs.
+  Octeon and Loongson ones, and not the Release 6 CPUs;
+- `-mfix-loongson3-llsc` does not add the `sync` that GNU as emits before an
+  `sc` when a branch between the `ll` and the `sc` targets a label before the
+  `ll`, which would put the `sync` inside the sequence.
 
 `cc -c` assembles its own MIPS output with the same assembler and the object
 conventions of LLVM MC: `.text`, `.data`, and `.bss` aligned to 16 bytes, an
@@ -578,7 +586,7 @@ with `-target`, `-march`, or `-mprofile` to inspect another configuration.
 | --- | --- |
 | `--print-targets` | Compiled-in architectures and their triples. |
 | `--print-profiles`, `--print-abis` (`-mabi=help`), `--print-manglings`, `--print-optimizations`, `--print-models` | Model entries. |
-| `--print-cpus` | The target's CPU entries with their parents, features, and issue widths. |
+| `--print-cpus` | The target's CPU entries with their parents, features, issue widths, and function alignments where one is set. |
 | `--print-costs` | The latency, issue cost, and availability of each of the target's instructions for `-march` and `-mtune`: a `cpu: NAME  tune: NAME  issue_width: N` line, then one `INSTRUCTION  latency: N  issue: N  available: yes` (or `no`) line per instruction. |
 | `--print-data-bases` | The `data_base` entries: one `NAME  base: REGISTER  sections: LIST  max_size: N  kinds: LIST  source: FILE:LINE` line each. |
 | `--print-options[=all\|optimization\|common\|target]` | Options, values, and origins. |

@@ -161,6 +161,8 @@ struct CpuEntry {
     std::vector<std::string> inherits;  // the bases, in order
     std::optional<std::vector<std::string>> features;
     std::optional<unsigned> issue_width;
+    // Bytes, a power of two.
+    std::optional<unsigned> function_alignment;
     std::vector<CpuInstructionEntry> instructions;
 };
 
@@ -182,6 +184,8 @@ struct DataBaseEntry {
 struct ResolvedCpu {
     std::vector<std::string> features;
     unsigned issue_width{1};
+    // Unset: the target's choice.
+    std::optional<unsigned> function_alignment;
     // By InstructionCostId; instructions no entry describes keep the
     // target's defaults.
     std::vector<InstructionCost> instructions;

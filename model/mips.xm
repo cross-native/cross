@@ -1011,7 +1011,9 @@ abi "eabi32" {
 # default costs, which cc --print-costs shows. The isa- entries hold an ISA
 # level's instructions and pipeline interlocks without an FPU, and the fpu-
 # entries an FPU; the ISA names and CPUs combine them. A CPU without costs
-# of its own names the entry it takes them from.
+# of its own names the entry it takes them from. An errata- entry enables
+# the workaround for a CPU's errata, which the CPU and its other spellings
+# inherit.
 
 # ISA levels. Without published timing, loads of MIPS I, MIPS II, and
 # MIPS32 CPUs are scheduled as four-cycle operations.
@@ -1109,6 +1111,31 @@ cpu "fpu-single" {
 cpu "fpu-odd-spreg" {
     architecture = "mips";
     features = ["odd-spreg"];
+}
+
+# Errata. The R4000 may misexecute an extended or variable shift while a
+# multiply is in flight or right after a divide starts, and a divide in a
+# branch delay slot; the R4400 the shift after a divide. LL/SC sequences
+# need a branch-likely retry on R10000s before revision 3.0, and a SYNC
+# before each LL and at each exit from the sequence on Loongson 3 systems.
+cpu "errata-r4000" {
+    architecture = "mips";
+    features = ["fix-r4000"];
+}
+
+cpu "errata-r4400" {
+    architecture = "mips";
+    features = ["fix-r4400"];
+}
+
+cpu "errata-r10000" {
+    architecture = "mips";
+    features = ["fix-r10000"];
+}
+
+cpu "errata-loongson3-llsc" {
+    architecture = "mips";
+    features = ["fix-loongson3-llsc"];
 }
 
 # ISA names. Releases 3 and 5 add microMIPS, EVA, XPA, virtualization, and
@@ -1278,8 +1305,9 @@ cpu "r4010" {
     inherits = "mips2";
 }
 
-# MIPS III.
-cpu "r4000" {
+# MIPS III. The R4000 and the R4400 share a pipeline and differ in their
+# errata.
+cpu "pipeline-r4000" {
     architecture = "mips";
     inherits = "mips3";
     instruction "mult" { latency = 10; issue = 10; }
@@ -1288,9 +1316,14 @@ cpu "r4000" {
     instruction "divu" { latency = 69; issue = 69; }
 }
 
+cpu "r4000" {
+    architecture = "mips";
+    inherits = ["pipeline-r4000", "errata-r4000"];
+}
+
 cpu "r4400" {
     architecture = "mips";
-    inherits = "r4000";
+    inherits = ["pipeline-r4000", "errata-r4400"];
 }
 
 cpu "r4600" {
@@ -1418,6 +1451,26 @@ cpu "loongson2f" {
     inherits = "loongson2e";
 }
 
+# The R5900 (the PlayStation 2 Emotion Engine) has no LL/SC and no
+# doubleword multiply or divide, and it interlocks loads, FPU transfers and
+# compares, and HI/LO. A loop of six instructions or fewer may run only once
+# or twice unless the branch that ends it has a NOP in its delay slot. Its
+# single-precision FPU does not follow IEEE 754 (it has no infinities, NaNs,
+# or denormals, and rounds toward zero), which Cross does not model, so the
+# entry has no FPU; the three-operand multiply and MMI are not modeled
+# either. Costs: those of isa-mips3.
+cpu "r5900" {
+    architecture = "mips";
+    inherits = "isa-mips3";
+    features = ["mips3", "soft-float", "branch-likely", "cond-move",
+                "load-interlocks", "fpu-transfer-interlocks",
+                "fpu-compare-interlocks", "hilo-interlocks", "fix-r5900"];
+    instruction "dmult" { available = false; }
+    instruction "dmultu" { available = false; }
+    instruction "ddiv" { available = false; }
+    instruction "ddivu" { available = false; }
+}
+
 # MIPS IV. Costs: those of mips4.
 cpu "r8000" {
     architecture = "mips";
@@ -1426,7 +1479,7 @@ cpu "r8000" {
 
 cpu "r10000" {
     architecture = "mips";
-    inherits = "mips4";
+    inherits = ["mips4", "errata-r10000"];
 }
 
 cpu "r12000" {
@@ -1809,10 +1862,12 @@ cpu "sr71000" {
 
 # MIPS64 Release 2 CPUs; the Loongson, Octeon, and XLP extensions are not
 # modeled. The GS464 has no odd single-precision registers, and the Octeon,
-# Octeon+, and Octeon II have no FPU. Costs: those of mips64r2.
+# Octeon+, and Octeon II have no FPU. The Loongson cores work around the
+# LL/SC erratum, as Linux does on every Loongson 3 system. Costs: those of
+# mips64r2.
 cpu "gs464" {
     architecture = "mips";
-    inherits = ["isa-mips64r2", "fpu-fp64"];
+    inherits = ["isa-mips64r2", "fpu-fp64", "errata-loongson3-llsc"];
 }
 
 cpu "loongson3a" {
@@ -1822,12 +1877,12 @@ cpu "loongson3a" {
 
 cpu "gs464e" {
     architecture = "mips";
-    inherits = "mips64r2";
+    inherits = ["mips64r2", "errata-loongson3-llsc"];
 }
 
 cpu "gs264e" {
     architecture = "mips";
-    inherits = "mips64r2";
+    inherits = ["mips64r2", "errata-loongson3-llsc"];
 }
 
 cpu "octeon" {
@@ -1876,10 +1931,14 @@ cpu "4130" { architecture = "mips"; inherits = "vr4130"; }
 cpu "r4130" { architecture = "mips"; inherits = "vr4130"; }
 cpu "4300" { architecture = "mips"; inherits = "vr4300"; }
 cpu "r4300" { architecture = "mips"; inherits = "vr4300"; }
+cpu "r4k" { architecture = "mips"; inherits = "r4000"; }
+cpu "4000" { architecture = "mips"; inherits = "r4000"; }
+cpu "4k" { architecture = "mips"; inherits = "r4000"; }
 cpu "4400" { architecture = "mips"; inherits = "r4400"; }
 cpu "4600" { architecture = "mips"; inherits = "r4600"; }
 cpu "4650" { architecture = "mips"; inherits = "r4650"; }
 cpu "4700" { architecture = "mips"; inherits = "r4700"; }
+cpu "5900" { architecture = "mips"; inherits = "r5900"; }
 cpu "r8k" { architecture = "mips"; inherits = "r8000"; }
 cpu "8000" { architecture = "mips"; inherits = "r8000"; }
 cpu "8k" { architecture = "mips"; inherits = "r8000"; }

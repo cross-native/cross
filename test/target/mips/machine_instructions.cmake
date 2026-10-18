@@ -99,10 +99,12 @@ if(code MATCHES "[$]zero,[0-9]+[(][$]sp[)]|[$]at,[0-9]+[(][$]sp[)]")
 endif()
 
 # Release 2 clears the Status hazard with one EHB.
-compile("${OUTPUT}-mips32r2.s" -march=mips32r2 -O2)
-file(READ "${OUTPUT}-mips32r2.s" text)
-body("${text}" set_status code)
-expect(set_status "${code}" "\tmtc0\t[$]a0,[$]12\n\tehb\n\tjr\t[$]ra\n")
+foreach(release2 mips32r2 mips64r2)
+    compile("${OUTPUT}-${release2}.s" -march=${release2} -O2)
+    file(READ "${OUTPUT}-${release2}.s" text)
+    body("${text}" set_status code)
+    expect(set_status "${code}" "\tmtc0\t[$]a0,[$]12\n\tehb\n\tjr\t[$]ra\n")
+endforeach()
 
 # Availability per ISA.
 file(WRITE "${OUTPUT}-query.x"

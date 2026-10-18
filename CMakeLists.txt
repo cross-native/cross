@@ -1934,7 +1934,7 @@ if(BUILD_TESTING)
         -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-machine-instructions
         -P "${CMAKE_SOURCE_DIR}/test/target/mips/machine_instructions.cmake")
     set_tests_properties(cross_mips_machine_instructions PROPERTIES
-        LABELS "check.compile;arch.mips;backend.native;feature.raw;diagnostics;isa.vr4300")
+        LABELS "check.compile;arch.mips;backend.native;feature.raw;diagnostics;isa.vr4300;isa.mips32r2;isa.mips64r2")
     # Naked functions: exception returns, coprocessor 0 selects, exception
     # instructions, and their diagnostics; raw branches, and managed calls to
     # naked routines with register interfaces, under o32 and n64.
@@ -2454,6 +2454,57 @@ if(BUILD_TESTING)
             LABELS "check.runtime;arch.mips;backend.native;feature.intrinsics;isa.mips64r2;isa.octeon;isa.vr5400;isa.sr71000;isa.gs464;isa.r10000;endian.big;endian.little;opt.${rotate_level}"
             SKIP_REGULAR_EXPRESSION "skipping MIPS")
     endforeach()
+    # The errata workarounds that CPU entries and -mfix-NAME select.
+    add_test(NAME cross_mips_errata
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/errata.x
+                -DLOOPS_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/short_loops.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-errata/case
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/errata.cmake")
+    set_tests_properties(cross_mips_errata PROPERTIES
+        LABELS "check.compile;arch.mips;backend.native;feature.errata;feature.atomics;feature.delay_slots;isa.r4000;isa.r4400;isa.r10000;isa.gs464;isa.r5900;isa.vr4300;endian.big;opt.O2;opt.O3;opt.Os;opt.Oz")
+    # The Release 2 selections (SEB, SEH, WSBH, DSBH, DSHD, EXT, INS, DEXT,
+    # DINS, DROTR, MUL): which CPUs select them, and their results under
+    # o32 on MIPS32 and MIPS64 Release 2 CPUs and under n64.
+    add_test(NAME cross_mips_release2
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/release2.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-release2/case
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/release2.cmake")
+    set_tests_properties(cross_mips_release2 PROPERTIES
+        LABELS "check.compile;arch.mips;backend.native;feature.codegen;isa.mips32r2;isa.mips64r2;isa.allegrex;isa.vr4300;isa.mips4;isa.mips32;endian.big;endian.little;opt.O0;opt.O2")
+    foreach(release2_level O0 O2)
+        add_test(NAME cross_mips_release2_runtime_${release2_level}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/release2.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-release2-${release2_level}
+                -DEXPECTED=P "-DCC_FLAGS=-${release2_level};-fno-eval-calls;-mfp32"
+                "-DMIPS_CPUS=mips32r2;24kc;mips64r2;octeon3;gs464e"
+                -DQEMU_CPU=MIPS64R2-generic
+                -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(cross_mips_release2_runtime_${release2_level} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;feature.codegen;isa.mips32r2;isa.24kc;isa.mips64r2;isa.octeon3;isa.gs464e;endian.big;endian.little;opt.${release2_level}"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS")
+        foreach(release2_endian big little)
+            add_test(NAME cross_mips_release2_n64_${release2_endian}_${release2_level}
+                COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/release2.x
+                    -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_n64_entry_start.s
+                    -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare-n64.ld
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-release2-n64-${release2_endian}-${release2_level}
+                    -DN64_ENDIAN=${release2_endian}
+                    "-DEXTRA_FLAGS=-${release2_level} -fno-eval-calls -march=mips64r2"
+                    -P "${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.cmake")
+            set_tests_properties(cross_mips_release2_n64_${release2_endian}_${release2_level} PROPERTIES
+                LABELS "check.runtime;arch.mips;backend.native;feature.codegen;isa.mips64r2;profile.n64;endian.${release2_endian};opt.${release2_level}"
+                SKIP_REGULAR_EXPRESSION "skipping MIPS")
+        endforeach()
+    endforeach()
     # The floating kernels with FPR allocation before MIPS III, against the
     # x86-64 reference. MIPS I lacks the float-to-integer conversion they use.
     # Each entry: name|endian|QEMU CPU|flags.
@@ -2783,6 +2834,13 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/model/cpu_entries.cmake")
     set_tests_properties(cross_model_cpu_entries PROPERTIES
         LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;feature.model;feature.driver;feature.optimization")
+    add_test(NAME cross_model_function_alignment
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/model-function-alignment
+                -P "${CMAKE_SOURCE_DIR}/test/model/function_alignment.cmake")
+    set_tests_properties(cross_model_function_alignment PROPERTIES
+        LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;feature.model;feature.alignment;opt.O2;opt.Os")
     add_test(NAME cross_model_cpu_catalog
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

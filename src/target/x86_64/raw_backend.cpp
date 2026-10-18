@@ -4024,6 +4024,7 @@ public:
         : module_(module), managed_(managed_module), hir_(hir_module),
           options_(options), diagnostics_(diagnostics),
           format_(subtarget.object_format()),
+          preferred_alignment_(subtarget.function_alignment()),
           debug_(debug && debug->active() ? debug : nullptr) {}
 
     mir::AssemblyBundle run() {
@@ -4191,10 +4192,10 @@ private:
             alignment_power = 2;
         } else if (options_.optimize_for == OptimizationGoal::Size) {
             alignment_power = 3;
-        } else if (options_.tune == "skylake" ||
-                   options_.tune == "skylake-avx512" ||
-                   options_.tune == "znver3") {
-            alignment_power = 5;
+        } else if (const auto preferred = preferred_alignment_) {
+            // The -mtune CPU's alignment for speed.
+            alignment_power =
+                static_cast<unsigned>(std::countr_zero(*preferred));
         }
         alignment_power = std::max(
             alignment_power,
@@ -4423,6 +4424,8 @@ private:
     const CompilerOptions& options_;
     Diagnostics& diagnostics_;
     ObjectFormat format_;
+    // The -mtune CPU's function alignment.
+    std::optional<unsigned> preferred_alignment_;
     // Null without -g.
     native::DebugInfo* debug_{};
     mir::AssemblyBundle bundle_;

@@ -127,6 +127,10 @@ public:
         return lacks_instructions_;
     }
     [[nodiscard]] unsigned issue_width() const { return issue_width_; }
+    // The -mtune CPU's function alignment in bytes, if it sets one.
+    [[nodiscard]] std::optional<unsigned> function_alignment() const {
+        return function_alignment_;
+    }
     // The first feature, or the instruction, that makes `form` unusable.
     [[nodiscard]] std::optional<InstructionFeatureConflict> form_conflict(
         const InstructionEntry& form) const;
@@ -150,6 +154,7 @@ private:
     std::vector<InstructionCost> instruction_costs_;
     bool lacks_instructions_{};
     unsigned issue_width_{1};
+    std::optional<unsigned> function_alignment_;
 };
 
 // Built-in table selected for a compiled-in target.  It is intentionally

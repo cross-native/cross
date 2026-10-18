@@ -26509,10 +26509,11 @@ private:
             alignment_power = 0;
         } else if (options_.optimize_for == OptimizationGoal::Size) {
             alignment_power = 3;
-        } else if (options_.tune == "skylake" ||
-                   options_.tune == "skylake-avx512" ||
-                   options_.tune == "znver3") {
-            alignment_power = 5;
+        } else if (const auto preferred =
+                       subtarget_.function_alignment()) {
+            // The -mtune CPU's alignment for speed.
+            alignment_power =
+                static_cast<unsigned>(std::countr_zero(*preferred));
         }
         alignment_power = std::max(
             alignment_power,

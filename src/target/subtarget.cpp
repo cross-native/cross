@@ -214,10 +214,23 @@ bool normalize_subtarget_options(const TargetInfo& target,
         states.emplace(std::string(feature.name),
                        feature.enabled_by_default);
     }
-    for (const auto& feature :
-         model_registry().resolve_cpu(target, *cpu).features) {
-        states[feature] = true;
-    }
+    const auto cpu_features = model_registry().resolve_cpu(target, *cpu).features;
+    for (const auto& feature : cpu_features) states[feature] = true;
+    // A feature that options cannot select is a fact of the -march CPU,
+    // which no option may take away, also not through a prerequisite or a
+    // conflict.
+    const auto required_fact = [&](const SubtargetFeature& feature) {
+        return !feature.selectable &&
+               std::find(cpu_features.begin(), cpu_features.end(),
+                         feature.name) != cpu_features.end();
+    };
+    const auto baseline_error = [&](std::string_view feature,
+                                    std::string_view reason) {
+        diagnostics.command_error(
+            "feature '" + std::string(feature) + "' of CPU '" + arch + "' " +
+            std::string(reason) +
+            "; the CPU baseline cannot be disabled with -m overrides");
+    };
 
     const auto arch_origin = arch_option ? arch_option->origin
                                          : OptionOrigin::Default;
@@ -355,6 +368,11 @@ bool normalize_subtarget_options(const TargetInfo& target,
                         }
                         return false;
                     }
+                    if (required_fact(feature)) {
+                        baseline_error(name, "requires '" + root +
+                                                 "', which the options disable");
+                        return false;
+                    }
                     states[name] = false;
                     unavailable_by.emplace(name, root);
                     const auto* required_option =
@@ -385,12 +403,23 @@ bool normalize_subtarget_options(const TargetInfo& target,
                     return false;
                 }
                 if (explicit_value(conflict, true)) {
+                    if (required_fact(feature)) {
+                        baseline_error(name, "conflicts with '-m" + conflict +
+                                                 "'");
+                        return false;
+                    }
                     states[name] = false;
                     unavailable_by.emplace(name, name);
                     update_implied_option(
                         name, false, "conflicts with m." + conflict,
                         arch_origin);
                 } else {
+                    if (const auto* lost = find_feature(*table, conflict);
+                        lost && required_fact(*lost)) {
+                        baseline_error(conflict, "conflicts with '-m" + name +
+                                                     "'");
+                        return false;
+                    }
                     states[conflict] = false;
                     unavailable_by.emplace(conflict, conflict);
                     update_implied_option(
@@ -568,6 +597,7 @@ std::optional<Subtarget> resolve_subtarget(const TargetInfo& target,
     result.cpu_ = cpu->canonical_name;
     result.tune_ = tune->canonical_name;
     result.issue_width_ = tune_model.issue_width;
+    result.function_alignment_ = tune_model.function_alignment;
     result.instruction_costs_ = tune_model.instructions;
     for (std::size_t index = 0; index < result.instruction_costs_.size();
          ++index) {
