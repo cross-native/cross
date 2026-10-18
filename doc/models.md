@@ -287,6 +287,7 @@ abi "example-regs" {
 | `result_register_failure` | text | `"error"` | no |
 | `call_clobbers` | list | `[]` | no |
 | `elf_abi_tag` | text | none | no |
+| `features` | list | `[]` | no |
 | `private_carrier_bits` | integer | none | no |
 | `llvm_calling_convention` | text | `""` | no |
 | `gcc_calling_attribute` | text | `""` | no |
@@ -352,6 +353,16 @@ it accepts, and any other tag is an error when the file loads. x86-64 defines
 none. MIPS defines `"eabi32"`, which requires `address_bits = 32` and writes
 `EF_MIPS_ABI_EABI32` and GNU's `.mdebug.eabi32` and `.gcc_compiled_long32`
 marker sections.
+
+`features` lists target features, as `cc --print-features` names them,
+that compilations with the entry as their ABI select in place of the
+features of the `-march` CPU entry that conflict with them. A feature whose
+prerequisites the CPU lacks is not selected, and `-m` options override the
+list. Each name may appear once, the listed features and their
+prerequisites may not conflict, and a CPU fact that options cannot select,
+such as `allegrex`, is an error. The shipped MIPS `o32`, `x32`, and `eabi32`
+list `fp32` and `n64` lists `fp64`, as GCC derives the FPR width from the
+ABI's general registers; `x64` keeps the CPU's.
 
 `private_carrier_bits` marks the entry as the convention that
 `-fprivate-abi` uses on MIPS for calls to functions defined without `global`

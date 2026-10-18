@@ -11,6 +11,8 @@ abi "x32" {
     gcc_calling_attribute = "";
     compilation_selectable = true;
     function_selectable = true;
+    # 32-bit carriers use the paired 32-bit FPR convention, as o32 does.
+    features = ["fp32"];
     private_carrier_bits = 32;
     argument_register_failure = "partial";
     result_register_failure = "error";
@@ -347,6 +349,8 @@ abi "o32" {
     gcc_calling_attribute = "";
     compilation_selectable = true;
     function_selectable = true;
+    # As GCC, FPRs as wide as the ABI's GPRs unless options select others.
+    features = ["fp32"];
     argument_register_failure = "partial";
     result_register_failure = "error";
     stack_layout = "slots";
@@ -575,6 +579,8 @@ abi "n64" {
     gcc_calling_attribute = "";
     compilation_selectable = true;
     function_selectable = true;
+    # The n64 object class is defined on 64-bit FPRs.
+    features = ["fp64"];
     argument_register_failure = "partial";
     result_register_failure = "error";
     stack_layout = "packed";
@@ -753,6 +759,7 @@ abi "eabi32" {
     gcc_calling_attribute = "";
     compilation_selectable = true;
     function_selectable = true;
+    features = ["fp32"];
     elf_abi_tag = "eabi32";
     argument_register_failure = "partial";
     result_register_failure = "error";

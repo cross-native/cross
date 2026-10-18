@@ -211,6 +211,9 @@ struct AbiEntry {
     // One of the target's elf_abi_tags; empty keeps the object writer's
     // default.
     std::string elf_abi_tag;
+    // Subtarget features the ABI selects in place of the -march CPU's
+    // conflicting ones; options override them.
+    std::vector<std::string> features;
     // Nonzero marks a private-call convention candidate for subtargets whose
     // native integer registers have this width.
     unsigned private_carrier_bits{};

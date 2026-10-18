@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace cross {
@@ -231,6 +232,47 @@ bool normalize_subtarget_options(const TargetInfo& target,
             std::string(reason) +
             "; the CPU baseline cannot be disabled with -m overrides");
     };
+    // The ABI's features replace the CPU's conflicting ones where the CPU
+    // has their prerequisites, which the features it lists imply.
+    const auto* abi =
+        model_registry().find_abi(target.architecture, options.abi,
+                                  options.target);
+    std::unordered_set<std::string> implied;
+    std::vector<std::string_view> pending;
+    for (const auto& [name, enabled] : states) {
+        if (enabled) pending.push_back(name);
+    }
+    while (!pending.empty()) {
+        const auto name = std::string(pending.back());
+        pending.pop_back();
+        if (!implied.insert(name).second) continue;
+        const auto& required = find_feature(*table, name)->prerequisites;
+        pending.insert(pending.end(), required.begin(), required.end());
+    }
+    std::unordered_set<std::string> abi_features;
+    for (const auto& name : abi ? abi->features : std::vector<std::string>{}) {
+        const auto* feature = find_feature(*table, name);
+        if (!std::ranges::all_of(feature->prerequisites,
+                                 [&](std::string_view required) {
+                                     return implied.contains(
+                                         std::string(required));
+                                 })) {
+            continue;
+        }
+        for (const auto conflict : feature->conflicts) {
+            if (!states[std::string(conflict)]) continue;
+            if (const auto* lost = find_feature(*table, conflict);
+                lost && required_fact(*lost)) {
+                baseline_error(conflict, "conflicts with the '" +
+                                             abi->canonical_name +
+                                             "' ABI's '" + name + "'");
+                return false;
+            }
+            states[std::string(conflict)] = false;
+        }
+        states[name] = true;
+        abi_features.insert(name);
+    }
 
     const auto arch_origin = arch_option ? arch_option->origin
                                          : OptionOrigin::Default;
@@ -257,7 +299,8 @@ bool normalize_subtarget_options(const TargetInfo& target,
         } else {
             selection.value = states[std::string(feature.name)];
             selection.origin = arch_origin;
-            selection.source = "m.arch=" + arch;
+            selection.source = abi_features.contains(std::string(feature.name))
+                ? "abi=" + abi->canonical_name : "m.arch=" + arch;
         }
     }
 

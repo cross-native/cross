@@ -255,3 +255,57 @@ expect_model_error(zero-private "ABI private_carrier_bits must be nonzero"
 expect_model_error(same-model-name
     "duplicate ABI model name or alias 'x' for mips with 64-bit addresses"
     second_x 64 "aliases = [\"x\"];")
+
+# features: a user ABI selects target features in place of the CPU's
+# conflicting ones; -m options override them, and a CPU without their
+# prerequisites keeps its own.
+string(REPLACE "user_follow\" {" "user_fpxx\" {\n    features = [\"fpxx\"];"
+       fpxx_text "${follow_text}")
+set(fpxx_model "${OUTPUT}/fpxx.y")
+file(WRITE "${fpxx_model}" "${fpxx_text}")
+foreach(case
+        "mips64r2||Hard float [(]32-bit CPU, Any FPU[)]"
+        "mips64r2|-mfp64|Hard float [(]32-bit CPU, 64-bit FPU[)]"
+        "r5900||Soft float")
+    string(REPLACE "|" ";" fields "${case}")
+    list(GET fields 0 cpu)
+    list(GET fields 1 option)
+    list(GET fields 2 fp_abi)
+    set(object "${OUTPUT}/fpxx-${cpu}${option}.o")
+    execute_process(
+        COMMAND "${CC}" "--model=${fpxx_model}" -c -O2 -target mips-unknown-elf
+                -march=${cpu} ${option} -mabi=user_fpxx "${source}"
+                -o "${object}"
+        RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+    if(NOT status EQUAL 0)
+        message(FATAL_ERROR "user_fpxx ${cpu} ${option} failed\n${stdout}\n${stderr}")
+    endif()
+    execute_process(COMMAND "${LLVM_READELF}" -A "${object}"
+                    OUTPUT_VARIABLE attributes)
+    if(NOT attributes MATCHES "FP ABI: ${fp_abi}\n")
+        message(FATAL_ERROR
+            "user_fpxx ${cpu} ${option}: expected FP ABI '${fp_abi}'\n${attributes}")
+    endif()
+endforeach()
+execute_process(
+    COMMAND "${CC}" "--model=${fpxx_model}" -target mips-unknown-elf
+            -march=mips64r2 -mabi=user_fpxx --print-options=target
+    RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+if(NOT status EQUAL 0 OR
+   NOT stdout MATCHES "\nm[.]fpxx  type: boolean  value: on  [^\n]*source: abi=user_fpxx\n" OR
+   NOT stdout MATCHES "\nm[.]fp64  type: boolean  value: off  ")
+    message(FATAL_ERROR "user_fpxx does not report its features\n${stdout}\n${stderr}")
+endif()
+
+expect_model_error(unknown-feature
+    "unknown-feature[.]y:6: error: unknown mips feature 'fp128'"
+    unknown_feature 32 "features = [\"fp128\"];")
+expect_model_error(feature-twice
+    "feature-twice[.]y:6: error: ABI features list 'fp32' twice"
+    feature_twice 32 "features = [\"fp32\", \"fp32\"];")
+expect_model_error(feature-conflict
+    "feature-conflict[.]y:6: error: ABI features 'fp32' and 'fp64' conflict"
+    feature_conflict 32 "features = [\"fp32\", \"fp64\"];")
+expect_model_error(feature-fact
+    "feature-fact[.]y:6: error: ABI feature 'allegrex' is a CPU fact that options cannot select"
+    feature_fact 32 "features = [\"allegrex\"];")

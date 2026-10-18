@@ -105,35 +105,68 @@ foreach(cpu mips32 mips32r2)
 endforeach()
 
 # Their objects are FP32 with odd single registers; FPXX code, and MIPS II
-# code, which has no odd single registers, is FPXX without them.
+# code, which has no odd single registers, is FPXX without them. The 32-bit
+# carrier ABIs select FP32 on MIPS64 CPUs too, and MIPS IV, which has no odd
+# single registers, is then FPXX; -mfp64 and x64 keep 64-bit FPRs.
 find_program(LLVM_READELF NAMES llvm-readelf)
 if(LLVM_READELF)
     foreach(case
-            "mips32||Hard float [(]double precision[)]|00000001"
-            "mips32r2||Hard float [(]double precision[)]|00000001"
-            "mips32|-mfpxx|Hard float [(]32-bit CPU, Any FPU[)]|00000000"
-            "mips2||Hard float [(]32-bit CPU, Any FPU[)]|00000000")
+            "o32|mips32||Hard float [(]double precision[)]|00000001"
+            "o32|mips32r2||Hard float [(]double precision[)]|00000001"
+            "o32|mips32|-mfpxx|Hard float [(]32-bit CPU, Any FPU[)]|00000000"
+            "o32|mips2||Hard float [(]32-bit CPU, Any FPU[)]|00000000"
+            "o32|mips64r2||Hard float [(]double precision[)]|00000001"
+            "x32|mips64r2||Hard float [(]double precision[)]|00000001"
+            "eabi32|mips64r2||Hard float [(]double precision[)]|00000001"
+            "o32|r10000||Hard float [(]32-bit CPU, Any FPU[)]|00000000"
+            "o32|mips64r2|-mfp64|Hard float [(]32-bit CPU, 64-bit FPU[)]|00000001"
+            "x64|mips64r2||Hard float [(]32-bit CPU, 64-bit FPU[)]|00000001")
         string(REPLACE "|" ";" fields "${case}")
-        list(GET fields 0 cpu)
-        list(GET fields 1 fpu)
-        list(GET fields 2 fp_abi)
-        list(GET fields 3 flags)
-        set(object "${OUTPUT}.${cpu}${fpu}.o")
+        list(GET fields 0 abi)
+        list(GET fields 1 cpu)
+        list(GET fields 2 fpu)
+        list(GET fields 3 fp_abi)
+        list(GET fields 4 flags)
+        set(object "${OUTPUT}.${abi}-${cpu}${fpu}.o")
         execute_process(
-            COMMAND "${CC}" -c -O2 -target mips-unknown-elf -mabi=o32
+            COMMAND "${CC}" -c -O2 -target mips-unknown-elf -mabi=${abi}
                     -march=${cpu} ${fpu} "${SINGLE_SOURCE}" -o "${object}"
             RESULT_VARIABLE status ERROR_VARIABLE stderr)
         if(NOT status EQUAL 0)
-            message(FATAL_ERROR "${cpu} ${fpu} object failed\n${stderr}")
+            message(FATAL_ERROR "${abi} ${cpu} ${fpu} object failed\n${stderr}")
         endif()
         execute_process(COMMAND "${LLVM_READELF}" -A "${object}"
                         OUTPUT_VARIABLE attributes)
         if(NOT attributes MATCHES "FP ABI: ${fp_abi}\n" OR
            NOT attributes MATCHES "FLAGS 1: ${flags}\n")
             message(FATAL_ERROR
-                "${cpu} ${fpu}: expected FP ABI '${fp_abi}', flags ${flags}\n${attributes}")
+                "${abi} ${cpu} ${fpu}: expected FP ABI '${fp_abi}', flags ${flags}\n${attributes}")
         endif()
     endforeach()
+endif()
+
+# FP32 doubles on a MIPS64 CPU keep to even registers; n64 selects 64-bit
+# FPRs on the VR4300, whose doubles then take odd registers as well.
+compile(mips64r2-o32 "${SOURCE}"
+        -target mips-unknown-elf -mabi=o32 -march=mips64r2)
+string(REGEX MATCHALL "\n[.]ent [a-z_0-9]+" entries "${assembly}")
+foreach(entry IN LISTS entries)
+    string(REGEX REPLACE "\n[.]ent " "" symbol "${entry}")
+    function_body("${assembly}" ${symbol} body)
+    if(body MATCHES "\n\t[a-z]+[.]d\t" AND body MATCHES "${odd_arithmetic}")
+        message(FATAL_ERROR
+            "mips64r2 o32: ${symbol} has doubles and odd register $f${CMAKE_MATCH_1}\n${body}")
+    endif()
+endforeach()
+file(WRITE "${OUTPUT}.n64.x" "global f64 poly(in f64 x, in f64 a, in f64 b,
+                                in f64 c, in f64 d) {
+    return (((a * x + b) * x + c) * x + d) * (x + a) * (x + b) * (x + c);
+}
+")
+compile(vr4300-n64 "${OUTPUT}.n64.x"
+        -target mips64-unknown-elf -mabi=n64 -march=vr4300)
+if(NOT assembly MATCHES "\n\t[a-z]+[.]d\t[^\n]*[$]f[0-9]*[13579][,\n]")
+    message(FATAL_ERROR "n64 VR4300 doubles kept to even registers\n${assembly}")
 endif()
 
 compile(mips1 "${SOURCE}" -target mips-unknown-elf -mabi=o32 -march=r3000)

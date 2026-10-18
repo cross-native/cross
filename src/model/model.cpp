@@ -234,11 +234,12 @@ std::optional<std::pair<unsigned, unsigned>> variadic_state_layout(
                      static_cast<unsigned>(alignment)};
 }
 
-// Why a cpu's features are invalid, or nothing: each must be a target
-// feature, listed once, and none may conflict with another or with what
-// another enables.
+// Why a cpu's or an ABI's features are invalid, or nothing: each must be a
+// target feature, listed once, and none may conflict with another or with
+// what another enables.
 std::optional<std::string> feature_problem(
-    const TargetInfo& target, const std::vector<std::string>& features) {
+    const TargetInfo& target, const std::vector<std::string>& features,
+    std::string_view entry = "cpu") {
     const auto& table = target.subtargets->features;
     // The index of a feature, or the table size.
     const auto find = [&](std::string_view name) {
@@ -257,7 +258,7 @@ std::optional<std::string> feature_problem(
                    " feature '" + name + "'";
         }
         if (std::count(features.begin(), features.end(), name) > 1) {
-            return "cpu features list '" + name + "' twice";
+            return std::string(entry) + " features list '" + name + "' twice";
         }
         pending.push_back(name);
     }
@@ -274,8 +275,9 @@ std::optional<std::string> feature_problem(
         for (const auto conflict : table[index].conflicts) {
             const auto other = find(conflict);
             if (other != table.size() && enabled[other]) {
-                return "cpu features '" + std::string(table[index].name) +
-                       "' and '" + std::string(conflict) + "' conflict";
+                return std::string(entry) + " features '" +
+                       std::string(table[index].name) + "' and '" +
+                       std::string(conflict) + "' conflict";
             }
         }
     }
@@ -1531,7 +1533,7 @@ private:
                 {"architecture", "address_bits", "aliases",
                  "llvm_calling_convention", "gcc_calling_attribute",
                  "compilation_selectable", "function_selectable",
-                 "elf_abi_tag", "private_carrier_bits",
+                 "elf_abi_tag", "features", "private_carrier_bits",
                  "call_clobbers", "argument_register_failure",
                  "result_register_failure", "stack_layout",
                  "argument_stack_base", "stack_alignment",
@@ -1594,6 +1596,21 @@ private:
                 return std::nullopt;
             }
             result.elf_abi_tag = *value;
+        }
+        if (auto features = list_property(properties, "features")) {
+            auto problem = feature_problem(*target_info, *features, "ABI");
+            for (const auto& feature : *features) {
+                if (problem) break;
+                if (!target_extension(*target_info, feature)) {
+                    problem = "ABI feature '" + feature +
+                              "' is a CPU fact that options cannot select";
+                }
+            }
+            if (problem) {
+                fail(properties.at("features").line, std::move(*problem));
+                return std::nullopt;
+            }
+            result.features = std::move(*features);
         }
         if (const auto value =
                 unsigned_property(properties, "private_carrier_bits")) {

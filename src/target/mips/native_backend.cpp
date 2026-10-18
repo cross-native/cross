@@ -177,13 +177,14 @@ bool colorable_floating(const Subtarget& subtarget, unsigned bits) {
             (bits <= 64 && !subtarget.has_feature(Feature::SingleFloat)));
 }
 
-// Whether code may name odd single-precision registers: the FPU has them
-// (`odd-spreg`, which MIPS I-IV lack) and the FPU register model is not
-// FPXX, whose objects keep to even registers.
+// Whether code may name odd single-precision registers: every FPR of an
+// FR=1 FPU, or an FR=0 FPU's odd ones (`odd-spreg`, which MIPS I-IV lack)
+// outside FPXX code, whose objects keep to even registers.
 bool odd_single_fprs(const Subtarget& subtarget) {
     return subtarget.has_feature(Feature::HardFloat) &&
-           subtarget.has_feature(Feature::OddSpreg) &&
-           !subtarget.has_feature(Feature::Fpxx);
+           (subtarget.has_feature(Feature::Fp64) ||
+            (subtarget.has_feature(Feature::OddSpreg) &&
+             !subtarget.has_feature(Feature::Fpxx)));
 }
 
 // Whether the FPRs of an FR=0 FPU with doubles pair up, so that an f64 in

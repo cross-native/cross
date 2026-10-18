@@ -341,8 +341,8 @@ options adjust them:
 | Option | Effect |
 | --- | --- |
 | `-mhard-float`, `-msoft-float`, `-msingle-float` | FPU availability. |
-| `-mfp32`, `-mfpxx`, `-mfp64` | FPU register model. |
-| `-modd-spreg` | The FPU has odd-numbered single-precision registers; the MIPS32 and MIPS64 CPUs with an FPU other than the GS464, and `allegrex`, enable it. A single-precision FPU and a 64-bit-register FPU (`-mfp64`) then keep values in all 32 registers; under `-mfp32`, where an `f64` occupies an even/odd pair, a function without `f64` values keeps its `f32` values in all 32 registers and others keep floating values in even registers. `-mfpxx` code and FPUs without them use even registers only. |
+| `-mfp32`, `-mfpxx`, `-mfp64` | FPU register model. The ABI selects the default ([models.md](models.md#entry-properties)): `-mfp32` under `o32`, `x32`, and `eabi32`, `-mfp64` under `n64`, and under `x64` the CPU's, which is `-mfp64` from MIPS IV and MIPS64 on. |
+| `-modd-spreg` | The FPU has odd-numbered single-precision registers with 32-bit FPRs; the MIPS32 and MIPS64 CPUs with an FPU other than the GS464, and `allegrex`, enable it. A single-precision FPU then keeps values in all 32 registers; under `-mfp32`, where an `f64` occupies an even/odd pair, a function without `f64` values keeps its `f32` values in all 32 registers and others keep floating values in even registers. `-mfpxx` code and FPUs without them use even registers only. `-mfp64` code keeps values in all 32 registers on every CPU. |
 | `-mllsc` | 32-bit LL/SC atomics. |
 | `-mfix-NAME` | The errata workarounds above. |
 | `-mnan2008` | Use the IEEE 754-2008 NaN encoding of MIPS32 Release 2 FPUs; the output declares it with `.nan 2008`. |
