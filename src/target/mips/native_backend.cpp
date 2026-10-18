@@ -659,6 +659,10 @@ std::optional<SignatureLayout> naked_signature_layout(
             return std::nullopt;
         }
         const bool floating = id->value >= fpr_physical_base;
+        // One GPR holds the value only if the CPU's GPRs are that wide.
+        if (!floating && bits > (subtarget.has_feature(Feature::Mips3) ? 64U : 32U)) {
+            return std::nullopt;
+        }
         ValuePiece result;
         result.location.reg =
             std::string(floating ? fpr_name(*id) : gpr_name(*id));
@@ -11064,7 +11068,7 @@ private:
             if (!layout) {
                 diagnostics_.error(location,
                                    "MIPS naked function has an interface "
-                                   "outside registers");
+                                   "outside registers that hold its values");
                 return std::nullopt;
             }
             return ActiveSignature{abi, std::move(*layout)};

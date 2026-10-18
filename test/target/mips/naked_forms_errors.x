@@ -39,4 +39,14 @@ global u32 caller(in u32 start) {
     bump(value);
     return value;
 }
+#elif NAKED_ERROR == 5
+// One 32-bit GPR cannot hold a u64 parameter.
+[[naked, clobber()]]
+global void wide(in u64 value "a0") {
+    register u32 link "ra";
+    $::_jr(link);
+}
+global void caller(in u64 start) {
+    wide(start);
+}
 #endif

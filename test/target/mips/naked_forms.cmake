@@ -87,7 +87,8 @@ foreach(case
         "1|vr4300|target instruction '[$]::_mfc0' requires feature 'mips32'"
         "2|vr4300|target instruction '[$]::_wait' requires feature 'mips32'"
         "3|vr4300|target instruction '[$]::_beq' transfers control and is only available in a naked function"
-        "4|vr4300|calls to a MIPS naked function with out or inout parameters are not implemented")
+        "4|vr4300|calls to a MIPS naked function with out or inout parameters are not implemented"
+        "5|r3000|MIPS naked function has an interface outside registers that hold its values")
     string(REGEX MATCH "^([0-9]+)[|]([a-z0-9]+)[|](.*)$" ignored "${case}")
     set(index "${CMAKE_MATCH_1}")
     set(cpu "${CMAKE_MATCH_2}")
