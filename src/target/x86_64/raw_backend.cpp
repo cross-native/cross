@@ -4172,7 +4172,8 @@ private:
         std::string section_error;
         const auto directive = assembly_section_directive(
             format_, {section, AssemblySectionKind::Code,
-                      function.section.has_value(), entity.retain,
+                      function.section.has_value(),
+                      entity.retain || hir_.retained_code_sections.contains(section),
                       entity.mergeable ? std::string_view(symbol)
                                        : std::string_view{}},
             section_error);

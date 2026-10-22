@@ -39,6 +39,8 @@ expect_error(eval-only "1:14: error: attribute 'constructor' requires runtime sy
     "[[eval_only, constructor]] static void set_up() {}\n")
 expect_error(repeated "1:16: error: attribute 'constructor' appears more than once"
     "[[constructor, constructor(101)]] static void set_up() {}\n")
+expect_error(repeated-later "1:28: error: attribute 'destructor' appears more than once"
+    "[[constructor, destructor, destructor]] static void set_up() {}\n")
 expect_error(two-priorities "1:3: error: attribute 'destructor' takes at most one priority"
     "[[destructor(101, 102)]] static void tear_down() {}\n")
 expect_error(priority-range "1:3: error: constructor priority must be an integer from 0 to 65535"
@@ -53,6 +55,8 @@ expect_error(object-section "3:16: error: attribute 'section' is not valid with 
     "${entry}[[constructor, section(\".init\")]] static entry pointer = run;\n")
 expect_error(object-both "3:16: error: an object cannot be both a constructor and a destructor entry"
     "${entry}[[constructor, destructor]] static entry pointer = run;\n")
+expect_error(object-aligned "4:16: error: an initializer table entry cannot be aligned beyond its type, since the table's entries follow one another without padding"
+    "${entry}[[used, constructor]] static entry first = run;\n[[constructor, aligned(32)]] static entry padded = run;\n")
 expect_error(local "1:25: error: attribute 'constructor' is not valid on a local object"
     "global void outer() { [[constructor]] static u32 x = 1u32; (void)x; }\n")
 expect_error(record "1:14: error: attribute 'destructor' is not valid on a record definition"

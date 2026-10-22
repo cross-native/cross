@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <bit>
 #include <cstdint>
+#include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -72,7 +73,14 @@ public:
             const Subtarget& subtarget, const CompilerOptions& options,
             Diagnostics& diagnostics)
         : module_(module), options_(options), diagnostics_(diagnostics),
-          format_(subtarget.object_format()) {}
+          format_(subtarget.object_format()) {
+        // A section is one input to a linker, so when it holds a retained
+        // object, each of its pieces carries the retention flag.
+        for (const auto& object : module_.data().objects) {
+            const auto& entity = module_.hir().object(object.source);
+            if (object.retain && entity.section) retained_sections_.insert(*entity.section);
+        }
+    }
 
     // Each source unit's functions in emission order, then its objects.
     std::string layout(std::vector<mir::FunctionAssembly> functions) {
@@ -337,7 +345,8 @@ private:
         }
         std::string error;
         const auto directive = assembly_section_directive(
-            format_, {section, kind, entity.section.has_value(), object.retain},
+            format_, {section, kind, entity.section.has_value(),
+                      object.retain || retained_sections_.contains(section)},
             error);
         if (!directive) {
             diagnostics_.error(object.location, error);
@@ -609,6 +618,7 @@ private:
     const CompilerOptions& options_;
     Diagnostics& diagnostics_;
     ObjectFormat format_;
+    std::set<std::string> retained_sections_;
     std::ostringstream out_;
 };
 

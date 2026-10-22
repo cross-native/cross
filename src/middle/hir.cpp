@@ -2538,6 +2538,15 @@ private:
             object.minimum_alignment = co_await parse_alignment_async(
                 representative->attributes, "an object definition",
                 source_namespace(object.source_name));
+            // The runtime walks a table's entries without gaps.
+            if (object.table_entry &&
+                object.minimum_alignment >
+                    layout_alignment(module_, object.type, target_).value_or(1)) {
+                const auto* aligned = object_attribute(*representative, "aligned");
+                diagnostics_.error(aligned ? aligned->location : object.location,
+                    "an initializer table entry cannot be aligned beyond its type, "
+                    "since the table's entries follow one another without padding");
+            }
             std::vector<const Attribute*> symbol_attributes;
             std::vector<const Attribute*> indirection_attributes;
             for (const auto* declaration : object.declarations) {
@@ -2682,6 +2691,10 @@ private:
                 }
                 function.link_symbol = *function.weakref_target;
             }
+        }
+        for (const auto& function : module_.functions) {
+            if (function.retain && function.section)
+                module_.retained_code_sections.insert(*function.section);
         }
 
         for (auto& object : module_.objects) {

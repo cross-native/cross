@@ -4087,7 +4087,9 @@ section are emitted into that section contiguously in definition order, with
 only the padding their alignments require; `-ffunction-sections` and
 `-fdata-sections` affect only definitions without an explicit section, which
 they place in a section named after the definition's link name in the object
-format's convention.
+format's convention. Where the object format retains whole sections, a
+`retain` definition retains the named section that holds it, with every
+definition placed there.
 
 ### Initializer tables
 
@@ -4111,7 +4113,8 @@ table's ABI, or an array of such pointers. The attribute implies `used`. It
 is invalid on a function declaration without a body, a generic function, and
 a translation-only function, with `section`, `thread_local`, `noinit`,
 `address`, `alias`, or `weakref` on the object, and as both `constructor`
-and `destructor` on one object.
+and `destructor` on one object. Entries follow one another without padding,
+so an entry object cannot be aligned beyond its type.
 
 An optional priority, an integer constant expression from 0 to 65535, orders
 the entries of a table: constructors with lower priorities run first, and

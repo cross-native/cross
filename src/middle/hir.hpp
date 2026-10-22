@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -353,6 +354,9 @@ public:
     std::vector<Function> functions;
     std::vector<Object> objects;
     std::vector<Label> labels;
+    // Named sections that hold a retained function. A section is one input
+    // to a linker, so each of its pieces carries the retention flag.
+    std::set<std::string> retained_code_sections;
     std::unordered_map<const FunctionDecl*, FunctionId> function_ids;
     std::unordered_map<const ObjectDecl*, ObjectId> object_ids;
     std::unordered_map<NominalTypeKey, RecordId, NominalTypeKeyHash> record_ids;

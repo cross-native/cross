@@ -81,6 +81,25 @@ if(NOT read_status EQUAL 0 OR
        "Name: [.]text[.]unlikely[.]metadata_cold[^}]*SHF_GNU_RETAIN")
     message(FATAL_ERROR "ELF function retain flag missing\n${elf_sections}\n${read_stderr}")
 endif()
+# Entities that share a named section with a retained one assemble into the
+# same retained section.
+foreach(target x86_64-unknown-linux-gnu mips64el-unknown-elf)
+    execute_process(
+        COMMAND "${CC}" -c -O2 -target "${target}" -DSHARED_SECTIONS=1 "${SOURCE}"
+                -o "${OUTPUT}-shared-${target}.o"
+        RESULT_VARIABLE shared_status ERROR_VARIABLE shared_stderr)
+    if(NOT shared_status EQUAL 0)
+        message(FATAL_ERROR "${target} shared retained sections failed\n${shared_stderr}")
+    endif()
+    execute_process(
+        COMMAND "${LLVM_READOBJ}" --sections "${OUTPUT}-shared-${target}.o"
+        OUTPUT_VARIABLE shared_sections)
+    foreach(section text data)
+        if(NOT shared_sections MATCHES "Name: [.]${section}[.]shared [^}]*SHF_GNU_RETAIN")
+            message(FATAL_ERROR "${target} .${section}.shared is not retained\n${shared_sections}")
+        endif()
+    endforeach()
+endforeach()
 
 execute_process(
     COMMAND "${CC}" -emit-llvm -O2 "${SOURCE}" -o "${OUTPUT}.ll"

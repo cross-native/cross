@@ -269,16 +269,21 @@ bool table_attribute(std::string_view name) {
 void validate_table_attributes(const std::vector<Attribute>& attributes,
                                const FunctionDecl* function, const ObjectDecl* object,
                                Diagnostics& diagnostics) {
-    const Attribute* first{};
+    const Attribute* constructor{};
+    const Attribute* destructor{};
     for (const auto& attribute : attributes) {
         if (!table_attribute(attribute.name)) continue;
         const auto subject = "attribute '" + attribute.name + "'";
+        const bool is_constructor = attribute.name == "constructor";
+        auto& seen = is_constructor ? constructor : destructor;
+        const auto* other = is_constructor ? destructor : constructor;
         if (attribute.arguments.size() > 1) {
             diagnostics.error(attribute.location, subject + " takes at most one priority");
-        } else if (first && (first->name == attribute.name || object)) {
-            diagnostics.error(attribute.location, first->name == attribute.name
-                ? subject + " appears more than once"
-                : "an object cannot be both a constructor and a destructor entry");
+        } else if (seen) {
+            diagnostics.error(attribute.location, subject + " appears more than once");
+        } else if (object && other) {
+            diagnostics.error(attribute.location,
+                "an object cannot be both a constructor and a destructor entry");
         } else if (function && !function->generic_parameters.empty()) {
             diagnostics.error(attribute.location, subject + " is not valid on a generic function");
         } else if (function && evaluation_only(*function) &&
@@ -306,7 +311,7 @@ void validate_table_attributes(const std::vector<Attribute>& attributes,
                 }
             }
         }
-        if (!first) first = &attribute;
+        if (!seen) seen = &attribute;
     }
 }
 

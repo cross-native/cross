@@ -91,6 +91,17 @@ body("${text}" unaligned_word code)
 expect(unaligned_word "${code}" "\tlwl\t[$]v0,0[(][$]a0[)]\n\tnop\n\tlwr\t[$]v0,3[(][$]a0[)]\n")
 reject(unaligned_word "${code}" "\tlwr\t[^\n]*\n\taddiu\t")
 reject(r3000 "${text}" "\n(movn|ins|teq|vector):")
+body("${text}" signed_immediates code)
+expect(signed_immediates "${code}" "\taddiu\t[$][a-z0-9]+,[$]a0,-1\n")
+expect(signed_immediates "${code}" "\tslti\t[$][a-z0-9]+,[$][a-z0-9]+,-32768\n")
+expect(signed_immediates "${code}" "\taddiu\t[$][a-z0-9]+,[$][a-z0-9]+,-5\n")
+expect(signed_immediates "${code}" "\tori\t[$][a-z0-9]+,[$][a-z0-9]+,65535\n")
+execute_process(COMMAND "${CC}" -c -O2 -target mips-unknown-elf -march=r3000 "${SOURCE}"
+                        -o "${OUTPUT}-r3000.o"
+    RESULT_VARIABLE status ERROR_VARIABLE errors)
+if(NOT status EQUAL 0)
+    message(FATAL_ERROR "r3000 object failed\n${errors}")
+endif()
 
 # Allegrex instructions are words with the mnemonic in a comment.
 compile(allegrex -mprofile=psp-allegrex)

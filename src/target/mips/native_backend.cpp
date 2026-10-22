@@ -2773,8 +2773,13 @@ private:
                                    "MIPS instruction immediate is not a "
                                    "constant");
             }
+            // The constant keeps its type's width and signedness, which
+            // decide how the emitter writes it.
+            const auto bits = type_bits(hir_, source.type);
             result.operands.push_back(immediate_operand(
-                source.integer, source.integer_high, machine::i32));
+                source.integer, source.integer_high,
+                {static_cast<std::uint16_t>(bits ? bits : 32U)},
+                is_signed_integer(hir_, source.type)));
         }
         const auto names = [](const std::vector<std::string_view>& resources,
                               std::string_view name) {
@@ -12287,6 +12292,7 @@ private:
         const auto& entry = encoded_entry(form);
         std::vector<std::string> texts;
         std::vector<std::uint64_t> immediates(form.operands.size());
+        std::vector<bool> signed_immediates(form.operands.size());
         // Register numbers, immediates, and memory offsets by operand of
         // the form, and the bases of its memory operands.
         std::vector<std::int64_t> numbers(form.operands.size());
@@ -12328,8 +12334,15 @@ private:
             } else {
                 const auto& immediate =
                     std::get<machine::ImmediateOperand>(value.operands[next++]);
-                immediates[index] = immediate.value;
-                numbers[index] = static_cast<std::int64_t>(immediate.value);
+                // A signed constant is written as its value, not its bits.
+                const auto bits = immediate.mode.bits;
+                const auto shift = bits && bits < 64U ? 64U - bits : 0U;
+                const auto written = immediate.is_signed
+                    ? static_cast<std::int64_t>(immediate.value << shift) >> shift
+                    : static_cast<std::int64_t>(immediate.value);
+                immediates[index] = static_cast<std::uint64_t>(written);
+                signed_immediates[index] = immediate.is_signed;
+                numbers[index] = written;
             }
         }
         // Inputs without a color take distinct scratches, which functions
@@ -12390,9 +12403,10 @@ private:
                 numbers[index] = number(input_names[index]);
                 texts.push_back(reg_name(input_names[index]));
             } else {
-                texts.push_back(field.assembly_register_number
-                                    ? "$" + std::to_string(immediates[index])
-                                    : std::to_string(immediates[index]));
+                const auto text = signed_immediates[index]
+                    ? std::to_string(static_cast<std::int64_t>(immediates[index]))
+                    : std::to_string(immediates[index]);
+                texts.push_back(field.assembly_register_number ? "$" + text : text);
             }
         }
         // The register that the form reads and writes starts as its input;
@@ -23266,7 +23280,8 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
     std::string section_error;
     const auto directive = assembly_section_directive(
         format_, {section, AssemblySectionKind::Code,
-                  entity.section.has_value(), entity.retain,
+                  entity.section.has_value(),
+                  entity.retain || hir_.retained_code_sections.contains(section),
                   entity.mergeable ? std::string_view(symbol)
                                    : std::string_view{}},
         section_error);

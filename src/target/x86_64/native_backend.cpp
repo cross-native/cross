@@ -26792,7 +26792,9 @@ private:
         std::string section_error;
         const auto directive = assembly_section_directive(
             format_, {section, AssemblySectionKind::Code,
-                      entity.section.has_value(), entity.retain, group},
+                      entity.section.has_value(),
+                      entity.retain || hir_.retained_code_sections.contains(section),
+                      group},
             section_error);
         if (!directive) {
             diagnostics_.error(function.location, section_error);

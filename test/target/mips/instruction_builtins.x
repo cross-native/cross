@@ -22,6 +22,21 @@ global u32 merged(in u32 a, in u32 b) {
     return first ^ second;
 }
 
+// Signed constants are written as their values, whatever their type's width;
+// unsigned ones as theirs.
+global i32 signed_immediates(in i32 a) {
+    i32 sum;
+    i32 less;
+    i32 below;
+    u32 mask;
+    $::_addiu(sum, a, -1);
+    $::_slti(less, sum, -32768);
+    $::_addiu(below, less, (i8)-5);
+    const u32 bits = (u32)below;
+    $::_ori(mask, bits, 0xffffu32);
+    return (i32)mask;
+}
+
 // ADD traps on overflow: it stays though nothing reads its result.
 global void trapping_add(in u32 a, in u32 b) {
     u32 sum;
