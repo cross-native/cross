@@ -13,6 +13,7 @@
 #include <charconv>
 #include <cctype>
 #include <iomanip>
+#include <iterator>
 #include <sstream>
 
 namespace cross {
@@ -51,14 +52,16 @@ std::string normalized(const std::filesystem::path& path) {
     return (error ? path.lexically_normal() : canonical).generic_string();
 }
 
-// `start` locates text[0]; `runs` are the later discontinuities.
+// `start` locates text[0]; `runs` are the later discontinuities, in order.
 SourceLocation run_location(SourceLocation start, const std::vector<TextRun>& runs,
                             std::size_t index) {
+    const auto after = std::upper_bound(
+        runs.begin(), runs.end(), index,
+        [](std::size_t at, const TextRun& run) { return at < run.index; });
     std::size_t base = 0;
-    for (const auto& run : runs) {
-        if (run.index > index) break;
-        start = run.location;
-        base = run.index;
+    if (after != runs.begin()) {
+        start = std::prev(after)->location;
+        base = std::prev(after)->index;
     }
     start.column += static_cast<unsigned>(index - base);
     start.offset += index - base;
