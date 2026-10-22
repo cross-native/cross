@@ -862,7 +862,8 @@ bool preprocess_inputs(const CompilerOptions& options, SourceManager& sources,
             line_units.assign(line_origins.size(),
                               unit_occurrence(unit, unit_counts));
             preprocessed = sources.add(input, std::move(source), {}, {},
-                                       line_origins, line_units);
+                                       line_origins, line_units,
+                                       std::move(preprocessor.output_column_origins()));
         }
         if (!preprocessed) continue;
         if (options.inputs.size() > 1)
@@ -908,12 +909,19 @@ std::vector<const SourceFile*> split_source_units(
             shifted.end -= begin;
             origins.push_back(std::move(shifted));
         }
+        std::vector<ColumnOrigin> columns;
+        for (auto column : source.column_origins) {
+            if (column.line <= begin_line || column.line > end_line) continue;
+            column.line -= static_cast<unsigned>(begin_line);
+            columns.push_back(column);
+        }
         result.push_back(sources.add(source.path,
             source.text.substr(begin, end - begin), {}, std::move(origins),
             std::vector<SourceLocation>(source.line_origins.begin() + first,
                                         source.line_origins.begin() + last),
             std::vector<std::string>(source.line_units.begin() + first,
-                                     source.line_units.begin() + last)));
+                                     source.line_units.begin() + last),
+            std::move(columns)));
         begin_line = end_line;
     }
     return result;
@@ -1166,6 +1174,7 @@ int cc_main(int argc, char** argv) {
     }
     for (const auto* unit : compilation_units)
         program.source_units.push_back(unit->source_unit_at(1));
+    const auto group_definitions = std::make_shared<GroupTypeDefinitions>();
     for (const auto* preprocessed_source : compilation_units) {
         auto tokens = Lexer(*preprocessed_source, diagnostics).lex();
         // One expansion path for every source unit. An unused syntax
@@ -1175,7 +1184,8 @@ int cc_main(int argc, char** argv) {
         std::shared_ptr<SyntaxExecution> execution;
         for (std::size_t at = 0; at < tokens.size(); ++at) {
             const bool invocation = at + 2 < tokens.size() &&
-                tokens[at].kind == TokenKind::Identifier && tokens[at + 1].is("!") &&
+                tokens[at].kind == TokenKind::Identifier &&
+                !is_reserved_identifier(tokens[at].text) && tokens[at + 1].is("!") &&
                 (tokens[at + 2].is("(") || tokens[at + 2].is("[") || tokens[at + 2].is("{"));
             // A role attribute list begins with "[["; starting the head scan
             // at every token would be quadratic in a long statement.
@@ -1192,9 +1202,10 @@ int cc_main(int argc, char** argv) {
         if (diagnostics.errors() != 0) return 1;
         Parser parser(std::move(tokens), diagnostics, std::move(execution),
                       program.address_bits);
+        parser.share_group_definitions(group_definitions, preprocessed_source->source_unit_at(1));
         auto unit = parser.parse();
         for (auto& record : unit.records) {
-            program.records.push_back(std::move(record));
+            if (!record.repeated) program.records.push_back(std::move(record));
         }
         for (auto& enumeration : unit.enumerations) {
             program.enumerations.push_back(std::move(enumeration));

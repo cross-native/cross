@@ -43,13 +43,10 @@ SourceLocation logical_location(const Token& token,
                                 std::span<const SourceLocation> origins) {
     if (token.location.line == 0 || token.location.line > origins.size() ||
         !origins[token.location.line - 1].valid()) return token.location;
-    auto result = origins[token.location.line - 1];
-    const auto shift = token.location.column - 1;
-    if (shift <= result.file->line(result.line).size()) {
-        result.column += shift;
-        result.offset += shift;
-    }
-    return result;
+    const auto result = token.location.file->logical_location(token.location);
+    // A preprocessed input's line may be longer than its written one.
+    return result.column - 1 <= result.file->line(result.line).size()
+        ? result : origins[token.location.line - 1];
 }
 
 struct SelectedFile {
@@ -204,7 +201,7 @@ EmbedDiscovery discover_embeds(SourceManager& sources, const SourceFile& source,
             [](const auto& left, const auto& right) { return left.begin < right.begin; });
         result.source = sources.add(source.path, source.text, {},
                                     std::move(token_origins), source.line_origins,
-                                    source.line_units);
+                                    source.line_units, source.column_origins);
     }
     return result;
 }

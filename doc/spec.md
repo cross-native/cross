@@ -231,9 +231,10 @@ u128      uptr      using     void      volatile  while
 ```
 
 A reserved keyword cannot name a declared entity, member, parameter, generic
-parameter, tag, enumerator, label, or namespace.
-No other word is reserved. In particular, `auto`, `char`, `double`, `extern`,
-`float`, `int`, `long`, `short`, `signed`, `unsigned`, and every
+parameter, tag, enumerator, label, or namespace. Neither can `_`, which is not
+a keyword but the discard of an `out` argument (see “Abstract parameter
+cells”). No other word is reserved. In particular, `auto`, `char`, `double`,
+`extern`, `float`, `int`, `long`, `short`, `signed`, `unsigned`, and every
 underscore-prefixed compatibility spelling are ordinary identifiers, not type
 specifiers or keywords. Compiler-controlled expression/type facilities use `$::`
 names instead of consuming keywords. Attribute names are contextual and consume
@@ -401,9 +402,12 @@ data instead, so an image patcher can change it.
 
 An **lvalue** designates an object or function. Except as the operand of `&`,
 `sizeof`, `$::alignof`, or assignment's destination, an object lvalue is read
-and becomes a value. An array lvalue becomes a pointer to its first element
-except under `sizeof`, `&`, and string-array initialization. A function name
-becomes a function pointer except under `&`.
+and becomes a value of the unqualified version of its type: `const`,
+`volatile`, `restrict`, and atomic qualification belong to objects, so no
+value, arithmetic result, or variadic actual carries them. An array lvalue
+becomes a pointer to its first element except under `sizeof`, `&`, and
+string-array initialization. A function name becomes a function pointer
+except under `&`.
 
 Assignment converts the source to the destination type. A cast `(T) value`
 requests the same conversion explicitly. Conversions are permitted between
@@ -420,11 +424,11 @@ integer wider sign-extends it. Floating/integer conversion truncates toward
 zero and is undefined when the finite result is not representable.
 
 An expression of type `void` has no value. It cannot supply an initializer,
-assignment source, value-producing cast, `in`/`inout` argument, or unnamed
-variadic argument. A void expression statement and void return forwarding keep
-their effects without a value; an `out` non-lvalue actual is evaluated only for
-effects as specified below. These source constraints also apply in untaken
-branches and unevaluated operands.
+assignment source, value-producing cast, argument, or unnamed variadic
+argument. A void expression statement and void return forwarding keep their
+effects without a value. A cast to `void`, `(void)expression`, evaluates its
+operand of any type for its effects and discards the value. These source
+constraints also apply in untaken branches and unevaluated operands.
 
 Initialization, assignment, arguments, return, and parameter copy-out all use
 assignment conversion and permit arithmetic narrowing. An implicit pointer
@@ -756,10 +760,12 @@ do not by themselves require that feature.
 | Character | One character/escape, type `u32`; multicharacter is invalid. |
 | UTF-8 string | `const u8[N]`, including zero terminator; adjacent strings concatenate. |
 
-C's numeric suffixes (such as `u`, `l`, and `ul`) and prefixed or wide strings
-do not exist. Cross provides no implicit Boolean-literal names: `true` and
-`false` are ordinary identifiers that user code or source macros may define if
-desired.
+A decimal floating literal has a decimal point, an exponent, or a floating
+suffix; the digits on either side of its point may be omitted, but not on
+both, so `.5`, `1.`, and `1e3` are floating literals. C's numeric suffixes
+(such as `u`, `l`, and `ul`) and prefixed or wide strings do not exist. Cross
+provides no implicit Boolean-literal names: `true` and `false` are ordinary
+identifiers that user code or source macros may define if desired.
 
 ### Enumerations
 
@@ -944,9 +950,11 @@ complete pointed-to type; the integer of a subscript or pointer offset
 converts to `iptr` before scaling. Within one array object, pointers may range from its
 first element through one past its last element. The one-past pointer may be
 formed, compared, and subtracted but not dereferenced. Subtracting two pointers
-requires positions in the same array and yields `iptr`; relational pointer
-comparison has defined ordering only within that array. Equality also compares
-null pointers and addresses outside a common array.
+to versions of one object type that may differ in `const`, `volatile`, and
+`restrict` qualification, as comparison also permits, requires positions in
+the same array and yields `iptr`; relational pointer comparison has defined
+ordering only within that array. Equality also compares null pointers and
+addresses outside a common array.
 
 Unary `*` requires a pointer to an object or function type, not `void`. Forming
 an incomplete object designator does not read its representation; for example,
@@ -1424,6 +1432,11 @@ is generated. An unknown active directive is an error unless the target
 documents it as a Cross pragma. Redefinition of a user macro replaces its prior
 definition; redefining or undefining a compiler-owned `$::` macro is an error.
 
+A macro name is recognized wherever its identifier appears outside a literal,
+whatever token follows it, so `case K1:` expands an object-like macro `K1`;
+labels are a parser concept. Only `::` followed by an identifier continues a
+qualified macro name.
+
 An unqualified macro defined in a namespace is its member and uses the
 preprocessor's namespace/import scope tracking. This affects macro lookup only;
 it does not qualify ordinary Cross identifiers in replacement text. Macro
@@ -1477,15 +1490,18 @@ is the input's source-unit identity, followed by its normal line marker. `cc`
 accepts this boundary in preprocessed Cross verbatim and uses it for `static`
 visibility. It is not a source directive and is
 rejected when written in a `.x` file. Duplicate global definitions and
-unnamespaced type or tag conflicts remain semantic errors; preprocessing does
-not rename them.
+conflicting type or tag definitions remain semantic errors (see “Compilation
+and separate compilation”); preprocessing does not rename them.
 
 ### Source positions and dependency output
 
 `cpp` emits `#line` around inputs/includes. Diagnostics and dependencies use
 original paths and positions, and `$::source::file` uses the original path
 after `-ffile-prefix-map`; diagnostics include file, line, column when known,
-and reason.
+and reason. Lines and columns are those of the written source: a token that a
+source-macro expansion produces is located at the macro's invocation, and every
+other token keeps its own position, unaffected by comments, line splices, and
+expansions earlier on its line.
 
 Dependencies come from the textual include graph and active, declared
 `$::embed` operations and never contain temporary paths. `-M` and `-MM`
@@ -1589,7 +1605,7 @@ An evaluated ordinary call uses the abstract parameter-cell semantics of
 uninitialized, and normal return saves the ordinary result and then performs
 assignment conversion and left-to-right copy-out. A copy-out destination must
 be translation-time automatic or allocated storage, including its subobjects;
-a non-output-capable argument receives a discarded temporary. Evaluation
+the discard `_` receives a hidden cell whose value is dropped. Evaluation
 failure or a non-normal exit performs no copy-out.
 
 #### The translation-time sandbox
@@ -1741,9 +1757,10 @@ argument, or a conflicting deduction is an error.
 
 Deduction first resolves the named generic entity, applies the ordinary
 array/function parameter adjustments, and obtains each fixed actual's type: for
-an `out` or `inout` argument the designator's type, or the expression's type
-when a discarded-output temporary is used, without reading an `out` value. The
-adjusted formal and actual types are then matched structurally: every
+an `out` or `inout` argument the designator's type, without reading an `out`
+value; the discard `_` supplies no type, so a parameter that only `_` would
+supply is not deduced. The adjusted formal and actual types are then matched
+structurally: every
 occurrence of an unbound type parameter must yield the same canonical type,
 retaining nominal enumeration and label identity, address spaces, pointer
 qualifications, and complete stable callable interfaces; the actual of an `in`
@@ -1911,6 +1928,8 @@ ABI transport, or machine entry/exit machinery (`abi`, `alias`, `aligned`,
 
 An invocation is a qualified macro name, `!`, and one balanced `(...)`, `[...]`,
 or `{...}` token tree; the delimiters group the input and are not part of it.
+A reserved keyword never names a macro, so a keyword followed by `!` never
+starts an invocation: `return !(x);` returns the negation of `x`.
 The result replaces the complete invocation as a token sequence in the
 surrounding source, without an implicit grammar boundary, scope, or
 parentheses: it may be empty, contain several items, or supply operators and
@@ -2787,6 +2806,20 @@ through such a pointer, and a normal return on a path where a leaf remains
 unassigned are errors. An address that escapes to a call or to storage
 neither assigns nor reads the cell.
 
+That control flow follows the operators that select what they evaluate, as
+in C# and Java: a leaf is assigned after a condition *when true* or *when
+false* if every evaluation that gives the condition that value assigns it.
+After `a && b` when true, and before `b`, everything assigned after `a` when
+true is assigned; after `a && b` when false, what is assigned both after `a`
+when false and after `b` when false. `a || b` is the dual, `!a` exchanges the
+two states, and after `c ? x : y` with a given value what is assigned after
+`x` and after `y` with that value, where `x` starts from `c` when true and `y`
+from `c` when false. Statements branch on these states, so in
+`if (!s || parse(s, v) || v < 0) { ... }` the read `v < 0` and the code after
+the `if` see `v` assigned by `parse`. Another expression has one state for
+both values; the truth of a stored value, such as `bool ok = get(v);`, is not
+tracked.
+
 Function declarations and their callers must agree on the normalized
 mode and ABI contract across separate compilations.
 
@@ -2795,11 +2828,12 @@ Such a function requires a stable standard or complete manual ABI.
 
 ### Variadic calls and implementation
 
-An ellipsis follows at least one named parameter. Variadic actuals undergo
-array/function decay; `bool`, 8/16-bit integers, and eligible enumerations
-promote to `i32`; `f32` promotes to `f64`. The selected ABI model defines all
-remaining classification, placement, register/overflow areas, hidden state,
-supported types, and named incoming-state resources.
+An ellipsis follows at least one named parameter. Variadic actuals are
+values, so they have unqualified types, and undergo array/function decay;
+`bool`, 8/16-bit integers, and eligible enumerations promote to `i32`; `f32`
+promotes to `f64`. The selected ABI model defines all remaining
+classification, placement, register/overflow areas, hidden state, supported
+types, and named incoming-state resources.
 
 Cross supplies no `va_list` or traversal API. A definition may bind ABI
 state into local cells:
@@ -2844,21 +2878,27 @@ For a call, the following abstract steps occur:
    from left to right in parameter declaration order.
 7. The saved ordinary result is delivered to the caller.
 
-For an output-capable modifiable lvalue, step 1 captures its object and address
-as the destination. Otherwise a temporary receives discarded copy-out, so
-constants and expressions are valid:
+The argument of an `out` or `inout` parameter is a modifiable lvalue, whose
+object and address step 1 captures as the destination; for `out`, without
+reading its value. The argument of an `out` parameter may instead be `_`,
+which designates no object: nothing is evaluated for it, and the cell's final
+value is discarded. Any other argument, such as a constant, an rvalue, or a
+`const` or array lvalue, is an error, so a result is never discarded
+silently; a value for an `inout` parameter whose result is not wanted is
+copied into an object first.
 
 ```x
 void normalize(inout i32 status);
+void measure(out i32 width, out i32 height);
 
-global void example(in i32 a, in i32 b) {
-    normalize(0);       // hidden cell initialized to 0; final value is discarded
-    normalize(a + b);   // hidden cell initialized to a + b
+global i32 example(in i32 a) {
+    i32 status = a;
+    normalize(status);  // status receives the result
+    i32 width;
+    measure(width, _);  // the height is discarded
+    return width + status;
 }
 ```
-
-For `out`, an lvalue's address is evaluated without reading its value. A
-non-lvalue is evaluated once for side effects, then ignored.
 
 Copy-out applies the assignment conversion back to the captured destination.
 Writing a `volatile` actual is therefore a volatile access. Copy-out does not
@@ -3292,7 +3332,6 @@ void normalize(inout i32 status "push=>pop") [[clobber()]];
 global i32 update() {
     i32 status = 0;
     normalize(status); // push status; call; pop final status
-    normalize(0);      // push 0; call; pop and discard final value
     return status;
 }
 ```
@@ -4099,6 +4138,18 @@ Consequently, an undecorated `mod::foo2` definition can satisfy calls when
 emits an external reference but the defining object exposes no external symbol,
 so linking fails. Marking the definition `global` makes separate linking valid.
 
+Types have no linkage: each source unit sees the tags, typedefs, and
+enumerators that it declares or includes. File- and namespace-scope
+definitions of a record, union, or enumeration with the same tag and the same
+token sequence after preprocessing, including the attributes that apply to
+them, in several source units of a group denote one type, so a header that
+defines types may be included by several inputs; the `n`-th anonymous
+definition with a given token sequence in one unit and the `n`-th in another
+also denote one type. The enumerators of such definitions are one entity each,
+and a typedef names the merged type in every unit that declares it. Two
+definitions of a tag with different token sequences, and two enumerators of
+the same name in different enumerations, are errors.
+
 ## Interoperation
 
 ### C interfaces
@@ -4336,7 +4387,9 @@ reject:
   evaluation, unhygienic or cyclic procedural expansion, and forbidden
   compile-time access to host or runtime state;
 - reads of unassigned `out` cells, writes to `const` parameter cells, missing
-  `out` assignment on normal return, and incompatible copy-out destinations;
+  `out` assignment on normal return, `out` and `inout` arguments that are not
+  modifiable lvalues (or `_` for `out`), and incompatible copy-out
+  destinations;
 - unknown, unavailable, mismatched, or data-model-incompatible ABIs; incomplete
   custom contracts; invalid variadic state; overlapping locations; and illegal
   stack-cleanup/output combinations;

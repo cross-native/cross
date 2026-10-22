@@ -1733,6 +1733,8 @@ bool deduce_generic_arguments(const FunctionDecl& generic,
     for (std::size_t index = 0; index < generic.parameters.size(); ++index) {
         const auto& parameter = generic.parameters[index];
         const auto& argument = *call.arguments[index];
+        // The discard has no type to deduce from.
+        if (parameter.mode == ParameterMode::Out && discard_expression(argument)) continue;
         auto actual = infer_generic_actual(
             argument, caller, program, state,
             parameter.mode == ParameterMode::In);
@@ -3990,7 +3992,7 @@ std::optional<ResolvedEnumerator> exact_enumerator(
     std::optional<ResolvedEnumerator> result;
     for (const auto& enumeration : program.enumerations) {
         for (const auto& enumerator : enumeration.enumerators) {
-            if (enumeration.local) continue;
+            if (enumeration.local || enumeration.repeated) continue;
             if (enumerator.name != name) continue;
             if (result) return std::nullopt;
             result = ResolvedEnumerator{&enumeration, &enumerator};
@@ -4857,6 +4859,10 @@ const char* source_address_error(const Expr& node, const Program& program,
     return nullptr;
 }
 
+bool is_void_type(const TypePtr& type) {
+    return type && type->kind == Type::Kind::Builtin && type->builtin == BuiltinType::Void;
+}
+
 bool incompatible_records(const TypePtr& left, const TypePtr& right) {
     // Value copying ignores top-level value qualifiers, not nominal identity.
     if (!left || !right || left->kind == Type::Kind::Generic || right->kind == Type::Kind::Generic)
@@ -4926,7 +4932,8 @@ std::optional<SourceExpressionIssue> source_offsetof_error(const Expr& node, con
 // A designator need not read its object. In particular, &*p can preserve an
 // incomplete record pointer, whereas an ordinary value use must know the
 // complete object type. This role is independent of execution/unevaluation.
-enum class SourceExpressionUse { Value, Designator };
+// `_` as an `out` argument designates nothing and is not visited.
+enum class SourceExpressionUse { Value, Designator, Discard };
 
 SourceExpressionUse source_left_use(const Expr& node, SourceExpressionUse inherited) {
     if (node.kind == Expr::Kind::Parenthesized) return inherited;
@@ -5034,7 +5041,7 @@ std::optional<SourceExpressionIssue> source_object_expression_error(const Expr& 
     if (node.kind == Expr::Kind::Conditional && node.right && node.third &&
         incompatible_records(type_of(*node.right, true), type_of(*node.third, true)))
         return error("conditional record operands must have the same nominal record type");
-    if (node.kind == Expr::Kind::Cast && node.left &&
+    if (node.kind == Expr::Kind::Cast && node.left && !is_void_type(node.type) &&
         incompatible_records(type_of(*node.left, true), node.type))
         return error("a record value requires the same nominal record type in cast");
     if (node.kind == Expr::Kind::Assign && node.text == "=" && node.left && node.right &&
@@ -5299,10 +5306,6 @@ bool source_constant_candidate(const Expr& expression);
 
 enum class SourceConversion { Implicit, Explicit };
 
-bool is_void_type(const TypePtr& type) {
-    return type && type->kind == Type::Kind::Builtin && type->builtin == BuiltinType::Void;
-}
-
 const char* source_value_error(const TypePtr& type) {
     return is_void_type(type) ? "void expression cannot supply a value" : nullptr;
 }
@@ -5402,7 +5405,7 @@ const char* source_meta_expression_error(const Expr& node, const TypeOf& type_of
         const auto source = type_of(*node.left, true);
         if (contains_meta_type(node.type) && !is_meta_type(node.type))
             return "opaque meta values cannot appear inside runtime pointer, array, or function types";
-        if (is_meta_type(source) || is_meta_type(node.type)) {
+        if (!is_void_type(node.type) && (is_meta_type(source) || is_meta_type(node.type))) {
             if (node.left->kind == Expr::Kind::Quote && !is_meta_type(node.type))
                 return "quote cannot enter runtime expressions";
             if (!conditional_meta_type(source, node.type)) return "incompatible meta value in cast";
@@ -5492,6 +5495,7 @@ std::optional<std::string> source_name_error(const Expr& node, Program& program,
         node.left->text.starts_with("$::"))
         return source_name_error(*node.left, program, caller, type_of, true);
     if (node.kind != Expr::Kind::Name) return {};
+    if (discard_expression(node)) return "'_' can only discard the result of an 'out' argument";
     if (node.text.starts_with("$::")) {
         // Instruction names and operand/resource interpretation stay with the
         // target. Compiler-owned names do not bypass source validation merely
@@ -5552,8 +5556,17 @@ SourceExpressionUse source_argument_use(const Expr& call, std::size_t index, con
     if (signature && signature->kind == Type::Kind::Function && signature->function &&
         index < signature->function->parameters.size() &&
         signature->function->parameters[index].mode == ParameterMode::Out)
-        return SourceExpressionUse::Designator;
+        return index < call.arguments.size() && discard_expression(*call.arguments[index])
+            ? SourceExpressionUse::Discard : SourceExpressionUse::Designator;
     return SourceExpressionUse::Value;
+}
+
+// A result-bearing argument names where the result goes: an `out` or `inout`
+// argument is a modifiable lvalue, or `_` for an `out` result to discard.
+const char* result_argument_error(ParameterMode mode) {
+    return mode == ParameterMode::Out
+        ? "an 'out' argument must be a modifiable lvalue or '_'"
+        : "an 'inout' argument must be a modifiable lvalue";
 }
 
 struct SourceConstantProbe {
@@ -6580,6 +6593,8 @@ private:
     void conversion(const Expr& value, const TypePtr& destination, std::string_view context,
                     SourceConversion kind = SourceConversion::Implicit,
                     bool compound = false) {
+        // `(void)value` discards a value of any type.
+        if (kind == SourceConversion::Explicit && is_void_type(destination)) return;
         const auto source = type(value);
         if (is_meta_type(source) || is_meta_type(destination)) {
             if (value.kind == Expr::Kind::Quote && !is_meta_type(destination))
@@ -6700,7 +6715,7 @@ private:
     EvaluationTask<void> expression_async(const Expr& node, bool potentially_evaluated = true,
                     bool ordinary_name = true, SourcePatchOperand patch_operand = {},
                     bool direct_callee = false, SourceExpressionUse use = SourceExpressionUse::Value) {
-        if (!valid_) co_return;
+        if (!valid_ || use == SourceExpressionUse::Discard) co_return;
         struct Depth {
             unsigned& value;
             ~Depth() { --value; }
@@ -6900,20 +6915,24 @@ private:
                     if (index < callable->parameters.size()) {
                         const auto& argument = *node.arguments[index];
                         const auto& parameter = callable->parameters[index];
+                        if (parameter.mode == ParameterMode::Out && discard_expression(argument)) continue;
                         const auto actual = type(argument, false);
-                        // Out arguments supply no input value. Nonmodifiable
-                        // actuals receive discarded copy-out, so even their
+                        // Out arguments supply no input value, so even their
                         // record type need not match the parameter cell.
                         if (parameter.mode != ParameterMode::Out || is_meta_type(actual) || is_meta_type(parameter.type))
                             conversion(argument, parameter.type, "call argument");
-                        if (parameter.mode != ParameterMode::In && actual && !actual->is_const &&
-                            actual->kind != Type::Kind::Array && actual->kind != Type::Kind::Function &&
-                            object_lvalue(argument)) {
-                            record_conversion(parameter.type, actual, argument.location, "parameter copy-out");
-                            if (valid_)
-                                if (const auto* reason = source_conversion_error(parameter.type, actual,
-                                        SourceConversion::Implicit, false, &program_))
-                                    error(argument.location, std::string(reason) + " in parameter copy-out");
+                        if (parameter.mode != ParameterMode::In && actual &&
+                            actual->kind != Type::Kind::Generic && !is_meta_type(actual)) {
+                            if (actual->is_const || actual->kind == Type::Kind::Array ||
+                                actual->kind == Type::Kind::Function || !object_lvalue(argument)) {
+                                if (valid_) error(argument.location, result_argument_error(parameter.mode));
+                            } else {
+                                record_conversion(parameter.type, actual, argument.location, "parameter copy-out");
+                                if (valid_)
+                                    if (const auto* reason = source_conversion_error(parameter.type, actual,
+                                            SourceConversion::Implicit, false, &program_))
+                                        error(argument.location, std::string(reason) + " in parameter copy-out");
+                            }
                         }
                     } else {
                         const auto actual = type(*node.arguments[index]);
@@ -9238,6 +9257,8 @@ public:
             std::optional<EvalValue> value;
             if (expression.left) value = co_await this->expression_async(*expression.left);
             if (!value || !expression.type) co_return std::nullopt;
+            // `(void)value` evaluates its operand and discards the value.
+            if (is_void_type(expression.type)) co_return EvalValue{UInt128{}, builtin_type(BuiltinType::Void)};
             co_return co_await convert_async(*value, expression.type, expression.location, true);
         }
         case Expr::Kind::Sizeof:
@@ -10094,6 +10115,12 @@ private:
                 co_return false;
             }
             const auto object = expression_type(argument, false);
+            if (parameter.mode != ParameterMode::In && object && object->kind != Type::Kind::Generic &&
+                !is_meta_type(object) && (object->is_const || object->kind == Type::Kind::Array ||
+                object->kind == Type::Kind::Function || !translation_lvalue(argument))) {
+                fail(argument.location, result_argument_error(parameter.mode));
+                co_return false;
+            }
             if (parameter.mode != ParameterMode::In && object && !object->is_const &&
                 object->kind != Type::Kind::Array && object->kind != Type::Kind::Function &&
                 translation_lvalue(argument)) {
@@ -10117,6 +10144,7 @@ private:
                                                                SourcePatchOperand patch_operand = {},
                                                                bool direct_callee = false,
                                                                SourceExpressionUse use = SourceExpressionUse::Value) {
+        if (use == SourceExpressionUse::Discard) co_return true;
         if (const auto issue = source_patch_intrinsic_error(node, program_, current_function_,
                 [&](const Expr& operand, bool decay) { return expression_type(operand, decay); })) {
             fail(issue->location, issue->message);
@@ -10253,6 +10281,7 @@ private:
 
     EvaluationTask<bool> validate_required_tree_async(const Expr& node, bool direct_callee = false,
                                                      SourceExpressionUse use = SourceExpressionUse::Value) {
+        if (use == SourceExpressionUse::Discard) co_return true;
         if (const auto issue = source_patch_intrinsic_error(node, program_, current_function_,
                 [&](const Expr& operand, bool decay) { return expression_type(operand, decay); })) {
             fail(issue->location, issue->message);
@@ -14021,6 +14050,10 @@ private:
             const auto& actual = *expression.arguments[index];
             const auto& parameter = function->parameters[index];
             EvaluatedCallArgument argument{{}, {}, actual.location};
+            if (parameter.mode == ParameterMode::Out && discard_expression(actual)) {
+                arguments.push_back(std::move(argument));
+                continue;
+            }
             const auto object = expression_type(actual, false);
             if (parameter.mode != ParameterMode::In && translation_lvalue(actual)) {
                 // Form the designator once even for a nonmodifiable lvalue.
@@ -14447,7 +14480,7 @@ private:
             for (const auto ch : type_name(type))
                 spelling.push_back(std::isalnum(static_cast<unsigned char>(ch)) != 0 ? ch : '_');
             if (spelling.empty() || std::isdigit(static_cast<unsigned char>(spelling.front())) != 0 ||
-                is_reserved_identifier(spelling))
+                is_reserved_identifier(spelling) || spelling == "_")
                 spelling.insert(spelling.begin(), '_');
             if (!charge_meta_bytes(96 + 2 * spelling.size(), location)) co_return std::nullopt;
             auto token = identifier(spelling, macro_context_, {});
@@ -14776,7 +14809,7 @@ private:
                         ++index;
             }
             if (prefix.empty() || std::isdigit(static_cast<unsigned char>(prefix.front())) != 0 ||
-                is_reserved_identifier(prefix))
+                is_reserved_identifier(prefix) || prefix == "_")
                 prefix.insert(prefix.begin(), '_');
             const auto source = macro_context_->invocation;
             auto fresh = std::make_shared<FreshIdentifier>();
@@ -15674,7 +15707,7 @@ EvaluationTask<bool> evaluate_enumerations_async(Program& program, Diagnostics& 
     };
     const auto errors = diagnostics.errors();
     const auto resources = program.evaluation_resource_errors;
-    std::unordered_set<std::string> names;
+    std::unordered_map<std::string, SourceLocation> names;
     // Nested instantiation prepares its own enums. Visit only this publication
     // batch, in declaration order, so a later generic actual may use an earlier
     // enumerator. Neither preparation nor evaluation may retain vector-element
@@ -15702,12 +15735,16 @@ EvaluationTask<bool> evaluate_enumerations_async(Program& program, Diagnostics& 
             }
             const auto location = program.enumerations[index].enumerators[item].location;
             const auto underlying = program.enumerations[index].underlying;
-            if (!program.enumerations[index].local &&
-                !names.insert(program.enumerations[index].enumerators[item].name).second) {
-                diagnostics.error(location,
-                                  "enumerator '" + program.enumerations[index].enumerators[item].name +
-                                      "' is declared more than once");
-                continue;
+            if (!program.enumerations[index].local && !program.enumerations[index].repeated) {
+                const auto [declared, inserted] =
+                    names.try_emplace(program.enumerations[index].enumerators[item].name, location);
+                if (!inserted) {
+                    diagnostics.error(location,
+                                      "enumerator '" + program.enumerations[index].enumerators[item].name +
+                                          "' is declared more than once");
+                    diagnostics.note(declared->second, "the other declaration is here");
+                    continue;
+                }
             }
             std::optional<EvalValue> value;
             if (const auto known = program.enumerations[index].enumerators[item].value) {

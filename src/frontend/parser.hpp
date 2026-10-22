@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <optional>
 #include <limits>
+#include <map>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -41,11 +42,32 @@ struct SyntaxHeaderBindings {
                 SourceLocation location);
 };
 
+// The file-scope type definitions of the source units of one compilation
+// group. A definition that repeats another unit's definition of the same tag
+// token for token denotes the same type; so does the n-th anonymous
+// definition with a given token sequence in each unit.
+struct GroupTypeDefinitions {
+    struct Definition {
+        std::string unit;
+        std::string tokens;
+        SourceLocation location;
+        std::shared_ptr<const NominalTypeIdentity> identity;
+    };
+    std::unordered_map<std::string, Definition> named;
+    std::map<std::pair<std::string, std::uint64_t>, Definition> anonymous;
+};
+
 class Parser {
 public:
     Parser(std::vector<Token> tokens, Diagnostics& diagnostics,
            std::shared_ptr<SyntaxExecution> execution = {},
            unsigned address_bits = 0);
+    // Match this source unit's type definitions with the group's other units.
+    void share_group_definitions(std::shared_ptr<GroupTypeDefinitions> definitions,
+                                 std::string unit) {
+        group_definitions_ = std::move(definitions);
+        group_unit_ = std::move(unit);
+    }
     Program parse();
     EvaluationTask<Program> parse_async();
     // Parse one bounded expansion declaration with the ordinary function
@@ -533,6 +555,16 @@ private:
     std::optional<HeaderNominalScope> completed_header_nominals_;
     std::vector<NameMap<LocalTag>> local_tag_scopes_;
     std::shared_ptr<std::uint64_t> nominal_occurrence_ = std::make_shared<std::uint64_t>();
+    std::shared_ptr<GroupTypeDefinitions> group_definitions_;
+    std::string group_unit_;
+    // This unit's anonymous file-scope definitions so far, by token sequence.
+    std::shared_ptr<std::map<std::string, std::uint64_t>> anonymous_definitions_ =
+        std::make_shared<std::map<std::string, std::uint64_t>>();
+    std::optional<std::size_t> brace_group_end(std::size_t first) const;
+    bool repeated_group_definition(std::string_view kind, const std::string& name,
+                                   std::size_t first, std::size_t end,
+                                   const std::vector<Attribute>& attributes, SourceLocation location,
+                                   std::shared_ptr<const NominalTypeIdentity>& identity);
     std::shared_ptr<const GenericTagOwner> generic_tag_owner_;
     std::shared_ptr<const FunctionScopeIdentity> function_scope_;
     std::optional<NameMap<LocalTag>> tag_destination_;

@@ -202,7 +202,9 @@ std::vector<Token> Lexer::lex() {
         }
         if (ident_start(peek())) result.push_back(lex_identifier());
         else if (peek() == '$') result.push_back(lex_builtin());
-        else if (std::isdigit(static_cast<unsigned char>(peek())) != 0) result.push_back(lex_number());
+        else if (std::isdigit(static_cast<unsigned char>(peek())) != 0 ||
+                 (peek() == '.' && std::isdigit(static_cast<unsigned char>(peek(1))) != 0))
+            result.push_back(lex_number());
         else if (peek() == '"') result.push_back(lex_quoted('"', TokenKind::String));
         else if (peek() == '\'') result.push_back(lex_quoted('\'', TokenKind::Character));
         else result.push_back(lex_punctuator());

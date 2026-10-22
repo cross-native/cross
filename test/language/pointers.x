@@ -36,7 +36,7 @@ global i32 copyout_addresses() {
     i32 value = 0i32;
     i32 *pointer = &value;
     write_pair(*pointer, *pointer);
-    write_pair(addressable_global, 1i32 + 2i32);
+    write_pair(addressable_global, _);
     return value + addressable_global;
 }
 

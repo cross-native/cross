@@ -45,10 +45,7 @@ static $::meta::tokens helper(in $::meta::tokens input) {
         struct Other array[1] = {{31uptr, 37u32}};
         volatile struct Pair observable = {41uptr, 43u32};
         struct Pair unexecuted_copy = observable;
-        output(0u32);
-        output(discarded);
-        output((struct Other)discarded);
-        output(array);
+        output(_);
         output(value);
     }
     return input;

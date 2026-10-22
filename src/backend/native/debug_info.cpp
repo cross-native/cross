@@ -124,13 +124,9 @@ SourceLocation written_location(SourceLocation location) {
             location = expansion->invocation;
             continue;
         }
-        if (location.line != 0 && location.line <= file->line_origins.size()) {
-            auto origin = file->line_origins[location.line - 1];
-            if (origin.valid()) {
-                origin.column += std::max(1U, location.column) - 1;
-                return origin;
-            }
-        }
+        if (location.line != 0 && location.line <= file->line_origins.size() &&
+            file->line_origins[location.line - 1].valid())
+            return file->logical_location(location);
         if (const auto* token = file->token_origin_at(location.offset);
             token && token->span.valid() && token->span.file != file) {
             location = token->span;

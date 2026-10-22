@@ -15,6 +15,13 @@
 
 namespace cross {
 
+// The written position of text[index] and of the characters after it, up
+// to the next run.
+struct TextRun {
+    std::size_t index{};
+    SourceLocation location;
+};
+
 class Preprocessor {
 public:
     Preprocessor(SourceManager& sources, Diagnostics& diagnostics,
@@ -24,6 +31,7 @@ public:
     const std::vector<SourceLocation>& output_line_locations() const {
         return output_line_locations_;
     }
+    std::vector<ColumnOrigin>& output_column_origins() { return output_column_origins_; }
 
 private:
     struct Macro {
@@ -38,10 +46,18 @@ private:
         std::string name;
         bool arguments{};
     };
+    // The input character that an expanded one comes from: copied, or the
+    // first character of the invocation that produced it.
+    struct ExpandedOrigin {
+        std::size_t input{};
+        bool expansion{};
+    };
 
     std::string expand_includes(const std::filesystem::path& path,
                                 std::vector<std::filesystem::path>& stack);
     std::string expand_macros(std::string_view source, const SourceFile* file);
+    void record_columns(const std::vector<ExpandedOrigin>& origins, SourceLocation location,
+                        const std::vector<TextRun>& runs);
     std::filesystem::path find_include(const std::filesystem::path& including,
                                        std::string_view name, bool quoted) const;
     void install_predefined_macros();
@@ -51,7 +67,8 @@ private:
                             unsigned depth,
                             std::optional<SourceLocation> condition = {},
                             std::optional<SourceLocation> origin = {},
-                            std::optional<OpenInvocation>* open = nullptr) const;
+                            std::optional<OpenInvocation>* open = nullptr,
+                            std::vector<ExpandedOrigin>* origins = nullptr) const;
     std::string substitute(const Macro& macro, const std::vector<std::string>& arguments,
                            std::unordered_set<std::string>& disabled,
                            unsigned depth,
@@ -68,7 +85,9 @@ private:
     std::unordered_set<std::string> pragma_once_files_;
     std::unordered_set<std::string> already_included_;
     std::vector<SourceLocation> line_locations_;
+    std::vector<std::vector<TextRun>> line_runs_;
     std::vector<SourceLocation> output_line_locations_;
+    std::vector<ColumnOrigin> output_column_origins_;
     std::vector<std::filesystem::path> dependencies_;
     std::unordered_set<std::string> dependency_identities_;
 };

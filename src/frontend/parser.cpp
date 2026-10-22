@@ -463,7 +463,9 @@ EvaluationTask<bool> Parser::parse_syntax_registration_async(Program* program) {
 }
 
 bool Parser::macro_start() const {
-    if (!syntax_ || current().kind != TokenKind::Identifier) return false;
+    // A keyword never names a macro: `return !(x)` negates.
+    if (!syntax_ || current().kind != TokenKind::Identifier ||
+        is_reserved_identifier(current().text)) return false;
     auto at = index_ + 1;
     while (at + 1 < tokens_.size() && tokens_[at].is("::") &&
            tokens_[at + 1].kind == TokenKind::Identifier) at += 2;
@@ -650,6 +652,9 @@ std::unique_ptr<Parser> Parser::replacement_parser(SyntaxExecution::Output outpu
     child->local_tag_scopes_ = local_tag_scopes_;
     child->scope_ambiguities_ = scope_ambiguities_;
     child->nominal_occurrence_ = nominal_occurrence_;
+    child->group_definitions_ = group_definitions_;
+    child->group_unit_ = group_unit_;
+    child->anonymous_definitions_ = anonymous_definitions_;
     child->generic_tag_owner_ = generic_tag_owner_;
     child->generic_header_depth_ = generic_header_depth_;
     child->function_scope_ = function_scope_;
@@ -2726,11 +2731,15 @@ void Parser::request_type_alignment(TypePtr& type, const Attribute& attribute) {
     type->alignment = std::max(type->alignment, static_cast<unsigned>(value));
 }
 
-// Keywords are lexical identifiers, never declared names.
+// Keywords are lexical identifiers, never declared names; neither is the
+// discard `_`.
 void Parser::reject_keyword_name(const Token& token) {
-    if (token.kind == TokenKind::Identifier && is_reserved_identifier(token.text))
+    if (token.kind != TokenKind::Identifier) return;
+    if (is_reserved_identifier(token.text))
         diagnostics_.error(token.location,
             "reserved keyword '" + std::string(token.text) + "' cannot be a declared name");
+    else if (token.text == "_")
+        diagnostics_.error(token.location, "'_' is the discard and cannot be a declared name");
 }
 
 void Parser::type_error(TypePtr& type, SourceLocation location, std::string message) {
@@ -3279,6 +3288,56 @@ std::shared_ptr<const NominalTypeIdentity> Parser::new_nominal_identity(SourceLo
         function_scope_});
 }
 
+// One past the brace that closes the group opened at `first`.
+std::optional<std::size_t> Parser::brace_group_end(std::size_t first) const {
+    if (first >= tokens_.size() || !tokens_[first].is("{")) return {};
+    std::size_t depth = 0;
+    for (auto at = first; at < tokens_.size() && tokens_[at].kind != TokenKind::End; ++at) {
+        if (tokens_[at].is("{")) ++depth;
+        else if (tokens_[at].is("}") && --depth == 0) return at + 1;
+    }
+    return {};
+}
+
+// Whether the file-scope definition in tokens [first, end) repeats another
+// source unit's definition of the same type; an anonymous one then takes
+// that definition's identity. A named one that differs is an error.
+bool Parser::repeated_group_definition(std::string_view kind, const std::string& name,
+    std::size_t first, std::size_t end, const std::vector<Attribute>& attributes,
+    SourceLocation location, std::shared_ptr<const NominalTypeIdentity>& identity) {
+    if (!group_definitions_ || parsing_public_fragment_ || preparing_header_ ||
+        generic_tag_owner_ || !binds_at_file_scope()) return false;
+    std::string tokens;
+    for (auto at = first; at < end && at < tokens_.size(); ++at) {
+        if (!tokens.empty()) tokens += ' ';
+        tokens += tokens_[at].text;
+    }
+    // Attributes written before the tag also shape the type.
+    for (const auto& attribute : attributes) {
+        tokens += " [[" + attribute.name;
+        for (const auto& argument : attribute.arguments) tokens += ' ' + argument;
+        tokens += "]]";
+    }
+    auto& group = *group_definitions_;
+    if (!name.empty()) {
+        const auto [found, inserted] = group.named.try_emplace(
+            std::string(kind) + ' ' + name, GroupTypeDefinitions::Definition{group_unit_, tokens, location, {}});
+        if (inserted || found->second.unit == group_unit_) return false;
+        if (found->second.tokens != tokens) {
+            diagnostics_.error(location, std::string(kind == "enum" ? "enumeration '" : "record '") + name +
+                "' is defined differently in another source unit of the compilation group");
+            diagnostics_.note(found->second.location, "the other definition is here");
+        }
+        return true;
+    }
+    const auto occurrence = (*anonymous_definitions_)[tokens]++;
+    const auto [found, inserted] = group.anonymous.try_emplace({tokens, occurrence},
+        GroupTypeDefinitions::Definition{group_unit_, tokens, location, identity});
+    if (inserted || found->second.unit == group_unit_) return false;
+    identity = found->second.identity;
+    return true;
+}
+
 TypePtr Parser::declare_local_tag(TypePtr type, SourceLocation location, bool complete,
                                   const GenericSignature& generic) {
     const NameKey key(type->nominal_name, location);
@@ -3704,10 +3763,17 @@ EvaluationTask<TypePtr> Parser::parse_type_async(bool record_specifiers,
                     std::make_move_iterator(record_attributes.end()));
                 if (!name) {
                     declaration.nominal_identity = new_nominal_identity(location);
+                    if (const auto end = brace_group_end(index_))
+                        declaration.repeated = repeated_group_definition(is_union ? "union" : "struct", {},
+                            keyword_index, *end, declaration.attributes, location, declaration.nominal_identity);
                 } else if (local_tag) {
                     type = declare_local_tag(record_type(*name, is_union), name_location, true, signature);
                     declaration.nominal_identity = type->nominal_identity;
                 } else {
+                    if (const auto end = brace_group_end(index_))
+                        declaration.repeated = repeated_group_definition(is_union ? "union" : "struct",
+                            declaration.name, keyword_index, *end, declaration.attributes, location,
+                            declaration.nominal_identity);
                     auto [tag, inserted] = record_types_.emplace(
                         declaration.name, RecordTag{is_union, true, signature});
                     if (!inserted && tag->second.is_union != is_union) {
@@ -3847,6 +3913,10 @@ EvaluationTask<TypePtr> Parser::parse_type_async(bool record_specifiers,
                     declaration.nominal_identity = type->nominal_identity;
                     declaration.captured_type_errors = type->captured_tag_errors;
                 }
+                if (!declaration.local)
+                    if (const auto end = brace_group_end(index_))
+                        declaration.repeated = repeated_group_definition("enum", declaration.name,
+                            keyword_index, *end, declaration.attributes, location, declaration.nominal_identity);
                 if (name && !local_tag) {
                     const auto found = enum_types_.find(declaration.name);
                     if (found != enum_types_.end() && found->second.underlying != declaration.underlying) {
@@ -4016,7 +4086,8 @@ EvaluationTask<std::vector<std::string>> Parser::preview_generic_types_async(boo
     };
     const auto expose_async = [&](std::size_t at)  -> EvaluationTask<void> {
         if (pending_fragments) {
-            if (at >= tokens_.size() || tokens_[at].kind != TokenKind::Identifier) co_return;
+            if (at >= tokens_.size() || tokens_[at].kind != TokenKind::Identifier ||
+                is_reserved_identifier(tokens_[at].text)) co_return;
             while (at + 2 < tokens_.size() && tokens_[at + 1].is("::") &&
                    tokens_[at + 2].kind == TokenKind::Identifier) at += 2;
             if (at + 2 < tokens_.size() && tokens_[at + 1].is("!") &&
@@ -6236,6 +6307,7 @@ EvaluationTask<void> Parser::parse_enum_declaration_async(Program& program,
     ProductionScope type_specifier(*this, SyntaxProduction::TypeSpecifier);
     ProductionScope enumeration(*this, SyntaxProduction::EnumSpecifier);
     const auto location = (co_await current_async()).location;
+    const auto keyword_index = index_;
     (co_await consume_async("enum"));
     const auto name_index = index_;
     auto name = (co_await parse_qualified_name_async());
@@ -6276,6 +6348,10 @@ EvaluationTask<void> Parser::parse_enum_declaration_async(Program& program,
     } else {
         enum_types_[*name] = {underlying, declaration.captured_type_errors};
     }
+    if ((co_await current_async()).is("{"))
+        if (const auto end = brace_group_end(index_))
+            declaration.repeated = repeated_group_definition("enum", declaration.name, keyword_index, *end,
+                declaration.attributes, location, declaration.nominal_identity);
     remember_tag_binding(name_index, written_name, enum_type(declaration), true);
     co_await parse_enumerators_async(declaration, name_space);
     enumeration.finish();
@@ -6410,6 +6486,7 @@ EvaluationTask<void> Parser::parse_record_declaration_async(
     ProductionScope type_specifier(*this, SyntaxProduction::TypeSpecifier);
     ProductionScope record(*this, SyntaxProduction::StructOrUnionSpecifier);
     const auto location = (co_await current_async()).location;
+    const auto keyword_index = index_;
     const bool is_union = (co_await consume_async("union"));
     if (!is_union) (co_await consume_async("struct"));
     const auto name_index = index_;
@@ -6456,6 +6533,10 @@ EvaluationTask<void> Parser::parse_record_declaration_async(
     declaration.is_union = is_union;
     declaration.attributes = std::move(attributes);
     remember_tag_binding(name_index, written_name, record_type(declaration), true);
+    if ((co_await current_async()).is("{"))
+        if (const auto end = brace_group_end(index_))
+            declaration.repeated = repeated_group_definition(is_union ? "union" : "struct", *name,
+                keyword_index, *end, declaration.attributes, location, declaration.nominal_identity);
     if ((co_await consume_async("{"))) {
         declaration.complete = true;
         if (!inserted && tag->second.complete) {

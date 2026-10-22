@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <fstream>
+#include <iterator>
 #include <sstream>
+#include <utility>
 
 namespace cross {
 
@@ -56,10 +58,12 @@ SourceFile::SourceFile(std::filesystem::path source_path, std::string source_tex
                        std::vector<SourceExpansion> source_expansions,
                        std::vector<SourceTokenOrigin> source_token_origins,
                        std::vector<SourceLocation> source_line_origins,
-                       std::vector<std::string> source_line_units)
+                       std::vector<std::string> source_line_units,
+                       std::vector<ColumnOrigin> source_column_origins)
     : path(std::move(source_path)), text(std::move(source_text)),
       expansions(std::move(source_expansions)),
       line_origins(std::move(source_line_origins)),
+      column_origins(std::move(source_column_origins)),
       line_units(std::move(source_line_units)),
       token_origins(std::move(source_token_origins)) {
     for (std::size_t i = 0; i < text.size(); ++i) {
@@ -73,6 +77,26 @@ std::string SourceFile::source_unit_at(unsigned number) const {
     if (number != 0 && number <= line_units.size() &&
         !line_units[number - 1].empty()) return line_units[number - 1];
     return path.generic_string();
+}
+
+SourceLocation SourceFile::logical_location(SourceLocation location) const {
+    if (location.line == 0 || location.line > line_origins.size() ||
+        !line_origins[location.line - 1].valid()) return location;
+    const auto column = std::max(1U, location.column);
+    const auto found = std::upper_bound(column_origins.begin(), column_origins.end(),
+        std::pair{location.line, column}, [](const auto& position, const ColumnOrigin& entry) {
+            return position < std::pair{entry.line, entry.column};
+        });
+    auto result = line_origins[location.line - 1];
+    unsigned shift = column - 1;
+    if (found != column_origins.begin() && std::prev(found)->line == location.line) {
+        const auto& entry = *std::prev(found);
+        result = entry.origin;
+        shift = entry.expansion ? 0 : column - entry.column;
+    }
+    result.column += shift;
+    result.offset += shift;
+    return result;
 }
 
 const SourceTokenOrigin* SourceFile::source_token_origin_at(std::size_t offset) const {
@@ -152,11 +176,12 @@ const SourceFile* SourceManager::add(
     std::vector<SourceExpansion> expansions,
     std::vector<SourceTokenOrigin> token_origins,
     std::vector<SourceLocation> line_origins,
-    std::vector<std::string> line_units) {
+    std::vector<std::string> line_units,
+    std::vector<ColumnOrigin> column_origins) {
     files_.push_back(std::make_unique<SourceFile>(
         std::move(path), std::move(text), std::move(expansions),
         std::move(token_origins), std::move(line_origins),
-        std::move(line_units)));
+        std::move(line_units), std::move(column_origins)));
     return files_.back().get();
 }
 

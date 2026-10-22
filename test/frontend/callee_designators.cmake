@@ -180,7 +180,7 @@ $::static_assert(sizeof((1u32 ? saved : callbacks[0u32])(1u32)) == sizeof(uptr),
 }
 $::static_assert(inspect((Callback)0u32) == sizeof(uptr) + 5uptr, "held pointer is not called");
 $::static_assert(sizeof(((u32 (*)(in bool))0uptr)((u32 *)0uptr)) == sizeof(u32), "pointer-to-bool argument");
-$::static_assert(sizeof(((u32 (*)(out u32))0uptr)(1.0f64)) == sizeof(u32), "discarded output has no input conversion");
+$::static_assert(sizeof(((u32 (*)(out u32))0uptr)(_)) == sizeof(u32), "the discard has no input conversion");
 ]=])
 check(indirect_copyout_record "same nominal record type.*copy-out" [=[
 struct Record { u32 value; };

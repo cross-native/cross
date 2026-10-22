@@ -30,6 +30,7 @@
 #include <set>
 #include <span>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -3812,6 +3813,13 @@ private:
         case Expr::Kind::Cast: {
             if (!expression.left || !expression.type) break;
             const auto destination_type = hir_.intern_type(expression.type);
+            if (void_type(hir_, destination_type)) {
+                // `(void)value` evaluates its operand and discards the value.
+                if (co_await lower_expression_async(*expression.left))
+                    result = add_value(ValueKind::VoidValue, destination_type,
+                                       expression.location);
+                break;
+            }
             if (pointer_type(hir_, destination_type) && expression.left->evaluated_integer &&
                 expression.left->evaluated_integer->value == UInt128{}) {
                 const auto source_type = infer_type(*expression.left);
@@ -4428,7 +4436,14 @@ private:
         if ((addition || subtraction) &&
             (left_pointer || right_pointer)) {
             if (left_pointer && right_pointer) {
-                if (!subtraction || !representation_compatible(hir_, *left_type, *right_type)) {
+                // The pointees may differ in qualification, as for comparison.
+                const auto left_pointee = hir_.type(*left_type).pointee;
+                const auto right_pointee = hir_.type(*right_type).pointee;
+                const bool same_pointee = left_pointee && right_pointee &&
+                    hir_.type(*left_type).address_space == hir_.type(*right_type).address_space &&
+                    hir_.type(*left_pointee).is_atomic == hir_.type(*right_pointee).is_atomic &&
+                    hir_.unqualified(*left_pointee) == hir_.unqualified(*right_pointee);
+                if (!subtraction || !same_pointee) {
                     diagnostics_.error(
                         expression.location,
                         "pointer subtraction requires matching pointer types");
@@ -6078,10 +6093,9 @@ private:
                 }
                 if (!initial) co_return std::nullopt;
                 (void)store_slot(temporary, *initial, actual.location);
-            } else if (!actual_local && !actual_object && !actual_designator && !actual_lane) {
-                // A non-lvalue `out` actual is still evaluated once for its
-                // source-visible effects; only its eventual copy-out is
-                // discarded.
+            } else if (!actual_local && !actual_object && !actual_designator && !actual_lane &&
+                       !discard_expression(actual)) {
+                // Source validation admits only lvalues and `_` here.
                 if (!co_await lower_expression_async(actual)) co_return std::nullopt;
             }
             arguments.push_back({std::nullopt, cell, parameter.type, false});
@@ -6109,6 +6123,8 @@ private:
              index < expression.arguments.size(); ++index) {
             const auto& actual = *expression.arguments[index];
             auto type = infer_type(actual);
+            // A variadic actual is a value: lvalue conversion drops qualifiers.
+            if (type) type = hir_.unqualified(*type);
             if (!type || !supported_call_type(hir_, *type, CallTypeUse::Variadic)) {
                 diagnostics_.error(actual.location,
                                    "unsupported variadic argument type");
@@ -7309,6 +7325,37 @@ bool out_type_complete(const hir::Module& module, const TargetInfo& target,
         [&](hir::TypeId type) { return storage_size(module, type, target); });
 }
 
+// The value whose truth decides `condition` having `truth`, through the
+// zero tests, logical negations and widenings that branch lowering adds.
+std::pair<ValueId, bool> truth_source(const ManagedFunction& function,
+                                      const hir::Module& module,
+                                      ValueId condition, bool truth) {
+    const auto zero = [&](ValueId id) {
+        const auto& value = function.values[id.value];
+        return value.kind == ValueKind::ConstantInteger && value.integer == 0 &&
+               value.integer_high == 0;
+    };
+    for (;;) {
+        const auto& value = function.values[condition.value];
+        if (value.kind == ValueKind::Unary && value.unary == UnaryOperation::IsZero &&
+            value.operands.size() == 1) {
+            truth = !truth;
+        } else if (value.kind == ValueKind::Binary && value.operands.size() == 2 &&
+                   (value.binary == BinaryOperation::NotEqual ||
+                    value.binary == BinaryOperation::Equal) && zero(value.operands[1])) {
+            if (value.binary == BinaryOperation::Equal) truth = !truth;
+        } else if (!(value.kind == ValueKind::Cast && value.operands.size() == 1 &&
+                     (value.cast == CastOperation::ZeroExtend ||
+                      value.cast == CastOperation::SignExtend ||
+                      value.cast == CastOperation::Reinterpret) &&
+                     integer_type(module, value.type) &&
+                     integer_type(module, function.values[value.operands[0].value].type))) {
+            return {condition, truth};
+        }
+        condition = value.operands[0];
+    }
+}
+
 // Run this on source MIR, before inlining or slot promotion can erase the
 // parameter-cell writes. A normal return consumes every `out` cell even when
 // the body contains no explicit load of it.
@@ -7320,6 +7367,9 @@ void check_out_definite_assignment(const ManagedFunction& function,
     if (std::none_of(source.parameters.begin(), source.parameters.end(),
                     [](const auto& parameter) { return parameter.mode == ParameterMode::Out; })) return;
     const LocalPointerAnalysis pointers(function, hir_module, target);
+    std::vector<std::optional<BlockId>> defined_in(function.values.size());
+    for (const auto& block : function.blocks)
+        for (const auto id : block.values) defined_in[id.value] = block.id;
     std::vector<bool> reachable(function.blocks.size());
     std::vector<BlockId> pending{function.entry};
     while (!pending.empty()) {
@@ -7389,9 +7439,61 @@ void check_out_definite_assignment(const ManagedFunction& function,
                                           std::move(assigned));
             return assigned;
         };
+        // A branch on a short-circuit or conditional result tests a phi of
+        // its operands' values, so each successor is reached only through the
+        // incoming edges whose value has that truth: the cell is assigned
+        // "when true" and "when false" as in C# and Java. No state means the
+        // edge cannot be taken.
+        using EdgeState = std::optional<OutBitIntervals>;
+        std::map<std::tuple<std::uint32_t, std::uint32_t, bool>, EdgeState> known;
+        std::function<EdgeState(BlockId, ValueId, bool)> given;
+        const auto edge = [&](BlockId from, BlockId to) -> EdgeState {
+            const auto& terminator = function.blocks[from.value].terminator;
+            if (terminator.kind == TerminatorKind::ConditionalBranch && terminator.value &&
+                terminator.successors.size() == 2 &&
+                terminator.successors[0] != terminator.successors[1])
+                return given(from, *terminator.value, terminator.successors[0] == to);
+            return assigned_out[from.value];
+        };
+        given = [&](BlockId block, ValueId condition, bool truth) -> EdgeState {
+            const auto [phi, wanted] = truth_source(function, hir_module, condition, truth);
+            const auto& value = function.values[phi.value];
+            if (value.kind != ValueKind::Phi || defined_in[phi.value] != block)
+                return assigned_out[block.value];
+            const auto key = std::tuple{block.value, phi.value, wanted};
+            if (const auto found = known.find(key); found != known.end()) return found->second;
+            // A cycle through loop phis learns nothing.
+            known.emplace(key, assigned_out[block.value]);
+            EdgeState joined;
+            bool possible = false;
+            for (const auto& incoming : value.incoming) {
+                const auto from = incoming.predecessor;
+                if (from.value >= reachable.size() || !reachable[from.value]) continue;
+                const auto [root, root_truth] = truth_source(function, hir_module, incoming.value, wanted);
+                const auto& source = function.values[root.value];
+                EdgeState state;
+                if (source.kind == ValueKind::ConstantInteger) {
+                    if ((source.integer != 0 || source.integer_high != 0) != root_truth) continue;
+                    state = edge(from, block);
+                } else if (defined_in[incoming.value.value] == from &&
+                           function.blocks[from.value].terminator.kind == TerminatorKind::Branch) {
+                    state = given(from, incoming.value, wanted);
+                } else {
+                    state = edge(from, block);
+                }
+                if (!state) continue;
+                joined = possible ? intersect_out_intervals(*joined, *state) : *state;
+                possible = true;
+            }
+            const auto result = possible
+                ? EdgeState(transfer(function.blocks[block.value], *joined)) : std::nullopt;
+            known[key] = result;
+            return result;
+        };
         bool changed = true;
         while (changed) {
             changed = false;
+            known.clear();
             for (const auto& block : function.blocks) {
                 if (!reachable[block.id.value]) continue;
                 OutBitIntervals incoming;
@@ -7401,14 +7503,16 @@ void check_out_definite_assignment(const ManagedFunction& function,
                     for (const auto predecessor : block.predecessors) {
                         if (predecessor.value >= reachable.size() ||
                             !reachable[predecessor.value]) continue;
+                        const auto state = edge(predecessor, block.id);
+                        if (!state) continue;
                         if (first) {
-                            incoming = assigned_out[predecessor.value];
+                            incoming = *state;
                             first = false;
                         } else {
-                            incoming = intersect_out_intervals(
-                                incoming, assigned_out[predecessor.value]);
+                            incoming = intersect_out_intervals(incoming, *state);
                         }
                     }
+                    if (first) incoming = top;
                 }
                 const auto outgoing = transfer(block, incoming);
                 if (assigned_in[block.id.value] != incoming ||

@@ -312,6 +312,16 @@ struct SourceExpansion {
           expander(expander_site) {}
 };
 
+// The logical position of the emitted columns from `column` of `line` up to
+// the next entry: written text keeps its columns, and every column of a
+// source-macro expansion is located at its invocation.
+struct ColumnOrigin {
+    unsigned line{};
+    unsigned column{};
+    SourceLocation origin;
+    bool expansion{};
+};
+
 struct SourceFile {
     std::filesystem::path path;
     std::string text;
@@ -319,6 +329,9 @@ struct SourceFile {
     std::vector<SourceExpansion> expansions;
     // One logical origin per emitted source line; empty for written source.
     std::vector<SourceLocation> line_origins;
+    // Sorted by line and column; only lines whose columns do not follow
+    // their origin's have entries.
+    std::vector<ColumnOrigin> column_origins;
     // Primary translation-unit identity is distinct from a line's include path.
     std::vector<std::string> line_units;
     // Sorted by begin; serialization records one exact range per token.
@@ -328,9 +341,13 @@ struct SourceFile {
                std::vector<SourceExpansion> expansions = {},
                std::vector<SourceTokenOrigin> token_origins = {},
                std::vector<SourceLocation> line_origins = {},
-               std::vector<std::string> line_units = {});
+               std::vector<std::string> line_units = {},
+               std::vector<ColumnOrigin> column_origins = {});
     [[nodiscard]] std::string_view line(unsigned line) const;
     [[nodiscard]] std::string source_unit_at(unsigned line) const;
+    // The written position of an emitted one, or `location` itself when this
+    // file records no origin for its line.
+    [[nodiscard]] SourceLocation logical_location(SourceLocation location) const;
     [[nodiscard]] const SourceExpansion* expansion_at(
         std::size_t offset) const;
     [[nodiscard]] const TokenOrigin* token_origin_at(std::size_t offset) const;
@@ -345,7 +362,8 @@ public:
                           std::vector<SourceExpansion> expansions,
                           std::vector<SourceTokenOrigin> token_origins = {},
                           std::vector<SourceLocation> line_origins = {},
-                          std::vector<std::string> line_units = {});
+                          std::vector<std::string> line_units = {},
+                          std::vector<ColumnOrigin> column_origins = {});
     ExpansionId next_expansion() { return {++next_expansion_}; }
 
 private:

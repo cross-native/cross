@@ -30,9 +30,9 @@ global u32 syntax_raw_entry() {
     choose(0);
     forward(8u32);
     if (use(&empty) != 1u32 || observed != 13u32) return 1u32;
-    // An out actual contributes effects, not an input value. Its void call
-    // must execute once even though the parameter result is discarded.
-    produce(write(16u32));
+    // The discard evaluates nothing; the call still runs.
+    write(16u32);
+    produce(_);
     if (observed != 29u32) return 2u32;
     return 61u32;
 }

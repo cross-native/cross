@@ -27,16 +27,16 @@ register restrict return sizeof stack static struct switch syntax typedef u8
 u16 u32 u64 union u128 uptr using void volatile while
 ```
 
-A keyword cannot name anything a program declares. `int`, `char`, `long`,
-`float`, `double`, `extern`, `auto`, `true`, and `false` are ordinary
-identifiers.
+A keyword cannot name anything a program declares, and neither can `_`,
+which discards an `out` argument. `int`, `char`, `long`, `float`, `double`,
+`extern`, `auto`, `true`, and `false` are ordinary identifiers.
 
 | Literal | Type |
 | --- | --- |
 | `42` | First of `i32`, `i64`, `i128` that fits. |
 | `0xff`, `0b1010`, `017` | First of `i32`, `u32`, `i64`, `u64`, `i128`, `u128` that fits. |
 | `4u32`, `0iptr`, `255u8` | The suffixed type; the value must fit. |
-| `1.5`, `1.5f32` | `f64`, or the suffixed `f32`, `f64`, `f80`, `f128`, or `fptr`. |
+| `1.5`, `.5`, `1.5f32` | `f64`, or the suffixed `f32`, `f64`, `f80`, `f128`, or `fptr`. |
 | `'a'` | `u32`. |
 | `"text"` | `const u8[N]`, UTF-8 with a terminating zero. |
 
@@ -57,7 +57,9 @@ Wide or prefixed strings and C's `u`, `l`, `ul` suffixes do not exist.
 Pointers, arrays, `struct`, `union`, `enum`, bit-fields, `typedef`, and
 `const`/`volatile`/`restrict` work as in C. Integer promotion and the usual
 arithmetic conversions follow C's rules applied to exact widths: `bool`, 8-bit,
-and 16-bit values promote to `i32`. Signed overflow, division by zero, and
+and 16-bit values promote to `i32`. A value read from a `const` or
+`volatile` object has the unqualified type, so it is promoted and passed to a
+variadic function like any other value. Signed overflow, division by zero, and
 out-of-range shifts are undefined. Floating expressions round to their own
 type; there is no excess precision. The selected profile declares which
 floating exceptions trap and whether denormal results flush to zero
@@ -211,6 +213,11 @@ global uptr prime_count() {
 }
 ```
 
+Types have no linkage. Each input sees the types and enumerators it declares
+or includes, and a record, union, or enumeration defined with the same tokens
+in several inputs of one command, as by a shared header, is one type; defining
+a tag differently in two inputs is an error.
+
 A `static` or `global` object without an initializer is zero-initialized.
 Exported names are the qualified source names (`net::send`) unless
 `-mmangling` selects another encoding or `[[link_name("send")]]` gives an exact
@@ -243,10 +250,9 @@ global void divide(in u32 a, in u32 b, out u32 quotient, out u32 remainder) {
 
 global u32 digits(u32 value) {
     u32 count = 1;
-    u32 rest;
-    divide(value, 10, value, rest);   // copy-out writes `value` after the call
+    divide(value, 10, value, _);   // copy-out writes `value`; `_` discards
     while (value != 0) {
-        divide(value, 10, value, rest);
+        divide(value, 10, value, _);
         count += 1;
     }
     return count;
@@ -254,8 +260,11 @@ global u32 digits(u32 value) {
 ```
 
 Every parameter is a distinct copy, so modes never create aliases. Copy-out
-happens left to right after the return value is computed. An `out` argument
-that is not an lvalue, such as a constant, receives a discarded temporary.
+happens left to right after the return value is computed. An `out` or `inout`
+argument must be a modifiable lvalue; `_` discards an `out` result. The
+compiler rejects a read of an `out` parameter before it is assigned and a
+return that leaves it unassigned, and it follows `&&`, `||`, `!`, and `?:` as
+C# does: after `if (!p || !parse(p, v)) return -1;`, `v` is assigned.
 
 Other rules:
 
@@ -308,9 +317,11 @@ Statements are C99's. The differences in expressions:
   initializers, and the expressions of a `for` loop's first and last clauses,
   which run left to right: `for (i = 0, j = n; i < j; ++i, --j)` is valid, but
   `i = 0, j = 1;` as a statement is not.
-- Pointer comparisons with integer constant zero, conversions through
-  `void *`, and casts follow C. Function pointers and `void *` do not convert;
-  see [Function pointers](#function-pointers) for their casts.
+- Pointer comparisons with integer constant zero, differences of pointers
+  that differ only in qualification, such as `const u8 *` minus `u8 *`,
+  conversions through `void *`, casts, and `(void)expression` follow C.
+  Function pointers and `void *` do not convert; see
+  [Function pointers](#function-pointers) for their casts.
 - `$::assume(condition)` and `$::unreachable()` state facts the optimizer may
   use; neither adds a check.
 - `$::sqrt`, `$::fabs`, `$::copysign`, `$::fmin`, and `$::fmax` take operands
@@ -544,7 +555,8 @@ tag is declared before its first use.
 
 A procedural macro is a Cross function that runs during compilation and
 returns tokens. It is invoked explicitly with `name!(...)`, `name![...]`, or
-`name! { ... }`, and its result replaces the invocation:
+`name! { ... }`, and its result replaces the invocation; a keyword never names
+a macro, so `return !(x)` is an ordinary negation:
 
 ```x
 [[macro]]

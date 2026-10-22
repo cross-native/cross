@@ -33,7 +33,8 @@ if(NOT status EQUAL 0)
 endif()
 file(READ "${OUTPUT}.s" assembly)
 foreach(pair "spanning;14" "nested;10" "parenthesis_below;6" "queried;1"
-             "after_spans;17")
+             "after_spans;17" "case_one;20" "case_two;30" "case_other;2"
+             "split_size;4")
     list(GET pair 0 name)
     list(GET pair 1 value)
     if(NOT assembly MATCHES "\n${name}:\n\t[.]long ${value}\n")
@@ -52,3 +53,26 @@ function(reject name source)
 endfunction()
 reject(end_of_input "#define TWICE(x) ((x) + (x))\nglobal i32 value = TWICE(1 +\n")
 reject(directive "#define TWICE(x) ((x) + (x))\nglobal i32 value = TWICE(1 +\n#define OTHER 2\n2);\n")
+
+# Diagnostics name written columns: tokens after a macro, a comment, or a line
+# splice keep their own, and an expansion's tokens take the invocation's.
+get_filename_component(directory "${SOURCE}" DIRECTORY)
+execute_process(COMMAND "${CC}" -S -target x86_64-unknown-linux-gnu
+    "${directory}/macro_columns.x" -o "${OUTPUT}.columns.s"
+    RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+foreach(location "10:36: error: record has no member named 'first'"
+                 "13:46: error: unresolved name 'second'"
+                 "17:24: error: record has no member named 'third'"
+                 "21:6: error: record has no member named 'fourth'")
+    if(status EQUAL 0 OR NOT err MATCHES "macro_columns[.]x:${location}")
+        message(FATAL_ERROR "diagnostic not at macro_columns.x:${location}\n${out}\n${err}")
+    endif()
+endforeach()
+file(WRITE "${OUTPUT}.expansion.x"
+    "#define BAD (1 +)\nglobal i32 value() { return 2 * BAD; }\n")
+execute_process(COMMAND "${CC}" -S -target x86_64-unknown-linux-gnu
+    "${OUTPUT}.expansion.x" -o "${OUTPUT}.expansion.s"
+    RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(status EQUAL 0 OR NOT err MATCHES "expansion[.]x:2:33: error: expected expression")
+    message(FATAL_ERROR "an expansion's token is not at its invocation\n${out}\n${err}")
+endif()

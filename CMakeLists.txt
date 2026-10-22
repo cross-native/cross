@@ -1250,6 +1250,20 @@ if(BUILD_TESTING)
         -P "${CMAKE_SOURCE_DIR}/test/language/semantics/errors.cmake")
     set_tests_properties(cross_semantic_errors PROPERTIES
         LABELS "check.compile;diagnostics;arch.x86_64;feature.semantics")
+    add_test(NAME cross_c_forms_runtime COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+        -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/semantics/c_forms.x
+        -DDRIVER=${CMAKE_SOURCE_DIR}/test/language/semantics/c_forms_driver.cpp
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/c-forms-runtime
+        -P "${CMAKE_SOURCE_DIR}/test/language/semantics/c_forms.cmake")
+    set_tests_properties(cross_c_forms_runtime PROPERTIES
+        LABELS "check.runtime;arch.x86_64;arch.mips;backend.native;feature.semantics;feature.variadic;feature.parameters")
+    add_test(NAME cross_out_arguments COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc>
+        -DOUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/out-arguments
+        -P "${CMAKE_SOURCE_DIR}/test/language/semantics/out_arguments.cmake")
+    set_tests_properties(cross_out_arguments PROPERTIES
+        LABELS "check.compile;diagnostics;frontend;feature.parameters;arch.x86_64;arch.mips")
     foreach(mode native custom mips mipsel mips64 mips64el)
         if(mode MATCHES "^mips")
             set(out_arch mips)
@@ -8000,6 +8014,18 @@ if(BUILD_TESTING)
                 -o "${CMAKE_CURRENT_BINARY_DIR}/group.s")
     set_tests_properties(cross_compilation_group PROPERTIES
         LABELS "check.compile;arch.x86_64;backend.native;feature.linkage;opt.O2")
+    foreach(level O0 O2)
+        add_test(NAME cross_group_types_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE_DIR=${CMAKE_SOURCE_DIR}/test/language
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/group-types-${level}
+                    -DLEVEL=${level}
+                    -P "${CMAKE_SOURCE_DIR}/test/language/group_types.cmake")
+        set_tests_properties(cross_group_types_${level} PROPERTIES
+            LABELS "check.runtime;diagnostics;arch.x86_64;arch.mips;backend.native;feature.linkage;feature.types;feature.debug;opt.${level}")
+    endforeach()
     add_test(NAME cross_source_unit_static
         COMMAND $<TARGET_FILE:cross_cc> -S -O2
                 "${CMAKE_SOURCE_DIR}/test/language/static_one.x"
@@ -8116,6 +8142,14 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/frontend/macro_lines.cmake")
     set_tests_properties(cross_macro_invocation_lines PROPERTIES
         LABELS "check.compile;arch.x86_64;frontend;feature.preprocessor;diagnostics")
+    add_test(NAME cross_keyword_negation
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/keyword_negation.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/keyword-negation
+                -P "${CMAKE_SOURCE_DIR}/test/frontend/keyword_negation.cmake")
+    set_tests_properties(cross_keyword_negation PROPERTIES
+        LABELS "check.compile;arch.x86_64;arch.mips;frontend;feature.procedural")
     add_test(NAME cross_generic_budgets
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

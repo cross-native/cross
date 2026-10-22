@@ -36,9 +36,11 @@ function(reject input stem expected)
     endif()
 endfunction()
 accept("${SOURCE_DIR}/out_valid.x" out_valid)
+accept("${SOURCE_DIR}/out_short_circuit.x" out_short_circuit)
 foreach(name out_read_before out_partial_branch out_compound_before out_loop_gap
-             out_goto_gap out_pointer_read out_partial_member out_member_read_before out_partial_bitfield)
-    if(name MATCHES "^(out_read_before|out_compound_before|out_pointer_read|out_member_read_before)$")
+             out_goto_gap out_pointer_read out_partial_member out_member_read_before out_partial_bitfield
+             out_short_circuit_read out_short_circuit_return out_conditional_arm out_stored_condition)
+    if(name MATCHES "^(out_read_before|out_compound_before|out_pointer_read|out_member_read_before|out_short_circuit_read|out_conditional_arm|out_stored_condition)$")
         set(expected "read of 'out' parameter")
     else()
         set(expected "normal return leaves 'out' parameter")

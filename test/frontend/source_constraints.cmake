@@ -174,6 +174,11 @@ endforeach()
 reject_expression(void_assignment "writable = empty()" "${void_value}")
 reject_expression(void_input "take(empty())" "${void_value}")
 reject_expression(void_inout "update(empty())" "${void_value}")
+reject_expression(void_output "output(empty())" "an 'out' argument must be a modifiable lvalue or '_'")
+reject_expression(rvalue_output "output(1u32)" "an 'out' argument must be a modifiable lvalue or '_'")
+reject_expression(const_output "output(readonly)" "an 'out' argument must be a modifiable lvalue or '_'")
+reject_expression(rvalue_inout "update(1u32)" "an 'inout' argument must be a modifiable lvalue")
+reject_expression(discard_inout "update(_)" "'_' can only discard the result of an 'out' argument")
 reject_expression(void_variadic "tail(1u32, empty())" "${void_value} in variadic argument" -DVOID_VARIADIC_CASE)
 check(void_unselected "${void_value}"
     "$::static_assert(1u32 || (u32)empty(), \"unselected void cast\");")
@@ -224,7 +229,7 @@ $::static_assert(sizeof((struct Pair)make()) == sizeof(struct Pair), "nominal co
 $::static_assert(sizeof(held = make()) == sizeof(struct Pair), "record copy assignment");
 $::static_assert(sizeof(1u32 ? make() : make()) == sizeof(struct Pair), "same record selection");
 $::static_assert($::alignof(&readonly) == $::alignof(const u32 *), "const address is valid");
-$::static_assert(sizeof(output(empty())) == sizeof(u32), "out actual supplies no value");
+$::static_assert(sizeof(output(_)) == sizeof(u32), "the discard supplies no value");
 $::static_assert(sizeof(&(*incomplete)) == sizeof(struct Incomplete *), "incomplete designator does not read");
 $::static_assert(sizeof(&(*incomplete_row)) == sizeof(IncompleteRow *), "incomplete array designator");
 $::static_assert(sizeof((*callback)(1u32)) == sizeof(u32), "function designator remains callable");
@@ -236,7 +241,7 @@ global u32 invoke(in u32 (*function)(in u32 value)) { return (*function)(1u32); 
 static $::meta::tokens inspect(in $::meta::tokens input) {
     u32 local;
     uptr width = sizeof(++local) + sizeof(&local);
-    if (0u32) { empty(); output(empty()); forward(); }
+    if (0u32) { empty(); output(_); forward(); }
     return input;
 }
 global u32 entry() { return 1u32; }

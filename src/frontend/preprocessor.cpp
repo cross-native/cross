@@ -29,7 +29,20 @@ bool identifier_start(char ch) {
 }
 
 bool identifier_continue(char ch) {
-    return std::isalnum(static_cast<unsigned char>(ch)) != 0 || ch == '_' || ch == '$' || ch == ':';
+    return std::isalnum(static_cast<unsigned char>(ch)) != 0 || ch == '_' || ch == '$';
+}
+
+// The end of the possibly qualified name starting at `begin`. Only `::`
+// followed by an identifier continues it: labels are a parser concept, so
+// `case K:` and `x ? K : y` both expand K.
+std::size_t name_end(std::string_view text, std::size_t begin) {
+    auto end = begin;
+    for (;;) {
+        while (end < text.size() && identifier_continue(text[end])) ++end;
+        if (end + 2 >= text.size() || text[end] != ':' || text[end + 1] != ':' ||
+            !identifier_start(text[end + 2])) return end;
+        end += 2;
+    }
 }
 
 std::string normalized(const std::filesystem::path& path) {
@@ -38,9 +51,25 @@ std::string normalized(const std::filesystem::path& path) {
     return (error ? path.lexically_normal() : canonical).generic_string();
 }
 
+// `start` locates text[0]; `runs` are the later discontinuities.
+SourceLocation run_location(SourceLocation start, const std::vector<TextRun>& runs,
+                            std::size_t index) {
+    std::size_t base = 0;
+    for (const auto& run : runs) {
+        if (run.index > index) break;
+        start = run.location;
+        base = run.index;
+    }
+    start.column += static_cast<unsigned>(index - base);
+    start.offset += index - base;
+    return start;
+}
+
 struct PreprocessingLine {
     std::string text;
     SourceLocation location;
+    // Empty when every character follows `location` in the written line.
+    std::vector<TextRun> runs;
 };
 
 // Splicing precedes comment removal. Keep original positions even though
@@ -48,7 +77,7 @@ struct PreprocessingLine {
 std::vector<PreprocessingLine> preprocessing_lines(const SourceFile& file,
                                                  Diagnostics& diagnostics) {
     std::vector<PreprocessingLine> result;
-    PreprocessingLine current{{}, {&file, 0, 1, 1}};
+    PreprocessingLine current{{}, {&file, 0, 1, 1}, {}};
     unsigned line = 1;
     const auto& text = file.text;
     for (std::size_t i = 0; i < text.size();) {
@@ -58,12 +87,13 @@ std::vector<PreprocessingLine> preprocessing_lines(const SourceFile& file,
             (next == '\r' && i + 2 < text.size() && text[i + 2] == '\n'))) {
             i += next == '\n' ? 2 : 3;
             ++line;
+            current.runs.push_back({current.text.size(), {&file, i, line, 1}});
             continue;
         }
         if (ch == '\n' || (ch == '\r' && next == '\n')) {
             i += ch == '\r' && next == '\n' ? 2 : 1;
             result.push_back(std::move(current));
-            current = {{}, {&file, i, ++line, 1}};
+            current = {{}, {&file, i, ++line, 1}, {}};
             continue;
         }
         current.text.push_back(ch);
@@ -74,7 +104,16 @@ std::vector<PreprocessingLine> preprocessing_lines(const SourceFile& file,
     SourceLocation comment_location;
     for (auto& item : result) {
         const auto raw = std::move(item.text);
+        const auto raw_runs = std::move(item.runs);
         item.text.clear();
+        item.runs.clear();
+        // The raw index of each kept character; a comment's space keeps the
+        // comment's position.
+        std::vector<std::size_t> from;
+        const auto keep = [&](char ch, std::size_t index) {
+            item.text.push_back(ch);
+            from.push_back(index);
+        };
         char quote = '\0';
         for (std::size_t i = 0; i < raw.size();) {
             const auto ch = raw[i];
@@ -85,25 +124,32 @@ std::vector<PreprocessingLine> preprocessing_lines(const SourceFile& file,
                 continue;
             }
             if (quote != '\0') {
-                item.text.push_back(ch);
+                keep(ch, i);
                 ++i;
-                if (ch == '\\' && i < raw.size()) item.text.push_back(raw[i++]);
+                if (ch == '\\' && i < raw.size()) { keep(raw[i], i); ++i; }
                 else if (ch == quote) quote = '\0';
                 continue;
             }
             if (ch == '/' && (next == '/' || next == '*')) {
-                item.text.push_back(' ');
+                keep(' ', i);
                 if (next == '/') break;
                 block_comment = true;
-                comment_location = item.location;
-                comment_location.column += static_cast<unsigned>(i);
-                comment_location.offset += i;
+                comment_location = run_location(item.location, raw_runs, i);
                 i += 2;
                 continue;
             }
             if (ch == '\'' || ch == '"') quote = ch;
-            item.text.push_back(ch);
+            keep(ch, i);
             ++i;
+        }
+        if (raw_runs.empty() && from.size() == raw.size()) continue;
+        auto expected = item.location;
+        for (std::size_t index = 0; index < from.size(); ++index) {
+            const auto written = run_location(item.location, raw_runs, from[index]);
+            if (written.line != expected.line || written.column != expected.column)
+                item.runs.push_back({index, written});
+            expected = written;
+            ++expected.column;
         }
     }
     if (block_comment) diagnostics.error(comment_location, "unterminated block comment");
@@ -272,7 +318,7 @@ std::string Preprocessor::expand_includes(const std::filesystem::path& path,
     already_included_.insert(identity);
     if (dependency_identities_.insert(identity).second) dependencies_.push_back(path);
     std::ostringstream output;
-    for (const auto& line : preprocessing_lines(*file, diagnostics_)) {
+    for (auto& line : preprocessing_lines(*file, diagnostics_)) {
         const auto stripped = trim(line.text);
         const auto command = stripped.starts_with('#') ? directive(stripped) : Directive{};
         if (command.name == "pragma" && command.operand == "once") {
@@ -298,6 +344,7 @@ std::string Preprocessor::expand_includes(const std::filesystem::path& path,
         }
         output << line.text << '\n';
         line_locations_.push_back(line.location);
+        line_runs_.push_back(std::move(line.runs));
     }
     stack.pop_back();
     return output.str();
@@ -330,7 +377,7 @@ std::string Preprocessor::substitute(const Macro& macro,
             while (i < macro.replacement.size() &&
                    std::isspace(static_cast<unsigned char>(macro.replacement[i])) != 0) ++i;
             const auto begin = i;
-            while (i < macro.replacement.size() && identifier_continue(macro.replacement[i])) ++i;
+            i = name_end(macro.replacement, i);
             const auto found = replacements.find(macro.replacement.substr(begin, i - begin));
             if (found == replacements.end()) {
                 output.push_back('#');
@@ -346,8 +393,8 @@ std::string Preprocessor::substitute(const Macro& macro,
             continue;
         }
         if (identifier_start(macro.replacement[i])) {
-            const auto begin = i++;
-            while (i < macro.replacement.size() && identifier_continue(macro.replacement[i])) ++i;
+            const auto begin = i;
+            i = name_end(macro.replacement, i);
             const auto name = macro.replacement.substr(begin, i - begin);
             const auto found = replacements.find(name);
             if (found != replacements.end()) {
@@ -525,10 +572,24 @@ std::string Preprocessor::expand_text(std::string_view text,
                                       unsigned depth,
                                       std::optional<SourceLocation> condition,
                                       std::optional<SourceLocation> origin,
-                                      std::optional<OpenInvocation>* open_invocation) const {
+                                      std::optional<OpenInvocation>* open_invocation,
+                                      std::vector<ExpandedOrigin>* origins) const {
     if (depth > 100) return std::string(text);
     std::string output;
+    // Each iteration appends text copied from `start` or, when `expanded`,
+    // the expansion of the invocation at `start`.
+    std::size_t mark = 0, start = 0;
+    bool expanded = false;
+    const auto track = [&] {
+        if (!origins) return;
+        for (auto at = mark; at < output.size(); ++at)
+            origins->push_back({expanded ? start : start + (at - mark), expanded});
+        mark = output.size();
+    };
     for (std::size_t i = 0; i < text.size();) {
+        track();
+        start = i;
+        expanded = false;
         if (text[i] == '"' || text[i] == '\'') {
             const char quote = text[i];
             do {
@@ -543,8 +604,8 @@ std::string Preprocessor::expand_text(std::string_view text,
             output.push_back(text[i++]);
             continue;
         }
-        const auto begin = i++;
-        while (i < text.size() && identifier_continue(text[i])) ++i;
+        const auto begin = i;
+        i = name_end(text, i);
         const std::string name(text.substr(begin, i - begin));
         if (condition && name == "defined") {
             const auto skip_space = [&] {
@@ -554,7 +615,7 @@ std::string Preprocessor::expand_text(std::string_view text,
             const bool parenthesized = i < text.size() && text[i] == '(';
             if (parenthesized) { ++i; skip_space(); }
             const auto operand_begin = i;
-            while (i < text.size() && identifier_continue(text[i])) ++i;
+            i = name_end(text, i);
             const auto operand = text.substr(operand_begin, i - operand_begin);
             skip_space();
             if (!valid_macro_name(operand) ||
@@ -564,16 +625,19 @@ std::string Preprocessor::expand_text(std::string_view text,
             }
             if (parenthesized) ++i;
             output += macros_.contains(std::string(operand)) ? "1 " : "0 ";
+            expanded = true;
             continue;
         }
         if (origin && origin->valid() && name == "$::source::file") {
             std::ostringstream spelling;
             spelling << std::quoted(mapped_source_path(options_, origin->file->path));
             output += spelling.str();
+            expanded = true;
             continue;
         }
         if (origin && origin->valid() && name == "$::source::line") {
             output += std::to_string(origin->line);
+            expanded = true;
             continue;
         }
         const auto found = macros_.find(name);
@@ -583,6 +647,7 @@ std::string Preprocessor::expand_text(std::string_view text,
         }
         const auto& macro = found->second;
         disabled.insert(name);
+        expanded = true;
         if (!macro.function_like) {
             output += expand_text(macro.replacement, disabled, depth + 1,
                                   condition, origin);
@@ -595,6 +660,7 @@ std::string Preprocessor::expand_text(std::string_view text,
             if (open_invocation && open >= text.size()) *open_invocation = OpenInvocation{name, false};
             disabled.erase(name);
             output += name;
+            expanded = false;
             continue;
         }
         std::vector<std::string> arguments;
@@ -631,7 +697,10 @@ std::string Preprocessor::expand_text(std::string_view text,
         }
         if (nesting != 0) {
             if (open_invocation) *open_invocation = OpenInvocation{name, true};
+            expanded = false;
             output += name;
+            track();
+            start = open;
             output.append(text.substr(open, i - open));
             disabled.erase(name);
             continue;
@@ -647,7 +716,35 @@ std::string Preprocessor::expand_text(std::string_view text,
         }
         disabled.erase(name);
     }
+    track();
     return output;
+}
+
+void Preprocessor::record_columns(const std::vector<ExpandedOrigin>& origins,
+                                  SourceLocation location,
+                                  const std::vector<TextRun>& runs) {
+    const auto line = static_cast<unsigned>(output_line_locations_.size());
+    const auto first = output_column_origins_.size();
+    SourceLocation previous;
+    bool previous_expansion = false;
+    for (std::size_t at = 0; at < origins.size(); ++at) {
+        const auto written = run_location(location, runs, origins[at].input);
+        const bool expansion = origins[at].expansion;
+        if (at == 0 || expansion != previous_expansion || written.file != previous.file ||
+            written.line != previous.line ||
+            written.column != previous.column + (expansion ? 0U : 1U))
+            output_column_origins_.push_back(
+                {line, static_cast<unsigned>(at + 1), written, expansion});
+        previous = written;
+        previous_expansion = expansion;
+    }
+    // Columns that all follow the line's origin need no entry.
+    if (output_column_origins_.size() == first + 1) {
+        const auto& only = output_column_origins_.back();
+        if (!only.expansion && only.origin.file == location.file &&
+            only.origin.line == location.line && only.origin.column == location.column)
+            output_column_origins_.pop_back();
+    }
 }
 
 std::string Preprocessor::expand_macros(std::string_view source, const SourceFile* file) {
@@ -685,15 +782,27 @@ std::string Preprocessor::expand_macros(std::string_view source, const SourceFil
             if (active) {
                 // An invocation's arguments may span lines; it ends at the
                 // matching parenthesis. Its expansion takes the first line.
+                auto runs = line_number <= line_runs_.size()
+                    ? line_runs_[line_number - 1] : std::vector<TextRun>{};
                 for (;;) {
                     std::unordered_set<std::string> disabled;
                     std::optional<OpenInvocation> open;
-                    auto expanded = expand_text(line, disabled, 0, {}, location, &open);
+                    std::vector<ExpandedOrigin> origins;
+                    auto expanded = expand_text(line, disabled, 0, {}, location, &open, &origins);
                     const auto next = line_number < lines.size()
                         ? trim(lines[line_number]) : std::string{};
                     if (open && line_number < lines.size() && !next.starts_with('#') &&
                         (open->arguments || next.starts_with('('))) {
+                        const auto joined = line_number < line_locations_.size()
+                            ? line_locations_[line_number] : location;
+                        runs.push_back({line.size(), joined});
                         line += ' ';
+                        runs.push_back({line.size(), joined});
+                        if (line_number < line_runs_.size())
+                            for (auto run : line_runs_[line_number]) {
+                                run.index += line.size();
+                                runs.push_back(run);
+                            }
                         line += lines[line_number++];
                         continue;
                     }
@@ -702,6 +811,7 @@ std::string Preprocessor::expand_macros(std::string_view source, const SourceFil
                                                          open->name + "'");
                     output << expanded << '\n';
                     output_line_locations_.push_back(location);
+                    record_columns(origins, location, runs);
                     break;
                 }
             }
@@ -752,8 +862,7 @@ std::string Preprocessor::expand_macros(std::string_view source, const SourceFil
         if (!active) continue;
         if (command.name == "define") {
             const auto& definition = command.operand;
-            std::size_t cursor = 0;
-            while (cursor < definition.size() && identifier_continue(definition[cursor])) ++cursor;
+            auto cursor = name_end(definition, 0);
             const auto name = definition.substr(0, cursor);
             if (!valid_macro_name(name) || name.starts_with("$::")) {
                 diagnostics_.error(location, "#define requires a non-builtin macro name");
@@ -834,7 +943,9 @@ std::string Preprocessor::expand_macros(std::string_view source, const SourceFil
 
 std::string Preprocessor::process(const std::filesystem::path& input) {
     line_locations_.clear();
+    line_runs_.clear();
     output_line_locations_.clear();
+    output_column_origins_.clear();
     dependencies_.clear();
     dependency_identities_.clear();
     std::vector<std::filesystem::path> stack;
@@ -848,10 +959,13 @@ std::string Preprocessor::process(const std::filesystem::path& input) {
     };
     for (const auto& name : options_.macro_includes) {
         line_locations_.clear();
+        line_runs_.clear();
         expand_macros(forced(name), nullptr);
         output_line_locations_.clear();
+        output_column_origins_.clear();
     }
     line_locations_.clear();
+    line_runs_.clear();
     std::string included;
     for (const auto& name : options_.forced_includes) included += forced(name);
     included += expand_includes(input, stack);

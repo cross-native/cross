@@ -29,14 +29,7 @@ void Diagnostics::report(DiagnosticLevel level, SourceLocation location,
                     << '\n';
             return;
         }
-        if (item.line != 0 && item.line <= item.file->line_origins.size()) {
-            const auto origin = item.file->line_origins[item.line - 1];
-            if (origin.valid()) {
-                const auto column = item.column;
-                item = origin;
-                item.column += std::max(1U, column) - 1;
-            }
-        }
+        item = item.file->logical_location(item);
         stream_ << item.file->path.string() << ':' << item.line << ':'
                 << item.column << ": " << item_label << ": "
                 << item_message << '\n';

@@ -67,7 +67,8 @@ check(noreturn_output "noreturn.*returned normally"
     "[[noreturn]] static void bad(out u32 value) { value = 1u32; return; } static u32 run() { u32 value; bad(value); return 1u32; } ${assert_run}")
 check(failed_body "division by zero"
     "static u32 bad(out u32 value, in u32 divisor) { value = 1u32; return 1u32 / divisor; } static u32 run() { u32 value; return bad(value, 0u32); } ${assert_run}")
-probe(const_discard pass "const u32 value; fill(value); return 1u32;")
+probe(discard pass "fill(_); return 1u32;")
+probe(const_output "an 'out' argument must be a modifiable lvalue" "const u32 value; fill(value); return 1u32;")
 check(complete_union pass
     "union Choice { uptr large; u8 small; }; static void small(out union Choice value) { value.small = 19u8; } static u32 run() { union Choice value; small(value); return value.small == 19u8 ? 1u32 : 0u32; } ${assert_run}")
 check(addressed_cells pass [=[

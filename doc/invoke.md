@@ -52,7 +52,9 @@ symbol with the linker.
 
 All inputs of one command form a single compilation group with one output, named
 after the first input when `-o` is absent. Definitions without `static` or
-`global` are shared within the group but not exported to the linker. Compile
+`global` are shared within the group but not exported to the linker. Each
+input sees the types it declares or includes, and a type that several inputs
+define with the same tokens, as through a shared header, is one type. Compile
 separately and link only `global` entities to combine objects. A function that
 is not `global` is emitted only when an emitted function or object refers to
 it, when it has `[[used]]` or `[[retain]]`, or when an alias names it, so a
@@ -656,7 +658,10 @@ with `-target`, `-march`, or `-mprofile` to inspect another configuration.
 ## Diagnostics
 
 Diagnostics have the form `file:line:column: error: message`, followed by the
-source line and a caret. Errors in generated code also show the macro or
+source line and a caret. Lines and columns are those of the written source,
+and a token that a preprocessor macro produces is reported at the macro's
+invocation; compiling `cpp` output (`.i`) instead reports columns of the
+preprocessed lines. Errors in generated code also show the macro or
 syntax expansion chain; `as` reports an error inside a macro at the line that
 invokes it, and `ld` an error in a linker script at its position. Errors in a
 model file have the form `file:line: error: message`, the same under `cc`,

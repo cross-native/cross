@@ -430,6 +430,11 @@ private:
     Statement* teardown_next_{};
 };
 
+// `_`, which can only discard the result of an `out` argument.
+inline bool discard_expression(const Expr& expression) {
+    return expression.kind == Expr::Kind::Name && expression.text == "_";
+}
+
 // The source form of a mandatory tail return is a call, allowing only
 // redundant parentheses around it. This does not establish ABI legality.
 inline const Expr* returned_call(const Statement& statement) {
@@ -575,6 +580,9 @@ struct EnumDecl {
     bool local{};
     // Brought by generated code like a carried record (see RecordDecl).
     bool carried{};
+    // Repeats another source unit's definition of the same type in the group;
+    // that definition is the type's, this one only binds its enumerators.
+    bool repeated{};
     [[nodiscard]] NominalTypeKey nominal_key() const { return {name, nominal_identity}; }
 };
 
@@ -611,6 +619,9 @@ struct RecordDecl {
     // A copy that generated code brought from the helper defining the record;
     // the program may also hold the original.
     bool carried{};
+    // Repeats another source unit's definition of the same type in the group,
+    // which alone enters the program.
+    bool repeated{};
     [[nodiscard]] NominalTypeKey nominal_key() const { return {name, nominal_identity, nominal_arguments}; }
     [[nodiscard]] const Attribute* attribute(std::string_view name) const;
 };
