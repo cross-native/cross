@@ -174,6 +174,31 @@ if(NOT text MATCHES "\tcmp\\.[a-z]+\\.d\t\\$f4," OR
     message(FATAL_ERROR "fpxx: odd FPRs or no comparison into $f4\n${text}")
 endif()
 
+# A comparison's result register is saved where the ABI preserves it: a
+# user ABI copied from n64 without f1 among its clobbers.
+file(READ "${CMAKE_CURRENT_LIST_DIR}/../../../model/mips.xm" shipped)
+string(FIND "${shipped}" "abi \"n64\" {" n64_start)
+string(SUBSTRING "${shipped}" ${n64_start} -1 n64_text)
+string(FIND "${n64_text}" "\n}\n" n64_end)
+math(EXPR n64_end "${n64_end} + 3")
+string(SUBSTRING "${n64_text}" 0 ${n64_end} n64_text)
+string(REPLACE "abi \"n64\" {" "abi \"n64_f1\" {" n64_text "${n64_text}")
+string(REGEX REPLACE "aliases = \\[[^]]*\\];" "" n64_text "${n64_text}")
+string(REPLACE "\"f0\", \"f1\", " "\"f0\", " n64_text "${n64_text}")
+file(WRITE "${OUTPUT}.keep-f1.xm" "${n64_text}")
+file(WRITE "${OUTPUT}.keep-f1.x" "global bool less(f64 a, f64 b) { return a < b; }\n")
+foreach(level -O0 -O2)
+    execute_process(COMMAND "${CC}" "--model=${OUTPUT}.keep-f1.xm" -target mips64-unknown-elf
+                            -mabi=n64_f1 -march=mips64r6 ${level} -S "${OUTPUT}.keep-f1.x"
+                            -o "${OUTPUT}.keep-f1${level}.s"
+                    RESULT_VARIABLE status ERROR_VARIABLE error)
+    file(READ "${OUTPUT}.keep-f1${level}.s" text)
+    if(NOT status EQUAL 0 OR NOT text MATCHES "\tsdc1\t\\$f1," OR
+       NOT text MATCHES "\tldc1\t\\$f1,")
+        message(FATAL_ERROR "keep-f1 ${level}: $f1 is not saved\n${error}\n${text}")
+    endif()
+endforeach()
+
 # The objects' ISA, NaN encoding, and FPU register model.
 find_program(LLVM_READELF NAMES llvm-readelf)
 if(NOT LLVM_READELF)

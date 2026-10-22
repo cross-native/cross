@@ -197,6 +197,22 @@ std::string_view release6_condition_fpr(const Subtarget& subtarget) {
     return subtarget.has_feature(Feature::Fp64) ? "f1" : "f4";
 }
 
+// release6_condition_fpr as a physical register.
+machine::PhysicalRegisterId release6_condition_register(const Subtarget& subtarget) {
+    return {fpr_physical_base + (subtarget.has_feature(Feature::Fp64) ? 1U : 4U)};
+}
+
+// Whether the function's code may write release6_condition_fpr, which its
+// floating comparisons write without an instruction naming it.
+bool writes_release6_condition(const Subtarget& subtarget,
+                               const machine::Function& function) {
+    return release6(subtarget) &&
+           std::ranges::any_of(function.virtual_register_classes,
+                               [](machine::VirtualRegisterClass kind) {
+                                   return kind == machine::VirtualRegisterClass::Floating;
+                               });
+}
+
 // Whether the FPRs of an FR=0 FPU with doubles pair up, so that an f64 in
 // an even register also occupies the odd one.
 bool paired_fprs(const Subtarget& subtarget) {
@@ -3592,6 +3608,9 @@ private:
                     }
                 }
             }
+            if (writes_release6_condition(subtarget_, function)) {
+                add_save(release6_condition_register(subtarget_));
+            }
             return changed;
         }
         const auto count = function.virtual_registers.size();
@@ -5176,6 +5195,9 @@ private:
                     }
                 }
             }
+        }
+        if (writes_release6_condition(subtarget_, function)) {
+            preserve_storage(release6_condition_register(subtarget_));
         }
         return changed;
     }
