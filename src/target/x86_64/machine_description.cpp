@@ -118,15 +118,25 @@ machine::TargetOpcodeId base_opcode(
     case Opcode::ShrUImm: return Opcode::ShrU;
     case Opcode::RotlImm: return Opcode::Rotl;
     case Opcode::RotrImm: return Opcode::Rotr;
+    case Opcode::CmpEqMem:
     case Opcode::CmpEqImm: return Opcode::CmpEq;
+    case Opcode::CmpNeMem:
     case Opcode::CmpNeImm: return Opcode::CmpNe;
+    case Opcode::CmpSgeMem:
     case Opcode::CmpSgeImm: return Opcode::CmpSge;
+    case Opcode::CmpSgtMem:
     case Opcode::CmpSgtImm: return Opcode::CmpSgt;
+    case Opcode::CmpSleMem:
     case Opcode::CmpSleImm: return Opcode::CmpSle;
+    case Opcode::CmpSltMem:
     case Opcode::CmpSltImm: return Opcode::CmpSlt;
+    case Opcode::CmpUgeMem:
     case Opcode::CmpUgeImm: return Opcode::CmpUge;
+    case Opcode::CmpUgtMem:
     case Opcode::CmpUgtImm: return Opcode::CmpUgt;
+    case Opcode::CmpUleMem:
     case Opcode::CmpUleImm: return Opcode::CmpUle;
+    case Opcode::CmpUltMem:
     case Opcode::CmpUltImm: return Opcode::CmpUlt;
     case Opcode::TestEqImm: return Opcode::TestEq;
     case Opcode::TestNeImm: return Opcode::TestNe;
@@ -179,6 +189,16 @@ machine::TargetOpcodeId memory_opcode(
     case Opcode::Fsub: return Opcode::FsubMem;
     case Opcode::Fmul: return Opcode::FmulMem;
     case Opcode::Fdiv: return Opcode::FdivMem;
+    case Opcode::CmpEq: return Opcode::CmpEqMem;
+    case Opcode::CmpNe: return Opcode::CmpNeMem;
+    case Opcode::CmpSlt: return Opcode::CmpSltMem;
+    case Opcode::CmpSle: return Opcode::CmpSleMem;
+    case Opcode::CmpSgt: return Opcode::CmpSgtMem;
+    case Opcode::CmpSge: return Opcode::CmpSgeMem;
+    case Opcode::CmpUlt: return Opcode::CmpUltMem;
+    case Opcode::CmpUle: return Opcode::CmpUleMem;
+    case Opcode::CmpUgt: return Opcode::CmpUgtMem;
+    case Opcode::CmpUge: return Opcode::CmpUgeMem;
     default: return {};
     }
 }

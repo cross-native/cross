@@ -79,6 +79,8 @@ enum class LoweringPass : std::uint16_t {
     RecognizeVectorByteSwaps,
     HoistVectorByteSwapMasks,
     FuseVectorReductions,
+    NarrowComparisons,
+    FoldNarrowLoads,
     SelectBinaryImmediates,
     CombineMachineImmediates,
     EliminateRedundantExpressions,
@@ -6201,6 +6203,143 @@ private:
         }
     }
 
+    void narrow_comparisons() {
+        if (!options_.machine_combine) return;
+        std::unordered_map<std::uint32_t, machine::Instruction*> definitions;
+        for (auto& block : current_.blocks) {
+            for (auto& instruction : block.instructions) {
+                if (instruction.defs.size() == 1 &&
+                    instruction.defs[0].kind == machine::RegisterKind::Virtual) {
+                    definitions[instruction.defs.front().id] = &instruction;
+                }
+            }
+        }
+        const auto narrow_predicate = [](machine::TargetOpcodeId opcode, bool zero) {
+            if (zero) {
+                switch (decode_opcode(opcode)) {
+                case Opcode::CmpSlt: return machine::TargetOpcodeId{Opcode::CmpUlt};
+                case Opcode::CmpSle: return machine::TargetOpcodeId{Opcode::CmpUle};
+                case Opcode::CmpSgt: return machine::TargetOpcodeId{Opcode::CmpUgt};
+                case Opcode::CmpSge: return machine::TargetOpcodeId{Opcode::CmpUge};
+                default: break;
+                }
+            }
+            return opcode;
+        };
+        // Equal extensions preserve equality and the corresponding order.
+        for (auto& block : current_.blocks) {
+            for (auto& instruction : block.instructions) {
+                if (!has_property(instruction.opcode, OpcodeProperty::Comparison) ||
+                    has_property(instruction.opcode, OpcodeProperty::Floating) ||
+                    has_property(instruction.opcode, OpcodeProperty::Vector) ||
+                    instruction.uses.size() != 2 || instruction.patch ||
+                    instruction.uses[0].kind != machine::RegisterKind::Virtual ||
+                    instruction.uses[1].kind != machine::RegisterKind::Virtual) continue;
+                const auto left = definitions.find(instruction.uses[0].id);
+                const auto right = definitions.find(instruction.uses[1].id);
+                if (left == definitions.end() || right == definitions.end()) continue;
+                const auto& a = *left->second;
+                const auto& b = *right->second;
+                if ((a.opcode == Opcode::Zext || a.opcode == Opcode::Sext) &&
+                    a.uses.size() == 1 &&
+                    (a.uses[0].mode.bits == 8 || a.uses[0].mode.bits == 16) &&
+                    b.opcode == Opcode::Constant && b.operands.size() == 1) {
+                    const auto* constant = std::get_if<machine::ImmediateOperand>(
+                        &b.operands[0]);
+                    const bool zero = a.opcode == Opcode::Zext;
+                    const auto bits = a.uses[0].mode.bits;
+                    const auto maximum = (std::uint64_t{1} << (bits - !zero)) - 1;
+                    if (constant && constant->high == 0 && constant->value <= maximum) {
+                        instruction.opcode = immediate_opcode(
+                            narrow_predicate(instruction.opcode, zero));
+                        instruction.uses = a.uses;
+                        instruction.operands = {machine::RegisterOperand{a.uses[0]},
+                            machine::ImmediateOperand{constant->value, 0,
+                                                       a.uses[0].mode, !zero}};
+                        continue;
+                    }
+                }
+                if ((a.opcode != Opcode::Zext && a.opcode != Opcode::Sext) ||
+                    a.opcode != b.opcode || a.uses.size() != 1 ||
+                    b.uses.size() != 1 || a.uses[0].mode != b.uses[0].mode ||
+                    (a.uses[0].mode.bits != 8 && a.uses[0].mode.bits != 16)) continue;
+                instruction.opcode = narrow_predicate(
+                    instruction.opcode, a.opcode == Opcode::Zext);
+                instruction.uses = {a.uses[0], b.uses[0]};
+                instruction.operands = {machine::RegisterOperand{a.uses[0]},
+                                        machine::RegisterOperand{b.uses[0]}};
+            }
+        }
+        eliminate_dead_machine_values();
+    }
+
+    void fold_narrow_loads() {
+        if (!options_.machine_combine) return;
+        std::unordered_map<std::uint32_t, machine::Instruction*> definitions;
+        std::unordered_set<const machine::Instruction*> merged;
+        std::vector<unsigned> uses(current_.virtual_registers.size());
+        for (const auto& block : current_.blocks) {
+            for (const auto& instruction : block.instructions) {
+                for (const auto reg : instruction.uses) {
+                    if (reg.kind == machine::RegisterKind::Virtual) ++uses[reg.id];
+                }
+            }
+        }
+        definitions.clear();
+        for (auto& block : current_.blocks) {
+            for (auto& instruction : block.instructions) {
+                if (instruction.defs.size() == 1 &&
+                    instruction.defs[0].kind == machine::RegisterKind::Virtual) {
+                    definitions[instruction.defs[0].id] = &instruction;
+                }
+            }
+        }
+        for (auto& block : current_.blocks) {
+            for (auto& extension : block.instructions) {
+                if ((extension.opcode != Opcode::Zext && extension.opcode != Opcode::Sext) ||
+                    extension.uses.size() != 1 || extension.defs.size() != 1 ||
+                    extension.patch || extension.defs[0].mode.bits > 64) continue;
+                const auto source = extension.uses[0];
+                if (source.kind != machine::RegisterKind::Virtual || uses[source.id] != 1 ||
+                    (source.mode.bits != 8 && source.mode.bits != 16)) continue;
+                const auto found = definitions.find(source.id);
+                if (found == definitions.end()) continue;
+                auto& load = *found->second;
+                if (load.patch) continue;
+                const bool indexed = load.opcode == Opcode::IndexedLoad;
+                const bool pointer = load.opcode == Opcode::PointerLoad;
+                if (!indexed && !pointer && load.opcode != Opcode::Load &&
+                    load.opcode != Opcode::GlobalLoad) continue;
+                if (indexed || pointer) {
+                    const machine::Operand zero{machine::ImmediateOperand{
+                        0, 0, machine::i64, true}};
+                    const auto scale = indexed && load.operands.size() >= 3
+                        ? load.operands[2] : machine::Operand{machine::ImmediateOperand{
+                            indexed ? mode_bytes(source.mode) : 1, 0, machine::i64, true}};
+                    const auto scale_value = std::get<machine::ImmediateOperand>(scale).value;
+                    if (scale_value != 1 && scale_value != 2 &&
+                        scale_value != 4 && scale_value != 8) continue;
+                    const auto displacement = indexed
+                        ? (load.operands.size() >= 4 ? load.operands[3] : zero)
+                        : (load.operands.size() >= 2 ? load.operands[1] : zero);
+                    load.operands = {zero, load.operands[0],
+                        indexed ? load.operands[1] : zero, scale, displacement};
+                }
+                load.operands.push_back(machine::ImmediateOperand{
+                    source.mode.bits, 0, machine::i32, false});
+                load.opcode = extension.opcode == Opcode::Zext
+                    ? Opcode::ZextLoad : Opcode::SextLoad;
+                load.defs = extension.defs;
+                merged.insert(&extension);
+            }
+        }
+        for (auto& block : current_.blocks) {
+            std::erase_if(block.instructions, [&](const machine::Instruction& value) {
+                return merged.contains(&value);
+            });
+        }
+    }
+
     void fold_scalar_memory_operands() {
         if (!options_.fold_memory_operands) return;
         std::vector<unsigned> uses(current_.virtual_registers.size());
@@ -6230,20 +6369,27 @@ private:
             for (std::size_t index = 0;
                  index < block.instructions.size(); ++index) {
                 auto& consumer = block.instructions[index];
-                const auto base = binary_base_opcode(consumer.opcode);
+                const bool branch = consumer.kind ==
+                    machine::InstructionKind::ConditionalBranch;
+                const auto selected = branch ? consumer.condition_predicate : consumer.opcode;
+                const auto base = binary_base_opcode(selected);
+                const bool compare = has_property(base, OpcodeProperty::Comparison) &&
+                    !has_property(base, OpcodeProperty::Floating) &&
+                    !has_property(base, OpcodeProperty::Vector);
                 const bool commutative =
                     base == Opcode::Add || base == Opcode::Mul ||
                     base == Opcode::And || base == Opcode::Or ||
                     base == Opcode::Xor;
-                if (!commutative || consumer.opcode != base ||
-                    consumer.defs.size() != 1 ||
+                if ((!commutative && !compare) || selected != base ||
+                    consumer.defs.size() != (branch ? 0U : 1U) ||
                     consumer.uses.size() != 2 ||
-                    consumer.operands.size() != 2 ||
+                    consumer.operands.size() != (branch ? 4U : 2U) ||
                     consumer.uses.front().mode.bits > 64) {
                     continue;
                 }
                 for (std::size_t memory_index = 0;
                      memory_index < 2; ++memory_index) {
+
                     const auto loaded = consumer.uses[memory_index];
                     if (loaded.kind != machine::RegisterKind::Virtual ||
                         loaded.id >= uses.size() || uses[loaded.id] != 1) {
@@ -6296,7 +6442,24 @@ private:
                     if (crosses_write) continue;
 
                     const auto other = consumer.uses[1 - memory_index];
-                    consumer.opcode = memory_opcode(consumer.opcode);
+                    auto predicate = selected;
+                    if (compare && memory_index == 0) {
+                        switch (decode_opcode(selected)) {
+                        case Opcode::CmpSlt: predicate = Opcode::CmpSgt; break;
+                        case Opcode::CmpSle: predicate = Opcode::CmpSge; break;
+                        case Opcode::CmpSgt: predicate = Opcode::CmpSlt; break;
+                        case Opcode::CmpSge: predicate = Opcode::CmpSle; break;
+                        case Opcode::CmpUlt: predicate = Opcode::CmpUgt; break;
+                        case Opcode::CmpUle: predicate = Opcode::CmpUge; break;
+                        case Opcode::CmpUgt: predicate = Opcode::CmpUlt; break;
+                        case Opcode::CmpUge: predicate = Opcode::CmpUle; break;
+                        default: break;
+                        }
+                    }
+                    const auto truth = branch ? consumer.operands[1] : machine::Operand{};
+                    const auto falsity = branch ? consumer.operands[2] : machine::Operand{};
+                    if (branch) consumer.condition_predicate = memory_opcode(predicate);
+                    else consumer.opcode = memory_opcode(predicate);
                     const machine::Operand zero{
                         machine::ImmediateOperand{0, 0, machine::i64, true}};
                     if (pointer) {
@@ -6319,6 +6482,11 @@ private:
                             load.operands.size() == 4 ? load.operands[3]
                                                       : zero};
                     }
+                    if (branch) {
+                        consumer.operands.insert(consumer.operands.begin() + 1,
+                                                 {truth, falsity});
+                    }
+                    if (compare) append_fixed_clobber(consumer, "rdx", machine::i64);
                     consumer.may_load = true;
                     removed.insert(found->second);
                     break;
@@ -7224,8 +7392,7 @@ private:
                     instruction.opcode == Opcode::VmulImm) {
                     vector_register_safe = floating_vector ||
                         (vector_shape && vector_shape->value == 16) ||
-                        (vector_shape && vector_shape->value == 32 &&
-                         subtarget_.has_feature(Feature::Sse41)) ||
+                        (vector_shape && vector_shape->value == 32) ||
                         (vector_shape && vector_shape->value == 64 &&
                          (subtarget_.has_feature(Feature::Avx2) ||
                           subtarget_.has_feature(Feature::Avx512dq)));
@@ -7740,6 +7907,7 @@ private:
                     opcode == Opcode::LifetimeEnd ||
                     opcode == Opcode::Load || opcode == Opcode::Store ||
                     opcode == Opcode::IndexedLoad ||
+                    opcode == Opcode::ZextLoad || opcode == Opcode::SextLoad ||
                     opcode == Opcode::GlobalLoad ||
                     opcode == Opcode::GlobalStore ||
                     opcode == Opcode::LabelAddress ||
@@ -8074,6 +8242,15 @@ private:
             };
         // These expansions write RAX/RCX only to stage a home-resident
         // operand or result.
+        const auto folded_compare = [](const machine::Instruction& instruction) {
+            const auto opcode = instruction.kind ==
+                    machine::InstructionKind::ConditionalBranch
+                ? instruction.condition_predicate : instruction.opcode;
+            return has_property(opcode, OpcodeProperty::Memory) &&
+                   has_property(opcode, OpcodeProperty::Comparison) &&
+                   !has_property(opcode, OpcodeProperty::Floating) &&
+                   !has_property(opcode, OpcodeProperty::Vector);
+        };
         const auto leaf_scratch_free =
             [&](const machine::Instruction& instruction) {
                 if (has_operand_of_class(
@@ -8136,6 +8313,8 @@ private:
                     instruction.opcode == Opcode::LifetimeStart ||
                     instruction.opcode == Opcode::LifetimeEnd ||
                     instruction.opcode == Opcode::IndexedLoad ||
+                    instruction.opcode == Opcode::ZextLoad ||
+                    instruction.opcode == Opcode::SextLoad ||
                     instruction.opcode == Opcode::IndexedStore ||
                     instruction.opcode == Opcode::FindexedStore ||
                     base == Opcode::Add || base == Opcode::Sub ||
@@ -8483,6 +8662,10 @@ private:
                     if (clobber.kind != machine::RegisterKind::Physical) {
                         continue;
                     }
+                    // A folded comparison stages only a spilled value in
+                    // RDX; the post-coloring scratch audit handles that case.
+                    if (rdx && clobber.id == rdx->storage_id &&
+                        folded_compare(*item)) continue;
                     auto& excluded =
                         item->kind == machine::InstructionKind::Call
                             ? call_forbidden : forbidden;
@@ -9773,7 +9956,7 @@ private:
                 }
                 return result;
             };
-            // Calls `conflict` for every value whose RAX or RCX color a
+            // Calls `conflict` for every value whose scratch color a
             // staging instruction would overwrite; `conflict` may withdraw
             // the color, which the rest of the scan then sees as a home.
             const auto scan_conflicts = [&](const auto& conflict) {
@@ -9783,7 +9966,7 @@ private:
                         current_.virtual_register_assignments[id];
                     if (assignment && (assignment->value == rax->storage_id ||
                                        assignment->value == rcx->storage_id)) {
-                        conflict(id);
+                        conflict(id, assignment->value);
                     }
                 };
                 const auto check_register = [&](const machine::Register& reg) {
@@ -9850,6 +10033,24 @@ private:
                                 check_register(reg);
                             }
                         }
+                        if (rdx && folded_compare(*item) &&
+                            in_home(item->uses.front())) {
+                            const auto check_rdx = [&](std::uint32_t id) {
+                                if (id >= count) return;
+                                const auto& assignment =
+                                    current_.virtual_register_assignments[id];
+                                if (assignment && assignment->value == rdx->storage_id) {
+                                    conflict(id, rdx->storage_id);
+                                }
+                            };
+                            for (const auto id : live) check_rdx(id);
+                            for (const auto& reg : item->uses) {
+                                if (reg.kind == machine::RegisterKind::Virtual) check_rdx(reg.id);
+                            }
+                            for (const auto& reg : item->defs) {
+                                if (reg.kind == machine::RegisterKind::Virtual) check_rdx(reg.id);
+                            }
+                        }
                         if (phi) continue;
                         for (const auto& use : item->uses) {
                             if (use.kind == machine::RegisterKind::Virtual) {
@@ -9859,24 +10060,28 @@ private:
                     }
                 }
             };
-            const auto forbid_scratch = [&](std::uint32_t id) {
-                forbidden[id].insert(rax->storage_id);
-                forbidden[id].insert(rcx->storage_id);
+            const auto forbid_scratch = [&](std::uint32_t id, std::uint32_t storage) {
+                if (rdx && storage == rdx->storage_id) {
+                    forbidden[id].insert(storage);
+                } else {
+                    forbidden[id].insert(rax->storage_id);
+                    forbidden[id].insert(rcx->storage_id);
+                }
             };
             // Recolor from the start with the conflicting values kept out of
-            // RAX and RCX, so that the other colors go to the values that
+            // scratch registers, so that other colors go to the values that
             // weigh most; a few rounds suffice in practice.
             for (unsigned round = 0; round < 4; ++round) {
                 bool conflicts = false;
-                scan_conflicts([&](std::uint32_t id) {
+                scan_conflicts([&](std::uint32_t id, std::uint32_t storage) {
                     // Its copy partners follow it, so that they can still
                     // share one color.
-                    forbid_scratch(id);
+                    forbid_scratch(id, storage);
                     for (const auto partner : affinity[id]) {
-                        forbid_scratch(partner);
+                        forbid_scratch(partner, storage);
                     }
                     for (const auto partner : backedge_affinity[id]) {
-                        forbid_scratch(partner);
+                        forbid_scratch(partner, storage);
                     }
                     conflicts = true;
                 });
@@ -9892,13 +10097,26 @@ private:
             std::vector<std::uint32_t> displaced;
             do {
                 displaced.clear();
-                scan_conflicts([&](std::uint32_t id) {
+                scan_conflicts([&](std::uint32_t id, std::uint32_t storage) {
                     current_.virtual_register_assignments[id].reset();
-                    forbid_scratch(id);
+                    forbid_scratch(id, storage);
                     displaced.push_back(id);
                 });
                 for (const auto id : displaced) color_value(id);
             } while (!displaced.empty());
+        }
+
+        for (auto& block : current_.blocks) {
+            for (auto& instruction : block.instructions) {
+                if (!rdx || !folded_compare(instruction) ||
+                    !current_.virtual_register_assignments[instruction.uses.front().id]) {
+                    continue;
+                }
+                std::erase_if(instruction.clobbers, [&](machine::Register reg) {
+                    return reg.kind == machine::RegisterKind::Physical &&
+                           reg.id == rdx->storage_id;
+                });
+            }
         }
 
         // The audited leaf path assumes every SIMD operand is resident. If
@@ -10698,6 +10916,8 @@ private:
         add(LoweringPass::FuseVectorReductions, Stage::InstructionCombining,
             "fuse-vector-reductions",
             &MachineLowerer::fuse_vector_reductions);
+        add(LoweringPass::NarrowComparisons, Stage::InstructionCombining,
+            "narrow-comparisons", &MachineLowerer::narrow_comparisons);
         add(LoweringPass::SelectBinaryImmediates, Stage::Legalization,
             "select-binary-immediates",
             &MachineLowerer::select_binary_immediates);
@@ -10747,6 +10967,8 @@ private:
         add(LoweringPass::EliminateRedundantLoadsLate,
             Stage::Canonicalization, "eliminate-redundant-loads-late",
             &MachineLowerer::eliminate_redundant_machine_loads);
+        add(LoweringPass::FoldNarrowLoads, Stage::InstructionCombining,
+            "fold-narrow-loads", &MachineLowerer::fold_narrow_loads);
         add(LoweringPass::FoldScalarMemoryOperands,
             Stage::InstructionCombining, "fold-scalar-memory-operands",
             &MachineLowerer::fold_scalar_memory_operands);
@@ -13028,6 +13250,13 @@ private:
                     to_home ? reg + ", " + home : home + ", " + reg);
     }
 
+    void emit_integer_load(unsigned bits, const std::string& address,
+                           std::string_view destination) {
+        instruction(bits == 8 ? "movzbl" : bits == 16 ? "movzwl" :
+                        "mov" + std::string(1, suffix(bits)),
+                    address + ", " + register_name(destination, std::max(32U, bits)));
+    }
+
     void load_slot(const machine::Function& function,
                    const machine::StackSlotOperand& source,
                    std::string_view low, std::string_view high = "rdx") {
@@ -13040,9 +13269,7 @@ private:
                                     register_name(high, 64));
             return;
         }
-        instruction("mov" + std::string(1, suffix(source.mode.bits)),
-                    memory(offset) + ", " +
-                        register_name(low, source.mode.bits));
+        emit_integer_load(source.mode.bits, memory(offset), low);
     }
 
     void store_slot(const machine::Function& function,
@@ -15555,6 +15782,28 @@ private:
                 emit_vector_qword_multiply(function, value, width);
                 return;
             }
+            if (value.opcode == Opcode::Vmul && shape.element_bits == 32 &&
+                width == 128 && !subtarget_.has_feature(Feature::Sse41)) {
+                const auto left = vector_register(value.uses[0], 0, 128);
+                const auto right = vector_register(value.uses[1], 1, 128);
+                for (unsigned chunk = 0;
+                     chunk < vector_chunks(value.defs.front(), 128); ++chunk) {
+                    load_vector(function, value.uses[0], 0, chunk, 128);
+                    load_vector(function, value.uses[1], 1, chunk, 128);
+                    // Keep the low dwords of the even and odd products.
+                    instruction("movdqa", "%" + left + ", %xmm2");
+                    instruction("pmuludq", "%" + right + ", %xmm2");
+                    instruction("pshufd", "$245, %" + left + ", %xmm0");
+                    instruction("pshufd", "$245, %" + right + ", %xmm1");
+                    instruction("pmuludq", "%xmm1, %xmm0");
+                    instruction("pshufd", "$136, %xmm2, %xmm2");
+                    instruction("pshufd", "$136, %xmm0, %xmm0");
+                    instruction("punpckldq", "%xmm0, %xmm2");
+                    store_vector_from(function, value.defs.front(),
+                                      "xmm2", chunk, 128);
+                }
+                return;
+            }
             const bool shift = value.opcode == Opcode::Vshl ||
                 value.opcode == Opcode::VshrS ||
                 value.opcode == Opcode::VshrU;
@@ -17284,16 +17533,17 @@ private:
             load(function, source, scratch);
             return std::string(scratch);
         };
+        const auto offset = value.kind == machine::InstructionKind::ConditionalBranch ? 2U : 0U;
         const auto base_register = address_register(
-            std::get<machine::RegisterOperand>(value.operands[1]).value, "rax");
+            std::get<machine::RegisterOperand>(value.operands[1 + offset]).value, "rax");
         const auto* index =
-            std::get_if<machine::RegisterOperand>(&value.operands[2]);
+            std::get_if<machine::RegisterOperand>(&value.operands[2 + offset]);
         const auto index_register =
             index ? address_register(index->value, "rcx") : std::string{};
         const auto scale =
-            std::get<machine::ImmediateOperand>(value.operands[3]).value;
+            std::get<machine::ImmediateOperand>(value.operands[3 + offset]).value;
         const auto displacement = static_cast<std::int64_t>(
-            std::get<machine::ImmediateOperand>(value.operands[4]).value);
+            std::get<machine::ImmediateOperand>(value.operands[4 + offset]).value);
         auto memory = (displacement == 0 ? std::string{}
                                          : std::to_string(displacement)) +
                       "(%" + base_register;
@@ -21424,6 +21674,20 @@ private:
         if (has_property(value.opcode, OpcodeProperty::Memory)) {
             const auto lhs = value.uses.front();
             const auto target = value.defs.front();
+            if (const auto code = condition_code(x86_64::base_opcode(value.opcode));
+                !code.empty()) {
+                const auto address = std::get<0>(folded_memory_operand(function, value));
+                const auto* assigned = assigned_integer_register(function, lhs);
+                const auto reg = assigned ? std::string(assigned->storage_name) : std::string("rdx");
+                if (!assigned) load(function, lhs, reg);
+                instruction("cmp" + std::string(1, suffix(lhs.mode.bits)),
+                            address + ", " + register_name(reg, lhs.mode.bits));
+                const auto* result = assigned_integer_register(function, target);
+                const auto destination = result ? std::string(result->storage_name) : std::string("rax");
+                instruction("set" + code, register_name(destination, 8));
+                store(function, target, destination);
+                return;
+            }
             const auto bits = lhs.mode.bits;
             const auto base = x86_64::base_opcode(value.opcode);
             const auto opcode = base == Opcode::Add ? "add" :
@@ -21815,6 +22079,31 @@ private:
         }
     }
 
+    void emit_extending_load(const machine::Function& function,
+                             const machine::Instruction& value) {
+        const auto target = value.defs.front();
+        const auto bits = std::get<machine::ImmediateOperand>(value.operands.back()).value;
+        std::string address;
+        if (const auto* slot = std::get_if<machine::StackSlotOperand>(
+                &value.operands.front())) {
+            address = memory(slot_offset(function, slot->slot) + slot->offset);
+        } else if (const auto* symbol = std::get_if<machine::SymbolOperand>(
+                       &value.operands.front())) {
+            address = global_memory(*symbol);
+        } else {
+            address = std::get<0>(folded_memory_operand(function, value));
+        }
+        const auto* assigned = assigned_integer_register(function, target);
+        const auto destination = assigned
+            ? std::string(assigned->storage_name) : std::string("rax");
+        const bool sign = value.opcode == Opcode::SextLoad;
+        const auto result_bits = sign && target.mode.bits == 64 ? 64U : 32U;
+        instruction(std::string(sign ? "movs" : "movz") + (bits == 8 ? "b" : "w") +
+                        (result_bits == 64 ? "q" : "l"),
+                    address + ", " + register_name(destination, result_bits));
+        store(function, target, destination);
+    }
+
     void emit_indexed_load(const machine::Function& function,
                            const machine::Instruction& value) {
         const auto base =
@@ -21881,9 +22170,7 @@ private:
         const auto destination = assigned_target
             ? std::string(assigned_target->storage_name)
             : std::string("rax");
-        instruction("mov" + std::string(1, suffix(target.mode.bits)),
-                    address + ", " +
-                        register_name(destination, target.mode.bits));
+        emit_integer_load(target.mode.bits, address, destination);
         store(function, target, destination);
     }
 
@@ -21982,9 +22269,7 @@ private:
                 const auto destination = assigned_target
                     ? std::string(assigned_target->storage_name)
                     : std::string("rax");
-                instruction("mov" + std::string(1, suffix(target.mode.bits)),
-                            at(0, base) + ", " +
-                                register_name(destination, target.mode.bits));
+                emit_integer_load(target.mode.bits, at(0, base), destination);
                 store(function, target, destination);
             }
             return;
@@ -22324,10 +22609,7 @@ private:
                 const auto* assigned = assigned_integer_register(function, target);
                 const auto destination = assigned
                     ? std::string(assigned->storage_name) : std::string("rax");
-                instruction("mov" +
-                                std::string(1, suffix(target.mode.bits)),
-                            address + ", " +
-                                register_name(destination, target.mode.bits));
+                emit_integer_load(target.mode.bits, address, destination);
                 store(function, target, destination);
             }
             return;
@@ -25703,11 +25985,15 @@ private:
                 }
                 const auto left = value.uses.front();
                 const auto bits = left.mode.bits;
+                const bool memory_compare = has_property(
+                    value.condition_predicate, OpcodeProperty::Memory);
+                const auto memory_operand = memory_compare
+                    ? std::get<0>(folded_memory_operand(function, value)) : std::string{};
                 const auto* assigned_left =
                     assigned_integer_register(function, left);
                 const auto left_register = assigned_left
                     ? std::string(assigned_left->storage_name)
-                    : std::string("rax");
+                    : std::string(memory_compare ? "rdx" : "rax");
                 if (!assigned_left) load(function, left, left_register);
                 std::string right_operand;
                 bool signed_zero_test = false;
@@ -25725,6 +26011,8 @@ private:
                              ? std::to_string(static_cast<std::int64_t>(
                                    immediate.value))
                              : std::to_string(immediate.value));
+                } else if (memory_compare) {
+                    right_operand = memory_operand;
                 } else {
                     if (value.uses.size() != 2) {
                         diagnostics_.error(
@@ -25909,12 +26197,19 @@ private:
                     }
                     return;
                 }
+                // Dispatch addresses use the full register even when the
+                // selector came from a narrow argument, reload, or truncation.
+                if (selector.mode.bits < 64) {
+                    instruction(selector.mode.bits == 8 ? "movzbl" :
+                                    selector.mode.bits == 16 ? "movzwl" : "movl",
+                                register_name(selector_register, selector.mode.bits) +
+                                    ", " + register_name(selector_register, 32));
+                }
                 if (!exhaustive) {
                     instruction(
-                        "cmp" + std::string(1, suffix(selector.mode.bits)),
+                        "cmpq",
                         "$" + std::to_string(count - 1) + ", " +
-                            register_name(selector_register,
-                                          selector.mode.bits));
+                            register_name(selector_register, 64));
                     instruction("ja", block_label(function, fallback));
                 }
                 JumpTable table;
@@ -26017,6 +26312,8 @@ private:
         } else if (value.opcode == Opcode::VpointerLoad ||
                    value.opcode == Opcode::VpointerStore) {
             emit_vector_pointer_access(function, value);
+        } else if (value.opcode == Opcode::ZextLoad || value.opcode == Opcode::SextLoad) {
+            emit_extending_load(function, value);
         } else if (value.opcode == Opcode::IndexedLoad) {
             emit_indexed_load(function, value);
         } else if (value.opcode == Opcode::IndexedStore) {

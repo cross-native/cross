@@ -78,8 +78,7 @@ inline bool packed_integer_operation(const Subtarget& subtarget,
     }
     return add_sub || bitwise ||
            (multiply && element_bits == 16) ||
-           (multiply && element_bits == 32 &&
-            subtarget.has_feature(Feature::Sse41)) ||
+           (multiply && element_bits == 32) ||
            (multiply && element_bits == 64 &&
             subtarget.has_feature(Feature::Avx2));
 }
@@ -141,7 +140,11 @@ inline std::vector<InstructionCostId> vector_operation_instructions(
         return {wide ? I::Psllq : I::Pslld};
     case O::Multiply:
         if (query.element_bits == 16) return {I::Pmullw};
-        if (query.element_bits == 32) return {I::Pmulld};
+        if (query.element_bits == 32) {
+            if (subtarget.has_feature(Feature::Sse41)) return {I::Pmulld};
+            return {I::Movdqa, I::Pmuludq, I::Pshufd, I::Pshufd,
+                    I::Pmuludq, I::Pshufd, I::Pshufd, I::Punpckldq};
+        }
         if (subtarget.has_feature(Feature::Avx512dq)) return {I::Vpmullq};
         return {I::Pmuludq, I::Pmuludq, I::Pmuludq, I::Psrlq, I::Psrlq,
                 I::Paddq, I::Paddq, I::Psllq};

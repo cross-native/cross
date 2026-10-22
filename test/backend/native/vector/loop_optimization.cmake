@@ -70,10 +70,18 @@ endforeach()
 # both slower and a needless long-lived register-pressure source.
 string(REGEX MATCHALL "andq[\t ]+[$]-16" rounded_limits "${assembly}")
 list(LENGTH rounded_limits rounded_limit_count)
-if(NOT rounded_limit_count EQUAL 5)
+if(NOT rounded_limit_count EQUAL 3)
     message(FATAL_ERROR
         "vectorized nested-loop limit was not materialized exactly once\n"
         "${assembly}")
+endif()
+
+# Plans containing long packed multiplies retain two streams under the
+# interleave budget, so their eight-element limits are rounded separately.
+string(REGEX MATCHALL "andq[\t ]+[$]-8" long_rounded_limits "${assembly}")
+list(LENGTH long_rounded_limits long_rounded_limit_count)
+if(NOT long_rounded_limit_count EQUAL 2)
+    message(FATAL_ERROR "long packed-operation loops lost their two-stream limits\n${assembly}")
 endif()
 
 # Index-derived affine terms are carried as packed recurrences. Re-expanding
@@ -98,7 +106,7 @@ endif()
 
 # At O3, one allocated shuffle mask feeds every interleaved byte swap.  The
 # constant qword-multiply expansion likewise caches the invariant upper half
-# of its multiplier: only the four data vectors should need a right shift.
+# of its multiplier: only the two data vectors should need a right shift.
 execute_process(
     COMMAND "${CC}" -S -O3 -funwind-tables -march=x86-64-v3
             "${SOURCE}" -o "${OUTPUT}.o3.s"
@@ -142,7 +150,7 @@ string(REGEX MATCHALL "vpsrlq[\t ]+[$]32" qword_high_shifts
 list(LENGTH qword_constant_splats qword_constant_splat_count)
 list(LENGTH qword_high_shifts qword_high_shift_count)
 if(NOT qword_constant_splat_count EQUAL 2 OR
-   NOT qword_high_shift_count EQUAL 4)
+   NOT qword_high_shift_count EQUAL 2)
     message(FATAL_ERROR
         "O3 AVX2 qword multiply did not cache its invariant high half\n"
         "${o3_constant_product}")

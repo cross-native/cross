@@ -18423,15 +18423,16 @@ bool rebalance_unsigned_add_recurrences(
     return !candidates.empty();
 }
 
-// A vectorizable access indexes by the loop index or by its zero extension
-// to address width. The recognized loops count up from zero below an
-// unsigned bound, so the narrower index never wraps.
+// An access indexes by the induction or its extension to address width.
+// A sign extension also needs the caller's nonnegative-induction proof.
 bool is_vector_address_index(const ManagedFunction& function,
-                             ValueId candidate, ValueId index) {
+                             ValueId candidate, ValueId index,
+                             bool nonnegative = false) {
     if (candidate == index) return true;
     const auto& value = function.values[candidate.value];
     return value.kind == ValueKind::Cast &&
-           value.cast == CastOperation::ZeroExtend &&
+           (value.cast == CastOperation::ZeroExtend ||
+            (nonnegative && value.cast == CastOperation::SignExtend)) &&
            value.operands.size() == 1 && value.operands.front() == index;
 }
 
@@ -18472,7 +18473,8 @@ std::optional<ReductionLoopPattern> find_reduction_loop(
     }
     const auto& condition = function.values[terminator.value->value];
     if (condition.kind != ValueKind::Binary ||
-        condition.binary != BinaryOperation::UnsignedLess ||
+        (condition.binary != BinaryOperation::UnsignedLess &&
+         condition.binary != BinaryOperation::SignedLess) ||
         condition.operands.size() != 2) {
         return std::nullopt;
     }
@@ -18875,6 +18877,9 @@ bool vectorizable_reduction_term(
             function, hir_module, pattern, definitions,
             value.operands.front(), required, arithmetic_operations, narrowed);
     }
+    const bool nonnegative = function.values[
+        function.blocks[pattern.loop.header.value].terminator.value->value]
+        .binary == BinaryOperation::SignedLess;
     if (value.kind == ValueKind::PointerLoad &&
         !value.is_volatile_access && value.operands.size() == 1) {
         const auto address_id = value.operands.front();
@@ -18883,7 +18888,7 @@ bool vectorizable_reduction_term(
         if (address.kind != ValueKind::IndexedAddress ||
             address.operands.size() != 2 ||
             !is_vector_address_index(function, address.operands[1],
-                                     pattern.index)) {
+                                     pattern.index, nonnegative)) {
             return false;
         }
         const auto base = address.operands.front();
@@ -18893,7 +18898,7 @@ bool vectorizable_reduction_term(
     if (value.kind == ValueKind::IndexedLoad &&
         !value.is_volatile_access && value.operands.size() == 2 &&
         is_vector_address_index(function, value.operands[1],
-                                pattern.index)) {
+                                pattern.index, nonnegative)) {
         const auto base = value.operands.front();
         return definitions[base.value] &&
                !pattern.loop.blocks.contains(definitions[base.value]->value);
@@ -19098,7 +19103,8 @@ bool vectorize_reduction_loop(
                ? 1U
                : conditional_depth != 0U
                    ? 2U
-                   : !pattern.stores.empty() ? memory_interleave : 4U)
+                   : !pattern.stores.empty() || packed_length > 4
+                       ? memory_interleave : 4U)
         : 1U;
     // A zero-based loop to a constant bound runs no vector step wider than
     // that bound.
@@ -19232,7 +19238,25 @@ bool vectorize_reduction_loop(
         for (auto& operand : clone.operands) operand = preheader_copy(operand);
         return append_value(preheader_values, std::move(clone));
     };
-    const auto bound = preheader_copy(pattern.bound);
+    auto bound = preheader_copy(pattern.bound);
+    const auto& scalar_condition = function.values[
+        function.blocks[pattern.loop.header.value].terminator.value->value];
+    if (scalar_condition.binary == BinaryOperation::SignedLess) {
+        const auto zero = add_integer_constant(index_type, 0);
+        ManagedValue positive;
+        positive.location = vector_header.location;
+        positive.type = bool_type;
+        positive.kind = ValueKind::Binary;
+        positive.binary = BinaryOperation::SignedGreater;
+        positive.operands = {bound, zero};
+        const auto is_positive = append_value(preheader_values, std::move(positive));
+        ManagedValue clamp;
+        clamp.location = vector_header.location;
+        clamp.type = index_type;
+        clamp.kind = ValueKind::Select;
+        clamp.operands = {is_positive, bound, zero};
+        bound = append_value(preheader_values, std::move(clamp));
+    }
     // The recognized induction starts at zero, so rounding the bound down to
     // a whole vector group gives a loop-invariant end index. Comparing the
     // induction with this limit avoids a subtract in every vector iteration.

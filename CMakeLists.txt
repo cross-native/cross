@@ -4344,6 +4344,79 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/middle/store_motion_codegen.cmake")
     set_tests_properties(cross_store_motion_codegen PROPERTIES
         LABELS "check.compile;arch.x86_64;arch.mips;middle;backend.native;feature.optimization;feature.object;feature.floating;feature.model;isa.vr4300;opt.O2;opt.O3;opt.Os")
+    if(WIN32)
+        set(perf_target x86_64-w64-windows-gnu)
+    else()
+        set(perf_target x86_64-unknown-linux-gnu)
+    endif()
+    foreach(perf_source narrow_loads runtime_integer_reduction)
+        if(perf_source STREQUAL "narrow_loads")
+            set(perf_path test/backend/machine/narrow_loads.x)
+            set(perf_name narrow_loads)
+            set(perf_labels "backend.machine;feature.memory")
+        else()
+            set(perf_path test/middle/runtime_integer_reduction.x)
+            set(perf_name integer_reduction)
+            set(perf_labels "middle;feature.vector")
+        endif()
+        foreach(perf_mode O0 O1 O2 O3 Os Oz O2-avx2 O3-avx2 O2-no-vectorize
+                          O2-no-combine O2-no-fold O2-no-fusion O2-no-thread O2-wrapv)
+            string(REGEX MATCH "^O[0-9sz]" perf_level "${perf_mode}")
+            set(perf_flags "-${perf_level};-fno-eval-calls;-target;${perf_target}")
+            if(perf_mode MATCHES "avx2")
+                list(APPEND perf_flags -march=x86-64-v3)
+            elseif(perf_mode MATCHES "no-vectorize")
+                list(APPEND perf_flags -fno-tree-loop-vectorize -fno-tree-slp-vectorize)
+            elseif(perf_mode MATCHES "no-combine")
+                list(APPEND perf_flags -fno-machine-combine)
+            elseif(perf_mode MATCHES "no-fold")
+                list(APPEND perf_flags -fno-fold-memory-operands)
+            elseif(perf_mode MATCHES "no-fusion")
+                list(APPEND perf_flags -fno-compare-branch-fusion)
+            elseif(perf_mode MATCHES "no-thread")
+                list(APPEND perf_flags -fno-thread-jumps)
+            elseif(perf_mode MATCHES "wrapv")
+                list(APPEND perf_flags -fwrapv)
+            endif()
+            add_test(NAME cross_runtime_${perf_name}_${perf_mode}
+                COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/${perf_path}
+                    -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/${perf_source}-${perf_mode}
+                    -DENTRY=test_entry -DEXPECTED=0 "-DCC_FLAGS=${perf_flags}"
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+            set_tests_properties(cross_runtime_${perf_name}_${perf_mode} PROPERTIES
+                LABELS "check.runtime;arch.x86_64;backend.native;${perf_labels};feature.optimization;opt.${perf_level}")
+        endforeach()
+        foreach(perf_level O2 O3)
+            add_test(NAME cross_runtime_${perf_name}_mips_${perf_level}
+                COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/${perf_path}
+                    -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/${perf_source}-mips-${perf_level}
+                    -DEXPECTED=P "-DCC_FLAGS=-${perf_level};-fno-eval-calls"
+                    -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+            set_tests_properties(cross_runtime_${perf_name}_mips_${perf_level} PROPERTIES
+                LABELS "check.runtime;arch.mips;backend.native;${perf_labels};feature.optimization;opt.${perf_level}"
+                SKIP_REGULAR_EXPRESSION "skipping MIPS")
+        endforeach()
+    endforeach()
+    add_test(NAME cross_narrow_loads_codegen
+        COMMAND "${CMAKE_COMMAND}" -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/machine/narrow_loads.x
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/narrow_loads-codegen
+            -P "${CMAKE_SOURCE_DIR}/test/backend/machine/narrow_loads.cmake")
+    set_tests_properties(cross_narrow_loads_codegen PROPERTIES
+        LABELS "check.codegen;arch.x86_64;backend.native;feature.optimization")
+    add_test(NAME cross_runtime_integer_reduction_codegen
+        COMMAND "${CMAKE_COMMAND}" -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/runtime_integer_reduction.x
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime_integer_reduction-codegen
+            -P "${CMAKE_SOURCE_DIR}/test/middle/runtime_integer_reduction.cmake")
+    set_tests_properties(cross_runtime_integer_reduction_codegen PROPERTIES
+        LABELS "check.codegen;arch.x86_64;backend.native;feature.optimization")
     # Conditional reductions over floating and narrowed index comparisons.
     foreach(reduction_mode O0 O2 O2-avx2 O3 O3-avx2)
         string(REGEX MATCH "^O[0-9s]" reduction_level "${reduction_mode}")
