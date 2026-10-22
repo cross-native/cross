@@ -163,6 +163,31 @@ static u32 mix(in u32 sum, in u32 value) { return sum * 31u32 + value; }
     return 1000u32;
 }
 
+// A value that a threaded path decides is read in a later loop, whose
+// blocks with one predecessor lead back to its header.
+struct Image { i32 npal; u8 pal[16][4]; u8 *ext; i32 next; };
+global u8 extension[24];
+
+static u32 be32(in const u8 *p) {
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3];
+}
+
+[[noinline]] global u32 cycled(in struct Image *img, in i32 w, in i32 h, in i32 bpp) {
+    u32 sum = 0u32;
+    const i32 has_ext = img->ext && img->next == 4 + img->npal;
+    const u32 flags = has_ext ? be32(img->ext) : 0u32;
+    for (i32 y = 0; y < h; y++) {
+        for (i32 x = 0; x < w; x++) {
+            if (bpp == 8) sum++;
+        }
+    }
+    for (i32 i = 0; i < img->npal; i++) {
+        sum += (u32)((img->pal[i][0] >> 3) << 11 |
+                     (has_ext ? img->ext[4 + i] & 1 : img->pal[i][3] >= 128));
+    }
+    return sum + flags;
+}
+
 global u32 test_entry() {
     const u32 lives[8] = {0u32, 1u32, 5u32, 63u32, 64u32, 65u32, 100u32, 4294967295u32};
     const u32 seeds[5] = {0u32, 0x3f00u32, 0x12345678u32, 0xffffffffu32, 0x2a00u32};
@@ -252,5 +277,22 @@ global u32 test_entry() {
     sum = mix(sum, $::runtime(dominated(9u32)));
     sum = mix(sum, $::runtime(dominated(10u32)));
     if (sum != 949184249u32) return 12u32;
+    for (u32 k = 0u32; k < opaque(24u32); ++k) extension[k] = (u8)(k * 37u32 + 5u32);
+    struct Image img;
+    sum = 0u32;
+    for (i32 npal = 0; npal < (i32)opaque(16u32); npal += 5) {
+        for (u32 e = 0u32; e < opaque(3u32); ++e) {
+            for (i32 bpp = 4; bpp <= 8; bpp += 4) {
+                img.npal = npal;
+                for (u32 k = 0u32; k < 16u32; ++k) {
+                    for (u32 c = 0u32; c < 4u32; ++c) img.pal[k][c] = (u8)(k * 29u32 + c * 71u32);
+                }
+                img.ext = e == 0u32 ? (u8 *)0 : &extension[0];
+                img.next = e == 2u32 ? 4 + npal : 3;
+                sum = mix(sum, $::runtime(cycled(&img, 3, 2, bpp)));
+            }
+        }
+    }
+    if (sum != 799702280u32) return 13u32;
     return 0u32;
 }

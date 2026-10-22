@@ -1529,8 +1529,10 @@ private:
             for (const auto predecessor : function_.blocks[at.value].predecessors) {
                 if (reachable[predecessor.value]) live.push_back(predecessor);
             }
+            // A cycle of reachable blocks has a block with several
+            // predecessors, whose phi ends the walk; a placeholder here
+            // would leak into the values a cycle computes.
             if (live.size() == 1) {
-                at_start[at.value] = original;
                 const auto value = end(live.front());
                 at_start[at.value] = value;
                 return value;
