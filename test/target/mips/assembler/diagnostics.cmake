@@ -74,7 +74,8 @@ expect(li error "        li $2, 0x100000000"
 expect(dli error ".set mips2|        dli $2, 5" "dli.s:2:9: error: instruction 'dli' is not available in mips2" ${o32})
 expect(numeric error "        .word 1b" "numeric.s:1:15: error: no previous definition of local label '1'" ${o32})
 expect(div error "        div $2, $3, $4"
-       "div.s:1:13: error: 'div' takes '[$]zero' as operand 1" ${o32})
+       "div.s:1:9: error: instruction 'div' with these operands is not available in mips3"
+       ${o32})
 expect(cfi error ".cfi_offset 31, -4"
        "cfi.s:1:1: error: this directive must appear between .cfi_startproc and .cfi_endproc" ${o32})
 expect(frame error ".cfi_startproc|        nop" "frame.s:1:1: error: missing .cfi_endproc" ${o32})

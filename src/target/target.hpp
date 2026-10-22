@@ -338,6 +338,9 @@ struct InstructionOperandEntry {
     // The immediate names an architectural register by number and prints in
     // register syntax, such as a MIPS coprocessor register `$12`.
     bool assembly_register_number{};
+    // The displacements a memory operand's encoding holds.
+    std::int64_t memory_offset_minimum{-32768};
+    std::int64_t memory_offset_maximum{32767};
 };
 
 // A pipeline resource the hardware does not interlock. A writer makes it

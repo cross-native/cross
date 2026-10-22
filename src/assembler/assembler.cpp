@@ -4404,7 +4404,8 @@ bool Assembler::Impl::record_elf(std::size_t section_index, Fragment& fragment, 
         return apply(fixup, info, value.constant, bytes, false);
     }
     const auto& target_symbol = as.symbols_[value.add->value];
-    if (info.pc_relative && resolves_in_place(value, section_index, fixup)) {
+    if (info.pc_relative && !info.relocate &&
+        resolves_in_place(value, section_index, fixup)) {
         const auto* base = as.base_symbol(target_symbol);
         return apply(fixup, info,
                      static_cast<std::int64_t>(address(*base)) + value.constant -

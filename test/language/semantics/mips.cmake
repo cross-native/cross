@@ -128,7 +128,24 @@ foreach(endian IN LISTS MIPS_ENDIANS)
         # STARTUP_AS, an assembler that takes cc's target options such as the
         # Cross as, gives the startup the ABI tag of STARTUP_AS_FLAGS, which
         # linkers check against the compiled units; llvm-mc tags it o32.
-        if(DEFINED STARTUP_AS AND NOT "${STARTUP_AS}" STREQUAL "")
+        if(MIPS_RELEASE6)
+            # Release 6 objects link only with Release 6 code of their level,
+            # and Release 6 has its own SDBBP for the semihosting exit.
+            if(cpu STREQUAL "mips32r6")
+                set(release6_level mips32r6)
+            else()
+                set(release6_level mips64r6)
+            endif()
+            file(READ "${STARTUP}" startup_text)
+            string(REGEX REPLACE "\\.set([ \t]+)mips3([ \t\r\n])" ".set\\1${release6_level}\\2"
+                   startup_text "${startup_text}")
+            string(REGEX REPLACE "\\.word([ \t]+)0x7000007f" ".word\\10x0000004e" startup_text
+                   "${startup_text}")
+            file(WRITE "${out}.start.s" "${startup_text}")
+            execute_process(COMMAND "${LLVM_MC}" --filetype=obj --triple=${arch}-unknown-elf
+                --mcpu=${release6_level} --mattr=+noabicalls "${out}.start.s"
+                -o "${out}.start.o" RESULT_VARIABLE s)
+        elseif(DEFINED STARTUP_AS AND NOT "${STARTUP_AS}" STREQUAL "")
             execute_process(COMMAND "${STARTUP_AS}" -target ${arch}-unknown-elf
                 -march=mips3 ${STARTUP_AS_FLAGS} "${STARTUP}" -o "${out}.start.o"
                 RESULT_VARIABLE s)

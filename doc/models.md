@@ -365,12 +365,14 @@ marker sections.
 `features` lists target features, as `cc --print-features` names them,
 that compilations with the entry as their ABI select in place of the
 features of the `-march` CPU entry that conflict with them. A feature whose
-prerequisites the CPU lacks is not selected, and `-m` options override the
-list. Each name may appear once, the listed features and their
-prerequisites may not conflict, and a CPU fact that options cannot select,
-such as `allegrex`, is an error. The shipped MIPS `o32`, `x32`, and `eabi32`
-list `fp32` and `n64` lists `fp64`, as GCC derives the FPR width from the
-ABI's general registers; `x64` keeps the CPU's.
+prerequisites the CPU lacks, or that conflicts with a CPU fact that options
+cannot select, is not selected, and `-m` options override the list. Each
+name may appear once, the listed features and their prerequisites may not
+conflict, and a CPU fact that options cannot select, such as `allegrex`, is
+an error. The shipped MIPS `o32`, `x32`, and `eabi32` list `fp32` and `n64`
+lists `fp64`, as GCC derives the FPR width from the ABI's general registers;
+`x64` keeps the CPU's, and so does every ABI on a Release 6 CPU, whose
+`mips32r6` or `mips64r6` conflicts with `fp32`.
 
 `private_carrier_bits` marks the entry as the convention that
 `-fprivate-abi` uses on MIPS for calls to functions defined without `global`
@@ -1156,7 +1158,7 @@ instruction "addu" {
 | `volatile` | bool | `false` | Every execution is observable: the compiler does not merge, remove, or reorder the form across another effect. |
 | `hazard_uses`, `hazard_writes` | list | `[]` | Pipeline facts of resources that the hardware does not interlock ([Effects](#effects)). |
 | `latency`, `issue` | integer | `1` | The default costs, from 0 and from 1 to 65535, that `cpu` entries replace. |
-| `constraints` | list | `[]` | Relations that immediate operands keep, such as `"pos+size <= 32"`: a sum of operands and integers compared with an integer by `<=`, `<`, `>=`, `>`, `==`, or `!=`. |
+| `constraints` | list | `[]` | Relations that operands keep, immediates by value and general registers by number, such as `"pos+size <= 32"` or `"rt-rs > 0"`: a sum of operands and integers compared with an integer by `<=`, `<`, `>=`, `>`, `==`, or `!=`. |
 | `builtin` | text | none | Exposes the form as the built-in `$::_NAME`. |
 | `alias` | text | none | Another entry, which this one spells under its own mnemonic ([Aliases and macros](#aliases-and-macros)). |
 | `macro` | text | none | A macro of the target's assembler that the form expands to. |
@@ -1186,8 +1188,9 @@ when it has at least the form's required operands and at most all of them,
 a register where the form has a register operand, and no register where the
 form has an immediate. Of several such forms that the CPU has, the
 statement assembles as the first whose immediate operands, where their
-values are known when it is assembled, hold those values and satisfy its
-constraints; when none does, the first reports the values that do not fit.
+values are known when it is assembled, hold those values and whose
+constraints those values and its registers satisfy; when none does, the
+first reports the values that do not fit.
 
 ### Encodings
 
@@ -1286,11 +1289,15 @@ MIPS instructions have 32 bits. The operand types:
 | `LOW..HIGH` | An integer from `LOW` to `HIGH`. | The value. | A constant. |
 | `imm` | An integer of up to 64 bits. | Macros only. | None. |
 | `mem`, `mem8`, `mem16`, `mem32`, `mem64` | `offset(base)`, `(base)`, or an absolute `offset`, whose base is `$zero`; the offset is signed 16 bits. | Parts `.base` and `.offset`. | An lvalue of any width, or of that width. |
+| `mem_simmK`, `memN_simmK` | As `mem` and `memN`, with a signed offset of `K` bits, from 1 to 16, that takes no relocation operator. | Parts `.base` and `.offset`. | As `mem` and `memN`. |
 | `branch`, `jump` | A label, reached PC-relative in 16 bits, or in the current 256 MB region in 26. | The relocated value. | For `branch`, a label of the function; none for `jump`. |
+| `branch21`, `branch26` | A label, reached PC-relative in 21 or 26 bits, as a `branch` counting words from the next instruction. | The relocated value. | None. |
+| `pcrel19s2`, `pcrel18s3` | A label, or a byte offset that is a multiple of 4 or 8, reached from the instruction in 19 bits of words or 18 bits of doublewords; the doubleword's counts from the instruction's doubleword. | The relocated value, or the offset in words or doublewords. | None. |
 
 `simm16`, `uimm16`, and memory offsets also take `%hi`, `%lo`, `%gp_rel`,
 `%higher`, and `%highest` and values that only layout settles; their field
-is bits 15-0, that of a `branch` too, and that of a `jump` bits 25-0.
+is bits 15-0, that of a `branch` too, that of a `jump` bits 25-0, and those
+of `branch21`, `branch26`, `pcrel19s2`, and `pcrel18s3` their low bits.
 
 The hazard classes are those of GNU as's reordering in `.set reorder` code.
 `load`: a load's register is ready one instruction late without
@@ -1304,11 +1311,16 @@ reader uses two instructions after a transfer that writes it and one after a
 compare without `fpu-compare-interlocks`. `no-delay-slot`: never moved into
 a delay slot. Without `hilo-interlocks`, a write of `hi` or `lo` follows a
 read of it by two instructions. The resource `cp0` marks a coprocessor 0
-instruction.
+instruction. A `branch` without a delay slot, a Release 6 compact branch,
+has a forbidden slot: in `.set reorder` code a `nop` follows it before a
+control transfer, data, an alignment, and the end of the input, and an
+instruction in it does not move into a later delay slot.
 
 The shipped `dext` and `dins` also spell `dextm` and `dextu`, and `dinsm`
 and `dinsu`, so that a field that ends or starts above bit 31 assembles as
-the instruction that takes it, as in GNU as. The macros `li` and `dli` take
+the instruction that takes it, as in GNU as. The forms that Release 6
+removes or re-encodes exclude `mips32r6` and `mips64r6`, and its own forms
+need them. The macros `li` and `dli` take
 a register and an `imm` operand and expand to the table's `addiu`, `ori`,
 `lui`, `dsll`, and `dsrl32` as GNU as expands 32- and 64-bit constants. The
 scratch register of `otherwise` is `$at`, which a macro under `.set noat`

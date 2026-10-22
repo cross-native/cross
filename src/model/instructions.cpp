@@ -738,8 +738,11 @@ public:
             }
             if (!expression(compact, line, constraint.terms, constraint.constant)) return false;
             for (const auto& item_term : constraint.terms) {
-                if (entry_.operands[item_term.operand].type.kind != OperandKind::Immediate) {
-                    return fail(line, "constraint '" + item + "' names a non-immediate operand");
+                const auto kind = entry_.operands[item_term.operand].type.kind;
+                if (kind != OperandKind::Immediate && kind != OperandKind::Register) {
+                    return fail(line, "constraint '" + item +
+                                          "' names an operand that is neither an immediate "
+                                          "nor a register");
                 }
             }
             entry_.constraints.push_back(std::move(constraint));
@@ -930,6 +933,8 @@ void add_builtin_forms(const TargetInfo& target, const ModelInstruction& entry,
                     case OperandKind::Memory:
                         field.allow_memory = true;
                         field.memory_bits = type.memory_bits;
+                        field.memory_offset_minimum = type.offset_minimum;
+                        field.memory_offset_maximum = type.offset_maximum;
                         break;
                     case OperandKind::Label:
                         // A label of the function the built-in is in.
@@ -1073,9 +1078,19 @@ bool complete_table(const TargetInfo& target, InstructionTable& table,
                     std::sort(items.begin(), items.end());
                     return items;
                 };
+                // Forms that differ in their constraints differ by the
+                // values of their operands.
+                const auto constraints = [&](const ModelInstruction& form) {
+                    std::vector<std::string> result;
+                    for (const auto& constraint : form.constraints) {
+                        result.push_back(constraint.text);
+                    }
+                    return sorted(result);
+                };
                 if (types(first_form) == types(second_form) &&
                     sorted(first_form.features) == sorted(second_form.features) &&
-                    sorted(first_form.excludes) == sorted(second_form.excludes)) {
+                    sorted(first_form.excludes) == sorted(second_form.excludes) &&
+                    constraints(first_form) == constraints(second_form)) {
                     return fail(second.position(),
                                 "instruction '" + second.name + "' duplicates the form of '" +
                                     std::string(mnemonic) + "' that '" +
@@ -1098,23 +1113,48 @@ bool complete_table(const TargetInfo& target, InstructionTable& table,
                 }
             }
         }
+        // The forms the compiler expects as operands and effects; forms with
+        // the same operands, such as those of different ISA levels, may
+        // differ in their effects.
+        std::vector<std::pair<std::string, std::string>> expectations;
         for (const auto expected : selected.forms) {
             const auto bar = expected.find('|');
-            const auto operands = trim(expected.substr(0, bar));
-            const auto effects =
-                bar == std::string_view::npos ? std::string{} : trim(expected.substr(bar + 1));
+            expectations.emplace_back(
+                trim(expected.substr(0, bar)),
+                bar == std::string_view::npos ? std::string{} : trim(expected.substr(bar + 1)));
+        }
+        if (found != table.forms.end()) {
+            for (const auto index : found->second) {
+                const auto& form = spelled_entry(table, entries[index]);
+                // A macro's instructions have the effects.
+                if (!form.encoded) continue;
+                const auto operands = operand_signature(form);
+                const auto effects = effect_signature(form);
+                std::string expected_effects;
+                bool selected_operands = false;
+                bool matched = false;
+                for (const auto& [expected_operands, expected] : expectations) {
+                    if (expected_operands != operands) continue;
+                    selected_operands = true;
+                    matched = matched || expected == effects;
+                    if (expected_effects.empty()) expected_effects = expected;
+                }
+                if (selected_operands && !matched) {
+                    return fail(entries[index].position(),
+                                "instruction '" + entries[index].name + "' has the effects '" +
+                                    effects + "'; the compiler selects it with '" +
+                                    expected_effects + "'");
+                }
+            }
+        }
+        for (const auto& [operands, effects] : expectations) {
             bool present = false;
             if (found != table.forms.end()) {
                 for (const auto index : found->second) {
                     const auto& form = spelled_entry(table, entries[index]);
-                    if (operand_signature(form) != operands) continue;
-                    present = true;
-                    // A macro's instructions have the effects.
-                    if (form.encoded && effect_signature(form) != effects) {
-                        return fail(entries[index].position(),
-                                    "instruction '" + entries[index].name +
-                                        "' has the effects '" + effect_signature(form) +
-                                        "'; the compiler selects it with '" + effects + "'");
+                    if (operand_signature(form) == operands &&
+                        (!form.encoded || effect_signature(form) == effects)) {
+                        present = true;
                     }
                 }
             }

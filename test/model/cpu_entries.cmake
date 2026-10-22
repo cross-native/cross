@@ -396,7 +396,7 @@ cpu "c" {
 expect_rejected(cpu-feature-conflict 3 "cpu features 'mips32' and 'mips3' conflict" [=[
 cpu "c" {
     architecture = "mips";
-    features = ["mips32", "fp64"];
+    features = ["mips32", "fix4300"];
 }
 ]=])
 expect_rejected(cpu-instruction 4 "unknown x86-64 instruction 'mult'" [=[

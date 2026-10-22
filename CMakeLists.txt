@@ -1780,6 +1780,24 @@ if(BUILD_TESTING)
         "-target mips-unknown-elf -march=vr4300 -mabi=32 -mgp32 -O2"
         "-EB -O2 -march=vr4300 -mabi=32 -mgp32"
         "endian.big" -DCHECK=${mips_assembler_checks}/conventions_check.cmake)
+    # Release 6: its instructions and the forms it re-encodes, and its
+    # branches, whose PC-relative relocations GNU as keeps in their section.
+    cross_mips_assembler_words(instructions_mips32r6 instructions_r6.s
+        "-target mips-unknown-elf -march=mips32r6" "-EB -march=mips32r6 -mabi=32"
+        "endian.big;isa.mips32r6")
+    cross_mips_assembler_words(instructions_mips64r6 instructions_r6_64.s
+        "-target mips64-unknown-elf -march=mips64r6 -mabi=n64" "-EB -march=mips64r6 -mabi=64"
+        "endian.big;isa.mips64r6")
+    cross_mips_assembler_words(branches_mips32r6 branches_r6.s
+        "-target mips-unknown-elf -march=mips32r6" "-EB -march=mips32r6 -mabi=32"
+        "endian.big;isa.mips32r6")
+    add_test(NAME cross_mips_assembler_release6
+        COMMAND "${CMAKE_COMMAND}"
+                -DAS=$<TARGET_FILE:cross_as>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-assembler-release6/case
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/assembler/release6.cmake")
+    set_tests_properties(cross_mips_assembler_release6 PROPERTIES
+        LABELS "feature.assembler;arch.mips;check.compile;diagnostics;isa.mips32r6;isa.mips64r6;isa.mips32r2;isa.mips64r2;endian.big")
     foreach(name module reorder data_relocations)
         add_test(NAME cross_mips_assembler_${name}
             COMMAND "${CMAKE_COMMAND}"
@@ -1967,7 +1985,7 @@ if(BUILD_TESTING)
         -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-machine-instructions
         -P "${CMAKE_SOURCE_DIR}/test/target/mips/machine_instructions.cmake")
     set_tests_properties(cross_mips_machine_instructions PROPERTIES
-        LABELS "check.compile;arch.mips;backend.native;feature.raw;diagnostics;isa.vr4300;isa.mips32r2;isa.mips64r2")
+        LABELS "check.compile;arch.mips;backend.native;feature.raw;diagnostics;isa.vr4300;isa.mips32r2;isa.mips64r2;isa.mips32r6;isa.mips64r6")
     # Naked functions: exception returns, coprocessor 0 selects, exception
     # instructions, and their diagnostics; raw branches, and managed calls to
     # naked routines with register interfaces, under o32 and n64.
@@ -2656,6 +2674,189 @@ if(BUILD_TESTING)
                     -P "${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.cmake")
             set_tests_properties(cross_mips_release2_n64_${release2_endian}_${release2_level} PROPERTIES
                 LABELS "check.runtime;arch.mips;backend.native;feature.codegen;isa.mips64r2;profile.n64;endian.${release2_endian};opt.${release2_level}"
+                SKIP_REGULAR_EXPRESSION "skipping MIPS")
+        endforeach()
+    endforeach()
+    # Release 6: what its CPUs select, the objects' ISA, NaN encoding, and
+    # FPU register model, the options it rejects, and GNU as's encodings.
+    add_test(NAME cross_mips_release6
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/release6.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-release6/case
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/release6.cmake")
+    set_tests_properties(cross_mips_release6 PROPERTIES
+        LABELS "check.compile;arch.mips;backend.native;feature.codegen;feature.floating;isa.mips32r6;isa.mips64r6;isa.i6400;isa.i6500;isa.p6600;isa.mips32r2;isa.mips64r2;isa.vr4300;isa.mips4;endian.big;endian.little;opt.O0;opt.O2")
+    # The Release 6 results under QEMU's Release 6 CPUs, whose startups
+    # MIPS_RELEASE6 assembles at the Release 6 level: o32 on MIPS32R6 and
+    # MIPS64R6 CPUs in both byte orders, also as FPXX code, and n64, and
+    # floating calls in both directions with GCC objects. Each o32 entry:
+    # name|CPUs|QEMU CPU|options.
+    foreach(release6_level O0 O2)
+        foreach(release6_case "mips32r6|mips32r6|mips32r6-generic|-fno-eval-calls"
+                              "mips32r6_fpxx|mips32r6|mips32r6-generic|-fno-eval-calls,-mfpxx"
+                              "mips64r6|mips64r6,i6400,i6500,p6600|I6400|-fno-eval-calls")
+            string(REPLACE "|" ";" release6_fields "${release6_case}")
+            list(GET release6_fields 0 release6_name)
+            list(GET release6_fields 1 release6_cpus)
+            list(GET release6_fields 2 release6_qemu)
+            list(GET release6_fields 3 release6_options)
+            string(REPLACE "," ";" release6_cpus "${release6_cpus}")
+            string(REPLACE "," ";" release6_options "${release6_options}")
+            set(release6_labels "check.runtime;arch.mips;backend.native;feature.codegen;feature.floating;feature.atomics;endian.big;endian.little;opt.${release6_level}")
+            foreach(release6_cpu IN LISTS release6_cpus)
+                list(APPEND release6_labels "isa.${release6_cpu}")
+            endforeach()
+            add_test(NAME cross_mips_release6_runtime_${release6_name}_${release6_level}
+                COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/release6.x
+                    -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-release6-${release6_name}-${release6_level}
+                    -DEXPECTED=P "-DCC_FLAGS=-${release6_level};${release6_options}"
+                    "-DMIPS_CPUS=${release6_cpus}" -DQEMU_CPU=${release6_qemu}
+                    -DMIPS_RELEASE6=ON
+                    -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+            set_tests_properties(cross_mips_release6_runtime_${release6_name}_${release6_level}
+                PROPERTIES LABELS "${release6_labels}" SKIP_REGULAR_EXPRESSION "skipping MIPS")
+        endforeach()
+        add_test(NAME cross_mips_release6_interop_${release6_level}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/release6_interop.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
+                -DGCC_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/release6_interop.c
+                -DGCC_FLAGS=-G0
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-release6-interop-${release6_level}
+                -DEXPECTED=P "-DCC_FLAGS=-${release6_level};-fno-eval-calls"
+                -DMIPS_CPUS=mips32r6 -DQEMU_CPU=mips32r6-generic -DMIPS_RELEASE6=ON
+                -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(cross_mips_release6_interop_${release6_level} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;feature.abi;feature.floating;feature.interop;profile.o32;isa.mips32r6;endian.big;endian.little;opt.${release6_level}"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS")
+        foreach(release6_endian big little)
+            add_test(NAME cross_mips_release6_n64_${release6_endian}_${release6_level}
+                COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/release6.x
+                    -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_n64_entry_start.s
+                    -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare-n64.ld
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-release6-n64-${release6_endian}-${release6_level}
+                    -DN64_ENDIAN=${release6_endian}
+                    "-DEXTRA_FLAGS=-${release6_level} -fno-eval-calls -march=mips64r6"
+                    -DN64_QEMU_CPU=I6400 -DMIPS_RELEASE6=ON
+                    -P "${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.cmake")
+            set_tests_properties(cross_mips_release6_n64_${release6_endian}_${release6_level} PROPERTIES
+                LABELS "check.runtime;arch.mips;backend.native;feature.codegen;feature.floating;feature.atomics;profile.n64;isa.mips64r6;endian.${release6_endian};opt.${release6_level}"
+                SKIP_REGULAR_EXPRESSION "skipping MIPS n64")
+            add_test(NAME cross_mips_release6_n64_interop_${release6_endian}_${release6_level}
+                COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/release6_interop.x
+                    -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_n64_entry_start.s
+                    -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare-n64.ld
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-release6-n64-interop-${release6_endian}-${release6_level}
+                    -DN64_ENDIAN=${release6_endian}
+                    "-DEXTRA_FLAGS=-${release6_level} -fno-eval-calls -march=i6500"
+                    -DGCC_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/release6_interop.c
+                    "-DGCC_FLAGS=-G0 -march=i6500"
+                    -DN64_QEMU_CPU=I6500 -DMIPS_RELEASE6=ON
+                    -P "${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.cmake")
+            set_tests_properties(cross_mips_release6_n64_interop_${release6_endian}_${release6_level} PROPERTIES
+                LABELS "check.runtime;arch.mips;backend.native;feature.abi;feature.floating;feature.interop;profile.n64;isa.i6500;endian.${release6_endian};opt.${release6_level}"
+                SKIP_REGULAR_EXPRESSION "skipping MIPS n64")
+        endforeach()
+    endforeach()
+    # Records by value and variadic calls across the n64 C ABI with GCC
+    # objects compiled for Release 6.
+    foreach(release6_endian big little)
+        add_test(NAME cross_mips_release6_n64_records_c_${release6_endian}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/n64_records.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/n64_records_start.s
+                -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare-n64.ld
+                -DN64_ENDIAN=${release6_endian}
+                "-DEXTRA_FLAGS=-O2 -march=mips64r6"
+                -DGCC_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/n64_records.c
+                "-DGCC_FLAGS=-G0 -march=mips64r6"
+                -DN64_QEMU_CPU=I6400 -DMIPS_RELEASE6=ON
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-release6-n64-records-c-${release6_endian}
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.cmake")
+        set_tests_properties(cross_mips_release6_n64_records_c_${release6_endian} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;feature.abi;feature.interop;feature.records;profile.n64;isa.mips64r6;endian.${release6_endian};opt.O2"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS n64")
+        add_test(NAME cross_mips_release6_variadic_n64_c_${release6_endian}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/variadic_c.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/variadic_n64_start.s
+                -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare-n64.ld
+                -DN64_ENDIAN=${release6_endian}
+                "-DEXTRA_FLAGS=-DDOUBLES=1 -O2 -march=mips64r6"
+                -DGCC_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/variadic_c.c
+                "-DGCC_FLAGS=-G0 -DDOUBLES=1 -march=mips64r6"
+                -DN64_QEMU_CPU=I6400 -DMIPS_RELEASE6=ON
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-release6-variadic-n64-c-${release6_endian}
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.cmake")
+        set_tests_properties(cross_mips_release6_variadic_n64_c_${release6_endian} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;feature.variadic;feature.abi;feature.interop;profile.n64;isa.mips64r6;endian.${release6_endian};opt.O2"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS n64")
+    endforeach()
+    # The differential kernels on Release 6 against the x86-64 reference.
+    # Each entry: name|endian|address model|QEMU CPU|optimization|Release 6
+    # level|flags; n64 entries only run the sets with n64 startups.
+    foreach(release6_set int float private quality boundary wide)
+        foreach(release6_case
+                "mips32r6|BE|32|mips32r6-generic|-O2|mips32r6|-target mips-unknown-elf -mabi=o32 -march=mips32r6"
+                "mips32r6_le_o0|LE|32|mips32r6-generic|-O0|mips32r6|-target mipsel-unknown-elf -mabi=o32 -march=mips32r6"
+                "i6400_o32|BE|32|I6400|-O2|mips64r6|-target mips-unknown-elf -mabi=o32 -march=i6400"
+                "n64|BE|64|I6400|-O2|mips64r6|-target mips64-unknown-elf -mabi=n64 -march=mips64r6"
+                "n64_le_o0|LE|64|I6500|-O0|mips64r6|-target mips64el-unknown-elf -mabi=n64 -march=i6500")
+            string(REPLACE "|" ";" release6_fields "${release6_case}")
+            list(GET release6_fields 0 release6_name)
+            list(GET release6_fields 1 release6_endian)
+            list(GET release6_fields 2 release6_address)
+            list(GET release6_fields 3 release6_qemu)
+            list(GET release6_fields 4 release6_level)
+            list(GET release6_fields 5 release6_isa)
+            list(GET release6_fields 6 release6_flags)
+            if(release6_address STREQUAL "64")
+                if(NOT release6_set MATCHES "^(quality|boundary|wide)$")
+                    continue()
+                endif()
+                set(release6_startup start_${release6_set}_n64.s)
+                set(release6_linker bare-n64.ld)
+            else()
+                set(release6_startup start_${release6_set}.s)
+                set(release6_linker bare.ld)
+            endif()
+            if(release6_endian STREQUAL "LE")
+                set(release6_endian_label little)
+            else()
+                set(release6_endian_label big)
+            endif()
+            string(SUBSTRING "${release6_level}" 1 -1 release6_level_label)
+            add_test(NAME cross_mips_differential_${release6_set}_r6_${release6_name}
+                COMMAND "${CMAKE_COMMAND}"
+                        -DCC=$<TARGET_FILE:cross_cc>
+                        -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                        -DTEMPLATE=${CMAKE_SOURCE_DIR}/test/target/mips/differential/${release6_set}_kernels.x.in
+                        -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/differential/${release6_startup}
+                        -DHOST_MAIN=${CMAKE_SOURCE_DIR}/test/target/mips/differential/main_${release6_set}.cpp
+                        -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/${release6_linker}
+                        -DWRAPPER_TEMPLATE=${CMAKE_SOURCE_DIR}/test/target/mips/runtime64.s.in
+                        -DWRAPPER_LINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare64.ld
+                        "-DTARGET_FLAGS=${release6_flags}"
+                        -DENDIAN=${release6_endian}
+                        -DADDRESS_MODEL=${release6_address}
+                        -DQEMU_CPU=${release6_qemu}
+                        -DOPT_LEVEL=${release6_level}
+                        -DRELEASE6=${release6_isa}
+                        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-differential-${release6_set}-r6-${release6_name}
+                        -P "${CMAKE_SOURCE_DIR}/test/target/mips/differential/differential.cmake")
+            set_tests_properties(cross_mips_differential_${release6_set}_r6_${release6_name} PROPERTIES
+                LABELS "check.runtime;arch.mips;backend.native;feature.codegen;isa.${release6_isa};endian.${release6_endian_label};opt.${release6_level_label}"
                 SKIP_REGULAR_EXPRESSION "skipping MIPS")
         endforeach()
     endforeach()

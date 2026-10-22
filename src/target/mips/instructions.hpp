@@ -32,6 +32,13 @@ enum class OperandTypeId : std::uint16_t {
     Memory,
     Branch,
     Jump,
+    // Release 6: compact branches reaching PC+4 plus 21 or 26 bits of
+    // words, and PC-relative operands of 19 bits of words or 18 bits of
+    // doublewords from the instruction.
+    Branch21,
+    Branch26,
+    PcRelative19,
+    PcRelative18,
 };
 
 } // namespace cross::mips

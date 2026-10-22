@@ -270,12 +270,12 @@ instruction "frob/b" {
     latency = 3;
 }
 ]=])
-expect_rejected(constraint 5 "constraint 'rd <= 3' names a non-immediate operand" [=[
+expect_rejected(constraint 5 "constraint 'target <= 3' names an operand that is neither an immediate nor a register" [=[
 instruction "frob" {
     architecture = "mips";
-    operands = ["rd:gpr"];
-    encoding = "011100 00000 00000 rd:5 00000 111111";
-    constraints = ["rd <= 3"];
+    operands = ["target:branch"];
+    encoding = "000100 00000 00000 target:16";
+    constraints = ["target <= 3"];
 }
 ]=])
 expect_rejected(architecture 2 "architecture 'x86-64' takes no instruction entries" [=[

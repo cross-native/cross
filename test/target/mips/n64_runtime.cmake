@@ -98,10 +98,23 @@ if(DEFINED GCC_SOURCE AND NOT "${GCC_SOURCE}" STREQUAL "")
     list(APPEND objects "${OUTPUT}.gcc.o")
 endif()
 # Startups shared with 32-bit address tests enable Status.FR, which these
-# ABIs need, under CROSS_MIPS_FR64.
+# ABIs need, under CROSS_MIPS_FR64. Release 6 objects link only with
+# Release 6 code, and Release 6 has its own SDBBP for the semihosting exit.
+set(startup_source "${STARTUP}")
+set(startup_cpu mips64)
+if(MIPS_RELEASE6)
+    file(READ "${STARTUP}" startup_text)
+    string(REGEX REPLACE "\\.set([ \t]+)mips64([ \t\r\n])" ".set\\1mips64r6\\2" startup_text
+           "${startup_text}")
+    string(REGEX REPLACE "\\.word([ \t]+)0x7000007f" ".word\\10x0000004e" startup_text
+           "${startup_text}")
+    set(startup_source "${OUTPUT}.start.s")
+    file(WRITE "${startup_source}" "${startup_text}")
+    set(startup_cpu mips64r6)
+endif()
 run_checked(startup "${LLVM_MC}" --filetype=obj
-            --triple=${n64_arch}-unknown-elf --mcpu=mips64
-            --mattr=+noabicalls --defsym=CROSS_MIPS_FR64=1 "${STARTUP}"
+            --triple=${n64_arch}-unknown-elf --mcpu=${startup_cpu}
+            --mattr=+noabicalls --defsym=CROSS_MIPS_FR64=1 "${startup_source}"
             -o "${start}")
 run_checked(link-elf64 "${LLD}" -m ${n64_link_emulation} -T "${LINKER}"
             "${start}" ${objects} -o "${image}")

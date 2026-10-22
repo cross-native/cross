@@ -100,13 +100,17 @@ X(Dmult, "dmult",
 X(Dmultu, "dmultu",
   "rs:gpr64, rt:gpr64 | reads=rs,rt writes=hi,lo")
 X(Div, "div",
-  "$zero, rs:gpr32, rt:gpr32 | reads=rs,rt writes=hi,lo")
+  "$zero, rs:gpr32, rt:gpr32 | reads=rs,rt writes=hi,lo",
+  "rd:gpr32, rs:gpr32, rt:gpr32 | reads=rs,rt writes=rd")
 X(Divu, "divu",
-  "$zero, rs:gpr32, rt:gpr32 | reads=rs,rt writes=hi,lo")
+  "$zero, rs:gpr32, rt:gpr32 | reads=rs,rt writes=hi,lo",
+  "rd:gpr32, rs:gpr32, rt:gpr32 | reads=rs,rt writes=rd")
 X(Ddiv, "ddiv",
-  "$zero, rs:gpr64, rt:gpr64 | reads=rs,rt writes=hi,lo")
+  "$zero, rs:gpr64, rt:gpr64 | reads=rs,rt writes=hi,lo",
+  "rd:gpr64, rs:gpr64, rt:gpr64 | reads=rs,rt writes=rd")
 X(Ddivu, "ddivu",
-  "$zero, rs:gpr64, rt:gpr64 | reads=rs,rt writes=hi,lo")
+  "$zero, rs:gpr64, rt:gpr64 | reads=rs,rt writes=hi,lo",
+  "rd:gpr64, rs:gpr64, rt:gpr64 | reads=rs,rt writes=rd")
 X(Mfhi, "mfhi",
   "rd:gpr | reads=hi writes=rd")
 X(Mflo, "mflo",
@@ -132,7 +136,8 @@ X(Lwc1, "lwc1",
 X(Ldc1, "ldc1",
   "ft:cpr64, address:mem64 | reads=memory writes=ft hazards=load,coprocessor-load")
 X(Ll, "ll",
-  "rt:gpr32, address:mem32 | reads=memory writes=rt hazards=load")
+  "rt:gpr32, address:mem32 | reads=memory writes=rt hazards=load",
+  "rt:gpr32, address:mem32_simm9 | reads=memory writes=rt hazards=load")
 X(Sb, "sb",
   "rt:gpr32, address:mem8 | reads=rt writes=memory")
 X(Sh, "sh",
@@ -146,7 +151,8 @@ X(Swc1, "swc1",
 X(Sdc1, "sdc1",
   "ft:cpr64, address:mem64 | reads=ft writes=memory")
 X(Sc, "sc",
-  "rt:gpr32, address:mem32 | reads=rt,memory writes=rt,memory")
+  "rt:gpr32, address:mem32 | reads=rt,memory writes=rt,memory",
+  "rt:gpr32, address:mem32_simm9 | reads=rt,memory writes=rt,memory")
 X(B, "b",
   "target:branch | control=jump delay_slot")
 X(Beq, "beq",
@@ -302,7 +308,8 @@ X(Movf, "movf",
 X(Movt, "movt",
   "rd:gpr, rs:gpr, cc:fcc | reads=rs,fcsr writes=rd hazards=condition-read")
 X(Mul, "mul",
-  "rd:gpr32, rs:gpr32, rt:gpr32 | reads=rs,rt writes=rd,hi,lo")
+  "rd:gpr32, rs:gpr32, rt:gpr32 | reads=rs,rt writes=rd,hi,lo",
+  "rd:gpr32, rs:gpr32, rt:gpr32 | reads=rs,rt writes=rd")
 X(Ext, "ext",
   "rt:gpr32, rs:gpr32, pos:0..31, size:1..32 | reads=rs writes=rt")
 X(Ins, "ins",
@@ -333,3 +340,59 @@ X(Dinsm, "dinsm",
   "rt:gpr64, rs:gpr64, pos:0..31, size:2..64 | reads=rt,rs writes=rt")
 X(Dinsu, "dinsu",
   "rt:gpr64, rs:gpr64, pos:32..63, size:1..32 | reads=rt,rs writes=rt")
+// Release 6: three-operand multiply and divide, selects on a zero test,
+// floating selects and comparisons into an FPR, and branches on one.
+X(Muh, "muh",
+  "rd:gpr32, rs:gpr32, rt:gpr32 | reads=rs,rt writes=rd")
+X(Mulu, "mulu",
+  "rd:gpr32, rs:gpr32, rt:gpr32 | reads=rs,rt writes=rd")
+X(Muhu, "muhu",
+  "rd:gpr32, rs:gpr32, rt:gpr32 | reads=rs,rt writes=rd")
+X(Mod, "mod",
+  "rd:gpr32, rs:gpr32, rt:gpr32 | reads=rs,rt writes=rd")
+X(Modu, "modu",
+  "rd:gpr32, rs:gpr32, rt:gpr32 | reads=rs,rt writes=rd")
+X(Dmul, "dmul",
+  "rd:gpr64, rs:gpr64, rt:gpr64 | reads=rs,rt writes=rd")
+X(Dmuh, "dmuh",
+  "rd:gpr64, rs:gpr64, rt:gpr64 | reads=rs,rt writes=rd")
+X(Dmulu, "dmulu",
+  "rd:gpr64, rs:gpr64, rt:gpr64 | reads=rs,rt writes=rd")
+X(Dmuhu, "dmuhu",
+  "rd:gpr64, rs:gpr64, rt:gpr64 | reads=rs,rt writes=rd")
+X(Dmod, "dmod",
+  "rd:gpr64, rs:gpr64, rt:gpr64 | reads=rs,rt writes=rd")
+X(Dmodu, "dmodu",
+  "rd:gpr64, rs:gpr64, rt:gpr64 | reads=rs,rt writes=rd")
+X(Seleqz, "seleqz",
+  "rd:gpr, rs:gpr, rt:gpr | reads=rs,rt writes=rd")
+X(Selnez, "selnez",
+  "rd:gpr, rs:gpr, rt:gpr | reads=rs,rt writes=rd")
+X(SelS, "sel.s",
+  "fd:fpr32, fs:fpr32, ft:fpr32 | reads=fd,fs,ft writes=fd")
+X(SelD, "sel.d",
+  "fd:fpr64, fs:fpr64, ft:fpr64 | reads=fd,fs,ft writes=fd")
+X(CmpEqS, "cmp.eq.s",
+  "fd:fpr32, fs:fpr32, ft:fpr32 | reads=fs,ft writes=fd")
+X(CmpEqD, "cmp.eq.d",
+  "fd:fpr64, fs:fpr64, ft:fpr64 | reads=fs,ft writes=fd")
+X(CmpLtS, "cmp.lt.s",
+  "fd:fpr32, fs:fpr32, ft:fpr32 | reads=fs,ft writes=fd")
+X(CmpLtD, "cmp.lt.d",
+  "fd:fpr64, fs:fpr64, ft:fpr64 | reads=fs,ft writes=fd")
+X(CmpSltS, "cmp.slt.s",
+  "fd:fpr32, fs:fpr32, ft:fpr32 | reads=fs,ft writes=fd")
+X(CmpSltD, "cmp.slt.d",
+  "fd:fpr64, fs:fpr64, ft:fpr64 | reads=fs,ft writes=fd")
+X(CmpSleS, "cmp.sle.s",
+  "fd:fpr32, fs:fpr32, ft:fpr32 | reads=fs,ft writes=fd")
+X(CmpSleD, "cmp.sle.d",
+  "fd:fpr64, fs:fpr64, ft:fpr64 | reads=fs,ft writes=fd")
+X(CmpUnS, "cmp.un.s",
+  "fd:fpr32, fs:fpr32, ft:fpr32 | reads=fs,ft writes=fd")
+X(CmpUnD, "cmp.un.d",
+  "fd:fpr64, fs:fpr64, ft:fpr64 | reads=fs,ft writes=fd")
+X(Bc1eqz, "bc1eqz",
+  "ft:fpr64, target:branch | reads=ft control=branch delay_slot")
+X(Bc1nez, "bc1nez",
+  "ft:fpr64, target:branch | reads=ft control=branch delay_slot")

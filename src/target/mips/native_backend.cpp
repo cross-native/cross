@@ -190,6 +190,13 @@ bool odd_single_fprs(const Subtarget& subtarget) {
              !subtarget.has_feature(Feature::Fpxx)));
 }
 
+// The FPR that holds a floating comparison's result on Release 6, which no
+// value takes: F1, or in FPXX code, which keeps 64-bit values such as a
+// double comparison's result in even registers, the staging register F4.
+std::string_view release6_condition_fpr(const Subtarget& subtarget) {
+    return subtarget.has_feature(Feature::Fp64) ? "f1" : "f4";
+}
+
 // Whether the FPRs of an FR=0 FPU with doubles pair up, so that an f64 in
 // an even register also occupies the odd one.
 bool paired_fprs(const Subtarget& subtarget) {
@@ -1279,10 +1286,13 @@ private:
                !subtarget_.has_feature(Feature::Mips32r2);
     }
 
+    // A scalar pointer access below its natural alignment, which goes
+    // through bytes unless ordinary accesses take misaligned addresses.
     bool unaligned_pointer_access(const mir::ManagedValue& value) const {
         if ((value.kind != mir::ValueKind::PointerLoad &&
              value.kind != mir::ValueKind::PointerStore) ||
-            value.memory_alignment == 0)
+            value.memory_alignment == 0 ||
+            subtarget_.has_feature(Feature::UnalignedAccess))
             return false;
         const auto type =
             value.kind == mir::ValueKind::PointerLoad
@@ -3165,10 +3175,12 @@ private:
     }
 
     // F0/F2/F4 remain reserved for conversion, comparison, and ABI
-    // staging. Even registers hold FR=0 doubles and the singles of FPUs
-    // without odd single-precision registers; odd ones hold values in the
-    // functions that odd_fpr_colors_ permits, except that the odd halves
-    // of the FR=0 staging pairs stay free. Volatile registers come first.
+    // staging, and on Release 6 F1 for comparison results outside FPXX
+    // code (release6_condition_fpr). Even registers
+    // hold FR=0 doubles and the singles of FPUs without odd
+    // single-precision registers; odd ones hold values in the functions
+    // that odd_fpr_colors_ permits, except that the odd halves of the FR=0
+    // staging pairs stay free. Volatile registers come first.
     std::vector<machine::PhysicalRegisterId> allocatable_fprs() const {
         std::vector<machine::PhysicalRegisterId> floating_colors;
         const auto add_colors = [&](unsigned first, unsigned last,
@@ -3180,7 +3192,7 @@ private:
             }
         };
         add_colors(6, 19, 1);
-        if (!paired_fprs(subtarget_)) add_colors(1, 5, 2);
+        if (!paired_fprs(subtarget_)) add_colors(release6(subtarget_) ? 3 : 1, 5, 2);
         add_colors(20, 31, 1);
         return floating_colors;
     }
@@ -4295,6 +4307,7 @@ private:
             for (const auto& name : entity.clobbers) {
                 const auto physical = physical_register_id(name);
                 if (!physical || physical->value <= 1 ||
+                    (release6(subtarget_) && name == release6_condition_fpr(subtarget_)) ||
                     std::any_of(hard_slots_.begin(), hard_slots_.end(),
                                 [&](const auto& hard) {
                                     return hard.second == *physical;
@@ -5133,7 +5146,7 @@ private:
     }
 
     // Folds a constant pointer offset into a registry form's memory
-    // displacement while the sum stays a signed 16-bit field.
+    // displacement while the sum stays within the form's field.
     bool fold_form_displacements(
         machine::Instruction& instruction,
         const std::vector<const machine::Instruction*>& definitions) const {
@@ -5165,8 +5178,7 @@ private:
             if (!offset) continue;
             const auto sum = static_cast<std::int64_t>(displacement.value) +
                              static_cast<std::int64_t>(offset->value);
-            if (sum < std::numeric_limits<std::int16_t>::min() ||
-                sum > std::numeric_limits<std::int16_t>::max()) {
+            if (sum < field.memory_offset_minimum || sum > field.memory_offset_maximum) {
                 continue;
             }
             const auto replacement = definitions[address.id]->uses.front();
@@ -8704,12 +8716,25 @@ private:
             return sum({wide ? I::Ldl : I::Lwl});
         case Opcode::Sdiv:
         case Opcode::Srem:
-        case Opcode::Sdivrem:
-            return sum({wide ? I::Ddiv : I::Div, I::Mflo});
         case Opcode::Udiv:
         case Opcode::Urem:
+            if (release6(subtarget_)) {
+                const bool is_signed = opcode == Opcode::Sdiv || opcode == Opcode::Srem;
+                if (opcode == Opcode::Sdiv || opcode == Opcode::Udiv) {
+                    return sum({wide ? (is_signed ? I::Ddiv : I::Ddivu)
+                                     : (is_signed ? I::Div : I::Divu)});
+                }
+                return sum({wide ? (is_signed ? I::Dmod : I::Dmodu)
+                                 : (is_signed ? I::Mod : I::Modu)});
+            }
+            [[fallthrough]];
+        case Opcode::Sdivrem:
         case Opcode::Udivrem:
-            return sum({wide ? I::Ddivu : I::Divu, I::Mflo});
+            if (opcode == Opcode::Udiv || opcode == Opcode::Urem ||
+                opcode == Opcode::Udivrem) {
+                return sum({wide ? I::Ddivu : I::Divu, I::Mflo});
+            }
+            return sum({wide ? I::Ddiv : I::Div, I::Mflo});
         // A split multiply's MFLO waits as long as the whole multiply.
         case Opcode::Mul:
         case Opcode::MulStart:
@@ -8717,9 +8742,13 @@ private:
                 selects_three_operand_multiply(subtarget_)) {
                 return sum({I::Mul});
             }
+            if (release6(subtarget_)) return sum({I::Dmul});
             return sum({wide ? I::Dmult : I::Mult, I::Mflo});
-        case Opcode::Mulhs: return sum({wide ? I::Dmult : I::Mult, I::Mfhi});
+        case Opcode::Mulhs:
+            if (release6(subtarget_)) return sum({wide ? I::Dmuh : I::Muh});
+            return sum({wide ? I::Dmult : I::Mult, I::Mfhi});
         case Opcode::Mulhu:
+            if (release6(subtarget_)) return sum({wide ? I::Dmuhu : I::Muhu});
             return sum({wide ? I::Dmultu : I::Multu, I::Mfhi});
         case Opcode::Fadd: return sum({single ? I::AddS : I::AddD});
         case Opcode::Fsub: return sum({single ? I::SubS : I::SubD});
@@ -8867,6 +8896,8 @@ private:
     }
 
     bool split_hilo_operations(machine::Function& function) {
+        // Release 6 has no HI and LO.
+        if (release6(subtarget_)) return false;
         bool changed = false;
         for (auto& block : function.blocks) {
             std::optional<machine::Register> completed_hilo;
@@ -10695,7 +10726,8 @@ private:
             {{LoweringPass::FuseDivisionResults},
               Stage::InstructionCombining, "fuse-division-results"},
             [this](machine::Function& function) {
-                if (!options_.machine_combine) return false;
+                // Release 6 divides and takes remainders separately.
+                if (!options_.machine_combine || release6(subtarget_)) return false;
                 const unsigned native_bits =
                     subtarget_.has_feature(Feature::Mips3) ? 64U : 32U;
                 return native::fuse_division_results(function,
@@ -11020,6 +11052,7 @@ private:
                                 "f0", "f2", "f4"}) {
             append_name(name);
         }
+        if (release6(subtarget_)) append_name(release6_condition_fpr(subtarget_));
         for (const auto assignment :
              function.virtual_register_assignments) {
             if (assignment) append(*assignment);
@@ -11700,8 +11733,9 @@ private:
         output_ << '\n';
     }
 
-    static bool writes_hilo(std::string_view opcode) {
-        // MUL leaves HI and LO unpredictable.
+    bool writes_hilo(std::string_view opcode) const {
+        // MUL leaves HI and LO unpredictable; Release 6 has neither.
+        if (release6(subtarget_)) return false;
         return opcode == "mul" || opcode == "mult" || opcode == "multu" ||
                opcode == "dmult" || opcode == "dmultu" ||
                opcode == "div" || opcode == "divu" ||
@@ -12429,6 +12463,14 @@ private:
                subtarget_.has_instruction(Instruction::Movn);
     }
 
+    // Whether an integer select of `bits` needs no branch: MOVN or MOVZ,
+    // or on Release 6 SELEQZ and SELNEZ.
+    bool selects_integer_without_branch(unsigned bits) const {
+        return (bits <= 32 && selects_cond_move()) ||
+               (release6(subtarget_) &&
+                !select_instructions(subtarget_, {bits, false, false}).empty());
+    }
+
     bool selects_rotate() const {
         return subtarget_.has_feature(Feature::Rotate) &&
                subtarget_.has_instruction(Instruction::Rotrv);
@@ -13154,9 +13196,15 @@ private:
         } else {
             instruction("li", reg_name(temporary) + "," +
                                   std::to_string(scale));
-            instruction(address_multiply(),
-                        reg_name(index) + "," + reg_name(temporary));
-            instruction("mflo", reg_name(scaled));
+            if (release6(subtarget_)) {
+                instruction(wide_addresses_ ? "dmulu" : "mulu",
+                            reg_name(scaled) + "," + reg_name(index) + "," +
+                                reg_name(temporary));
+            } else {
+                instruction(address_multiply(),
+                            reg_name(index) + "," + reg_name(temporary));
+                instruction("mflo", reg_name(scaled));
+            }
         }
         instruction(address_add(), reg_name(destination) + "," +
                                        reg_name(base) + "," +
@@ -14040,8 +14088,9 @@ private:
     }
 
     // Without 64-bit GPRs, an f64 in the FR=0 pair of `fpr` holds its low
-    // word in the even register and its high word in the odd one. Where
-    // those words pass through memory, `value`'s home carries them.
+    // word in the even register and its high word in the odd one; MTHC1
+    // writes the high word in either FR mode. Where those words pass
+    // through memory, `value`'s home carries them.
     void move_words_to_fpr(const machine::Function& function,
                            machine::Register value, std::string_view low,
                            std::string_view high, std::string_view fpr,
@@ -14081,10 +14130,56 @@ private:
         }
     }
 
+    // C.cond.fmt with the condition `condition` (C.cond.fmt's name, as
+    // "olt") and `suffix` (".s" or ".d"). Release 6 has CMP.cond.fmt, which
+    // writes the result to release6_condition_fpr: its condition with the
+    // same predicate and exceptions keeps a quiet condition's name and
+    // gives a signaling one an S.
+    void floating_compare(std::string_view condition, std::string_view suffix,
+                          std::string_view operands) {
+        if (!release6(subtarget_)) {
+            instruction("c." + std::string(condition) + std::string(suffix), operands);
+            return;
+        }
+        static constexpr std::array<std::pair<std::string_view, std::string_view>, 16>
+            conditions{{{"f", "af"}, {"un", "un"}, {"eq", "eq"}, {"ueq", "ueq"},
+                        {"olt", "lt"}, {"ult", "ult"}, {"ole", "le"}, {"ule", "ule"},
+                        {"sf", "saf"}, {"ngle", "sun"}, {"seq", "seq"}, {"ngl", "sueq"},
+                        {"lt", "slt"}, {"nge", "sult"}, {"le", "sle"}, {"ngt", "sule"}}};
+        const auto found = std::find_if(conditions.begin(), conditions.end(),
+                                        [&](const auto& entry) { return entry.first == condition; });
+        instruction("cmp." + std::string(found->second) + std::string(suffix),
+                    "$" + std::string(release6_condition_fpr(subtarget_)) + "," +
+                        std::string(operands));
+    }
+
+    // BC1T or BC1F on the condition of floating_compare: BC1NEZ or BC1EQZ
+    // on release6_condition_fpr on Release 6, which has no branch-likely
+    // forms.
+    void floating_branch(bool on_condition, std::string_view target,
+                         bool likely = false) {
+        if (!release6(subtarget_)) {
+            instruction(std::string(on_condition ? "bc1t" : "bc1f") + (likely ? "l" : ""),
+                        target);
+            return;
+        }
+        instruction(on_condition ? "bc1nez" : "bc1eqz",
+                    "$" + std::string(release6_condition_fpr(subtarget_)) + "," +
+                        std::string(target));
+    }
+
     // The 0 or 1 of the floating condition in `gpr`: MOVT/MOVF where the
-    // FPU selects on its condition, a branch elsewhere.
+    // FPU selects on its condition, a branch elsewhere. Release 6's
+    // comparison leaves all ones or zero, which MFC1 reads.
     void condition_value(const machine::Function& function,
                          std::string_view gpr, bool true_on_condition) {
+        if (release6(subtarget_)) {
+            instruction("mfc1", reg_name(gpr) + ",$" +
+                                    std::string(release6_condition_fpr(subtarget_)));
+            instruction(true_on_condition ? "andi" : "addiu",
+                        reg_name(gpr) + "," + reg_name(gpr) + ",1");
+            return;
+        }
         if (!select_instructions(subtarget_, {32, true, true}).empty()) {
             instruction("li", reg_name(gpr) + ",1");
             instruction(true_on_condition ? "movf" : "movt",
@@ -14093,7 +14188,7 @@ private:
         }
         const auto yes = local_label(function);
         const auto done = local_label(function);
-        instruction(true_on_condition ? "bc1t" : "bc1f", yes);
+        floating_branch(true_on_condition, yes);
         instruction("move", reg_name(gpr) + ",$zero");
         instruction("b", done);
         instruction("nop");
@@ -16162,11 +16257,19 @@ private:
         }
         normalize_integer("t0", hir_.address_bits, false);
         load_immediate("t1", element.value, hir_.address_bits);
-        instruction(wide_addresses_ ? "dmultu" : "multu", "$t0,$t1");
-        instruction("mfhi", "$t1");
-        instruction("bne", "$t1,$zero," + invalid);
-        instruction("nop");
-        instruction("mflo", "$t1");
+        if (release6(subtarget_)) {
+            // $t2 is set from $sp below.
+            instruction(wide_addresses_ ? "dmuhu" : "muhu", "$t2,$t0,$t1");
+            instruction("bne", "$t2,$zero," + invalid);
+            instruction("nop");
+            instruction(wide_addresses_ ? "dmulu" : "mulu", "$t1,$t0,$t1");
+        } else {
+            instruction(wide_addresses_ ? "dmultu" : "multu", "$t0,$t1");
+            instruction("mfhi", "$t1");
+            instruction("bne", "$t1,$zero," + invalid);
+            instruction("nop");
+            instruction("mflo", "$t1");
+        }
         normalize_integer("t1", hir_.address_bits, false);
         instruction("move", "$t2,$sp");
         normalize_integer("t2", hir_.address_bits, false);
@@ -18643,6 +18746,8 @@ private:
         std::span<const machine::Instruction> values);
     void emit_float_select(const machine::Function& function,
                            const machine::Instruction& value);
+    void emit_release6_float_select(const machine::Function& function,
+                                    const machine::Instruction& value);
     std::optional<bool> emit_fused_order_compare(
         const machine::Function& function,
         const machine::Instruction& branch);
@@ -18901,6 +19006,16 @@ void AssemblyEmitter::emit_integer_pair_binary(
         store_pair();
         return;
     case Opcode::Mul:
+        if (release6(subtarget_)) {
+            instruction("mulu", "$t4,$t0,$t2");
+            instruction("muhu", "$t5,$t0,$t2");
+            instruction("mul", "$t6,$t0,$t3");
+            instruction("addu", "$t5,$t5,$t6");
+            instruction("mul", "$t6,$t1,$t2");
+            instruction("addu", "$t5,$t5,$t6");
+            store_pair();
+            return;
+        }
         instruction("multu", "$t0,$t2");
         instruction("mflo", "$t4");
         instruction("mfhi", "$t5");
@@ -19190,30 +19305,46 @@ void AssemblyEmitter::emit_integer_pair_binary(
         // The high 64 bits of the 128-bit product, from the four 32-bit
         // products of the words: t6/t7 accumulate bits 64-127, and the
         // carries out of bits 32-63 (t5) and 64-95 (t7's start) go up.
-        instruction("multu", "$t0,$t2");
-        instruction("mfhi", "$t4");
-        instruction("multu", "$t0,$t3");
-        instruction("mflo", "$t5");
-        instruction("mfhi", "$t6");
+        // The low and high words of a product: Release 6's MULU and MUHU,
+        // or one MULTU and MFLO and MFHI.
+        const bool r6 = release6(subtarget_);
+        const auto product = [&](std::string_view left_word, std::string_view right_word) {
+            if (!r6) instruction("multu", std::string(left_word) + "," + std::string(right_word));
+        };
+        const auto word = [&](bool high, std::string_view destination,
+                              std::string_view left_word, std::string_view right_word) {
+            if (r6) {
+                instruction(high ? "muhu" : "mulu", std::string(destination) + "," +
+                                                        std::string(left_word) + "," +
+                                                        std::string(right_word));
+            } else {
+                instruction(high ? "mfhi" : "mflo", destination);
+            }
+        };
+        product("$t0", "$t2");
+        word(true, "$t4", "$t0", "$t2");
+        product("$t0", "$t3");
+        word(false, "$t5", "$t0", "$t3");
+        word(true, "$t6", "$t0", "$t3");
         instruction("addu", "$t4,$t4,$t5");
         instruction("sltu", "$t5,$t4,$t5");
-        instruction("multu", "$t1,$t2");
-        instruction("mflo", "$t7");
+        product("$t1", "$t2");
+        word(false, "$t7", "$t1", "$t2");
         instruction("addu", "$t4,$t4,$t7");
         instruction("sltu", "$t7,$t4,$t7");
         instruction("addu", "$t5,$t5,$t7");
-        instruction("mfhi", "$t7");
+        word(true, "$t7", "$t1", "$t2");
         instruction("addu", "$t6,$t6,$t7");
         instruction("sltu", "$t7,$t6,$t7");
         instruction("addu", "$t6,$t6,$t5");
         instruction("sltu", "$t5,$t6,$t5");
         instruction("addu", "$t7,$t7,$t5");
-        instruction("multu", "$t1,$t3");
-        instruction("mflo", "$t5");
+        product("$t1", "$t3");
+        word(false, "$t5", "$t1", "$t3");
         instruction("addu", "$t6,$t6,$t5");
         instruction("sltu", "$t5,$t6,$t5");
         instruction("addu", "$t7,$t7,$t5");
-        instruction("mfhi", "$t5");
+        word(true, "$t5", "$t1", "$t3");
         instruction("addu", "$t7,$t7,$t5");
         if (opcode == Opcode::Mulhs) {
             // A negative operand's unsigned value exceeds its signed one by
@@ -19381,12 +19512,22 @@ void AssemblyEmitter::emit_integer_binary(
             instruction("mul", binary_operands());
             break;
         }
+        if (release6(subtarget_)) {
+            instruction("dmul", binary_operands());
+            break;
+        }
         instruction(wide ? "dmult" : "mult",
                     reg_name(left_gpr) + "," + reg_name(right_gpr));
         instruction("mflo", reg_name(target_gpr));
         break;
     case Opcode::Mulhs:
     case Opcode::Mulhu:
+        if (release6(subtarget_)) {
+            instruction(opcode == Opcode::Mulhs ? (wide ? "dmuh" : "muh")
+                                                : (wide ? "dmuhu" : "muhu"),
+                        binary_operands());
+            break;
+        }
         instruction(opcode == Opcode::Mulhs ? (wide ? "dmult" : "mult")
                                             : (wide ? "dmultu" : "multu"),
                     reg_name(left_gpr) + "," + reg_name(right_gpr));
@@ -19394,6 +19535,12 @@ void AssemblyEmitter::emit_integer_binary(
         break;
     case Opcode::Sdiv:
     case Opcode::Srem:
+        if (release6(subtarget_)) {
+            instruction(value.opcode == Opcode::Srem ? (wide ? "dmod" : "mod")
+                                                     : (wide ? "ddiv" : "div"),
+                        binary_operands());
+            break;
+        }
         instruction(wide ? "ddiv" : "div",
                     "$zero," + reg_name(left_gpr) + "," +
                         reg_name(right_gpr));
@@ -19402,6 +19549,12 @@ void AssemblyEmitter::emit_integer_binary(
         break;
     case Opcode::Udiv:
     case Opcode::Urem:
+        if (release6(subtarget_)) {
+            instruction(value.opcode == Opcode::Urem ? (wide ? "dmodu" : "modu")
+                                                     : (wide ? "ddivu" : "divu"),
+                        binary_operands());
+            break;
+        }
         instruction(wide ? "ddivu" : "divu",
                     "$zero," + reg_name(left_gpr) + "," +
                         reg_name(right_gpr));
@@ -19580,25 +19733,25 @@ void AssemblyEmitter::emit_floating_binary(
         reg_name(left_fpr) + "," + reg_name(right_fpr);
     switch (opcode) {
     case Opcode::FcmpEq:
-        instruction("c.eq" + suffix, comparison_operands);
+        floating_compare("eq", suffix, comparison_operands);
         break;
     case Opcode::FcmpNe:
-        instruction("c.eq" + suffix, comparison_operands);
+        floating_compare("eq", suffix, comparison_operands);
         true_on_condition = false;
         break;
     case Opcode::FcmpLt:
-        instruction("c.lt" + suffix, comparison_operands);
+        floating_compare("lt", suffix, comparison_operands);
         break;
     case Opcode::FcmpLe:
-        instruction("c.le" + suffix, comparison_operands);
+        floating_compare("le", suffix, comparison_operands);
         break;
     case Opcode::FcmpGt:
-        instruction("c.lt" + suffix,
-                    reg_name(right_fpr) + "," + reg_name(left_fpr));
+        floating_compare("lt", suffix,
+                         reg_name(right_fpr) + "," + reg_name(left_fpr));
         break;
     case Opcode::FcmpGe:
-        instruction("c.le" + suffix,
-                    reg_name(right_fpr) + "," + reg_name(left_fpr));
+        floating_compare("le", suffix,
+                         reg_name(right_fpr) + "," + reg_name(left_fpr));
         break;
     default:
         diagnostics_.error(value.location,
@@ -19820,6 +19973,16 @@ void AssemblyEmitter::emit_cast(const machine::Function& function,
                 "full-range u64-to-float conversion is not implemented in the MIPS slice yet");
             return;
         }
+        // Without 64-bit GPRs, a word pair reaches the 64-bit FPR through
+        // MTC1 and MTHC1.
+        if (use_long && legalizes_to_pair(source)) {
+            load_vreg_pair(function, source, "t0", "t1", value.location);
+            const auto output = output_fpr(function, target, "f2");
+            move_words_to_fpr(function, source, "t0", "t1", output, value.location);
+            instruction(destination + "l", reg_name(output) + "," + reg_name(output));
+            commit_fpr(function, target, output, value.location);
+            return;
+        }
         // The integer travels into the result register and converts there.
         // A narrow source's register bits above its width are unspecified;
         // extended by its signedness it is an exact word, never negative
@@ -19864,18 +20027,23 @@ void AssemblyEmitter::emit_cast(const machine::Function& function,
                 // the reserved TRUNC.L/DMFC1 forms.
                 const auto ordinary = local_label(function);
                 const auto done = local_label(function);
+                // The threshold stays out of the register that a Release 6
+                // comparison writes.
+                const std::string_view threshold_fpr =
+                    release6(subtarget_) && release6_condition_fpr(subtarget_) == "f4"
+                        ? "f2" : "f4";
+                const auto threshold = reg_name(threshold_fpr);
                 instruction("lui", "$t0,32768");
-                move_gpr_to_fpr("t0", "f4", 32);
+                move_gpr_to_fpr("t0", threshold_fpr, 32);
                 instruction(std::string("cvt") + source_suffix + ".w",
-                            "$f4,$f4");
+                            threshold + "," + threshold);
                 instruction(std::string("abs") + source_suffix,
-                            "$f4,$f4");
-                instruction(std::string("c.lt") + source_suffix,
-                            input + ",$f4");
-                instruction("bc1t", ordinary);
+                            threshold + "," + threshold);
+                floating_compare("lt", source_suffix, input + "," + threshold);
+                floating_branch(true, ordinary);
                 instruction("nop");
                 instruction(std::string("sub") + source_suffix,
-                            "$f2," + input + ",$f4");
+                            "$f2," + input + "," + threshold);
                 instruction(std::string("trunc.w") + source_suffix,
                             "$f2,$f2");
                 move_fpr_to_gpr("f2", "t0", 32);
@@ -19905,6 +20073,12 @@ void AssemblyEmitter::emit_cast(const machine::Function& function,
             }
             instruction(std::string("trunc.l") + source_suffix,
                         "$f2," + input);
+            if (legalizes_to_pair(target)) {
+                move_fpr_word(function, target, "f2", false, "t0", value.location);
+                move_fpr_word(function, target, "f2", true, "t1", value.location);
+                store_vreg_pair(function, target, "t0", "t1", value.location);
+                return;
+            }
             move_fpr_to_gpr("f2", output, 64);
         }
         canonicalize_integer_value(
@@ -20037,22 +20211,42 @@ void AssemblyEmitter::emit_atomic(const machine::Function& function,
             (metadata->high >> 16U) & 0xffU);
         switch (operation) {
         case mir::BinaryOperation::Multiply:
+            if (release6(subtarget_)) {
+                instruction("mul", "$t2,$t1,$t3");
+                break;
+            }
             instruction("mult", "$t1,$t3");
             instruction("mflo", "$t2");
             break;
         case mir::BinaryOperation::SignedDivide:
+            if (release6(subtarget_)) {
+                instruction("div", "$t2,$t1,$t3");
+                break;
+            }
             instruction("div", "$zero,$t1,$t3");
             instruction("mflo", "$t2");
             break;
         case mir::BinaryOperation::UnsignedDivide:
+            if (release6(subtarget_)) {
+                instruction("divu", "$t2,$t1,$t3");
+                break;
+            }
             instruction("divu", "$zero,$t1,$t3");
             instruction("mflo", "$t2");
             break;
         case mir::BinaryOperation::SignedRemainder:
+            if (release6(subtarget_)) {
+                instruction("mod", "$t2,$t1,$t3");
+                break;
+            }
             instruction("div", "$zero,$t1,$t3");
             instruction("mfhi", "$t2");
             break;
         case mir::BinaryOperation::UnsignedRemainder:
+            if (release6(subtarget_)) {
+                instruction("modu", "$t2,$t1,$t3");
+                break;
+            }
             instruction("divu", "$zero,$t1,$t3");
             instruction("mfhi", "$t2");
             break;
@@ -20935,14 +21129,14 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
         const auto take_right = local_label(function);
         const auto take_left = local_label(function);
         const auto done = local_label(function);
-        instruction("c.un" + suffix, reg_name(left) + "," + reg_name(left));
-        instruction("bc1t", left_nan);
+        floating_compare("un", suffix, reg_name(left) + "," + reg_name(left));
+        floating_branch(true, left_nan);
         instruction("nop");
-        instruction("c.olt" + suffix,
-                    opcode == Opcode::Fmin
-                        ? reg_name(right) + "," + reg_name(left)
-                        : reg_name(left) + "," + reg_name(right));
-        instruction("bc1f", take_left);
+        floating_compare("olt", suffix,
+                         opcode == Opcode::Fmin
+                             ? reg_name(right) + "," + reg_name(left)
+                             : reg_name(left) + "," + reg_name(right));
+        floating_branch(false, take_left);
         instruction("nop");
         output_ << take_right << ":\n";
         if (destination != right) {
@@ -20952,7 +21146,7 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
         instruction("b", done);
         instruction("nop");
         output_ << left_nan << ":\n";
-        instruction("c.un" + suffix, reg_name(right) + "," + reg_name(right));
+        floating_compare("un", suffix, reg_name(right) + "," + reg_name(right));
         instruction("b", take_right);
         instruction("nop");
         output_ << take_left << ":\n";
@@ -21062,8 +21256,7 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
             } else {
                 zero_fpr_pair("f2");
             }
-            instruction("c.eq" + suffix,
-                        reg_name(source_fpr) + ",$f2");
+            floating_compare("eq", suffix, reg_name(source_fpr) + ",$f2");
             const auto target = value.defs.front();
             const auto destination = output_gpr(function, target, "t0");
             condition_value(function, destination, true);
@@ -21170,6 +21363,42 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
     }
     if (opcode == Opcode::Select) {
         if (value.uses.size() < 3 || value.defs.empty()) return;
+        if (release6(subtarget_) &&
+            !select_instructions(subtarget_,
+                                 {value.defs.front().mode.bits, false, false})
+                 .empty()) {
+            // SELEQZ keeps the false value where the condition is zero and
+            // SELNEZ the true value where it is not, each zero otherwise;
+            // their OR is the selection.
+            const auto condition =
+                input_gpr(function, value.uses[0], "t0", value.location);
+            const auto yes =
+                input_gpr(function, value.uses[1], "t1", value.location);
+            const auto no =
+                input_gpr(function, value.uses[2], "t2", value.location);
+            const auto target = value.defs.front();
+            const auto result = output_gpr(function, target, "t2");
+            // A naked function's temporaries come from its clobbers.
+            std::string_view work = "at";
+            if (naked_writable_) {
+                for (const std::string_view scratch : {"t2", "t1", "t0", "t3"}) {
+                    if (naked_writable_->contains(std::string(scratch)) &&
+                        scratch != condition && scratch != yes && scratch != no &&
+                        scratch != result) {
+                        work = scratch;
+                        break;
+                    }
+                }
+            }
+            instruction("seleqz", reg_name(work) + "," + reg_name(no) + "," +
+                                      reg_name(condition));
+            instruction("selnez", reg_name(result) + "," + reg_name(yes) + "," +
+                                      reg_name(condition));
+            instruction("or", reg_name(result) + "," + reg_name(result) + "," +
+                                  reg_name(work));
+            commit_gpr(function, target, result, value.location);
+            return;
+        }
         if (value.defs.front().mode.bits <= 32 &&
             selects_cond_move()) {
             const auto condition =
@@ -21283,6 +21512,11 @@ void AssemblyEmitter::emit_float_select(const machine::Function& function,
     const auto falsity = value.uses.back();
     const auto bits = target.mode.bits;
     const std::string suffix = bits == 32 ? ".s" : ".d";
+    if (release6(subtarget_) &&
+        !select_instructions(subtarget_, {bits, true, fused}).empty()) {
+        emit_release6_float_select(function, value);
+        return;
+    }
     if (select_instructions(subtarget_, {bits, true, fused}).empty()) {
         const auto otherwise = local_label(function);
         const auto done = local_label(function);
@@ -21347,6 +21581,58 @@ void AssemblyEmitter::emit_float_select(const machine::Function& function,
                     reg_name(destination) + "," + reg_name(moved) + "," +
                         condition_operand);
     }
+    commit_fpr(function, target, destination, value.location);
+}
+
+// Release 6: SEL.fmt picks between the operands on bit 0 of the register
+// it writes, release6_condition_fpr, which first receives the condition:
+// the fused comparison's CMP.cond.fmt result or the boolean through MTC1.
+// MOV.fmt then copies the result.
+void AssemblyEmitter::emit_release6_float_select(
+    const machine::Function& function, const machine::Instruction& value) {
+    const bool fused = !value.condition_predicate.empty();
+    const auto target = value.defs.front();
+    const std::string suffix = target.mode.bits == 32 ? ".s" : ".d";
+    const auto condition = "$" + std::string(release6_condition_fpr(subtarget_));
+    bool on_condition = true;
+    if (fused) {
+        auto left = input_fpr(function, value.uses[0], "f0", value.location);
+        auto right = input_fpr(function, value.uses[1], "f2", value.location);
+        std::string_view comparison;
+        switch (decode_opcode(value.condition_predicate)) {
+        case Opcode::FcmpEq: comparison = "eq"; break;
+        case Opcode::FcmpNe:
+            comparison = "eq";
+            on_condition = false;
+            break;
+        case Opcode::FcmpLt: comparison = "lt"; break;
+        case Opcode::FcmpLe: comparison = "le"; break;
+        case Opcode::FcmpGt:
+            comparison = "lt";
+            std::swap(left, right);
+            break;
+        case Opcode::FcmpGe:
+            comparison = "le";
+            std::swap(left, right);
+            break;
+        default:
+            diagnostics_.error(value.location, "malformed fused MIPS floating select");
+            return;
+        }
+        floating_compare(comparison, suffix, reg_name(left) + "," + reg_name(right));
+    } else {
+        const auto truth =
+            input_gpr(function, value.uses.front(), "t0", value.location);
+        instruction("mtc1", reg_name(truth) + "," + condition);
+    }
+    const auto selected =
+        input_fpr(function, value.uses[value.uses.size() - 2], "f0", value.location);
+    const auto otherwise = input_fpr(function, value.uses.back(), "f2", value.location);
+    const auto destination = output_fpr(function, target, "f4");
+    instruction("sel" + suffix,
+                condition + "," + reg_name(on_condition ? otherwise : selected) + "," +
+                    reg_name(on_condition ? selected : otherwise));
+    instruction("mov" + suffix, reg_name(destination) + "," + condition);
     commit_fpr(function, target, destination, value.location);
 }
 
@@ -21657,7 +21943,7 @@ void AssemblyEmitter::emit_terminator(
                                           value.location);
                     std::string_view right;
                     bool truth_on_condition = true;
-                    std::string comparison;
+                    std::string_view comparison;
                     const auto suffix = value.uses[0].mode.bits == 32
                         ? std::string{".s"} : std::string{".d"};
                     if (predicate == Opcode::Fiszero) {
@@ -21669,45 +21955,41 @@ void AssemblyEmitter::emit_terminator(
                         } else {
                             zero_fpr_pair("f2");
                         }
-                        comparison = "c.eq" + suffix;
+                        comparison = "eq";
                     } else {
                         if (value.uses.size() < 2) return false;
                         right = input_fpr(function, value.uses[1], "f2",
                                           value.location);
                         switch (predicate) {
                         case Opcode::FcmpEq:
-                            comparison = "c.eq" + suffix;
+                            comparison = "eq";
                             break;
                         case Opcode::FcmpNe:
-                            comparison = "c.eq" + suffix;
+                            comparison = "eq";
                             truth_on_condition = false;
                             break;
                         case Opcode::FcmpLt:
-                            comparison = "c.lt" + suffix;
+                            comparison = "lt";
                             break;
                         case Opcode::FcmpLe:
-                            comparison = "c.le" + suffix;
+                            comparison = "le";
                             break;
                         case Opcode::FcmpGt:
-                            comparison = "c.lt" + suffix;
+                            comparison = "lt";
                             std::swap(left, right);
                             break;
                         case Opcode::FcmpGe:
                             // Not !(a < b), which a NaN satisfies.
-                            comparison = "c.le" + suffix;
+                            comparison = "le";
                             std::swap(left, right);
                             break;
                         default: return false;
                         }
                     }
-                    instruction(comparison,
-                                reg_name(left) + "," + reg_name(right));
-                    auto branch = branch_on_truth == truth_on_condition
-                        ? std::string{"bc1t"} : std::string{"bc1f"};
-                    if (copy || (use_taken_delay && likely_slot)) {
-                        branch += 'l';
-                    }
-                    instruction(branch, destination);
+                    floating_compare(comparison, suffix,
+                                     reg_name(left) + "," + reg_name(right));
+                    floating_branch(branch_on_truth == truth_on_condition, destination,
+                                    copy || (use_taken_delay && likely_slot));
                     selected_delay();
                     return true;
                 }
@@ -22131,13 +22413,18 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
     // and floating-point options apply again after it.
     output_ << ".set push\n.set noreorder\n.set noat\n";
     if (pic_ == PicModel::None) output_ << ".option pic0\n";
-    if (subtarget_.has_feature(Feature::Mips64r2)) output_ << ".set mips64r2\n";
+    if (subtarget_.has_feature(Feature::Mips64r6)) output_ << ".set mips64r6\n";
+    else if (subtarget_.has_feature(Feature::Mips32r6)) output_ << ".set mips32r6\n";
+    else if (subtarget_.has_feature(Feature::Mips64r2)) output_ << ".set mips64r2\n";
     else if (subtarget_.has_feature(Feature::Mips64)) output_ << ".set mips64\n";
     else if (subtarget_.has_feature(Feature::Mips5)) output_ << ".set mips5\n";
     else if (subtarget_.has_feature(Feature::Mips4)) output_ << ".set mips4\n";
     else if (subtarget_.has_feature(Feature::Mips3)) output_ << ".set mips3\n";
-    else if (subtarget_.has_feature(Feature::Mips32r2)) output_ << ".set mips32r2\n";
-    else if (subtarget_.has_feature(Feature::Mips32)) output_ << ".set mips32\n";
+    else if (subtarget_.has_feature(Feature::Mips32r2)) {
+        // `.set mips32r2` also selects 32-bit FPRs, as in GNU as.
+        output_ << ".set mips32r2\n";
+        if (subtarget_.has_feature(Feature::Fp64)) output_ << ".set fp=64\n";
+    } else if (subtarget_.has_feature(Feature::Mips32)) output_ << ".set mips32\n";
     // MIPS II has no odd single-precision arithmetic registers; code that
     // uses them leaves the ISA to the assembler's CPU.
     else if (subtarget_.has_feature(Feature::Mips2)) {
@@ -22408,8 +22695,7 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
                 if (options_.compare_select_fusion &&
                     decode_opcode(value.opcode) == Opcode::Select &&
                     value.uses.size() >= 3 && !value.defs.empty() &&
-                    !(value.defs.front().mode.bits <= 32 &&
-                      selects_cond_move())) {
+                    !selects_integer_without_branch(value.defs.front().mode.bits)) {
                     std::size_t end = index + 1;
                     while (end < found->instructions.size()) {
                         const auto& candidate = found->instructions[end];
@@ -22419,8 +22705,8 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
                             candidate.uses.size() < 3 ||
                             candidate.defs.empty() ||
                             candidate.uses.front() != value.uses.front() ||
-                            (candidate.defs.front().mode.bits <= 32 &&
-                             selects_cond_move())) {
+                            selects_integer_without_branch(
+                                candidate.defs.front().mode.bits)) {
                             break;
                         }
                         ++end;

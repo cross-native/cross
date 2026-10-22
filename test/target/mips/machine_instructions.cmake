@@ -111,7 +111,8 @@ file(WRITE "${OUTPUT}-query.x"
     "global u32 cache_query() { return $::has_instruction($::_cache); }\n"
     "global u32 sqrt_query() { return $::has_instruction($::_sqrt); }\n"
     "global u32 dmfc0_query() { return $::has_instruction($::_dmfc0); }\n")
-foreach(case "vr4300|1 1 1" "r3000|0 0 0" "mips2|0 1 0" "mips32|1 1 0")
+foreach(case "vr4300|1 1 1" "r3000|0 0 0" "mips2|0 1 0" "mips32|1 1 0" "mips32r6|1 1 0"
+             "mips64r6|1 1 1")
     string(REPLACE "|" ";" parts "${case}")
     list(GET parts 0 cpu)
     list(GET parts 1 expected)
@@ -130,9 +131,11 @@ endforeach()
 execute_process(COMMAND "${CC}" -target mips-unknown-elf --print-instructions
     RESULT_VARIABLE status OUTPUT_VARIABLE registry ERROR_VARIABLE errors)
 foreach(row "$::_mfc0 instruction [mips] privileged volatile"
-            "$::_cache instruction [mips3] privileged volatile"
+            "$::_cache instruction [mips3,!mips32r6,!mips64r6] privileged volatile"
+            "$::_cache instruction [mips32r6] privileged volatile"
             "$::_sqrt instruction [mips2,hard-float,!single-float]"
-            "$::_jr instruction [mips]")
+            "$::_jr instruction [mips,!mips32r6,!mips64r6]"
+            "$::_jr instruction [mips64r6]")
     string(FIND "${registry}" "${row}" position)
     if(NOT status EQUAL 0 OR position EQUAL -1)
         message(FATAL_ERROR "--print-instructions lacks '${row}'\n${registry}${errors}")

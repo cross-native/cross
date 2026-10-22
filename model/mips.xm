@@ -1162,6 +1162,24 @@ cpu "isa-mips64r2" {
                 "fpu-compare-interlocks", "hilo-interlocks"];
 }
 
+# Release 6 has no branch-likely, conditional-move, HI/LO, or unaligned
+# word instructions and handles misaligned ordinary accesses; its FPU has
+# only 64-bit registers and the IEEE 754-2008 NaN encoding.
+cpu "isa-mips32r6" {
+    architecture = "mips";
+    inherits = "isa-mips32r2";
+    features = ["mips32r6", "llsc", "rotate", "unaligned-access",
+                "load-interlocks", "fpu-transfer-interlocks",
+                "fpu-compare-interlocks", "hilo-interlocks"];
+}
+
+cpu "isa-mips64r6" {
+    architecture = "mips";
+    features = ["mips64r6", "llsc", "rotate", "unaligned-access",
+                "load-interlocks", "fpu-transfer-interlocks",
+                "fpu-compare-interlocks", "hilo-interlocks"];
+}
+
 # FPUs.
 cpu "fpu-none" {
     architecture = "mips";
@@ -1283,6 +1301,16 @@ cpu "mips64r3" {
 cpu "mips64r5" {
     architecture = "mips";
     inherits = "mips64r2";
+}
+
+cpu "mips32r6" {
+    architecture = "mips";
+    inherits = ["isa-mips32r6", "fpu-fp64", "fpu-odd-spreg"];
+}
+
+cpu "mips64r6" {
+    architecture = "mips";
+    inherits = ["isa-mips64r6", "fpu-fp64", "fpu-odd-spreg"];
 }
 
 # MIPS I. The R3000 with the R3010 FPU.
@@ -1983,6 +2011,23 @@ cpu "octeon3" {
 cpu "xlp" {
     architecture = "mips";
     inherits = "mips64r2";
+}
+
+# MIPS64 Release 6 CPUs; MSA, CRC, and GINV are not modeled. The I6500 is
+# the multi-cluster I6400. Costs: those of mips64r6.
+cpu "i6400" {
+    architecture = "mips";
+    inherits = "mips64r6";
+}
+
+cpu "i6500" {
+    architecture = "mips";
+    inherits = "i6400";
+}
+
+cpu "p6600" {
+    architecture = "mips";
+    inherits = "mips64r6";
 }
 
 # Other spellings that GCC and GNU as accept.

@@ -303,13 +303,12 @@ and a larger one through a hidden pointer.
 `-march=` and `-mtune=` name `cpu` model entries
 ([models.md](models.md#cpu-entries)); `cc --print-cpus` lists the loaded
 entries. `model/mips.xm` ships `generic`, the ISA names `mips1` to `mips5`,
-`mips32`, `mips32r2`, `mips32r3`, `mips32r5`, `mips64`, `mips64r2`,
-`mips64r3`, and `mips64r5`, and the CPUs that GCC, Clang, and GNU as accept
-for these levels, from `r2000`, `r3900`, and `r4650` to `vr5500`, `24kf`,
-`m5100`, `sb1`, `loongson3a`, and `octeon3`, with the other spellings they
-accept, such as `r4300` for `vr4300` and `r10k` for `r10000`. Not shipped
-are the Release 6 CPUs (`mips32r6`, `mips64r6`, `i6400`, `i6500`, `p6600`),
-whose instruction encodings Cross does not implement. Entries named `isa-`
+`mips32`, `mips32r2`, `mips32r3`, `mips32r5`, `mips32r6`, `mips64`,
+`mips64r2`, `mips64r3`, `mips64r5`, and `mips64r6`, and the CPUs that GCC,
+Clang, and GNU as accept for these levels, from `r2000`, `r3900`, and
+`r4650` to `vr5500`, `24kf`, `m5100`, `sb1`, `loongson3a`, `octeon3`, and
+`p6600`, with the other spellings they accept, such as `r4300` for `vr4300`
+and `r10k` for `r10000`. Entries named `isa-`
 hold an ISA level's instructions and pipeline interlocks without an FPU,
 `fpu-` entries an FPU, and `errata-` entries the workarounds of a CPU's
 errata; the ISA names and CPUs combine them. CPUs without an FPU, such as
@@ -354,6 +353,26 @@ and Allegrex code uses its `seb`, `seh`, `ext`, and `ins` words. Each
 replaces the sequence it shortens only where the `-mtune` latencies are no
 higher.
 
+Release 6 CPUs (`mips32r6`, `mips64r6`, `i6400`, `i6500`, and `p6600`) have
+the Release 2 instructions but no branch-likely, conditional-move, HI/LO,
+`c.cond.fmt`, or unaligned word instructions. They multiply and divide with
+`mul`, `muh`, `mulu`, `muhu`, `div`, `mod`, `divu`, `modu`, and their `d`
+forms, select with `seleqz`, `selnez`, and `sel.s` or `sel.d`, and compare
+floating values with `cmp.cond.fmt` into `$f1`, which holds no other value
+there (`$f4` under `-mfpxx`, whose code keeps 64-bit values in even
+registers), branching on it with `bc1eqz` and `bc1nez`; branches keep their
+delay slots, and compact branches are not selected. Their FPU has only 64-bit
+registers and the IEEE 754-2008 NaN encoding, so the `o32`, `x32`, and
+`eabi32` ABIs keep the CPU's 64-bit FPRs there, as GCC does, `-mfpxx` is
+accepted, and `-mfp32`, `-mno-nan2008`, `-mbranch-likely`, and `-mcond-move`
+are errors. Release 6 requires the system to accept misaligned ordinary
+loads and stores, in hardware or by emulation, and its CPUs enable
+`-munaligned-access`: misaligned data is accessed with ordinary loads and
+stores, as GCC does, unless `-mno-unaligned-access` copies it through bytes,
+as on other CPUs. A naked function that compares floating values on
+Release 6 names that register, `f1` or `f4`, in its clobbers and binds no
+object to it.
+
 The `r2000`, `r3000`, `r6000`, `r4000`, `r4400`, `r4600`, and `vr4300`
 entries give those CPUs' multiply and divide cycle counts, all but `r4000`
 and `r4400` also their floating-point ones, and `r2000`, `r3000`, and
@@ -366,12 +385,13 @@ options adjust them:
 | Option | Effect |
 | --- | --- |
 | `-mhard-float`, `-msoft-float`, `-msingle-float` | FPU availability. |
-| `-mfp32`, `-mfpxx`, `-mfp64` | FPU register model. The ABI selects the default ([models.md](models.md#entry-properties)): `-mfp32` under `o32`, `x32`, and `eabi32`, `-mfp64` under `n64`, and under `x64` the CPU's, which is `-mfp64` from MIPS IV and MIPS64 on. |
+| `-mfp32`, `-mfpxx`, `-mfp64` | FPU register model. The ABI selects the default ([models.md](models.md#entry-properties)): `-mfp32` under `o32`, `x32`, and `eabi32`, `-mfp64` under `n64`, and under `x64` the CPU's, which is `-mfp64` from MIPS IV and MIPS64 on; Release 6 FPUs have only 64-bit registers. `-mfp64` needs MIPS III or MIPS32 Release 2. |
 | `-modd-spreg` | The FPU has odd-numbered single-precision registers with 32-bit FPRs; the MIPS32 and MIPS64 CPUs with an FPU other than the GS464, and `allegrex`, enable it. A single-precision FPU then keeps values in all 32 registers; under `-mfp32`, where an `f64` occupies an even/odd pair, a function without `f64` values keeps its `f32` values in all 32 registers and others keep floating values in even registers. `-mfpxx` code and FPUs without them use even registers only. `-mfp64` code keeps values in all 32 registers on every CPU. |
 | `-mllsc` | 32-bit LL/SC atomics. |
 | `-mfix-NAME` | The errata workarounds above. |
-| `-mnan2008` | Use the IEEE 754-2008 NaN encoding of MIPS32 Release 2 FPUs; the output declares it with `.nan 2008`. |
-| `-mbranch-likely`, `-mcond-move`, `-mrotate` | Allow branch-likely, conditional-move, and rotate instructions. |
+| `-mnan2008` | Use the IEEE 754-2008 NaN encoding of Release 2 FPUs, which Release 6 FPUs always use; the output declares it with `.nan 2008`. |
+| `-munaligned-access` | Access misaligned data, such as the members of `[[packed]]` records, with ordinary loads and stores, which the system must accept, as Release 6 systems do; otherwise through bytes. Release 6 CPUs enable it. |
+| `-mbranch-likely`, `-mcond-move`, `-mrotate` | Allow branch-likely, conditional-move, and rotate instructions; Release 6 has neither of the first two. |
 | `-mcmodel=large` | Materialize full 64-bit addresses and call through registers. |
 | `-mlong-calls` | Call every function through a register (`lui`, `addiu`, `jalr`), so callers and callees need not lie in the same 256 MB region that `jal` reaches. |
 | `-mabicalls` | SVR4 abicalls code, described below; `-fpic`, `-fPIC`, `-fpie`, and `-fPIE` imply it. |

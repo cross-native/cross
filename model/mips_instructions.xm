@@ -460,6 +460,7 @@ instruction "clz" {
     operands = ["rd:gpr32", "rs:gpr32"];
     encoding = "011100 rs:5 rd:5 rd:5 00000 100000";
     features = ["mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rs"];
     writes = ["rd"];
 }
@@ -479,6 +480,7 @@ instruction "clo" {
     operands = ["rd:gpr32", "rs:gpr32"];
     encoding = "011100 rs:5 rd:5 rd:5 00000 100001";
     features = ["mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rs"];
     writes = ["rd"];
 }
@@ -498,6 +500,7 @@ instruction "dclz" {
     operands = ["rd:gpr64", "rs:gpr64"];
     encoding = "011100 rs:5 rd:5 rd:5 00000 100100";
     features = ["mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rs"];
     writes = ["rd"];
 }
@@ -507,6 +510,7 @@ instruction "dclo" {
     operands = ["rd:gpr64", "rs:gpr64"];
     encoding = "011100 rs:5 rd:5 rd:5 00000 100101";
     features = ["mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rs"];
     writes = ["rd"];
 }
@@ -544,6 +548,7 @@ instruction "movn" {
     operands = ["rd:gpr", "rs:gpr", "rt:gpr"];
     encoding = "000000 rs:5 rt:5 rd:5 00000 001011";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rs", "rt"];
     writes = ["rd"];
 }
@@ -552,6 +557,7 @@ instruction "mult" {
     architecture = "mips";
     operands = ["rs:gpr32", "rt:gpr32"];
     encoding = "000000 rs:5 rt:5 00000 00000 011000";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rs", "rt"];
     writes = ["hi", "lo"];
     latency = 7;
@@ -561,6 +567,7 @@ instruction "multu" {
     architecture = "mips";
     operands = ["rs:gpr32", "rt:gpr32"];
     encoding = "000000 rs:5 rt:5 00000 00000 011001";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rs", "rt"];
     writes = ["hi", "lo"];
     latency = 7;
@@ -571,6 +578,7 @@ instruction "dmult" {
     operands = ["rs:gpr64", "rt:gpr64"];
     encoding = "000000 rs:5 rt:5 00000 00000 011100";
     features = ["mips3"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rs", "rt"];
     writes = ["hi", "lo"];
     latency = 7;
@@ -581,6 +589,7 @@ instruction "dmultu" {
     operands = ["rs:gpr64", "rt:gpr64"];
     encoding = "000000 rs:5 rt:5 00000 00000 011101";
     features = ["mips3"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rs", "rt"];
     writes = ["hi", "lo"];
     latency = 7;
@@ -590,6 +599,7 @@ instruction "div" {
     architecture = "mips";
     operands = ["$zero", "rs:gpr32", "rt:gpr32"];
     encoding = "000000 rs:5 rt:5 00000 00000 011010";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rs", "rt"];
     writes = ["hi", "lo"];
     latency = 35;
@@ -599,6 +609,7 @@ instruction "divu" {
     architecture = "mips";
     operands = ["$zero", "rs:gpr32", "rt:gpr32"];
     encoding = "000000 rs:5 rt:5 00000 00000 011011";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rs", "rt"];
     writes = ["hi", "lo"];
     latency = 35;
@@ -609,6 +620,7 @@ instruction "ddiv" {
     operands = ["$zero", "rs:gpr64", "rt:gpr64"];
     encoding = "000000 rs:5 rt:5 00000 00000 011110";
     features = ["mips3"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rs", "rt"];
     writes = ["hi", "lo"];
     latency = 35;
@@ -619,6 +631,7 @@ instruction "ddivu" {
     operands = ["$zero", "rs:gpr64", "rt:gpr64"];
     encoding = "000000 rs:5 rt:5 00000 00000 011111";
     features = ["mips3"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rs", "rt"];
     writes = ["hi", "lo"];
     latency = 35;
@@ -628,6 +641,7 @@ instruction "mfhi" {
     architecture = "mips";
     operands = ["rd:gpr"];
     encoding = "000000 00000 00000 rd:5 00000 010000";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["hi"];
     writes = ["rd"];
 }
@@ -636,6 +650,7 @@ instruction "mflo" {
     architecture = "mips";
     operands = ["rd:gpr"];
     encoding = "000000 00000 00000 rd:5 00000 010010";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["lo"];
     writes = ["rd"];
 }
@@ -644,6 +659,7 @@ instruction "mthi" {
     architecture = "mips";
     operands = ["rs:gpr"];
     encoding = "000000 rs:5 00000 00000 00000 010001";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rs"];
     writes = ["hi"];
 }
@@ -652,6 +668,7 @@ instruction "mtlo" {
     architecture = "mips";
     operands = ["rs:gpr"];
     encoding = "000000 rs:5 00000 00000 00000 010011";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rs"];
     writes = ["lo"];
 }
@@ -732,6 +749,7 @@ instruction "lwl" {
     architecture = "mips";
     operands = ["rt:gpr32", "address:mem32"];
     encoding = "100010 address.base:5 rt:5 address.offset:16";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["memory"];
     writes = ["rt"];
     hazards = ["load"];
@@ -742,6 +760,7 @@ instruction "lwr" {
     architecture = "mips";
     operands = ["rt:gpr32", "address:mem32"];
     encoding = "100110 address.base:5 rt:5 address.offset:16";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["memory"];
     writes = ["rt"];
     hazards = ["load"];
@@ -753,6 +772,7 @@ instruction "ldl" {
     operands = ["rt:gpr64", "address:mem64"];
     encoding = "011010 address.base:5 rt:5 address.offset:16";
     features = ["mips3"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["memory"];
     writes = ["rt"];
     hazards = ["load"];
@@ -764,6 +784,7 @@ instruction "ldr" {
     operands = ["rt:gpr64", "address:mem64"];
     encoding = "011011 address.base:5 rt:5 address.offset:16";
     features = ["mips3"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["memory"];
     writes = ["rt"];
     hazards = ["load"];
@@ -796,6 +817,7 @@ instruction "ll" {
     operands = ["rt:gpr32", "address:mem32"];
     encoding = "110000 address.base:5 rt:5 address.offset:16";
     features = ["mips2"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["memory"];
     writes = ["rt"];
     hazards = ["load"];
@@ -807,6 +829,7 @@ instruction "lld" {
     operands = ["rt:gpr64", "address:mem64"];
     encoding = "110100 address.base:5 rt:5 address.offset:16";
     features = ["mips3"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["memory"];
     writes = ["rt"];
     hazards = ["load"];
@@ -850,6 +873,7 @@ instruction "swl" {
     architecture = "mips";
     operands = ["rt:gpr32", "address:mem32"];
     encoding = "101010 address.base:5 rt:5 address.offset:16";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rt"];
     writes = ["memory"];
 }
@@ -858,6 +882,7 @@ instruction "swr" {
     architecture = "mips";
     operands = ["rt:gpr32", "address:mem32"];
     encoding = "101110 address.base:5 rt:5 address.offset:16";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rt"];
     writes = ["memory"];
 }
@@ -867,6 +892,7 @@ instruction "sdl" {
     operands = ["rt:gpr64", "address:mem64"];
     encoding = "101100 address.base:5 rt:5 address.offset:16";
     features = ["mips3"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rt"];
     writes = ["memory"];
 }
@@ -876,6 +902,7 @@ instruction "sdr" {
     operands = ["rt:gpr64", "address:mem64"];
     encoding = "101101 address.base:5 rt:5 address.offset:16";
     features = ["mips3"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rt"];
     writes = ["memory"];
 }
@@ -902,6 +929,7 @@ instruction "sc" {
     operands = ["rt:gpr32", "address:mem32"];
     encoding = "111000 address.base:5 rt:5 address.offset:16";
     features = ["mips2"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rt", "memory"];
     writes = ["rt", "memory"];
 }
@@ -911,6 +939,7 @@ instruction "scd" {
     operands = ["rt:gpr64", "address:mem64"];
     encoding = "111100 address.base:5 rt:5 address.offset:16";
     features = ["mips3"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rt", "memory"];
     writes = ["rt", "memory"];
 }
@@ -1025,6 +1054,7 @@ instruction "bltzal" {
     architecture = "mips";
     operands = ["rs:gpr", "target:branch"];
     encoding = "000001 rs:5 10000 target:16";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rs"];
     writes = ["ra"];
     control = "branch";
@@ -1035,6 +1065,7 @@ instruction "bgezal" {
     architecture = "mips";
     operands = ["rs:gpr", "target:branch"];
     encoding = "000001 rs:5 10001 target:16";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rs"];
     writes = ["ra"];
     control = "branch";
@@ -1045,6 +1076,7 @@ instruction "bc1t" {
     architecture = "mips";
     operands = ["target:branch"];
     encoding = "010001 01000 00001 target:16";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fcsr"];
     hazards = ["condition-read"];
     control = "branch";
@@ -1057,6 +1089,7 @@ instruction "bc1t/cc" {
     operands = ["cc:fcc", "target:branch"];
     encoding = "010001 01000 cc:3 01 target:16";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fcsr"];
     hazards = ["condition-read"];
     control = "branch";
@@ -1067,6 +1100,7 @@ instruction "bc1f" {
     architecture = "mips";
     operands = ["target:branch"];
     encoding = "010001 01000 00000 target:16";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fcsr"];
     hazards = ["condition-read"];
     control = "branch";
@@ -1079,6 +1113,7 @@ instruction "bc1f/cc" {
     operands = ["cc:fcc", "target:branch"];
     encoding = "010001 01000 cc:3 00 target:16";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fcsr"];
     hazards = ["condition-read"];
     control = "branch";
@@ -1090,6 +1125,7 @@ instruction "beql" {
     operands = ["rs:gpr", "rt:gpr", "target:branch"];
     encoding = "010100 rs:5 rt:5 target:16";
     features = ["mips2"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rs", "rt"];
     control = "branch";
     delay_slot = true;
@@ -1101,6 +1137,7 @@ instruction "bnel" {
     operands = ["rs:gpr", "rt:gpr", "target:branch"];
     encoding = "010101 rs:5 rt:5 target:16";
     features = ["mips2"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rs", "rt"];
     control = "branch";
     delay_slot = true;
@@ -1112,6 +1149,7 @@ instruction "beqzl" {
     operands = ["rs:gpr", "target:branch"];
     encoding = "010100 rs:5 zero:5 target:16";
     features = ["mips2"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rs"];
     control = "branch";
     delay_slot = true;
@@ -1123,6 +1161,7 @@ instruction "bnezl" {
     operands = ["rs:gpr", "target:branch"];
     encoding = "010101 rs:5 zero:5 target:16";
     features = ["mips2"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rs"];
     control = "branch";
     delay_slot = true;
@@ -1134,6 +1173,7 @@ instruction "bltzl" {
     operands = ["rs:gpr", "target:branch"];
     encoding = "000001 rs:5 00010 target:16";
     features = ["mips2"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rs"];
     control = "branch";
     delay_slot = true;
@@ -1145,6 +1185,7 @@ instruction "bgezl" {
     operands = ["rs:gpr", "target:branch"];
     encoding = "000001 rs:5 00011 target:16";
     features = ["mips2"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rs"];
     control = "branch";
     delay_slot = true;
@@ -1156,6 +1197,7 @@ instruction "blezl" {
     operands = ["rs:gpr", "target:branch"];
     encoding = "010110 rs:5 00000 target:16";
     features = ["mips2"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rs"];
     control = "branch";
     delay_slot = true;
@@ -1167,6 +1209,7 @@ instruction "bgtzl" {
     operands = ["rs:gpr", "target:branch"];
     encoding = "010111 rs:5 00000 target:16";
     features = ["mips2"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rs"];
     control = "branch";
     delay_slot = true;
@@ -1178,6 +1221,7 @@ instruction "bc1tl" {
     operands = ["target:branch"];
     encoding = "010001 01000 00011 target:16";
     features = ["mips2"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fcsr"];
     hazards = ["condition-read"];
     control = "branch";
@@ -1191,6 +1235,7 @@ instruction "bc1tl/cc" {
     operands = ["cc:fcc", "target:branch"];
     encoding = "010001 01000 cc:3 11 target:16";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fcsr"];
     hazards = ["condition-read"];
     control = "branch";
@@ -1203,6 +1248,7 @@ instruction "bc1fl" {
     operands = ["target:branch"];
     encoding = "010001 01000 00010 target:16";
     features = ["mips2"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fcsr"];
     hazards = ["condition-read"];
     control = "branch";
@@ -1216,6 +1262,7 @@ instruction "bc1fl/cc" {
     operands = ["cc:fcc", "target:branch"];
     encoding = "010001 01000 cc:3 10 target:16";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fcsr"];
     hazards = ["condition-read"];
     control = "branch";
@@ -1244,6 +1291,7 @@ instruction "jr" {
     architecture = "mips";
     operands = ["rs:gpr"];
     encoding = "000000 rs:5 00000 00000 00000 001000";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rs"];
     control = "exit";
     delay_slot = true;
@@ -1530,6 +1578,7 @@ instruction "c.eq.s" {
     architecture = "mips";
     operands = ["fs:fpr32", "ft:fpr32"];
     encoding = "010001 10000 ft:5 fs:5 00000 110010";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -1541,6 +1590,7 @@ instruction "c.eq.s/cc" {
     operands = ["cc:fcc", "fs:fpr32", "ft:fpr32"];
     encoding = "010001 10000 ft:5 fs:5 cc:3 00 110010";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -1550,6 +1600,7 @@ instruction "c.eq.d" {
     architecture = "mips";
     operands = ["fs:fpr64", "ft:fpr64"];
     encoding = "010001 10001 ft:5 fs:5 00000 110010";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -1561,6 +1612,7 @@ instruction "c.eq.d/cc" {
     operands = ["cc:fcc", "fs:fpr64", "ft:fpr64"];
     encoding = "010001 10001 ft:5 fs:5 cc:3 00 110010";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -1570,6 +1622,7 @@ instruction "c.lt.s" {
     architecture = "mips";
     operands = ["fs:fpr32", "ft:fpr32"];
     encoding = "010001 10000 ft:5 fs:5 00000 111100";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -1581,6 +1634,7 @@ instruction "c.lt.s/cc" {
     operands = ["cc:fcc", "fs:fpr32", "ft:fpr32"];
     encoding = "010001 10000 ft:5 fs:5 cc:3 00 111100";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -1590,6 +1644,7 @@ instruction "c.lt.d" {
     architecture = "mips";
     operands = ["fs:fpr64", "ft:fpr64"];
     encoding = "010001 10001 ft:5 fs:5 00000 111100";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -1601,6 +1656,7 @@ instruction "c.lt.d/cc" {
     operands = ["cc:fcc", "fs:fpr64", "ft:fpr64"];
     encoding = "010001 10001 ft:5 fs:5 cc:3 00 111100";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -1610,6 +1666,7 @@ instruction "c.le.s" {
     architecture = "mips";
     operands = ["fs:fpr32", "ft:fpr32"];
     encoding = "010001 10000 ft:5 fs:5 00000 111110";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -1621,6 +1678,7 @@ instruction "c.le.s/cc" {
     operands = ["cc:fcc", "fs:fpr32", "ft:fpr32"];
     encoding = "010001 10000 ft:5 fs:5 cc:3 00 111110";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -1630,6 +1688,7 @@ instruction "c.le.d" {
     architecture = "mips";
     operands = ["fs:fpr64", "ft:fpr64"];
     encoding = "010001 10001 ft:5 fs:5 00000 111110";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -1641,6 +1700,7 @@ instruction "c.le.d/cc" {
     operands = ["cc:fcc", "fs:fpr64", "ft:fpr64"];
     encoding = "010001 10001 ft:5 fs:5 cc:3 00 111110";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -1650,6 +1710,7 @@ instruction "c.olt.s" {
     architecture = "mips";
     operands = ["fs:fpr32", "ft:fpr32"];
     encoding = "010001 10000 ft:5 fs:5 00000 110100";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -1661,6 +1722,7 @@ instruction "c.olt.s/cc" {
     operands = ["cc:fcc", "fs:fpr32", "ft:fpr32"];
     encoding = "010001 10000 ft:5 fs:5 cc:3 00 110100";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -1670,6 +1732,7 @@ instruction "c.olt.d" {
     architecture = "mips";
     operands = ["fs:fpr64", "ft:fpr64"];
     encoding = "010001 10001 ft:5 fs:5 00000 110100";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -1681,6 +1744,7 @@ instruction "c.olt.d/cc" {
     operands = ["cc:fcc", "fs:fpr64", "ft:fpr64"];
     encoding = "010001 10001 ft:5 fs:5 cc:3 00 110100";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -1690,6 +1754,7 @@ instruction "c.un.s" {
     architecture = "mips";
     operands = ["fs:fpr32", "ft:fpr32"];
     encoding = "010001 10000 ft:5 fs:5 00000 110001";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -1701,6 +1766,7 @@ instruction "c.un.s/cc" {
     operands = ["cc:fcc", "fs:fpr32", "ft:fpr32"];
     encoding = "010001 10000 ft:5 fs:5 cc:3 00 110001";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -1710,6 +1776,7 @@ instruction "c.un.d" {
     architecture = "mips";
     operands = ["fs:fpr64", "ft:fpr64"];
     encoding = "010001 10001 ft:5 fs:5 00000 110001";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -1721,6 +1788,7 @@ instruction "c.un.d/cc" {
     operands = ["cc:fcc", "fs:fpr64", "ft:fpr64"];
     encoding = "010001 10001 ft:5 fs:5 cc:3 00 110001";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -1881,6 +1949,7 @@ instruction "cache" {
     operands = ["op:uimm5", "address:mem"];
     encoding = "101111 address.base:5 op:5 address.offset:16";
     features = ["mips3", "mips32", "allegrex"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["memory", "cp0", "tlb"];
     writes = ["memory", "cp0"];
     privileged = true;
@@ -2066,6 +2135,7 @@ instruction "movn.s" {
     operands = ["fd:fpr32", "fs:fpr32", "rt:gpr"];
     encoding = "010001 10000 rt:5 fs:5 fd:5 010011";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "rt"];
     writes = ["fd"];
 }
@@ -2075,6 +2145,7 @@ instruction "movn.d" {
     operands = ["fd:fpr64", "fs:fpr64", "rt:gpr"];
     encoding = "010001 10001 rt:5 fs:5 fd:5 010011";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "rt"];
     writes = ["fd"];
 }
@@ -2084,6 +2155,7 @@ instruction "movz.s" {
     operands = ["fd:fpr32", "fs:fpr32", "rt:gpr"];
     encoding = "010001 10000 rt:5 fs:5 fd:5 010010";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "rt"];
     writes = ["fd"];
 }
@@ -2093,6 +2165,7 @@ instruction "movz.d" {
     operands = ["fd:fpr64", "fs:fpr64", "rt:gpr"];
     encoding = "010001 10001 rt:5 fs:5 fd:5 010010";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "rt"];
     writes = ["fd"];
 }
@@ -2102,6 +2175,7 @@ instruction "movt.s" {
     operands = ["fd:fpr32", "fs:fpr32", "cc:fcc"];
     encoding = "010001 10000 cc:3 01 fs:5 fd:5 010001";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "fcsr"];
     writes = ["fd"];
     hazards = ["condition-read"];
@@ -2112,6 +2186,7 @@ instruction "movt.d" {
     operands = ["fd:fpr64", "fs:fpr64", "cc:fcc"];
     encoding = "010001 10001 cc:3 01 fs:5 fd:5 010001";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "fcsr"];
     writes = ["fd"];
     hazards = ["condition-read"];
@@ -2122,6 +2197,7 @@ instruction "movf.s" {
     operands = ["fd:fpr32", "fs:fpr32", "cc:fcc"];
     encoding = "010001 10000 cc:3 00 fs:5 fd:5 010001";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "fcsr"];
     writes = ["fd"];
     hazards = ["condition-read"];
@@ -2132,6 +2208,7 @@ instruction "movf.d" {
     operands = ["fd:fpr64", "fs:fpr64", "cc:fcc"];
     encoding = "010001 10001 cc:3 00 fs:5 fd:5 010001";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "fcsr"];
     writes = ["fd"];
     hazards = ["condition-read"];
@@ -2142,6 +2219,7 @@ instruction "movz" {
     operands = ["rd:gpr", "rs:gpr", "rt:gpr"];
     encoding = "000000 rs:5 rt:5 rd:5 00000 001010";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rs", "rt"];
     writes = ["rd"];
 }
@@ -2151,6 +2229,7 @@ instruction "movf" {
     operands = ["rd:gpr", "rs:gpr", "cc:fcc"];
     encoding = "000000 rs:5 cc:3 00 rd:5 00000 000001";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rs", "fcsr"];
     writes = ["rd"];
     hazards = ["condition-read"];
@@ -2161,6 +2240,7 @@ instruction "movt" {
     operands = ["rd:gpr", "rs:gpr", "cc:fcc"];
     encoding = "000000 rs:5 cc:3 01 rd:5 00000 000001";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rs", "fcsr"];
     writes = ["rd"];
     hazards = ["condition-read"];
@@ -2180,12 +2260,14 @@ instruction "add/immediate" {
     operands = ["rd:gpr32", "rs:gpr32", "value:imm"];
     expands = ["addi rd, rs, value"];
     otherwise = ["add rd, rs, $at"];
+    excludes = ["mips32r6", "mips64r6"];
 }
 
 instruction "addi" {
     architecture = "mips";
     operands = ["rt:gpr32", "rs:gpr32", "imm:simm16"];
     encoding = "001000 rs:5 rt:5 imm:16";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rs"];
     writes = ["rt"];
 }
@@ -2204,6 +2286,7 @@ instruction "sub/immediate" {
     operands = ["rd:gpr32", "rs:gpr32", "value:imm"];
     expands = ["addi rd, rs, -value"];
     otherwise = ["sub rd, rs, $at"];
+    excludes = ["mips32r6", "mips64r6"];
 }
 
 instruction "dadd" {
@@ -2222,6 +2305,7 @@ instruction "dadd/immediate" {
     expands = ["daddi rd, rs, value"];
     otherwise = ["dadd rd, rs, $at"];
     features = ["mips3"];
+    excludes = ["mips32r6", "mips64r6"];
 }
 
 instruction "daddi" {
@@ -2229,6 +2313,7 @@ instruction "daddi" {
     operands = ["rt:gpr64", "rs:gpr64", "imm:simm16"];
     encoding = "011000 rs:5 rt:5 imm:16";
     features = ["mips3"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rs"];
     writes = ["rt"];
 }
@@ -2249,6 +2334,7 @@ instruction "dsub/immediate" {
     expands = ["daddi rd, rs, -value"];
     otherwise = ["dsub rd, rs, $at"];
     features = ["mips3"];
+    excludes = ["mips32r6", "mips64r6"];
 }
 
 instruction "negu" {
@@ -2326,7 +2412,7 @@ instruction "teq/immediate" {
     expands = ["teqi rs, value"];
     otherwise = ["teq rs, $at"];
     features = ["mips2"];
-    excludes = ["allegrex"];
+    excludes = ["allegrex", "mips32r6", "mips64r6"];
 }
 
 instruction "tne" {
@@ -2346,7 +2432,7 @@ instruction "tne/immediate" {
     expands = ["tnei rs, value"];
     otherwise = ["tne rs, $at"];
     features = ["mips2"];
-    excludes = ["allegrex"];
+    excludes = ["allegrex", "mips32r6", "mips64r6"];
 }
 
 instruction "tge" {
@@ -2366,7 +2452,7 @@ instruction "tge/immediate" {
     expands = ["tgei rs, value"];
     otherwise = ["tge rs, $at"];
     features = ["mips2"];
-    excludes = ["allegrex"];
+    excludes = ["allegrex", "mips32r6", "mips64r6"];
 }
 
 instruction "tgeu" {
@@ -2386,7 +2472,7 @@ instruction "tgeu/immediate" {
     expands = ["tgeiu rs, value"];
     otherwise = ["tgeu rs, $at"];
     features = ["mips2"];
-    excludes = ["allegrex"];
+    excludes = ["allegrex", "mips32r6", "mips64r6"];
 }
 
 instruction "tlt" {
@@ -2406,7 +2492,7 @@ instruction "tlt/immediate" {
     expands = ["tlti rs, value"];
     otherwise = ["tlt rs, $at"];
     features = ["mips2"];
-    excludes = ["allegrex"];
+    excludes = ["allegrex", "mips32r6", "mips64r6"];
 }
 
 instruction "tltu" {
@@ -2426,7 +2512,7 @@ instruction "tltu/immediate" {
     expands = ["tltiu rs, value"];
     otherwise = ["tltu rs, $at"];
     features = ["mips2"];
-    excludes = ["allegrex"];
+    excludes = ["allegrex", "mips32r6", "mips64r6"];
 }
 
 instruction "teqi" {
@@ -2434,7 +2520,7 @@ instruction "teqi" {
     operands = ["rs:gpr", "imm:simm16"];
     encoding = "000001 rs:5 01100 imm:16";
     features = ["mips2"];
-    excludes = ["allegrex"];
+    excludes = ["allegrex", "mips32r6", "mips64r6"];
     reads = ["rs"];
     hazards = ["no-delay-slot"];
 }
@@ -2444,7 +2530,7 @@ instruction "tnei" {
     operands = ["rs:gpr", "imm:simm16"];
     encoding = "000001 rs:5 01110 imm:16";
     features = ["mips2"];
-    excludes = ["allegrex"];
+    excludes = ["allegrex", "mips32r6", "mips64r6"];
     reads = ["rs"];
     hazards = ["no-delay-slot"];
 }
@@ -2454,7 +2540,7 @@ instruction "tgei" {
     operands = ["rs:gpr", "imm:simm16"];
     encoding = "000001 rs:5 01000 imm:16";
     features = ["mips2"];
-    excludes = ["allegrex"];
+    excludes = ["allegrex", "mips32r6", "mips64r6"];
     reads = ["rs"];
     hazards = ["no-delay-slot"];
 }
@@ -2464,7 +2550,7 @@ instruction "tgeiu" {
     operands = ["rs:gpr", "imm:simm16"];
     encoding = "000001 rs:5 01001 imm:16";
     features = ["mips2"];
-    excludes = ["allegrex"];
+    excludes = ["allegrex", "mips32r6", "mips64r6"];
     reads = ["rs"];
     hazards = ["no-delay-slot"];
 }
@@ -2474,7 +2560,7 @@ instruction "tlti" {
     operands = ["rs:gpr", "imm:simm16"];
     encoding = "000001 rs:5 01010 imm:16";
     features = ["mips2"];
-    excludes = ["allegrex"];
+    excludes = ["allegrex", "mips32r6", "mips64r6"];
     reads = ["rs"];
     hazards = ["no-delay-slot"];
 }
@@ -2484,7 +2570,7 @@ instruction "tltiu" {
     operands = ["rs:gpr", "imm:simm16"];
     encoding = "000001 rs:5 01011 imm:16";
     features = ["mips2"];
-    excludes = ["allegrex"];
+    excludes = ["allegrex", "mips32r6", "mips64r6"];
     reads = ["rs"];
     hazards = ["no-delay-slot"];
 }
@@ -2494,6 +2580,7 @@ instruction "mul" {
     operands = ["rd:gpr32", "rs:gpr32", "rt:gpr32"];
     encoding = "011100 rs:5 rt:5 rd:5 00000 000010";
     features = ["mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rs", "rt"];
     writes = ["rd", "hi", "lo"];
     latency = 7;
@@ -2504,6 +2591,7 @@ instruction "mul/immediate" {
     mnemonic = "mul";
     operands = ["rd:gpr32", "rs:gpr32", "value:imm"];
     otherwise = ["mult rs, $at", "mflo rd"];
+    excludes = ["mips32r6", "mips64r6"];
 }
 
 instruction "mul/macro" {
@@ -2511,6 +2599,7 @@ instruction "mul/macro" {
     mnemonic = "mul";
     operands = ["rd:gpr32", "rs:gpr32", "rt:gpr32"];
     expands = ["multu rs, rt", "mflo rd"];
+    excludes = ["mips32r6", "mips64r6"];
 }
 
 instruction "madd" {
@@ -2518,6 +2607,7 @@ instruction "madd" {
     operands = ["rs:gpr32", "rt:gpr32"];
     encoding = "011100 rs:5 rt:5 00000 00000 000000";
     features = ["mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rs", "rt", "hi", "lo"];
     writes = ["hi", "lo"];
 }
@@ -2537,6 +2627,7 @@ instruction "maddu" {
     operands = ["rs:gpr32", "rt:gpr32"];
     encoding = "011100 rs:5 rt:5 00000 00000 000001";
     features = ["mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rs", "rt", "hi", "lo"];
     writes = ["hi", "lo"];
 }
@@ -2556,6 +2647,7 @@ instruction "msub" {
     operands = ["rs:gpr32", "rt:gpr32"];
     encoding = "011100 rs:5 rt:5 00000 00000 000100";
     features = ["mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rs", "rt", "hi", "lo"];
     writes = ["hi", "lo"];
 }
@@ -2575,6 +2667,7 @@ instruction "msubu" {
     operands = ["rs:gpr32", "rt:gpr32"];
     encoding = "011100 rs:5 rt:5 00000 00000 000101";
     features = ["mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["rs", "rt", "hi", "lo"];
     writes = ["hi", "lo"];
 }
@@ -2632,6 +2725,7 @@ instruction "pref" {
     operands = ["op:uimm5", "address:mem"];
     encoding = "110011 address.base:5 op:5 address.offset:16";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
 }
 
 instruction "max" {
@@ -2839,6 +2933,7 @@ instruction "c.f.s" {
     architecture = "mips";
     operands = ["fs:fpr32", "ft:fpr32"];
     encoding = "010001 10000 ft:5 fs:5 00000 110000";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -2850,6 +2945,7 @@ instruction "c.f.s/cc" {
     operands = ["cc:fcc", "fs:fpr32", "ft:fpr32"];
     encoding = "010001 10000 ft:5 fs:5 cc:3 00 110000";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -2859,6 +2955,7 @@ instruction "c.f.d" {
     architecture = "mips";
     operands = ["fs:fpr64", "ft:fpr64"];
     encoding = "010001 10001 ft:5 fs:5 00000 110000";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -2870,6 +2967,7 @@ instruction "c.f.d/cc" {
     operands = ["cc:fcc", "fs:fpr64", "ft:fpr64"];
     encoding = "010001 10001 ft:5 fs:5 cc:3 00 110000";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -2879,6 +2977,7 @@ instruction "c.ueq.s" {
     architecture = "mips";
     operands = ["fs:fpr32", "ft:fpr32"];
     encoding = "010001 10000 ft:5 fs:5 00000 110011";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -2890,6 +2989,7 @@ instruction "c.ueq.s/cc" {
     operands = ["cc:fcc", "fs:fpr32", "ft:fpr32"];
     encoding = "010001 10000 ft:5 fs:5 cc:3 00 110011";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -2899,6 +2999,7 @@ instruction "c.ueq.d" {
     architecture = "mips";
     operands = ["fs:fpr64", "ft:fpr64"];
     encoding = "010001 10001 ft:5 fs:5 00000 110011";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -2910,6 +3011,7 @@ instruction "c.ueq.d/cc" {
     operands = ["cc:fcc", "fs:fpr64", "ft:fpr64"];
     encoding = "010001 10001 ft:5 fs:5 cc:3 00 110011";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -2919,6 +3021,7 @@ instruction "c.ult.s" {
     architecture = "mips";
     operands = ["fs:fpr32", "ft:fpr32"];
     encoding = "010001 10000 ft:5 fs:5 00000 110101";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -2930,6 +3033,7 @@ instruction "c.ult.s/cc" {
     operands = ["cc:fcc", "fs:fpr32", "ft:fpr32"];
     encoding = "010001 10000 ft:5 fs:5 cc:3 00 110101";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -2939,6 +3043,7 @@ instruction "c.ult.d" {
     architecture = "mips";
     operands = ["fs:fpr64", "ft:fpr64"];
     encoding = "010001 10001 ft:5 fs:5 00000 110101";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -2950,6 +3055,7 @@ instruction "c.ult.d/cc" {
     operands = ["cc:fcc", "fs:fpr64", "ft:fpr64"];
     encoding = "010001 10001 ft:5 fs:5 cc:3 00 110101";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -2959,6 +3065,7 @@ instruction "c.ole.s" {
     architecture = "mips";
     operands = ["fs:fpr32", "ft:fpr32"];
     encoding = "010001 10000 ft:5 fs:5 00000 110110";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -2970,6 +3077,7 @@ instruction "c.ole.s/cc" {
     operands = ["cc:fcc", "fs:fpr32", "ft:fpr32"];
     encoding = "010001 10000 ft:5 fs:5 cc:3 00 110110";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -2979,6 +3087,7 @@ instruction "c.ole.d" {
     architecture = "mips";
     operands = ["fs:fpr64", "ft:fpr64"];
     encoding = "010001 10001 ft:5 fs:5 00000 110110";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -2990,6 +3099,7 @@ instruction "c.ole.d/cc" {
     operands = ["cc:fcc", "fs:fpr64", "ft:fpr64"];
     encoding = "010001 10001 ft:5 fs:5 cc:3 00 110110";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -2999,6 +3109,7 @@ instruction "c.ule.s" {
     architecture = "mips";
     operands = ["fs:fpr32", "ft:fpr32"];
     encoding = "010001 10000 ft:5 fs:5 00000 110111";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -3010,6 +3121,7 @@ instruction "c.ule.s/cc" {
     operands = ["cc:fcc", "fs:fpr32", "ft:fpr32"];
     encoding = "010001 10000 ft:5 fs:5 cc:3 00 110111";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -3019,6 +3131,7 @@ instruction "c.ule.d" {
     architecture = "mips";
     operands = ["fs:fpr64", "ft:fpr64"];
     encoding = "010001 10001 ft:5 fs:5 00000 110111";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -3030,6 +3143,7 @@ instruction "c.ule.d/cc" {
     operands = ["cc:fcc", "fs:fpr64", "ft:fpr64"];
     encoding = "010001 10001 ft:5 fs:5 cc:3 00 110111";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -3039,6 +3153,7 @@ instruction "c.sf.s" {
     architecture = "mips";
     operands = ["fs:fpr32", "ft:fpr32"];
     encoding = "010001 10000 ft:5 fs:5 00000 111000";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -3050,6 +3165,7 @@ instruction "c.sf.s/cc" {
     operands = ["cc:fcc", "fs:fpr32", "ft:fpr32"];
     encoding = "010001 10000 ft:5 fs:5 cc:3 00 111000";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -3059,6 +3175,7 @@ instruction "c.sf.d" {
     architecture = "mips";
     operands = ["fs:fpr64", "ft:fpr64"];
     encoding = "010001 10001 ft:5 fs:5 00000 111000";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -3070,6 +3187,7 @@ instruction "c.sf.d/cc" {
     operands = ["cc:fcc", "fs:fpr64", "ft:fpr64"];
     encoding = "010001 10001 ft:5 fs:5 cc:3 00 111000";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -3079,6 +3197,7 @@ instruction "c.ngle.s" {
     architecture = "mips";
     operands = ["fs:fpr32", "ft:fpr32"];
     encoding = "010001 10000 ft:5 fs:5 00000 111001";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -3090,6 +3209,7 @@ instruction "c.ngle.s/cc" {
     operands = ["cc:fcc", "fs:fpr32", "ft:fpr32"];
     encoding = "010001 10000 ft:5 fs:5 cc:3 00 111001";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -3099,6 +3219,7 @@ instruction "c.ngle.d" {
     architecture = "mips";
     operands = ["fs:fpr64", "ft:fpr64"];
     encoding = "010001 10001 ft:5 fs:5 00000 111001";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -3110,6 +3231,7 @@ instruction "c.ngle.d/cc" {
     operands = ["cc:fcc", "fs:fpr64", "ft:fpr64"];
     encoding = "010001 10001 ft:5 fs:5 cc:3 00 111001";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -3119,6 +3241,7 @@ instruction "c.seq.s" {
     architecture = "mips";
     operands = ["fs:fpr32", "ft:fpr32"];
     encoding = "010001 10000 ft:5 fs:5 00000 111010";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -3130,6 +3253,7 @@ instruction "c.seq.s/cc" {
     operands = ["cc:fcc", "fs:fpr32", "ft:fpr32"];
     encoding = "010001 10000 ft:5 fs:5 cc:3 00 111010";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -3139,6 +3263,7 @@ instruction "c.seq.d" {
     architecture = "mips";
     operands = ["fs:fpr64", "ft:fpr64"];
     encoding = "010001 10001 ft:5 fs:5 00000 111010";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -3150,6 +3275,7 @@ instruction "c.seq.d/cc" {
     operands = ["cc:fcc", "fs:fpr64", "ft:fpr64"];
     encoding = "010001 10001 ft:5 fs:5 cc:3 00 111010";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -3159,6 +3285,7 @@ instruction "c.ngl.s" {
     architecture = "mips";
     operands = ["fs:fpr32", "ft:fpr32"];
     encoding = "010001 10000 ft:5 fs:5 00000 111011";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -3170,6 +3297,7 @@ instruction "c.ngl.s/cc" {
     operands = ["cc:fcc", "fs:fpr32", "ft:fpr32"];
     encoding = "010001 10000 ft:5 fs:5 cc:3 00 111011";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -3179,6 +3307,7 @@ instruction "c.ngl.d" {
     architecture = "mips";
     operands = ["fs:fpr64", "ft:fpr64"];
     encoding = "010001 10001 ft:5 fs:5 00000 111011";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -3190,6 +3319,7 @@ instruction "c.ngl.d/cc" {
     operands = ["cc:fcc", "fs:fpr64", "ft:fpr64"];
     encoding = "010001 10001 ft:5 fs:5 cc:3 00 111011";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -3199,6 +3329,7 @@ instruction "c.nge.s" {
     architecture = "mips";
     operands = ["fs:fpr32", "ft:fpr32"];
     encoding = "010001 10000 ft:5 fs:5 00000 111101";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -3210,6 +3341,7 @@ instruction "c.nge.s/cc" {
     operands = ["cc:fcc", "fs:fpr32", "ft:fpr32"];
     encoding = "010001 10000 ft:5 fs:5 cc:3 00 111101";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -3219,6 +3351,7 @@ instruction "c.nge.d" {
     architecture = "mips";
     operands = ["fs:fpr64", "ft:fpr64"];
     encoding = "010001 10001 ft:5 fs:5 00000 111101";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -3230,6 +3363,7 @@ instruction "c.nge.d/cc" {
     operands = ["cc:fcc", "fs:fpr64", "ft:fpr64"];
     encoding = "010001 10001 ft:5 fs:5 cc:3 00 111101";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -3239,6 +3373,7 @@ instruction "c.ngt.s" {
     architecture = "mips";
     operands = ["fs:fpr32", "ft:fpr32"];
     encoding = "010001 10000 ft:5 fs:5 00000 111111";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -3250,6 +3385,7 @@ instruction "c.ngt.s/cc" {
     operands = ["cc:fcc", "fs:fpr32", "ft:fpr32"];
     encoding = "010001 10000 ft:5 fs:5 cc:3 00 111111";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -3259,6 +3395,7 @@ instruction "c.ngt.d" {
     architecture = "mips";
     operands = ["fs:fpr64", "ft:fpr64"];
     encoding = "010001 10001 ft:5 fs:5 00000 111111";
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -3270,6 +3407,7 @@ instruction "c.ngt.d/cc" {
     operands = ["cc:fcc", "fs:fpr64", "ft:fpr64"];
     encoding = "010001 10001 ft:5 fs:5 cc:3 00 111111";
     features = ["mips4", "mips32", "mips64"];
+    excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "ft"];
     writes = ["fcsr"];
     hazards = ["condition-write"];
@@ -3401,4 +3539,1486 @@ instruction "dinsu" {
     reads = ["rt", "rs"];
     writes = ["rt"];
     constraints = ["pos+size <= 64"];
+}
+
+# Release 6 (MIPS32R6 and MIPS64R6). The forms R6 removes exclude it; these
+# are the forms it adds or re-encodes. A compact branch has no delay slot,
+# and a conditional one has a forbidden slot: the next instruction must not
+# transfer control. PC-relative operands count from the instruction itself,
+# branch21 and branch26 from the next one.
+instruction "mul/r6" {
+    architecture = "mips";
+    mnemonic = "mul";
+    operands = ["rd:gpr32", "rs:gpr32", "rt:gpr32"];
+    encoding = "000000 rs:5 rt:5 rd:5 00010 011000";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["rs", "rt"];
+    writes = ["rd"];
+}
+
+instruction "muh" {
+    architecture = "mips";
+    operands = ["rd:gpr32", "rs:gpr32", "rt:gpr32"];
+    encoding = "000000 rs:5 rt:5 rd:5 00011 011000";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["rs", "rt"];
+    writes = ["rd"];
+    latency = 7;
+}
+
+instruction "mulu" {
+    architecture = "mips";
+    operands = ["rd:gpr32", "rs:gpr32", "rt:gpr32"];
+    encoding = "000000 rs:5 rt:5 rd:5 00010 011001";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["rs", "rt"];
+    writes = ["rd"];
+    latency = 7;
+}
+
+instruction "muhu" {
+    architecture = "mips";
+    operands = ["rd:gpr32", "rs:gpr32", "rt:gpr32"];
+    encoding = "000000 rs:5 rt:5 rd:5 00011 011001";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["rs", "rt"];
+    writes = ["rd"];
+    latency = 7;
+}
+
+instruction "div/r6" {
+    architecture = "mips";
+    mnemonic = "div";
+    operands = ["rd:gpr32", "rs:gpr32", "rt:gpr32"];
+    encoding = "000000 rs:5 rt:5 rd:5 00010 011010";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["rs", "rt"];
+    writes = ["rd"];
+}
+
+instruction "mod" {
+    architecture = "mips";
+    operands = ["rd:gpr32", "rs:gpr32", "rt:gpr32"];
+    encoding = "000000 rs:5 rt:5 rd:5 00011 011010";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["rs", "rt"];
+    writes = ["rd"];
+    latency = 35;
+}
+
+instruction "divu/r6" {
+    architecture = "mips";
+    mnemonic = "divu";
+    operands = ["rd:gpr32", "rs:gpr32", "rt:gpr32"];
+    encoding = "000000 rs:5 rt:5 rd:5 00010 011011";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["rs", "rt"];
+    writes = ["rd"];
+}
+
+instruction "modu" {
+    architecture = "mips";
+    operands = ["rd:gpr32", "rs:gpr32", "rt:gpr32"];
+    encoding = "000000 rs:5 rt:5 rd:5 00011 011011";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["rs", "rt"];
+    writes = ["rd"];
+    latency = 35;
+}
+
+instruction "dmul" {
+    architecture = "mips";
+    operands = ["rd:gpr64", "rs:gpr64", "rt:gpr64"];
+    encoding = "000000 rs:5 rt:5 rd:5 00010 011100";
+    features = ["mips64r6"];
+    reads = ["rs", "rt"];
+    writes = ["rd"];
+    latency = 7;
+}
+
+instruction "dmuh" {
+    architecture = "mips";
+    operands = ["rd:gpr64", "rs:gpr64", "rt:gpr64"];
+    encoding = "000000 rs:5 rt:5 rd:5 00011 011100";
+    features = ["mips64r6"];
+    reads = ["rs", "rt"];
+    writes = ["rd"];
+    latency = 7;
+}
+
+instruction "dmulu" {
+    architecture = "mips";
+    operands = ["rd:gpr64", "rs:gpr64", "rt:gpr64"];
+    encoding = "000000 rs:5 rt:5 rd:5 00010 011101";
+    features = ["mips64r6"];
+    reads = ["rs", "rt"];
+    writes = ["rd"];
+    latency = 7;
+}
+
+instruction "dmuhu" {
+    architecture = "mips";
+    operands = ["rd:gpr64", "rs:gpr64", "rt:gpr64"];
+    encoding = "000000 rs:5 rt:5 rd:5 00011 011101";
+    features = ["mips64r6"];
+    reads = ["rs", "rt"];
+    writes = ["rd"];
+    latency = 7;
+}
+
+instruction "ddiv/r6" {
+    architecture = "mips";
+    mnemonic = "ddiv";
+    operands = ["rd:gpr64", "rs:gpr64", "rt:gpr64"];
+    encoding = "000000 rs:5 rt:5 rd:5 00010 011110";
+    features = ["mips64r6"];
+    reads = ["rs", "rt"];
+    writes = ["rd"];
+}
+
+instruction "dmod" {
+    architecture = "mips";
+    operands = ["rd:gpr64", "rs:gpr64", "rt:gpr64"];
+    encoding = "000000 rs:5 rt:5 rd:5 00011 011110";
+    features = ["mips64r6"];
+    reads = ["rs", "rt"];
+    writes = ["rd"];
+    latency = 35;
+}
+
+instruction "ddivu/r6" {
+    architecture = "mips";
+    mnemonic = "ddivu";
+    operands = ["rd:gpr64", "rs:gpr64", "rt:gpr64"];
+    encoding = "000000 rs:5 rt:5 rd:5 00010 011111";
+    features = ["mips64r6"];
+    reads = ["rs", "rt"];
+    writes = ["rd"];
+}
+
+instruction "dmodu" {
+    architecture = "mips";
+    operands = ["rd:gpr64", "rs:gpr64", "rt:gpr64"];
+    encoding = "000000 rs:5 rt:5 rd:5 00011 011111";
+    features = ["mips64r6"];
+    reads = ["rs", "rt"];
+    writes = ["rd"];
+    latency = 35;
+}
+
+instruction "seleqz" {
+    architecture = "mips";
+    operands = ["rd:gpr", "rs:gpr", "rt:gpr"];
+    encoding = "000000 rs:5 rt:5 rd:5 00000 110101";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["rs", "rt"];
+    writes = ["rd"];
+}
+
+instruction "selnez" {
+    architecture = "mips";
+    operands = ["rd:gpr", "rs:gpr", "rt:gpr"];
+    encoding = "000000 rs:5 rt:5 rd:5 00000 110111";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["rs", "rt"];
+    writes = ["rd"];
+}
+
+instruction "sel.s" {
+    architecture = "mips";
+    operands = ["fd:fpr32", "fs:fpr32", "ft:fpr32"];
+    encoding = "010001 10000 ft:5 fs:5 fd:5 010000";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fd", "fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "sel.d" {
+    architecture = "mips";
+    operands = ["fd:fpr64", "fs:fpr64", "ft:fpr64"];
+    encoding = "010001 10001 ft:5 fs:5 fd:5 010000";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fd", "fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "seleqz.s" {
+    architecture = "mips";
+    operands = ["fd:fpr32", "fs:fpr32", "ft:fpr32"];
+    encoding = "010001 10000 ft:5 fs:5 fd:5 010100";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "selnez.s" {
+    architecture = "mips";
+    operands = ["fd:fpr32", "fs:fpr32", "ft:fpr32"];
+    encoding = "010001 10000 ft:5 fs:5 fd:5 010111";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "seleqz.d" {
+    architecture = "mips";
+    operands = ["fd:fpr64", "fs:fpr64", "ft:fpr64"];
+    encoding = "010001 10001 ft:5 fs:5 fd:5 010100";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "selnez.d" {
+    architecture = "mips";
+    operands = ["fd:fpr64", "fs:fpr64", "ft:fpr64"];
+    encoding = "010001 10001 ft:5 fs:5 fd:5 010111";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.af.s" {
+    architecture = "mips";
+    operands = ["fd:fpr32", "fs:fpr32", "ft:fpr32"];
+    encoding = "010001 10100 ft:5 fs:5 fd:5 0 00000";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.un.s" {
+    architecture = "mips";
+    operands = ["fd:fpr32", "fs:fpr32", "ft:fpr32"];
+    encoding = "010001 10100 ft:5 fs:5 fd:5 0 00001";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.eq.s" {
+    architecture = "mips";
+    operands = ["fd:fpr32", "fs:fpr32", "ft:fpr32"];
+    encoding = "010001 10100 ft:5 fs:5 fd:5 0 00010";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.ueq.s" {
+    architecture = "mips";
+    operands = ["fd:fpr32", "fs:fpr32", "ft:fpr32"];
+    encoding = "010001 10100 ft:5 fs:5 fd:5 0 00011";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.lt.s" {
+    architecture = "mips";
+    operands = ["fd:fpr32", "fs:fpr32", "ft:fpr32"];
+    encoding = "010001 10100 ft:5 fs:5 fd:5 0 00100";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.ult.s" {
+    architecture = "mips";
+    operands = ["fd:fpr32", "fs:fpr32", "ft:fpr32"];
+    encoding = "010001 10100 ft:5 fs:5 fd:5 0 00101";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.le.s" {
+    architecture = "mips";
+    operands = ["fd:fpr32", "fs:fpr32", "ft:fpr32"];
+    encoding = "010001 10100 ft:5 fs:5 fd:5 0 00110";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.ule.s" {
+    architecture = "mips";
+    operands = ["fd:fpr32", "fs:fpr32", "ft:fpr32"];
+    encoding = "010001 10100 ft:5 fs:5 fd:5 0 00111";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.saf.s" {
+    architecture = "mips";
+    operands = ["fd:fpr32", "fs:fpr32", "ft:fpr32"];
+    encoding = "010001 10100 ft:5 fs:5 fd:5 0 01000";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.sun.s" {
+    architecture = "mips";
+    operands = ["fd:fpr32", "fs:fpr32", "ft:fpr32"];
+    encoding = "010001 10100 ft:5 fs:5 fd:5 0 01001";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.seq.s" {
+    architecture = "mips";
+    operands = ["fd:fpr32", "fs:fpr32", "ft:fpr32"];
+    encoding = "010001 10100 ft:5 fs:5 fd:5 0 01010";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.sueq.s" {
+    architecture = "mips";
+    operands = ["fd:fpr32", "fs:fpr32", "ft:fpr32"];
+    encoding = "010001 10100 ft:5 fs:5 fd:5 0 01011";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.slt.s" {
+    architecture = "mips";
+    operands = ["fd:fpr32", "fs:fpr32", "ft:fpr32"];
+    encoding = "010001 10100 ft:5 fs:5 fd:5 0 01100";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.sult.s" {
+    architecture = "mips";
+    operands = ["fd:fpr32", "fs:fpr32", "ft:fpr32"];
+    encoding = "010001 10100 ft:5 fs:5 fd:5 0 01101";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.sle.s" {
+    architecture = "mips";
+    operands = ["fd:fpr32", "fs:fpr32", "ft:fpr32"];
+    encoding = "010001 10100 ft:5 fs:5 fd:5 0 01110";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.sule.s" {
+    architecture = "mips";
+    operands = ["fd:fpr32", "fs:fpr32", "ft:fpr32"];
+    encoding = "010001 10100 ft:5 fs:5 fd:5 0 01111";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.or.s" {
+    architecture = "mips";
+    operands = ["fd:fpr32", "fs:fpr32", "ft:fpr32"];
+    encoding = "010001 10100 ft:5 fs:5 fd:5 0 10001";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.une.s" {
+    architecture = "mips";
+    operands = ["fd:fpr32", "fs:fpr32", "ft:fpr32"];
+    encoding = "010001 10100 ft:5 fs:5 fd:5 0 10010";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.ne.s" {
+    architecture = "mips";
+    operands = ["fd:fpr32", "fs:fpr32", "ft:fpr32"];
+    encoding = "010001 10100 ft:5 fs:5 fd:5 0 10011";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.sor.s" {
+    architecture = "mips";
+    operands = ["fd:fpr32", "fs:fpr32", "ft:fpr32"];
+    encoding = "010001 10100 ft:5 fs:5 fd:5 0 11001";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.sune.s" {
+    architecture = "mips";
+    operands = ["fd:fpr32", "fs:fpr32", "ft:fpr32"];
+    encoding = "010001 10100 ft:5 fs:5 fd:5 0 11010";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.sne.s" {
+    architecture = "mips";
+    operands = ["fd:fpr32", "fs:fpr32", "ft:fpr32"];
+    encoding = "010001 10100 ft:5 fs:5 fd:5 0 11011";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.af.d" {
+    architecture = "mips";
+    operands = ["fd:fpr64", "fs:fpr64", "ft:fpr64"];
+    encoding = "010001 10101 ft:5 fs:5 fd:5 0 00000";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.un.d" {
+    architecture = "mips";
+    operands = ["fd:fpr64", "fs:fpr64", "ft:fpr64"];
+    encoding = "010001 10101 ft:5 fs:5 fd:5 0 00001";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.eq.d" {
+    architecture = "mips";
+    operands = ["fd:fpr64", "fs:fpr64", "ft:fpr64"];
+    encoding = "010001 10101 ft:5 fs:5 fd:5 0 00010";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.ueq.d" {
+    architecture = "mips";
+    operands = ["fd:fpr64", "fs:fpr64", "ft:fpr64"];
+    encoding = "010001 10101 ft:5 fs:5 fd:5 0 00011";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.lt.d" {
+    architecture = "mips";
+    operands = ["fd:fpr64", "fs:fpr64", "ft:fpr64"];
+    encoding = "010001 10101 ft:5 fs:5 fd:5 0 00100";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.ult.d" {
+    architecture = "mips";
+    operands = ["fd:fpr64", "fs:fpr64", "ft:fpr64"];
+    encoding = "010001 10101 ft:5 fs:5 fd:5 0 00101";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.le.d" {
+    architecture = "mips";
+    operands = ["fd:fpr64", "fs:fpr64", "ft:fpr64"];
+    encoding = "010001 10101 ft:5 fs:5 fd:5 0 00110";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.ule.d" {
+    architecture = "mips";
+    operands = ["fd:fpr64", "fs:fpr64", "ft:fpr64"];
+    encoding = "010001 10101 ft:5 fs:5 fd:5 0 00111";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.saf.d" {
+    architecture = "mips";
+    operands = ["fd:fpr64", "fs:fpr64", "ft:fpr64"];
+    encoding = "010001 10101 ft:5 fs:5 fd:5 0 01000";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.sun.d" {
+    architecture = "mips";
+    operands = ["fd:fpr64", "fs:fpr64", "ft:fpr64"];
+    encoding = "010001 10101 ft:5 fs:5 fd:5 0 01001";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.seq.d" {
+    architecture = "mips";
+    operands = ["fd:fpr64", "fs:fpr64", "ft:fpr64"];
+    encoding = "010001 10101 ft:5 fs:5 fd:5 0 01010";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.sueq.d" {
+    architecture = "mips";
+    operands = ["fd:fpr64", "fs:fpr64", "ft:fpr64"];
+    encoding = "010001 10101 ft:5 fs:5 fd:5 0 01011";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.slt.d" {
+    architecture = "mips";
+    operands = ["fd:fpr64", "fs:fpr64", "ft:fpr64"];
+    encoding = "010001 10101 ft:5 fs:5 fd:5 0 01100";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.sult.d" {
+    architecture = "mips";
+    operands = ["fd:fpr64", "fs:fpr64", "ft:fpr64"];
+    encoding = "010001 10101 ft:5 fs:5 fd:5 0 01101";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.sle.d" {
+    architecture = "mips";
+    operands = ["fd:fpr64", "fs:fpr64", "ft:fpr64"];
+    encoding = "010001 10101 ft:5 fs:5 fd:5 0 01110";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.sule.d" {
+    architecture = "mips";
+    operands = ["fd:fpr64", "fs:fpr64", "ft:fpr64"];
+    encoding = "010001 10101 ft:5 fs:5 fd:5 0 01111";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.or.d" {
+    architecture = "mips";
+    operands = ["fd:fpr64", "fs:fpr64", "ft:fpr64"];
+    encoding = "010001 10101 ft:5 fs:5 fd:5 0 10001";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.une.d" {
+    architecture = "mips";
+    operands = ["fd:fpr64", "fs:fpr64", "ft:fpr64"];
+    encoding = "010001 10101 ft:5 fs:5 fd:5 0 10010";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.ne.d" {
+    architecture = "mips";
+    operands = ["fd:fpr64", "fs:fpr64", "ft:fpr64"];
+    encoding = "010001 10101 ft:5 fs:5 fd:5 0 10011";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.sor.d" {
+    architecture = "mips";
+    operands = ["fd:fpr64", "fs:fpr64", "ft:fpr64"];
+    encoding = "010001 10101 ft:5 fs:5 fd:5 0 11001";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.sune.d" {
+    architecture = "mips";
+    operands = ["fd:fpr64", "fs:fpr64", "ft:fpr64"];
+    encoding = "010001 10101 ft:5 fs:5 fd:5 0 11010";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "cmp.sne.d" {
+    architecture = "mips";
+    operands = ["fd:fpr64", "fs:fpr64", "ft:fpr64"];
+    encoding = "010001 10101 ft:5 fs:5 fd:5 0 11011";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "bc1eqz" {
+    architecture = "mips";
+    operands = ["ft:fpr64", "target:branch"];
+    encoding = "010001 01001 ft:5 target:16";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["ft"];
+    control = "branch";
+    delay_slot = true;
+}
+
+instruction "bc1nez" {
+    architecture = "mips";
+    operands = ["ft:fpr64", "target:branch"];
+    encoding = "010001 01101 ft:5 target:16";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["ft"];
+    control = "branch";
+    delay_slot = true;
+}
+
+instruction "maddf.s" {
+    architecture = "mips";
+    operands = ["fd:fpr32", "fs:fpr32", "ft:fpr32"];
+    encoding = "010001 10000 ft:5 fs:5 fd:5 011000";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fd", "fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "msubf.s" {
+    architecture = "mips";
+    operands = ["fd:fpr32", "fs:fpr32", "ft:fpr32"];
+    encoding = "010001 10000 ft:5 fs:5 fd:5 011001";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fd", "fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "rint.s" {
+    architecture = "mips";
+    operands = ["fd:fpr32", "fs:fpr32"];
+    encoding = "010001 10000 00000 fs:5 fd:5 011010";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs"];
+    writes = ["fd"];
+}
+
+instruction "class.s" {
+    architecture = "mips";
+    operands = ["fd:fpr32", "fs:fpr32"];
+    encoding = "010001 10000 00000 fs:5 fd:5 011011";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs"];
+    writes = ["fd"];
+}
+
+instruction "min.s" {
+    architecture = "mips";
+    operands = ["fd:fpr32", "fs:fpr32", "ft:fpr32"];
+    encoding = "010001 10000 ft:5 fs:5 fd:5 011100";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "mina.s" {
+    architecture = "mips";
+    operands = ["fd:fpr32", "fs:fpr32", "ft:fpr32"];
+    encoding = "010001 10000 ft:5 fs:5 fd:5 011101";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "max.s" {
+    architecture = "mips";
+    operands = ["fd:fpr32", "fs:fpr32", "ft:fpr32"];
+    encoding = "010001 10000 ft:5 fs:5 fd:5 011110";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "maxa.s" {
+    architecture = "mips";
+    operands = ["fd:fpr32", "fs:fpr32", "ft:fpr32"];
+    encoding = "010001 10000 ft:5 fs:5 fd:5 011111";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "maddf.d" {
+    architecture = "mips";
+    operands = ["fd:fpr64", "fs:fpr64", "ft:fpr64"];
+    encoding = "010001 10001 ft:5 fs:5 fd:5 011000";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fd", "fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "msubf.d" {
+    architecture = "mips";
+    operands = ["fd:fpr64", "fs:fpr64", "ft:fpr64"];
+    encoding = "010001 10001 ft:5 fs:5 fd:5 011001";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fd", "fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "rint.d" {
+    architecture = "mips";
+    operands = ["fd:fpr64", "fs:fpr64"];
+    encoding = "010001 10001 00000 fs:5 fd:5 011010";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs"];
+    writes = ["fd"];
+}
+
+instruction "class.d" {
+    architecture = "mips";
+    operands = ["fd:fpr64", "fs:fpr64"];
+    encoding = "010001 10001 00000 fs:5 fd:5 011011";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs"];
+    writes = ["fd"];
+}
+
+instruction "min.d" {
+    architecture = "mips";
+    operands = ["fd:fpr64", "fs:fpr64", "ft:fpr64"];
+    encoding = "010001 10001 ft:5 fs:5 fd:5 011100";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "mina.d" {
+    architecture = "mips";
+    operands = ["fd:fpr64", "fs:fpr64", "ft:fpr64"];
+    encoding = "010001 10001 ft:5 fs:5 fd:5 011101";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "max.d" {
+    architecture = "mips";
+    operands = ["fd:fpr64", "fs:fpr64", "ft:fpr64"];
+    encoding = "010001 10001 ft:5 fs:5 fd:5 011110";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "maxa.d" {
+    architecture = "mips";
+    operands = ["fd:fpr64", "fs:fpr64", "ft:fpr64"];
+    encoding = "010001 10001 ft:5 fs:5 fd:5 011111";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["fs", "ft"];
+    writes = ["fd"];
+}
+
+instruction "bc" {
+    architecture = "mips";
+    operands = ["target:branch26"];
+    encoding = "110010 target:26";
+    features = ["mips32r6", "mips64r6"];
+    control = "jump";
+    hazards = ["no-delay-slot"];
+}
+
+instruction "balc" {
+    architecture = "mips";
+    operands = ["target:branch26"];
+    encoding = "111010 target:26";
+    features = ["mips32r6", "mips64r6"];
+    writes = ["ra"];
+    control = "jump";
+    hazards = ["no-delay-slot"];
+}
+
+instruction "beqzc" {
+    architecture = "mips";
+    operands = ["rs:gpr", "target:branch21"];
+    encoding = "110110 rs:5 target:21";
+    features = ["mips32r6", "mips64r6"];
+    constraints = ["rs != 0"];
+    reads = ["rs"];
+    control = "branch";
+    hazards = ["no-delay-slot"];
+}
+
+instruction "bnezc" {
+    architecture = "mips";
+    operands = ["rs:gpr", "target:branch21"];
+    encoding = "111110 rs:5 target:21";
+    features = ["mips32r6", "mips64r6"];
+    constraints = ["rs != 0"];
+    reads = ["rs"];
+    control = "branch";
+    hazards = ["no-delay-slot"];
+}
+
+instruction "jic" {
+    architecture = "mips";
+    operands = ["rt:gpr", "offset:simm16"];
+    encoding = "110110 00000 rt:5 offset:16";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["rt"];
+    control = "exit";
+    hazards = ["no-delay-slot"];
+}
+
+instruction "jialc" {
+    architecture = "mips";
+    operands = ["rt:gpr", "offset:simm16"];
+    encoding = "111110 00000 rt:5 offset:16";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["rt"];
+    writes = ["ra"];
+    control = "jump";
+    hazards = ["no-delay-slot"];
+}
+
+instruction "jrc" {
+    architecture = "mips";
+    operands = ["rt:gpr"];
+    encoding = "110110 00000 rt:5 0000000000000000";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["rt"];
+    control = "exit";
+    hazards = ["no-delay-slot"];
+}
+
+instruction "beqc" {
+    architecture = "mips";
+    operands = ["rs:gpr", "rt:gpr", "target:branch"];
+    encoding = "001000 rs:5 rt:5 target:16";
+    features = ["mips32r6", "mips64r6"];
+    constraints = ["rs != 0", "rt-rs > 0"];
+    reads = ["rs", "rt"];
+    control = "branch";
+    hazards = ["no-delay-slot"];
+}
+
+instruction "beqc/swapped" {
+    architecture = "mips";
+    operands = ["rs:gpr", "rt:gpr", "target:branch"];
+    encoding = "001000 rt:5 rs:5 target:16";
+    features = ["mips32r6", "mips64r6"];
+    mnemonic = "beqc";
+    constraints = ["rt != 0", "rs-rt > 0"];
+    reads = ["rs", "rt"];
+    control = "branch";
+    hazards = ["no-delay-slot"];
+}
+
+instruction "bnec" {
+    architecture = "mips";
+    operands = ["rs:gpr", "rt:gpr", "target:branch"];
+    encoding = "011000 rs:5 rt:5 target:16";
+    features = ["mips32r6", "mips64r6"];
+    constraints = ["rs != 0", "rt-rs > 0"];
+    reads = ["rs", "rt"];
+    control = "branch";
+    hazards = ["no-delay-slot"];
+}
+
+instruction "bnec/swapped" {
+    architecture = "mips";
+    operands = ["rs:gpr", "rt:gpr", "target:branch"];
+    encoding = "011000 rt:5 rs:5 target:16";
+    features = ["mips32r6", "mips64r6"];
+    mnemonic = "bnec";
+    constraints = ["rt != 0", "rs-rt > 0"];
+    reads = ["rs", "rt"];
+    control = "branch";
+    hazards = ["no-delay-slot"];
+}
+
+instruction "bovc" {
+    architecture = "mips";
+    operands = ["rs:gpr", "rt:gpr", "target:branch"];
+    encoding = "001000 rs:5 rt:5 target:16";
+    features = ["mips32r6", "mips64r6"];
+    constraints = ["rs-rt >= 0"];
+    reads = ["rs", "rt"];
+    control = "branch";
+    hazards = ["no-delay-slot"];
+}
+
+instruction "bovc/swapped" {
+    architecture = "mips";
+    operands = ["rs:gpr", "rt:gpr", "target:branch"];
+    encoding = "001000 rt:5 rs:5 target:16";
+    features = ["mips32r6", "mips64r6"];
+    mnemonic = "bovc";
+    constraints = ["rt-rs > 0"];
+    reads = ["rs", "rt"];
+    control = "branch";
+    hazards = ["no-delay-slot"];
+}
+
+instruction "bnvc" {
+    architecture = "mips";
+    operands = ["rs:gpr", "rt:gpr", "target:branch"];
+    encoding = "011000 rs:5 rt:5 target:16";
+    features = ["mips32r6", "mips64r6"];
+    constraints = ["rs-rt >= 0"];
+    reads = ["rs", "rt"];
+    control = "branch";
+    hazards = ["no-delay-slot"];
+}
+
+instruction "bnvc/swapped" {
+    architecture = "mips";
+    operands = ["rs:gpr", "rt:gpr", "target:branch"];
+    encoding = "011000 rt:5 rs:5 target:16";
+    features = ["mips32r6", "mips64r6"];
+    mnemonic = "bnvc";
+    constraints = ["rt-rs > 0"];
+    reads = ["rs", "rt"];
+    control = "branch";
+    hazards = ["no-delay-slot"];
+}
+
+instruction "bltc" {
+    architecture = "mips";
+    operands = ["rs:gpr", "rt:gpr", "target:branch"];
+    encoding = "010111 rs:5 rt:5 target:16";
+    features = ["mips32r6", "mips64r6"];
+    constraints = ["rs != 0", "rt != 0", "rs-rt != 0"];
+    reads = ["rs", "rt"];
+    control = "branch";
+    hazards = ["no-delay-slot"];
+}
+
+instruction "bgec" {
+    architecture = "mips";
+    operands = ["rs:gpr", "rt:gpr", "target:branch"];
+    encoding = "010110 rs:5 rt:5 target:16";
+    features = ["mips32r6", "mips64r6"];
+    constraints = ["rs != 0", "rt != 0", "rs-rt != 0"];
+    reads = ["rs", "rt"];
+    control = "branch";
+    hazards = ["no-delay-slot"];
+}
+
+instruction "bltuc" {
+    architecture = "mips";
+    operands = ["rs:gpr", "rt:gpr", "target:branch"];
+    encoding = "000111 rs:5 rt:5 target:16";
+    features = ["mips32r6", "mips64r6"];
+    constraints = ["rs != 0", "rt != 0", "rs-rt != 0"];
+    reads = ["rs", "rt"];
+    control = "branch";
+    hazards = ["no-delay-slot"];
+}
+
+instruction "bgeuc" {
+    architecture = "mips";
+    operands = ["rs:gpr", "rt:gpr", "target:branch"];
+    encoding = "000110 rs:5 rt:5 target:16";
+    features = ["mips32r6", "mips64r6"];
+    constraints = ["rs != 0", "rt != 0", "rs-rt != 0"];
+    reads = ["rs", "rt"];
+    control = "branch";
+    hazards = ["no-delay-slot"];
+}
+
+instruction "bltzc" {
+    architecture = "mips";
+    operands = ["rt:gpr", "target:branch"];
+    encoding = "010111 rt:5 rt:5 target:16";
+    features = ["mips32r6", "mips64r6"];
+    constraints = ["rt != 0"];
+    reads = ["rt"];
+    control = "branch";
+    hazards = ["no-delay-slot"];
+}
+
+instruction "bgezc" {
+    architecture = "mips";
+    operands = ["rt:gpr", "target:branch"];
+    encoding = "010110 rt:5 rt:5 target:16";
+    features = ["mips32r6", "mips64r6"];
+    constraints = ["rt != 0"];
+    reads = ["rt"];
+    control = "branch";
+    hazards = ["no-delay-slot"];
+}
+
+instruction "blezc" {
+    architecture = "mips";
+    operands = ["rt:gpr", "target:branch"];
+    encoding = "010110 00000 rt:5 target:16";
+    features = ["mips32r6", "mips64r6"];
+    constraints = ["rt != 0"];
+    reads = ["rt"];
+    control = "branch";
+    hazards = ["no-delay-slot"];
+}
+
+instruction "bgtzc" {
+    architecture = "mips";
+    operands = ["rt:gpr", "target:branch"];
+    encoding = "010111 00000 rt:5 target:16";
+    features = ["mips32r6", "mips64r6"];
+    constraints = ["rt != 0"];
+    reads = ["rt"];
+    control = "branch";
+    hazards = ["no-delay-slot"];
+}
+
+instruction "beqzalc" {
+    architecture = "mips";
+    operands = ["rt:gpr", "target:branch"];
+    encoding = "001000 00000 rt:5 target:16";
+    features = ["mips32r6", "mips64r6"];
+    constraints = ["rt != 0"];
+    reads = ["rt"];
+    writes = ["ra"];
+    control = "branch";
+    hazards = ["no-delay-slot"];
+}
+
+instruction "bnezalc" {
+    architecture = "mips";
+    operands = ["rt:gpr", "target:branch"];
+    encoding = "011000 00000 rt:5 target:16";
+    features = ["mips32r6", "mips64r6"];
+    constraints = ["rt != 0"];
+    reads = ["rt"];
+    writes = ["ra"];
+    control = "branch";
+    hazards = ["no-delay-slot"];
+}
+
+instruction "blezalc" {
+    architecture = "mips";
+    operands = ["rt:gpr", "target:branch"];
+    encoding = "000110 00000 rt:5 target:16";
+    features = ["mips32r6", "mips64r6"];
+    constraints = ["rt != 0"];
+    reads = ["rt"];
+    writes = ["ra"];
+    control = "branch";
+    hazards = ["no-delay-slot"];
+}
+
+instruction "bgezalc" {
+    architecture = "mips";
+    operands = ["rt:gpr", "target:branch"];
+    encoding = "000110 rt:5 rt:5 target:16";
+    features = ["mips32r6", "mips64r6"];
+    constraints = ["rt != 0"];
+    reads = ["rt"];
+    writes = ["ra"];
+    control = "branch";
+    hazards = ["no-delay-slot"];
+}
+
+instruction "bgtzalc" {
+    architecture = "mips";
+    operands = ["rt:gpr", "target:branch"];
+    encoding = "000111 00000 rt:5 target:16";
+    features = ["mips32r6", "mips64r6"];
+    constraints = ["rt != 0"];
+    reads = ["rt"];
+    writes = ["ra"];
+    control = "branch";
+    hazards = ["no-delay-slot"];
+}
+
+instruction "bltzalc" {
+    architecture = "mips";
+    operands = ["rt:gpr", "target:branch"];
+    encoding = "000111 rt:5 rt:5 target:16";
+    features = ["mips32r6", "mips64r6"];
+    constraints = ["rt != 0"];
+    reads = ["rt"];
+    writes = ["ra"];
+    control = "branch";
+    hazards = ["no-delay-slot"];
+}
+
+instruction "addiupc" {
+    architecture = "mips";
+    operands = ["rs:gpr", "offset:pcrel19s2"];
+    encoding = "111011 rs:5 00 offset:19";
+    features = ["mips32r6", "mips64r6"];
+    writes = ["rs"];
+}
+
+instruction "lapc" {
+    architecture = "mips";
+    alias = "addiupc";
+}
+
+instruction "lwpc" {
+    architecture = "mips";
+    operands = ["rs:gpr32", "offset:pcrel19s2"];
+    encoding = "111011 rs:5 01 offset:19";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["memory"];
+    writes = ["rs"];
+    hazards = ["load"];
+}
+
+instruction "lwupc" {
+    architecture = "mips";
+    operands = ["rs:gpr64", "offset:pcrel19s2"];
+    encoding = "111011 rs:5 10 offset:19";
+    features = ["mips64r6"];
+    reads = ["memory"];
+    writes = ["rs"];
+    hazards = ["load"];
+}
+
+instruction "ldpc" {
+    architecture = "mips";
+    operands = ["rs:gpr64", "offset:pcrel18s3"];
+    encoding = "111011 rs:5 110 offset:18";
+    features = ["mips64r6"];
+    reads = ["memory"];
+    writes = ["rs"];
+    hazards = ["load"];
+}
+
+instruction "auipc" {
+    architecture = "mips";
+    operands = ["rs:gpr", "imm:uimm16"];
+    encoding = "111011 rs:5 11110 imm:16";
+    features = ["mips32r6", "mips64r6"];
+    writes = ["rs"];
+}
+
+instruction "aluipc" {
+    architecture = "mips";
+    operands = ["rs:gpr", "imm:uimm16"];
+    encoding = "111011 rs:5 11111 imm:16";
+    features = ["mips32r6", "mips64r6"];
+    writes = ["rs"];
+}
+
+instruction "lsa" {
+    architecture = "mips";
+    operands = ["rd:gpr32", "rs:gpr32", "rt:gpr32", "sa:1..4"];
+    encoding = "000000 rs:5 rt:5 rd:5 000 sa-1:2 000101";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["rs", "rt"];
+    writes = ["rd"];
+}
+
+instruction "dlsa" {
+    architecture = "mips";
+    operands = ["rd:gpr64", "rs:gpr64", "rt:gpr64", "sa:1..4"];
+    encoding = "000000 rs:5 rt:5 rd:5 000 sa-1:2 010101";
+    features = ["mips64r6"];
+    reads = ["rs", "rt"];
+    writes = ["rd"];
+}
+
+instruction "aui" {
+    architecture = "mips";
+    operands = ["rt:gpr32", "rs:gpr32", "imm:uimm16"];
+    encoding = "001111 rs:5 rt:5 imm:16";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["rs"];
+    writes = ["rt"];
+}
+
+instruction "daui" {
+    architecture = "mips";
+    operands = ["rt:gpr64", "rs:gpr64", "imm:uimm16"];
+    encoding = "011101 rs:5 rt:5 imm:16";
+    features = ["mips64r6"];
+    constraints = ["rs != 0"];
+    reads = ["rs"];
+    writes = ["rt"];
+}
+
+# DAHI and DATI add to a register in place; GNU as spells it twice.
+instruction "dahi" {
+    architecture = "mips";
+    operands = ["rs:gpr64", "rt:gpr64", "imm:uimm16"];
+    encoding = "000001 rs+rt-rt:5 00110 imm:16";
+    features = ["mips64r6"];
+    constraints = ["rs-rt == 0"];
+    reads = ["rs"];
+    writes = ["rs"];
+}
+
+instruction "dati" {
+    architecture = "mips";
+    operands = ["rs:gpr64", "rt:gpr64", "imm:uimm16"];
+    encoding = "000001 rs+rt-rt:5 11110 imm:16";
+    features = ["mips64r6"];
+    constraints = ["rs-rt == 0"];
+    reads = ["rs"];
+    writes = ["rs"];
+}
+
+instruction "align" {
+    architecture = "mips";
+    operands = ["rd:gpr32", "rs:gpr32", "rt:gpr32", "bp:0..3"];
+    encoding = "011111 rs:5 rt:5 rd:5 010 bp:2 100000";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["rs", "rt"];
+    writes = ["rd"];
+}
+
+instruction "dalign" {
+    architecture = "mips";
+    operands = ["rd:gpr64", "rs:gpr64", "rt:gpr64", "bp:0..7"];
+    encoding = "011111 rs:5 rt:5 rd:5 01 bp:3 100100";
+    features = ["mips64r6"];
+    reads = ["rs", "rt"];
+    writes = ["rd"];
+}
+
+instruction "bitswap" {
+    architecture = "mips";
+    operands = ["rd:gpr32", "rt:gpr32"];
+    encoding = "011111 00000 rt:5 rd:5 00000 100000";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["rt"];
+    writes = ["rd"];
+}
+
+instruction "dbitswap" {
+    architecture = "mips";
+    operands = ["rd:gpr64", "rt:gpr64"];
+    encoding = "011111 00000 rt:5 rd:5 00000 100100";
+    features = ["mips64r6"];
+    reads = ["rt"];
+    writes = ["rd"];
+}
+
+instruction "sigrie" {
+    architecture = "mips";
+    operands = ["code:uimm16"];
+    encoding = "000001 00000 10111 code:16";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["memory"];
+    writes = ["memory"];
+    hazards = ["no-delay-slot"];
+    volatile = true;
+}
+
+instruction "clz/r6" {
+    architecture = "mips";
+    mnemonic = "clz";
+    operands = ["rd:gpr32", "rs:gpr32"];
+    encoding = "000000 rs:5 00000 rd:5 00001 010000";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["rs"];
+    writes = ["rd"];
+}
+
+instruction "clo/r6" {
+    architecture = "mips";
+    mnemonic = "clo";
+    operands = ["rd:gpr32", "rs:gpr32"];
+    encoding = "000000 rs:5 00000 rd:5 00001 010001";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["rs"];
+    writes = ["rd"];
+}
+
+instruction "dclz/r6" {
+    architecture = "mips";
+    mnemonic = "dclz";
+    operands = ["rd:gpr64", "rs:gpr64"];
+    encoding = "000000 rs:5 00000 rd:5 00001 010010";
+    features = ["mips64r6"];
+    reads = ["rs"];
+    writes = ["rd"];
+}
+
+instruction "dclo/r6" {
+    architecture = "mips";
+    mnemonic = "dclo";
+    operands = ["rd:gpr64", "rs:gpr64"];
+    encoding = "000000 rs:5 00000 rd:5 00001 010011";
+    features = ["mips64r6"];
+    reads = ["rs"];
+    writes = ["rd"];
+}
+
+instruction "ll/r6" {
+    architecture = "mips";
+    mnemonic = "ll";
+    operands = ["rt:gpr32", "address:mem32_simm9"];
+    encoding = "011111 address.base:5 rt:5 address.offset:9 0 110110";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["memory"];
+    writes = ["rt"];
+    hazards = ["load"];
+}
+
+instruction "lld/r6" {
+    architecture = "mips";
+    mnemonic = "lld";
+    operands = ["rt:gpr64", "address:mem64_simm9"];
+    encoding = "011111 address.base:5 rt:5 address.offset:9 0 110111";
+    features = ["mips64r6"];
+    reads = ["memory"];
+    writes = ["rt"];
+    hazards = ["load"];
+}
+
+instruction "sc/r6" {
+    architecture = "mips";
+    mnemonic = "sc";
+    operands = ["rt:gpr32", "address:mem32_simm9"];
+    encoding = "011111 address.base:5 rt:5 address.offset:9 0 100110";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["rt", "memory"];
+    writes = ["rt", "memory"];
+}
+
+instruction "scd/r6" {
+    architecture = "mips";
+    mnemonic = "scd";
+    operands = ["rt:gpr64", "address:mem64_simm9"];
+    encoding = "011111 address.base:5 rt:5 address.offset:9 0 100111";
+    features = ["mips64r6"];
+    reads = ["rt", "memory"];
+    writes = ["rt", "memory"];
+}
+
+instruction "cache/r6" {
+    architecture = "mips";
+    mnemonic = "cache";
+    operands = ["op:uimm5", "address:mem_simm9"];
+    encoding = "011111 address.base:5 op:5 address.offset:9 0 100101";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["memory", "cp0", "tlb"];
+    writes = ["memory", "cp0"];
+    privileged = true;
+    volatile = true;
+    hazard_uses = ["tlb@4", "dcache.line@3"];
+    hazard_writes = ["cp0.28@8 if op=4|5|6|7", "cp0.29@8 if op=4|5|6|7"];
+    builtin = "cache";
+}
+
+instruction "pref/r6" {
+    architecture = "mips";
+    mnemonic = "pref";
+    operands = ["op:uimm5", "address:mem_simm9"];
+    encoding = "011111 address.base:5 op:5 address.offset:9 0 110101";
+    features = ["mips32r6", "mips64r6"];
+}
+
+instruction "jr/r6" {
+    architecture = "mips";
+    mnemonic = "jr";
+    operands = ["rs:gpr"];
+    encoding = "000000 rs:5 00000 00000 00000 001001";
+    features = ["mips32r6", "mips64r6"];
+    reads = ["rs"];
+    control = "exit";
+    delay_slot = true;
+    builtin = "jr";
+}
+
+instruction "add/immediate-r6" {
+    architecture = "mips";
+    mnemonic = "add";
+    operands = ["rd:gpr32", "rs:gpr32", "value:imm"];
+    otherwise = ["add rd, rs, $at"];
+    features = ["mips32r6", "mips64r6"];
+}
+
+instruction "sub/immediate-r6" {
+    architecture = "mips";
+    mnemonic = "sub";
+    operands = ["rd:gpr32", "rs:gpr32", "value:imm"];
+    otherwise = ["sub rd, rs, $at"];
+    features = ["mips32r6", "mips64r6"];
+}
+
+instruction "dadd/immediate-r6" {
+    architecture = "mips";
+    mnemonic = "dadd";
+    operands = ["rd:gpr64", "rs:gpr64", "value:imm"];
+    otherwise = ["dadd rd, rs, $at"];
+    features = ["mips64r6"];
+}
+
+instruction "dsub/immediate-r6" {
+    architecture = "mips";
+    mnemonic = "dsub";
+    operands = ["rd:gpr64", "rs:gpr64", "value:imm"];
+    otherwise = ["dsub rd, rs, $at"];
+    features = ["mips64r6"];
+}
+
+instruction "teq/immediate-r6" {
+    architecture = "mips";
+    mnemonic = "teq";
+    operands = ["rs:gpr", "value:imm"];
+    otherwise = ["teq rs, $at"];
+    features = ["mips32r6", "mips64r6"];
+}
+
+instruction "tne/immediate-r6" {
+    architecture = "mips";
+    mnemonic = "tne";
+    operands = ["rs:gpr", "value:imm"];
+    otherwise = ["tne rs, $at"];
+    features = ["mips32r6", "mips64r6"];
+}
+
+instruction "tge/immediate-r6" {
+    architecture = "mips";
+    mnemonic = "tge";
+    operands = ["rs:gpr", "value:imm"];
+    otherwise = ["tge rs, $at"];
+    features = ["mips32r6", "mips64r6"];
+}
+
+instruction "tgeu/immediate-r6" {
+    architecture = "mips";
+    mnemonic = "tgeu";
+    operands = ["rs:gpr", "value:imm"];
+    otherwise = ["tgeu rs, $at"];
+    features = ["mips32r6", "mips64r6"];
+}
+
+instruction "tlt/immediate-r6" {
+    architecture = "mips";
+    mnemonic = "tlt";
+    operands = ["rs:gpr", "value:imm"];
+    otherwise = ["tlt rs, $at"];
+    features = ["mips32r6", "mips64r6"];
+}
+
+instruction "tltu/immediate-r6" {
+    architecture = "mips";
+    mnemonic = "tltu";
+    operands = ["rs:gpr", "value:imm"];
+    otherwise = ["tltu rs, $at"];
+    features = ["mips32r6", "mips64r6"];
 }

@@ -144,10 +144,26 @@ set(elf64 "${OUTPUT}.elf64")
 
 run_checked(mips-compile "${CC}" -c "${OPT_LEVEL}" ${target_flags} ${extra_flags}
             "${mips_x}" -o "${mips_object}")
+# RELEASE6 names the Release 6 level of the code: its objects link only with
+# Release 6 code, and Release 6 has its own SDBBP for the semihosting exit.
+set(startup_source "${STARTUP}")
+if(DEFINED RELEASE6 AND NOT "${RELEASE6}" STREQUAL "")
+    file(READ "${STARTUP}" startup_text)
+    string(REGEX REPLACE "\\.set([ \t]+)mips(3|64)([ \t\r\n])" ".set\\1${RELEASE6}\\3"
+           startup_text "${startup_text}")
+    string(REGEX REPLACE "\\.word([ \t]+)0x7000007f" ".word\\10x0000004e" startup_text
+           "${startup_text}")
+    set(startup_source "${OUTPUT}.start.s")
+    file(WRITE "${startup_source}" "${startup_text}")
+endif()
 if(ADDRESS_MODEL STREQUAL "64")
+    set(startup_cpu mips64)
+    if(DEFINED RELEASE6 AND NOT "${RELEASE6}" STREQUAL "")
+        set(startup_cpu ${RELEASE6})
+    endif()
     run_checked(startup "${LLVM_MC}" --filetype=obj
-                --triple=${mips_triple} --mcpu=mips64
-                --mattr=+noabicalls "${STARTUP}" -o "${start_object}")
+                --triple=${mips_triple} --mcpu=${startup_cpu}
+                --mattr=+noabicalls "${startup_source}" -o "${start_object}")
     run_checked(link-elf64 "${LLD}" -m ${elf64_format} -T "${LINKER}"
                 "${start_object}" "${mips_object}" -o "${elf64}")
 else()
@@ -155,7 +171,11 @@ else()
     # FPU tag: MIPS I objects are FP32 and VR4300 objects are FPXX. STARTUP_AS,
     # an assembler that takes cc's target options, gives it the ABI tag of
     # STARTUP_AS_FLAGS instead of llvm-mc's o32.
-    if(DEFINED STARTUP_AS AND NOT "${STARTUP_AS}" STREQUAL "")
+    if(DEFINED RELEASE6 AND NOT "${RELEASE6}" STREQUAL "")
+        run_checked(startup "${LLVM_MC}" --filetype=obj --triple=${mips_triple}
+                    --mcpu=${RELEASE6} --mattr=+noabicalls "${startup_source}"
+                    -o "${start_object}")
+    elseif(DEFINED STARTUP_AS AND NOT "${STARTUP_AS}" STREQUAL "")
         split_flags("${STARTUP_AS_FLAGS}" startup_as_flags)
         run_checked(startup "${STARTUP_AS}" -target ${mips_triple} -march=mips3
                     ${startup_as_flags} "${STARTUP}" -o "${start_object}")

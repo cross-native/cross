@@ -364,6 +364,9 @@ struct FrameFacts {
 struct FixupInfo {
     unsigned size{};
     bool pc_relative{};
+    // The field takes a relocation even when its target is in the same
+    // section, as GNU as keeps MIPS Release 6 PC-relative relocations.
+    bool relocate{};
 };
 
 struct RelocationChoice {

@@ -55,6 +55,9 @@ struct SubtargetFeature {
     // diagnoses explicit contradictions without architecture-name branches.
     std::vector<std::string_view> prerequisites;
     std::vector<std::string_view> conflicts;
+    // Each list needs one of its features. The resolver does not choose
+    // one: without any, the feature is unavailable.
+    std::vector<std::vector<std::string_view>> any_prerequisites{};
 };
 
 struct SubtargetTable {

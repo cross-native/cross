@@ -43,9 +43,14 @@ enum : std::uint16_t {
     isa_mips32r2 = 1U << 6,
     isa_mips64 = 1U << 7,
     isa_mips64r2 = 1U << 8,
+    isa_mips32r6 = 1U << 9,
+    isa_mips64r6 = 1U << 10,
 };
 // The levels with 64-bit general registers.
-constexpr std::uint16_t isa_64bit = isa_mips3 | isa_mips4 | isa_mips5 | isa_mips64 | isa_mips64r2;
+constexpr std::uint16_t isa_64bit =
+    isa_mips3 | isa_mips4 | isa_mips5 | isa_mips64 | isa_mips64r2 | isa_mips64r6;
+// Release 6.
+constexpr std::uint16_t isa_r6 = isa_mips32r6 | isa_mips64r6;
 
 struct IsaLevel {
     std::string_view name;
@@ -65,6 +70,8 @@ constexpr std::array isa_levels{
     IsaLevel{"mips32r2", isa_mips32r2, 32, 2, 0x70000000},
     IsaLevel{"mips64", isa_mips64, 64, 1, 0x60000000},
     IsaLevel{"mips64r2", isa_mips64r2, 64, 2, 0x80000000},
+    IsaLevel{"mips32r6", isa_mips32r6, 32, 6, 0x90000000},
+    IsaLevel{"mips64r6", isa_mips64r6, 64, 6, 0xa0000000},
 };
 
 const IsaLevel& isa_level(std::uint16_t bit) {
@@ -85,6 +92,12 @@ enum : std::uint16_t {
     // A plain 16-bit immediate that only layout makes absolute.
     fixup_signed16,
     fixup_unsigned16,
+    // Release 6: compact branches of 21 and 26 bits, and the PC-relative
+    // operands of ADDIUPC, LWPC, LWUPC (words) and LDPC (doublewords).
+    fixup_branch21,
+    fixup_branch26,
+    fixup_pc19,
+    fixup_pc18,
     // The GOT and call operators of SVR4 PIC code.
     fixup_got16,
     fixup_call16,
@@ -125,6 +138,13 @@ enum : std::uint16_t {
     // `.reloc`, names a local symbol's section in RELA objects.
     fixup_jalr_hint,
 };
+
+// The PC-relative fields, which GNU as relocates on Release 6 even in
+// their own section.
+bool pc_relative_fixup(std::uint16_t kind) {
+    return kind == fixup_branch16 || kind == fixup_branch21 || kind == fixup_branch26 ||
+           kind == fixup_pc19 || kind == fixup_pc18;
+}
 
 // The operators whose relocations name TLS symbols.
 bool tls_fixup(std::uint16_t kind) {
@@ -174,7 +194,8 @@ constexpr FeatureBits bit(Feature feature) {
 constexpr FeatureBits level_features =
     bit(Feature::Mips1) | bit(Feature::Mips2) | bit(Feature::Mips3) | bit(Feature::Mips4) |
     bit(Feature::Mips5) | bit(Feature::Mips32) | bit(Feature::Mips32r2) |
-    bit(Feature::Mips64) | bit(Feature::Mips64r2);
+    bit(Feature::Mips64) | bit(Feature::Mips64r2) | bit(Feature::Mips32r6) |
+    bit(Feature::Mips64r6);
 
 // The bit of the feature named `name`; 0 for none.
 FeatureBits feature_bit(const SubtargetTable& table, std::string_view name) {
@@ -216,7 +237,9 @@ Architecture architecture_from(FeatureBits features) {
     const auto has = [&](Feature feature) { return (features & bit(feature)) != 0; };
     Architecture result;
     result.features = features;
-    result.isa = has(Feature::Mips64r2)   ? isa_mips64r2
+    result.isa = has(Feature::Mips64r6)   ? isa_mips64r6
+                 : has(Feature::Mips32r6) ? isa_mips32r6
+                 : has(Feature::Mips64r2) ? isa_mips64r2
                  : has(Feature::Mips64)   ? isa_mips64
                  : has(Feature::Mips32r2) ? isa_mips32r2
                  : has(Feature::Mips32)   ? isa_mips32
@@ -457,6 +480,10 @@ inline constexpr std::uint32_t likely = 1U << 12;
 inline constexpr std::uint32_t no_delay_slot = 1U << 13;
 inline constexpr std::uint32_t coprocessor = 1U << 14;
 inline constexpr std::uint32_t cp0 = 1U << 15;
+// A control transfer, and one whose next instruction must not be one: a
+// conditional compact branch of Release 6.
+inline constexpr std::uint32_t transfer = 1U << 16;
+inline constexpr std::uint32_t forbidden_slot = 1U << 17;
 inline constexpr std::uint32_t any = ~0U;
 } // namespace effect
 
@@ -559,6 +586,12 @@ EffectPlan effect_plan(const ModelInstruction& entry) {
         }
     }
     if (entry.likely) plan.flags |= likely;
+    if (entry.control != InstructionControlEffect::None) {
+        plan.flags |= transfer;
+        if (entry.control == InstructionControlEffect::ConditionalBranch && !entry.delay_slot) {
+            plan.flags |= forbidden_slot;
+        }
+    }
     for (unsigned index = 0; index < entry.operands.size(); ++index) {
         const auto id = type_id(entry.operands[index]);
         if (id == OperandTypeId::Memory) plan.bases.push_back(index);
@@ -709,7 +742,13 @@ public:
         switch (kind.value) {
         case fixup_none: case fixup_jalr: case fixup_jalr_hint: return {0, false};
         case fixup_gprel64: case fixup_dtprel64: case fixup_tprel64: return {8, false};
-        default: return {4, kind.value == fixup_branch16};
+        default: {
+            // LDPC counts from its doubleword, which only a linker knows.
+            const bool pc_relative = pc_relative_fixup(kind.value);
+            return {4, pc_relative,
+                    kind.value == fixup_pc18 ||
+                        (pc_relative && model_.gnu && (model_.architecture.isa & isa_r6) != 0)};
+        }
         }
     }
 
@@ -1253,6 +1292,8 @@ bool MipsTarget::can_swap(Assembler& as, const Effects& branch, std::uint32_t wo
     }
     const auto& before = previous.effects;
     if ((before.flags & no_delay_slot) != 0) return false;
+    // The branch would take a compact branch's forbidden slot.
+    if ((history_[1].effects.flags & forbidden_slot) != 0) return false;
     if (nops_for(0, history_.data() + 1, &branch) > 0) return false;
     if (nops_for_sequence(0, history_.data() + 1, branch, before) > 0) return false;
     if ((branch.gpr_read & before.gpr_write) != 0 || (branch.fpr_read & before.fpr_write) != 0 ||
@@ -1380,6 +1421,14 @@ void MipsTarget::append(Assembler& as, std::uint32_t word,
     // GNU as applies the fix in either reorder mode.
     if (subtarget_.has_feature(Feature::FixLoongson3Llsc)) fix_loongson3_llsc(as, sequence);
     if (!options_.noreorder) {
+        // A control transfer never takes a conditional compact branch's
+        // forbidden slot.
+        if ((history_[0].effects.flags & forbidden_slot) != 0 &&
+            (effects.flags & transfer) != 0) {
+            emit_nops(as, 1);
+            insert_history(0, 1, Emitted{});
+            move_labels(as);
+        }
         const int nops = optimize_ == 0 ? nops_for(0, history_.data(), nullptr)
                                         : nops_for_target(0, history_.data(), effects);
         if (nops > 0) {
@@ -1457,7 +1506,10 @@ void MipsTarget::append(Assembler& as, std::uint32_t word,
 
 void MipsTarget::flush(Assembler& as) {
     if (!options_.noreorder) {
-        if (const int nops = nops_for(0, history_.data(), nullptr); nops > 0) {
+        // Whatever follows may transfer control.
+        int nops = (history_[0].effects.flags & effect::forbidden_slot) != 0 ? 1 : 0;
+        nops = std::max(nops, nops_for(0, history_.data(), nullptr));
+        if (nops > 0) {
             emit_nops(as, static_cast<unsigned>(nops));
             move_labels(as);
         }
@@ -1679,6 +1731,10 @@ bool MipsTarget::shape_matches(const ModelInstruction& entry,
         case OperandTypeId::Memory:
         case OperandTypeId::Branch:
         case OperandTypeId::Jump:
+        case OperandTypeId::Branch21:
+        case OperandTypeId::Branch26:
+        case OperandTypeId::PcRelative19:
+        case OperandTypeId::PcRelative18:
             break;
         default:
             if (!text.starts_with('$')) return false;
@@ -1696,6 +1752,18 @@ std::optional<const Form*> MipsTarget::fitting_form(Assembler& as, const Cursor&
     const auto rest = cursor.rest();
     std::vector<std::optional<std::int64_t>> values(operands.size());
     for (std::size_t index = 0; index < operands.size(); ++index) {
+        // General registers, by number, which constraints may relate.
+        if (std::all_of(candidates.begin(), candidates.end(), [&](const Form* form) {
+                const auto& operand = form->entry->operands[index];
+                return !operand.name.empty() && type_id(operand) == OperandTypeId::Gpr;
+            })) {
+            if (operands[index].starts_with('$')) {
+                if (const auto number = gpr_number(operands[index].substr(1), model_.elf64)) {
+                    values[index] = *number;
+                }
+            }
+            continue;
+        }
         const bool immediate =
             std::all_of(candidates.begin(), candidates.end(), [&](const Form* form) {
                 const auto& operand = form->entry->operands[index];
@@ -1860,6 +1928,13 @@ bool MipsTarget::parse_operand(Assembler& as, Cursor& cursor, const ModelInstruc
     case OperandTypeId::Memory: {
         if (cursor.rest().starts_with("($")) {
             cursor.consume("(");
+        } else if (operand.type.relocated_bits == 0) {
+            // A short offset takes no relocation.
+            const auto offset = absolute(as, cursor, operand.type.offset_minimum,
+                                         operand.type.offset_maximum, "offset");
+            if (!offset) return false;
+            value.value = *offset;
+            if (!cursor.consume("(")) return true;
         } else {
             const auto offset = immediate(as, cursor);
             if (!offset || !sixteen(as, *offset, operand.type.offset_minimum,
@@ -1885,11 +1960,39 @@ bool MipsTarget::parse_operand(Assembler& as, Cursor& cursor, const ModelInstruc
         return true;
     }
     case OperandTypeId::Branch:
-    case OperandTypeId::Jump: {
+    case OperandTypeId::Jump:
+    case OperandTypeId::Branch21:
+    case OperandTypeId::Branch26: {
         const auto target = as.parse_expression(cursor);
         if (!target) return false;
-        value.fixup = PendingFixup{id == OperandTypeId::Jump ? fixup_jump26 : fixup_branch16,
+        value.fixup = PendingFixup{id == OperandTypeId::Jump       ? fixup_jump26
+                                   : id == OperandTypeId::Branch21 ? fixup_branch21
+                                   : id == OperandTypeId::Branch26 ? fixup_branch26
+                                                                   : fixup_branch16,
                                    *target, value.location};
+        return true;
+    }
+    case OperandTypeId::PcRelative19:
+    case OperandTypeId::PcRelative18: {
+        // A label, or a byte offset from the instruction that the field
+        // holds in words or doublewords.
+        const auto target = as.parse_expression(cursor);
+        if (!target) return false;
+        const bool words = id == OperandTypeId::PcRelative19;
+        if (const auto offset = as.absolute_now(*target)) {
+            const auto scale = words ? 4 : 8;
+            const auto limit = std::int64_t{1} << (words ? 18 : 17);
+            if (*offset % scale != 0 || *offset / scale < -limit || *offset / scale >= limit) {
+                as.error(value.location, "offset " + std::to_string(*offset) +
+                                             " is not a multiple of " + std::to_string(scale) +
+                                             " in [" + std::to_string(-limit * scale) + ", " +
+                                             std::to_string((limit - 1) * scale) + "]");
+                return false;
+            }
+            value.value = *offset / scale;
+            return true;
+        }
+        value.fixup = PendingFixup{words ? fixup_pc19 : fixup_pc18, *target, value.location};
         return true;
     }
     }
@@ -2375,7 +2478,8 @@ void MipsTarget::set_directive(Assembler& as, Statement& statement) {
             if (isa == isa_mips1) options_.fpr = FprMode::Fp32;
             options_.gp64 = has_64bit_registers(isa);
             if (options_.fpr != FprMode::Fpxx) {
-                options_.fpr = options_.gp64 ? FprMode::Fp64 : FprMode::Fp32;
+                options_.fpr = options_.gp64 || (isa & isa_r6) != 0 ? FprMode::Fp64
+                                                                   : FprMode::Fp32;
             }
             return;
         }
@@ -2415,7 +2519,9 @@ void MipsTarget::module_directive(Assembler& as, Statement& statement) {
                                 abi_gpr_bits(subtarget_.abi_info()) == 64;
             }
             if (!fp_explicit_ && settings.fpr != FprMode::Fpxx) {
-                settings.fpr = settings.gp64 ? FprMode::Fp64 : FprMode::Fp32;
+                settings.fpr = settings.gp64 || (settings.architecture.isa & isa_r6) != 0
+                                   ? FprMode::Fp64
+                                   : FprMode::Fp32;
             }
             break;
         }
@@ -3104,18 +3210,37 @@ bool MipsTarget::apply_fixup(Assembler& as, const assembler::Fixup& fixup, std::
         field = jump26(unsigned_value);
         mask = jump26_mask;
         break;
-    case fixup_branch16: {
-        const auto displacement = value - 4;
-        if (!relocated && (displacement & 3) != 0) {
-            as.error(fixup.location, "branch target is not word aligned");
+    case fixup_branch16:
+    case fixup_branch21:
+    case fixup_branch26:
+    case fixup_pc19:
+    case fixup_pc18: {
+        // Branches count from the next instruction, the PC-relative
+        // operands from the instruction, LDPC's from its doubleword (which
+        // its relocation's linker computes).
+        const bool branch = kind == fixup_branch16 || kind == fixup_branch21 ||
+                            kind == fixup_branch26;
+        const unsigned bits = kind == fixup_branch16 ? 16
+                              : kind == fixup_branch21 ? 21
+                              : kind == fixup_branch26 ? 26
+                              : kind == fixup_pc19     ? 19
+                                                       : 18;
+        const unsigned shift = kind == fixup_pc18 ? 3 : 2;
+        const auto displacement = branch ? value - 4 : value;
+        if (!relocated && (displacement & ((1 << shift) - 1)) != 0) {
+            as.error(fixup.location, branch ? "branch target is not word aligned"
+                                            : "PC-relative target is not aligned");
             return false;
         }
-        const auto offset = displacement / 4;
-        if (!is_int16(offset)) {
-            as.error(fixup.location, "branch target is out of range");
+        const auto offset = displacement / (std::int64_t{1} << shift);
+        const auto limit = std::int64_t{1} << (bits - 1);
+        if (offset < -limit || offset >= limit) {
+            as.error(fixup.location, branch ? "branch target is out of range"
+                                            : "PC-relative target is out of range");
             return false;
         }
-        field = static_cast<std::uint32_t>(offset) & 0xffffU;
+        mask = static_cast<std::uint32_t>((std::uint64_t{1} << bits) - 1);
+        field = static_cast<std::uint32_t>(offset) & mask;
         break;
     }
     case fixup_signed16:
@@ -3167,7 +3292,23 @@ std::optional<assembler::RelocationChoice> MipsTarget::relocation(
     case fixup_higher: return assembler::RelocationChoice{r_mips_higher};
     case fixup_highest: return assembler::RelocationChoice{r_mips_highest};
     case fixup_jump26: return assembler::RelocationChoice{r_mips_26};
-    case fixup_branch16: return assembler::RelocationChoice{r_mips_pc16, false, -4};
+    // GNU as names a Release 6 PC-relative relocation's own symbol.
+    case fixup_branch16:
+    case fixup_branch21:
+    case fixup_branch26:
+    case fixup_pc19:
+    case fixup_pc18: {
+        const auto kind = fixup.kind.value;
+        const auto type = kind == fixup_branch16   ? r_mips_pc16
+                          : kind == fixup_branch21 ? r_mips_pc21_s2
+                          : kind == fixup_branch26 ? r_mips_pc26_s2
+                          : kind == fixup_pc19     ? r_mips_pc19_s2
+                                                   : r_mips_pc18_s3;
+        const bool branch = kind == fixup_branch16 || kind == fixup_branch21 ||
+                            kind == fixup_branch26;
+        return assembler::RelocationChoice{
+            type, model_.gnu && (model_.architecture.isa & isa_r6) != 0, branch ? -4 : 0};
+    }
     default:
         break;
     }

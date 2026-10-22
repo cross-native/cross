@@ -1254,7 +1254,7 @@ bool parse_as_options(int argc, char** argv, CompilerOptions& options,
             command.no_warnings = true;
             continue;
         }
-        // GNU as spells ISA levels -mips1 ... -mips64r2.
+        // GNU as spells ISA levels -mips1 ... -mips64r6.
         if (argument.starts_with("-mips") && argument.size() > 5 &&
             argument[5] >= '0' && argument[5] <= '9') {
             add_command_option(options, "m.arch", std::string(argument.substr(1)),

@@ -189,7 +189,7 @@ COFF/PE, or Mach-O as the triple names (`x86_64-unknown-linux-gnu`,
 | --- | --- |
 | `-o FILE` | The object file (default `a.out`). |
 | `-target TRIPLE`, `-mprofile=NAME` | The target and its defaults, as for `cc`. |
-| `-march=CPU`, `-mips1` ... `-mips64r2` | The CPU or ISA level whose instructions are accepted, until a `.set` directive changes it. |
+| `-march=CPU`, `-mips1` ... `-mips64r6` | The CPU or ISA level whose instructions are accepted, until a `.set` directive changes it. |
 | `-mabi=NAME`, `-32`, `-64` | The ABI, which fixes the ELF class and ABI flags: `-mabi=32` and `-32` select o32, `-mabi=64` and `-64` n64 (also switching the triple to `mips64`), `-mabi=eabi` EABI32. An ABI without a fixed address width, such as `x64`, takes the ELF class of the triple. |
 | `-EB`, `-EL` | Big- or little-endian output. |
 | `-mFEATURE`, `-mno-FEATURE`, `-mnan=2008\|legacy` | Target features, such as `-msoft-float`, `-msingle-float`, `-mfp32`, `-mfpxx`, and `-mfp64`, which set the floating-point ABI that `.MIPS.abiflags` records, and the errata workarounds `-mfix-r5900` and `-mfix-loongson3-llsc`, which the `-march` CPU may enable ([targets.md](targets.md#mips)). |
@@ -224,7 +224,7 @@ value, `<text>` passes text, parameters may be named without a backslash, and
 For MIPS, `as` reads the GNU as dialect of GCC output and hand-written
 assembly and writes the object GNU as writes for embedded MIPS ELF. The MIPS
 directives are `.set` (`push`, `pop`, `reorder`, `noreorder`, `at`, `noat`,
-`macro`, `nomacro`, `move` and `volatile`, `mips0` ... `mips64r2`,
+`macro`, `nomacro`, `move` and `volatile`, `mips0` ... `mips64r6`,
 `arch=CPU`, `gp=32`, `gp=64`, `fp=32`, `fp=xx`, `fp=64`, `oddspreg`,
 `nooddspreg`, and the `default` forms), `.module` before any code (`arch=`,
 `mipsN`, `gp=`, `fp=`, `oddspreg`, `nooddspreg`, `softfloat`, `hardfloat`,
@@ -235,7 +235,8 @@ and `.cpadd`, `.gpword` and `.gpdword`, `.dtprelword`, `.dtpreldword`,
 `R_MIPS_NONE` at `.` or a label of the current section, `.ent`, `.end`,
 `.frame`, `.mask`, `.fmask`, and `.nan`. As in GNU as, `.set mipsN` selects
 the model's CPU of that name, dropping a CPU extension such as Allegrex's,
-and also sets 64-bit general and floating-point registers for a 64-bit ISA;
+and also sets 64-bit general and floating-point registers for a 64-bit ISA
+and 64-bit floating-point registers for Release 6;
 the PIC directives do nothing outside SVR4 PIC code, `.cpload` and
 `.cprestore` nothing in ELF64 objects, and `.cpsetup`, `.cplocal`, and
 `.cpreturn` nothing in ELF32 ones; and `.gpword` and `.gpdword` give plain
@@ -246,7 +247,8 @@ The instructions are those of the loaded MIPS instruction table
 current ISA and CPU have it, and `cc --print-instructions` lists them. The
 shipped table has the integer, multiply and divide, load and store, branch,
 jump, FPU, FPU control, CP0, TLB, cache, and `sync` instructions of MIPS
-I-V, MIPS32, and MIPS64 Release 1 and 2, with multiply-accumulate, `mul`,
+I-V, MIPS32, and MIPS64 Releases 1, 2, and 6, the instructions Release 6
+removes rejected there, with multiply-accumulate, `mul`,
 `ext`, `ins`, `seb`, `seh`, traps, `pref`, every rounding conversion and FPU
 comparison, and the Allegrex instructions (`clz`, `clo`, `max`, `min`,
 `bitrev`, `wsbw`, `mfic`, `mtic`, and its own multiply-accumulate
@@ -282,7 +284,10 @@ HI/LO read (`hilo-interlocks`). A branch takes the place of the instruction
 before it, which moves into the delay slot, unless that instruction is in a
 `.set noreorder` block or has a label, the branch depends on it, or the move
 would create a hazard at either end; otherwise the delay slot gets a `nop`.
-Branch-likely instructions always get a `nop`. A label before an instruction
+Branch-likely instructions always get a `nop`. A Release 6 conditional
+compact branch gets a `nop` in its forbidden slot before a control transfer,
+data, an alignment, or the end of the input, and the instruction in that
+slot stays out of a later delay slot. A label before an instruction
 that needs hazard `nop`s moves past them, and `.set noreorder` adds the `nop`s
 earlier instructions may need, keeping only those the instructions after it
 need. With `-mfix-r5900`, a conditional branch back to a label at most five
@@ -304,9 +309,11 @@ contents and code sections end padded to their alignment; `.sdata`, `.sbss`,
 objects every name starting with `$`, such as GCC's `$L` labels, stays out of
 the symbol table unless a relocation must name it, as `.L` names do in every
 object; the first `.file` gives the file symbol, and `.file` without `.loc`
-gives no line table; and `.2byte` or `.half` of a symbol is an error in an o32
+gives no line table; `.2byte` or `.half` of a symbol is an error in an o32
 object, which has no 2-byte data relocation, and `R_MIPS_REL16` in an n64
-object. Unlike GNU as:
+object; and in a Release 6 object every PC-relative field, a branch's too,
+keeps a relocation against its target, also within its section. Unlike GNU
+as:
 
 - the hazard `nop`s follow the CPU model rather than GNU as's tables: the
   shipped `vr4300` model has no FPU transfer or compare interlocks, so
@@ -330,7 +337,13 @@ object. Unlike GNU as:
 - `-march` and `.set arch=` accept the CPUs that `cc --print-cpus` lists
   ([targets.md](targets.md#mips)), with the instructions of their ISA level
   and Allegrex's, but not the instructions that other CPUs add, such as the
-  Octeon and Loongson ones, and not the Release 6 CPUs;
+  Octeon and Loongson ones;
+- the Release 6 `ll`, `sc`, `lld`, `scd`, `cache`, and `pref`, whose offsets
+  have 9 bits, take no larger offset or symbol, which GNU as adds into a
+  register first;
+- a constant operand of `lapc`, `lwpc`, `lwupc`, and `ldpc` is an offset
+  from the instruction, where GNU as reads an address that a relocation
+  reaches, and `addiupc` also takes a label;
 - `-mfix-loongson3-llsc` does not add the `sync` that GNU as emits before an
   `sc` when a branch between the `ll` and the `sc` targets a label before the
   `ll`, which would put the `sync` inside the sequence.

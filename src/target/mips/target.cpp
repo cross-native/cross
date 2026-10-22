@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <limits>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -191,17 +192,24 @@ unsigned mips64_constant_materialization_cost(std::uint64_t value) {
 
 // The multiply and divide unit: MULT/MULTU and DIV/DIVU, their D forms from
 // MIPS III, and the MFLO or MFHI that reads the result, or the MIPS32 and
-// MIPS64 MUL where it pays. Before MIPS III a doubleword operation is a
-// pair-legalized sequence.
+// MIPS64 MUL where it pays; Release 6's three-operand forms. Before MIPS III
+// a doubleword operation is a pair-legalized sequence.
 std::vector<InstructionCostId> integer_operation_instructions(
     const Subtarget& subtarget, CostedIntegerOperation operation,
     const IntegerOperationCostQuery& query) {
     using mips::Instruction;
     const bool wide = query.bits == 64;
+    // Release 6 computes each result in one instruction.
+    const bool r6 = mips::release6(subtarget);
     // Before MIPS III a 64-bit multiply-high combines the four products of
     // the words; the other doubleword operations are software loops.
     if (wide && !subtarget.has_feature(mips::Feature::Mips3)) {
         if (operation != CostedIntegerOperation::MultiplyHigh) return {};
+        if (r6) {
+            return {Instruction::Muhu, Instruction::Mulu, Instruction::Muhu,
+                    Instruction::Mulu, Instruction::Muhu, Instruction::Mulu,
+                    Instruction::Muhu};
+        }
         return {Instruction::Multu, Instruction::Mfhi, Instruction::Multu,
                 Instruction::Mflo, Instruction::Multu, Instruction::Mflo,
                 Instruction::Multu, Instruction::Mflo};
@@ -212,16 +220,25 @@ std::vector<InstructionCostId> integer_operation_instructions(
         if (!wide && mips::selects_three_operand_multiply(subtarget)) {
             return {Instruction::Mul};
         }
+        if (r6) return {Instruction::Dmul};
         return {wide ? Instruction::Dmult : Instruction::Mult,
                 Instruction::Mflo};
     case CostedIntegerOperation::MultiplyHigh:
         if (query.bits != 32 && !wide) return {};
+        if (r6) {
+            return {query.is_signed ? (wide ? Instruction::Dmuh : Instruction::Muh)
+                                    : (wide ? Instruction::Dmuhu : Instruction::Muhu)};
+        }
         return {query.is_signed
                     ? (wide ? Instruction::Dmult : Instruction::Mult)
                     : (wide ? Instruction::Dmultu : Instruction::Multu),
                 Instruction::Mfhi};
     case CostedIntegerOperation::Divide:
         if (query.bits != 32 && !wide) return {};
+        if (r6) {
+            return {query.is_signed ? (wide ? Instruction::Ddiv : Instruction::Div)
+                                    : (wide ? Instruction::Ddivu : Instruction::Divu)};
+        }
         return {query.is_signed
                     ? (wide ? Instruction::Ddiv : Instruction::Div)
                     : (wide ? Instruction::Ddivu : Instruction::Divu),
@@ -271,14 +288,23 @@ const SubtargetTable subtargets{
         {"mips32r2", false, true, {"mips32"}, {}},
         {"mips64", false, true, {"mips3"}, {"mips32", "mips32r2"}},
         {"mips64r2", false, true, {"mips64"}, {}},
+        // Release 6 re-encodes and removes instructions of earlier
+        // releases, so it is a fact of the -march CPU rather than an
+        // option; its FPU uses the IEEE 754-2008 NaN encoding.
+        {"mips32r6", false, false, {"mips32r2", "nan2008"}, {}},
+        {"mips64r6", false, false, {"mips64r2", "nan2008"}, {}},
         {"hard-float", false, true, {"mips1"}, {"soft-float"}},
         {"soft-float", false, true, {"mips1"}, {"hard-float"}},
-        {"fp32", false, true, {"hard-float"}, {"fp64", "fpxx"}},
-        {"fp64", false, true, {"hard-float", "mips3"}, {"fp32", "fpxx"}},
+        // Release 6 FPUs have only 64-bit registers. 64-bit FPRs need
+        // 64-bit GPRs or MTHC1/MFHC1 (Release 2).
+        {"fp32", false, true, {"hard-float"},
+         {"fp64", "fpxx", "mips32r6", "mips64r6"}},
+        {"fp64", false, true, {"hard-float"}, {"fp32", "fpxx"},
+         {{"mips3", "mips32r2"}}},
         {"fpxx", false, true, {"hard-float", "mips2"}, {"fp32", "fp64"}},
         {"odd-spreg", false, true, {"hard-float"}, {}},
         {"llsc", false, true, {"mips2"}, {}},
-        {"branch-likely", false, true, {"mips2"}, {}},
+        {"branch-likely", false, true, {"mips2"}, {"mips32r6", "mips64r6"}},
         {"fix4300", false, true, {"mips3", "hard-float"}, {}},
         {"abicalls", false, true, {"mips1"}, {}},
         // -mno-shared: -mabicalls code for an executable, which reaches
@@ -289,7 +315,7 @@ const SubtargetTable subtargets{
         {"single-float", false, true, {"hard-float"}, {"fp64", "fpxx"}},
         {"allegrex", false, false,
          {"mips2", "hard-float", "single-float"}, {}},
-        {"cond-move", false, true, {"mips1"}, {}},
+        {"cond-move", false, true, {"mips1"}, {"mips32r6", "mips64r6"}},
         {"rotate", false, true, {"mips1"}, {}},
         {"vfpu", false, true, {"allegrex"}, {}},
         // Pipeline interlocks are CPU facts rather than user-visible ISA
@@ -301,13 +327,16 @@ const SubtargetTable subtargets{
         {"hilo-interlocks", false, false, {"mips1"}, {}},
         // FCSR.NAN2008: Release 2 FPUs may implement the IEEE 754-2008 NaN
         // encoding; earlier ones have only the legacy encoding.
-        {"nan2008", false, true, {"mips32r2"}, {}},
+        {"nan2008", false, true, {}, {}, {{"mips32r2", "mips64r2"}}},
         // Errata workarounds, which the entries of the affected CPUs enable.
         {"fix-r4000", false, true, {"mips1"}, {}},
         {"fix-r4400", false, true, {"mips1"}, {}},
         {"fix-r10000", false, true, {"mips1"}, {}},
         {"fix-r5900", false, true, {"mips1"}, {}},
         {"fix-loongson3-llsc", false, true, {"mips1"}, {}},
+        // Ordinary loads and stores take misaligned addresses, in hardware
+        // or through the system's emulation, as Release 6 requires.
+        {"unaligned-access", false, true, {"mips1"}, {}},
     },
 };
 
@@ -372,6 +401,8 @@ std::vector<OptionDefinition> target_options() {
             "and at LL/SC exits");
     boolean("nan2008", false,
             "use the IEEE 754-2008 NaN encoding instead of the legacy one");
+    boolean("unaligned-access", false,
+            "access misaligned data with ordinary loads and stores");
     boolean("long-calls", false,
             "call through a register so the callee may lie outside the "
             "caller's 256 MB region");
@@ -449,6 +480,18 @@ std::optional<OperandType> operand_type(std::string_view name) {
         result.id = id(name == "branch" ? Id::Branch : Id::Jump);
         return result;
     }
+    // Release 6 compact branches and PC-relative operands.
+    for (const auto& [spelling, type, bits] :
+         {std::tuple{std::string_view{"branch21"}, Id::Branch21, 21U},
+          std::tuple{std::string_view{"branch26"}, Id::Branch26, 26U},
+          std::tuple{std::string_view{"pcrel19s2"}, Id::PcRelative19, 19U},
+          std::tuple{std::string_view{"pcrel18s3"}, Id::PcRelative18, 18U}}) {
+        if (name != spelling) continue;
+        OperandType result{OperandKind::Label};
+        result.relocated_bits = bits;
+        result.id = id(type);
+        return result;
+    }
     const auto parse = [](std::string_view text) -> std::optional<std::int64_t> {
         std::int64_t value{};
         const auto* end = text.data() + text.size();
@@ -456,13 +499,25 @@ std::optional<OperandType> operand_type(std::string_view name) {
         if (text.empty() || parsed.ec != std::errc{} || parsed.ptr != end) return std::nullopt;
         return value;
     };
-    // memN: a GPR base and a signed 16-bit offset, for an N-bit access.
+    // memN: a GPR base and a signed 16-bit offset, for an N-bit access;
+    // memN_simmK: a signed K-bit offset, which takes no relocation.
     if (name.starts_with("mem")) {
-        const auto bits = name.size() == 3 ? std::optional<std::int64_t>(0) : parse(name.substr(3));
+        auto spelling = name.substr(3);
+        std::int64_t offset_bits = 16;
+        if (const auto suffix = spelling.find("_simm"); suffix != std::string_view::npos) {
+            const auto width = parse(spelling.substr(suffix + 5));
+            if (!width || *width < 1 || *width > 16) return std::nullopt;
+            offset_bits = *width;
+            spelling = spelling.substr(0, suffix);
+        }
+        const auto bits = spelling.empty() ? std::optional<std::int64_t>(0) : parse(spelling);
         if (!bits || (*bits != 0 && *bits != 8 && *bits != 16 && *bits != 32 && *bits != 64)) {
             return std::nullopt;
         }
-        OperandType result{OperandKind::Memory, "integer", 0, 31, 16, -32768, 32767,
+        OperandType result{OperandKind::Memory, "integer", 0, 31,
+                           offset_bits == 16 ? 16U : 0U,
+                           -(std::int64_t{1} << (offset_bits - 1)),
+                           (std::int64_t{1} << (offset_bits - 1)) - 1,
                            static_cast<unsigned>(*bits)};
         result.exposable = true;
         result.id = id(Id::Memory);

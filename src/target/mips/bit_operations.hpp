@@ -17,6 +17,13 @@ inline bool release2(const Subtarget& subtarget) {
            subtarget.has_feature(Feature::Mips64r2);
 }
 
+// MIPS32 or MIPS64 Release 6, which has no HI/LO, conditional-move,
+// branch-likely, or FCSR-condition instructions.
+inline bool release6(const Subtarget& subtarget) {
+    return subtarget.has_feature(Feature::Mips32r6) ||
+           subtarget.has_feature(Feature::Mips64r6);
+}
+
 // Whether a Release 2 instruction replaces a sequence: the -march CPU has
 // it and its -mtune latency is at most the sequence's.
 inline bool favors(const Subtarget& subtarget, Instruction instruction,
@@ -56,12 +63,13 @@ inline bool selects_bit_fields(const Subtarget& subtarget, unsigned bits) {
 }
 
 // MUL, the three-operand multiply of MIPS32 and MIPS64, in place of MULT
-// and MFLO for a product of at most 32 bits.
+// and MFLO for a product of at most 32 bits; Release 6 has only MUL.
 inline bool selects_three_operand_multiply(const Subtarget& subtarget) {
     using I = Instruction;
-    return (subtarget.has_feature(Feature::Mips32) ||
-            subtarget.has_feature(Feature::Mips64)) &&
-           favors(subtarget, I::Mul, {I::Mult, I::Mflo});
+    return release6(subtarget) ||
+           ((subtarget.has_feature(Feature::Mips32) ||
+             subtarget.has_feature(Feature::Mips64)) &&
+            favors(subtarget, I::Mul, {I::Mult, I::Mflo}));
 }
 
 // DROTR, DROTR32, and DROTRV rotate a doubleword (MIPS64 Release 2 with

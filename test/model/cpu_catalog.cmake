@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 # The shipped CPU catalog: every -march name that GCC, LLVM, or GNU as
-# accepts for MIPS and x86-64, except Release 6 MIPS and 32-bit x86 CPUs;
+# accepts for MIPS and x86-64, except 32-bit x86 CPUs;
 # other spellings that resolve to their CPU; the features of the CPUs that
 # the catalog composes; the costs that composition keeps; and `.set arch=`
 # with MIPS64 Release 2 CPUs.
@@ -33,9 +33,9 @@ set(mips_present
     r20kc sb1 sb1a sr71000 sr71k xlr loongson3a gs464 gs464e gs264e octeon
     octeon+ octeon2 octeon3 xlp generic mips5 r4010 4010 vr4181 4181 r4181
     rm5200 5200 r5200 rm5230 5230 r5230 rm5231 5231 r5231 rm5261 5261 r5261
-    rm5721 5721 r5721 m4kp interaptiv-mr2 25kf r25kf r4k 4000 4k r5900 5900)
-set(mips_absent
+    rm5721 5721 r5721 m4kp interaptiv-mr2 25kf r25kf r4k 4000 4k r5900 5900
     mips32r6 mips64r6 i6400 i6500 p6600)
+set(mips_absent)
 set(x86_present
     nocona core2 nehalem corei7 westmere sandybridge corei7-avx ivybridge
     core-avx-i haswell core-avx2 broadwell skylake skylake-avx512 cannonlake
@@ -127,8 +127,7 @@ foreach(arch mips x86)
     endforeach()
 endforeach()
 foreach(case "x86_64-unknown-linux-gnu;i686;unknown x86-64 architecture CPU 'i686'"
-             "mips-unknown-elf;i6400;unknown mips architecture CPU 'i6400'"
-             "mips-unknown-elf;mips64r6;unknown mips architecture CPU 'mips64r6'")
+             "mips-unknown-elf;i7200;unknown mips architecture CPU 'i7200'")
     list(GET case 0 triple)
     list(GET case 1 cpu)
     list(GET case 2 message)
@@ -189,6 +188,18 @@ expect_features(mips mips32r2 branch-likely cond-move fp32
     llsc load-interlocks mips32r2 odd-spreg rotate)
 expect_features(mips mips3 branch-likely fp32 hard-float llsc load-interlocks
     mips3)
+# Release 6 has no branch-likely or conditional moves, misaligned ordinary
+# accesses work, and the FPU has 64-bit registers.
+foreach(cpu mips32r6 mips64r6 i6400 i6500 p6600)
+    if(cpu STREQUAL "mips32r6")
+        set(level mips32r6)
+    else()
+        set(level mips64r6)
+    endif()
+    expect_features(mips ${cpu} ${level} fp64 fpu-compare-interlocks
+        fpu-transfer-interlocks hard-float hilo-interlocks llsc load-interlocks
+        odd-spreg rotate unaligned-access)
+endforeach()
 expect_features(mips r4000 branch-likely fp32 hard-float llsc load-interlocks
     mips3 fix-r4000)
 expect_features(mips r4400 branch-likely fp32 hard-float llsc load-interlocks

@@ -50,6 +50,11 @@ inline constexpr std::uint32_t r_mips_tls_tprel32 = 47;
 inline constexpr std::uint32_t r_mips_tls_tprel64 = 48;
 inline constexpr std::uint32_t r_mips_tls_tprel_hi16 = 49;
 inline constexpr std::uint32_t r_mips_tls_tprel_lo16 = 50;
+// Release 6 PC-relative fields.
+inline constexpr std::uint32_t r_mips_pc21_s2 = 60;
+inline constexpr std::uint32_t r_mips_pc26_s2 = 61;
+inline constexpr std::uint32_t r_mips_pc18_s3 = 62;
+inline constexpr std::uint32_t r_mips_pc19_s2 = 63;
 inline constexpr std::uint32_t r_mips_pc32 = 248;
 
 // The thread pointer (UserLocal, which `rdhwr $3, $29` reads) points 0x7000

@@ -33,6 +33,33 @@ const CpuEntry* find_cpu(const TargetInfo& target, std::string_view name) {
     return model_registry().find_cpu(target.architecture, name);
 }
 
+// Whether `a` or `b` lists the other as a conflict.
+bool conflicting(const SubtargetFeature& a, const SubtargetFeature& b) {
+    return std::ranges::find(a.conflicts, b.name) != a.conflicts.end() ||
+           std::ranges::find(b.conflicts, a.name) != b.conflicts.end();
+}
+
+// The first list of `feature`'s alternative prerequisites of which
+// `enabled` has none.
+template <typename Enabled>
+const std::vector<std::string_view>* missing_alternative(
+    const SubtargetFeature& feature, Enabled enabled) {
+    for (const auto& alternatives : feature.any_prerequisites) {
+        if (std::ranges::none_of(alternatives, enabled)) return &alternatives;
+    }
+    return nullptr;
+}
+
+// "'-mA' or '-mB'".
+std::string alternative_options(const std::vector<std::string_view>& names) {
+    std::string result;
+    for (std::size_t index = 0; index < names.size(); ++index) {
+        if (index != 0) result += index + 1 == names.size() ? " or " : ", ";
+        result += "'-m" + std::string(names[index]) + "'";
+    }
+    return result;
+}
+
 } // namespace
 
 bool Subtarget::has_feature(TargetFeatureId feature) const {
@@ -252,27 +279,30 @@ bool normalize_subtarget_options(const TargetInfo& target,
         }
         return result;
     };
+    // An ABI feature applies only where the CPU allows it: the features
+    // enabled so far imply its prerequisites, and it conflicts with no
+    // feature of the CPU that options cannot select.
     std::unordered_set<std::string> abi_features;
     for (const auto& name : abi ? abi->features : std::vector<std::string>{}) {
         const auto* feature = find_feature(*table, name);
         const auto available = implied();
-        if (!std::ranges::all_of(feature->prerequisites,
-                                 [&](std::string_view required) {
-                                     return available.contains(
-                                         std::string(required));
-                                 })) {
+        const auto has = [&](std::string_view required) {
+            return available.contains(std::string(required));
+        };
+        if (!std::ranges::all_of(feature->prerequisites, has) ||
+            missing_alternative(*feature, has)) {
             continue;
         }
-        for (const auto conflict : feature->conflicts) {
-            if (!states[std::string(conflict)]) continue;
-            if (const auto* lost = find_feature(*table, conflict);
-                lost && required_fact(*lost)) {
-                baseline_error(conflict, "conflicts with the '" +
-                                             abi->canonical_name +
-                                             "' ABI's '" + name + "'");
-                return false;
-            }
-            states[std::string(conflict)] = false;
+        const auto conflicts = [&](const SubtargetFeature& other) {
+            return states[std::string(other.name)] && conflicting(*feature, other);
+        };
+        if (std::ranges::any_of(table->features, [&](const SubtargetFeature& other) {
+                return conflicts(other) && required_fact(other);
+            })) {
+            continue;
+        }
+        for (const auto& other : table->features) {
+            if (conflicts(other)) states[std::string(other.name)] = false;
         }
         states[name] = true;
         abi_features.insert(name);
@@ -309,7 +339,12 @@ bool normalize_subtarget_options(const TargetInfo& target,
     }
 
     for (const auto& feature : table->features) {
-        for (const auto required : feature.prerequisites) {
+        auto required_names = feature.prerequisites;
+        for (const auto& alternatives : feature.any_prerequisites) {
+            required_names.insert(required_names.end(), alternatives.begin(),
+                                  alternatives.end());
+        }
+        for (const auto required : required_names) {
             if (!find_feature(*table, required)) {
                 diagnostics.command_error(
                     "target description feature '" +
@@ -476,6 +511,29 @@ bool normalize_subtarget_options(const TargetInfo& target,
                 changed = true;
             }
         }
+        // Alternative prerequisites, once implications have settled: the
+        // resolver does not choose one, so without any the feature goes.
+        if (changed) continue;
+        for (const auto& feature : table->features) {
+            const auto name = std::string(feature.name);
+            if (!states[name]) continue;
+            const auto* alternatives = missing_alternative(
+                feature, [&](std::string_view other) { return states[std::string(other)]; });
+            if (!alternatives) continue;
+            const auto needed = alternative_options(*alternatives);
+            if (explicit_value(name, true)) {
+                diagnostics.command_error("target option '-m" + name + "' requires " + needed);
+                return false;
+            }
+            if (required_fact(feature)) {
+                baseline_error(name, "requires " + needed);
+                return false;
+            }
+            states[name] = false;
+            unavailable_by.emplace(name, name);
+            update_implied_option(name, false, "requires " + needed, arch_origin);
+            changed = true;
+        }
     }
 
     options.cpu = arch;
@@ -633,6 +691,22 @@ std::optional<Subtarget> resolve_subtarget(const TargetInfo& target,
                 }
                 changed = true;
             }
+        }
+        if (changed) continue;
+        for (const auto& feature : table.features) {
+            const auto name = std::string(feature.name);
+            if (!states[name]) continue;
+            const auto* alternatives = missing_alternative(
+                feature, [&](std::string_view other) { return states[std::string(other)]; });
+            if (!alternatives) continue;
+            if (selections[name] == '+') {
+                diagnostics.command_error("target feature '" + name + "' requires " +
+                                          alternative_options(*alternatives));
+                return std::nullopt;
+            }
+            states[name] = false;
+            unavailable_by.emplace(name, name);
+            changed = true;
         }
     }
 
