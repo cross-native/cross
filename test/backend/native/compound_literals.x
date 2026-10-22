@@ -56,8 +56,50 @@ static i32 evaluated() {
 
 global i32 evaluated_total = evaluated();
 
+// One object per literal and block activation, at runtime as in evaluation.
+static i32 same_literal() {
+    i32 *p = (i32 *)0;
+    i32 *old = (i32 *)0;
+    i32 i = 0;
+    while ((p = (i32[]){ i++ }) != (i32 *)0 && i < 2) old = p;
+    return p == old && *p == 1 ? 1 : 0;
+}
+
+static i32 same_nested() {
+    const i32 *w = (const i32 *)0;
+    const i32 *old = (const i32 *)0;
+    i32 i = 0;
+    while ((w = (struct segment){ .weights = (const i32[]){ i } }.weights) != (const i32 *)0 && ++i < 3)
+        old = w;
+    return w == old && *w == 2 ? 1 : 0;
+}
+
+static i32 depth_sum(in i32 n) {
+    const i32 *here = (const i32[]){ n };
+    return n == 0 ? *here : *here + depth_sum(n - 1);
+}
+
+static i32 literal_address() {
+    struct point *p = &(struct point){ 4, 5 };
+    i32 *y = &((struct point){ 6, 7 }).y;
+    return p->x + *y;
+}
+
+static i32 parenthesized() {
+    struct point local = ((struct point){ 11, 12 });
+    return local.x + local.y;
+}
+
+global i32 same_folded = same_literal() + same_nested();
+global i32 depth_folded = depth_sum(3);
+global i32 address_folded = literal_address();
+global i32 parenthesized_folded = parenthesized();
+global struct point paren_corner = ((struct point){ 7, 8 });
+global struct segment paren_line = { .from = ((struct point){ 1, 2 }), .weights = ((const i32[]){ 3 }) };
+
 $::static_assert(sizeof((i32[]){ 1, 2, [5] = 6 }) == 6uptr * sizeof(i32), "inferred bound");
 $::static_assert(((u32[]){ 4u32, 5u32, 6u32 })[2] == 6u32, "translation-time literal");
+$::static_assert((&(struct point){ 1, 2 })->y == 2, "literal address");
 
 static T first<T>(in const T *values) { return values[0]; }
 
@@ -98,5 +140,12 @@ again:
     if (fixed[0] + fixed[1] != -3 || sizeof((u8[]){ 1, 2, 3, 0 }) != 4uptr) return 14;
     origin->y = 40;
     if (origin->y != 40) return 15;
+    if (same_folded != 2 || $::runtime(same_literal()) + $::runtime(same_nested()) != 2) return 16;
+    if (depth_folded != 6 || $::runtime(depth_sum(3)) != 6) return 17;
+    if (address_folded != 11 || $::runtime(literal_address()) != 11) return 18;
+    if (parenthesized_folded != 23 || $::runtime(parenthesized()) != 23) return 19;
+    if (paren_corner.y != 8 || paren_line.from.x != 1 || paren_line.weights[0] != 3) return 20;
+    static struct point kept = ((struct point){ 9, 10 });
+    if (kept.x + kept.y != 19) return 21;
     return 1;
 }

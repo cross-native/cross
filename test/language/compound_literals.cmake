@@ -82,6 +82,31 @@ global u32 entry() { return bump ((u32[]){ 1u32, 2u32 })[1]; }
 $::static_assert(bump ((u32[]){ 4u32 })[0] == 5u32, "expanded literal");
 ]=])
 
+# Taking a literal's address and parenthesizing it keep its meaning.
+accept(address_and_parentheses [=[
+struct point { u32 x; u32 y; };
+struct pair { struct point first; struct point second; };
+$::static_assert((&(struct point){ 1u32, 2u32 })->x == 1u32, "address");
+$::static_assert(*&((struct point){ 3u32, 4u32 }).y == 4u32, "member address");
+global struct point corner = ((struct point){ 5u32, 6u32 });
+global struct pair both = { .first = ((struct point){ 7u32, 8u32 }), .second = (((struct point){ 9u32, 1u32 })) };
+global u32 kept() {
+    static struct point saved = ((struct point){ 2u32, 3u32 });
+    return saved.y;
+}
+]=])
+
+# A literal whose address another literal holds lives as long as its block,
+# or outside any block as long as translation.
+accept(nested_lifetime [=[
+struct holder { const i32 *values; };
+enum e { first = ((struct holder){ (const i32[]){ 4 } }).values[0] };
+$::static_assert(first == 4, "enumerator");
+$::static_assert((&(struct holder){ (const i32[]){ 6, 7 } })->values[1] == 7, "static assertion");
+static i32 inner() { return ((struct holder){ (const i32[]){ 8, 9 } }).values[1]; }
+$::static_assert(inner() == 9, "block");
+]=])
+
 set(record "struct point { i32 x; i32 y; };\nstruct other { i32 x; };\n")
 reject(scalar "brace initializer requires an aggregate destination"
     "global u32 f() { return (u32){ 5u32 }; }")
@@ -102,3 +127,21 @@ reject(runtime_bound "runtime local or parameter is not a translation-time value
 # A block-scope literal has automatic storage, even in a static initializer.
 reject(static_block_address "a compound literal in a block has automatic storage; its address is not a static initializer"
     "global i32 *f() { static i32 *saved = (i32[]){ 1, 2 }; return saved; }")
+# A literal's object ends with its block, in translation-time evaluation too.
+set(lifetime "translation-time pointer refers to an object outside its lifetime")
+reject(returned_literal "${lifetime}" [=[
+static i32 *leak(in i32 v) { return (i32[]){ v }; }
+$::static_assert(*leak(3) == 3, "returned literal");
+]=])
+reject(previous_iteration "${lifetime}" [=[
+static i32 stale() {
+    i32 *kept = (i32 *)0;
+    for (i32 i = 0; i < 2; ++i) {
+        i32 *cell = (i32[]){ i };
+        if (kept) return *kept;
+        kept = cell;
+    }
+    return 0;
+}
+$::static_assert(stale() == 0, "previous iteration");
+]=])

@@ -9967,11 +9967,18 @@ private:
             : value(std::move(initial)), initialized(assigned), read_only(immutable), type_only(unavailable) {}
     };
 
+    // A block activation: its cells and the objects of the compound literals
+    // evaluated in it, each named by the literal's location.
+    struct Scope : NameMap<Cell> {
+        std::vector<std::pair<SourceLocation, EvalValue>> literals;
+    };
+
     void pop_scope() {
         for (auto& [name, cell] : scopes_.back()) {
             if (cell.storage) cell.storage->alive = false;
             if (cell.value.object) cell.value.object->alive = false;
         }
+        for (auto& [location, object] : scopes_.back().literals) object.object->alive = false;
         scopes_.pop_back();
     }
 
@@ -13054,9 +13061,23 @@ private:
         co_return co_await initialize_object_async(initializer, type);
     }
 
+    // A literal has one object per block activation, or outside any block one
+    // per evaluator, initialized anew at each evaluation. Its location names
+    // it, since evaluation may work on a copy of the expression.
     EvaluationTask<std::optional<EvalValue>> compound_literal_async(const Expr& expression) {
         if (!expression.type || !expression.left) co_return std::nullopt;
-        co_return co_await compound_literal_async(expression.type, *expression.left);
+        auto value = co_await compound_literal_async(expression.type, *expression.left);
+        if (!value) co_return value;
+        auto& literals = scopes_.empty() ? translation_literals_ : scopes_.back().literals;
+        const auto site = std::find_if(literals.begin(), literals.end(), [&](const auto& entry) {
+            return entry.first.file == expression.location.file && entry.first.offset == expression.location.offset;
+        });
+        if (site == literals.end()) {
+            literals.emplace_back(expression.location, *value);
+            co_return value;
+        }
+        *site->second.object = *value->object;
+        co_return site->second;
     }
 
     EvaluationTask<std::optional<EvalValue>> meta_designator_pointer_async(const Expr& source) {
@@ -13507,7 +13528,7 @@ private:
             while (designator->kind == Expr::Kind::Parenthesized && designator->left)
                 designator = designator->left.get();
             const bool local = (designator->kind == Expr::Kind::Name &&
-                lookup_mutable(*designator)) ||
+                lookup_mutable(*designator)) || designator->kind == Expr::Kind::CompoundLiteral ||
                 (designator->kind == Expr::Kind::Binary && designator->left &&
                  meta_pointer_source(*designator->left)) ||
                 (designator->kind == Expr::Kind::Unary && designator->text == "*" &&
@@ -15679,7 +15700,8 @@ private:
     std::size_t meta_bytes_{};
     std::uint64_t fresh_ordinal_{};
     std::unordered_set<const std::string*> counted_asset_backings_;
-    std::vector<NameMap<Cell>> scopes_;
+    std::vector<Scope> scopes_;
+    std::vector<std::pair<SourceLocation, EvalValue>> translation_literals_;
     std::size_t frame_base_{};
     std::uint64_t steps_{};
     unsigned depth_{};
@@ -17969,6 +17991,14 @@ private:
     void rewrite(std::unique_ptr<Expr>& expression, const TypePtr& destination = {}) {
         if (!expression || expression->kind == Expr::Kind::Sizeof ||
             expression->kind == Expr::Kind::Alignof) return;
+        if (expression->kind == Expr::Kind::Parenthesized) {
+            // Parentheses keep the destination; a literal flattened inside
+            // them is the destination's brace list.
+            rewrite(expression->left, destination);
+            if (expression->left && expression->left->kind == Expr::Kind::AggregateInitializer)
+                expression = std::move(expression->left);
+            return;
+        }
         if (expression->kind == Expr::Kind::CompoundLiteral && expression->type && expression->left) {
             if (same_value_type(expression->type, destination)) {
                 expression = std::move(expression->left);
