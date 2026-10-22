@@ -4494,6 +4494,19 @@ if(BUILD_TESTING)
             LABELS "check.runtime;arch.mips;backend.native;middle;feature.optimization;isa.vr4300;isa.r3000;endian.big;endian.little;opt.${thread_level}"
             SKIP_REGULAR_EXPRESSION "skipping MIPS")
     endforeach()
+    # Values live across a call whose ABI preserves t0/t1 stay out of the
+    # registers that compose its result.
+    add_test(NAME cross_runtime_mips_low_scratch_calls
+        COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/low_scratch_calls.x
+            -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-mips-low-scratch-calls
+            -DEXPECTED=P "-DCC_FLAGS=-O2;-fno-eval-calls;--model=${CMAKE_SOURCE_DIR}/test/target/mips/low_scratch_calls.xm"
+            -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+    set_tests_properties(cross_runtime_mips_low_scratch_calls PROPERTIES
+        LABELS "check.runtime;arch.mips;backend.native;feature.abi;feature.model;isa.vr4300;isa.r3000;endian.big;endian.little;opt.O2"
+        SKIP_REGULAR_EXPRESSION "skipping MIPS")
     add_test(NAME cross_jump_threading_codegen
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

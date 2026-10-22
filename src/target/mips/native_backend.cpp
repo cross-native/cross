@@ -4151,7 +4151,9 @@ private:
             auto live = live_out[block.id.value];
             for (auto item = block.instructions.rbegin();
                  item != block.instructions.rend(); ++item) {
-                // A call places its results through t0 and t1.
+                // A call places its results through t0 and t1, so neither
+                // its operands nor a value live across it may hold them,
+                // also where the callee's ABI preserves them.
                 if (low_scratch_colors_ &&
                     item->kind == machine::InstructionKind::Call) {
                     for (const auto* registers : {&item->uses, &item->defs}) {
@@ -4161,6 +4163,10 @@ private:
                                 hard_forbidden_colors[*id].insert(9U);
                             }
                         }
+                    }
+                    for (const auto id : live) {
+                        hard_forbidden_colors[id].insert(8U);
+                        hard_forbidden_colors[id].insert(9U);
                     }
                 }
                 // Another instruction's clobbers are its expansion's
