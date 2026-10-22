@@ -114,7 +114,6 @@ foreach(case
         "MEMBER_QUALIFIERS|incompatible pointed-to type or qualifiers"
         "ARRAY_QUALIFIERS|incompatible pointed-to type or qualifiers"
         "NESTED|incompatible pointed-to type or qualifiers"
-        "CAST_QUALIFIERS|incompatible pointed-to type or qualifiers"
         "STRING_QUALIFIERS|incompatible pointed-to type or qualifiers"
         "WRONG_TYPE|incompatible pointed-to type or qualifiers"
         "UNKNOWN|unresolved name in generic pointer argument"
@@ -131,8 +130,6 @@ foreach(case
         "ESCAPE|object pointer cannot escape into a generic argument"
         "UNINITIALIZED|read of uninitialized value"
         "INDIRECT_CALL|indirect calls are not permitted"
-        "CALL_QUALIFIERS|incompatible pointed-to type or qualifiers"
-        "ROUNDTRIP_QUALIFIERS|incompatible pointed-to type or qualifiers"
         "EVAL_ADDRESS|requires a function with a runtime address"
         "RUNTIME|runtime expression is not permitted in a generic pointer argument")
     string(REPLACE "|" ";" fields "${case}")

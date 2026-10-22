@@ -205,12 +205,20 @@ are:
 ```text
 [ ] ( ) { } . -> ++ -- & * + - ~ ! / % << >> < <= > >=
 == != ^ | && || ? : ; ... = *= /= %= += -= <<= >>= &= ^= |=
-, # ## :: [[ ]]
+, # ## ::
 ```
 
-`#` and `##` are valid only while processing source macros. `[[` and `]]`
-delimit attributes; two separately whitespace-separated `[` or `]` tokens do
-not. A source character that begins no token is an error.
+`#` and `##` are valid only while processing source macros. A source character
+that begins no token is an error.
+
+Two consecutive `[` tokens, with or without whitespace between them, open an
+*attribute bracket* `[[`, and the two consecutive `]` tokens that balance it
+close it as `]]`; every other bracket token is an ordinary `[` or `]`. Thus
+`a[b[i]]` closes two subscripts, `[ [packed] ]` is the attribute specifier
+`[[packed]]`, and the `[` that delimits a procedural invocation `name![...]`
+does not pair with a following `[`. An attribute bracket is valid only where
+the grammar admits an attribute specifier or inside balanced tokens; elsewhere,
+as in `a[[i]]`, it is an error.
 
 Character and string escapes are `\'`, `\"`, `\\`, `\?`, `\a`, `\b`, `\f`,
 `\n`, `\r`, `\t`, `\v`, one to three octal digits, and `\x` followed by one or
@@ -398,6 +406,32 @@ zero bits may be placed in storage the loader zeroes; `-fzero-init-in-data`
 places every such object, including a thread-local one, with the initialized
 data instead, so an image patcher can change it.
 
+A compound literal `(T){ entries }`, where `T` is a type name, designates an
+unnamed object of type `T` initialized as a declaration of `T` with that brace
+initializer would be. An omitted first array bound is taken from the
+initializer; `T` cannot be a variable-length array type. A compound literal is
+an lvalue, modifiable unless its type is `const`, and its address may be taken.
+In a block it has automatic storage duration: the object belongs to the
+enclosing block and lives until that block exits, and each evaluation of the
+compound literal initializes it anew. In the initializer of a static-duration
+object outside a function body it has static storage duration, and that
+initializer may use its address or its initial value. Elsewhere outside a
+function body, as in a static assertion, it exists only during translation.
+
+```x
+struct point { i32 x; i32 y; };
+
+static i32 norm1(in struct point p) { return p.x + p.y; }
+
+global const u8 *digits = (const u8[]){ '0', '1', 0 };   // a static object
+
+global i32 shifted(in i32 dx) {
+    struct point *p = &(struct point){ .x = dx, .y = 2 };
+    p->y += 1;
+    return norm1(*p) + norm1((struct point){ 1, 1 });
+}
+```
+
 ### Values, conversions, and casts
 
 An **lvalue** designates an object or function. Except as the operand of `&`,
@@ -414,10 +448,14 @@ requests the same conversion explicitly. Conversions are permitted between
 arithmetic types, between compatible pointer types, between `void *` and
 object pointers, between pointers to a record or union and to a type
 embedded in it, and between pointers and sufficiently wide integers as
-specified below. An explicit cast may also convert between any two
-function-pointer types; calling through a pointer whose callable interface
+specified below. An explicit cast may also convert between any two object
+pointer types, including one that discards pointee qualifiers, and between any
+two function-pointer types. The result keeps the address; an access through it
+follows the alignment, effective-type, and qualifier rules of “Pointer and
+object-access model”, and calling through a pointer whose callable interface
 differs from the called function's own is undefined unless the target
-documents that the two interfaces are physically identical. A scalar converts to `bool` as false when it is numeric zero
+documents that the two interfaces are physically identical. Function and
+object pointers convert to each other only where the target defines it. A scalar converts to `bool` as false when it is numeric zero
 or null and true otherwise. Converting to a narrower integer keeps the low
 bits; converting an unsigned integer wider zero-extends it; converting a signed
 integer wider sign-extends it. Floating/integer conversion truncates toward
@@ -486,7 +524,7 @@ which associate right-to-left.
 
 | Class | Forms |
 | --- | --- |
-| primary/postfix | `name`, literal, `(e)`, `e[a]`, `e(args)`, `e.m`, `e->m`, `e++`, `e--`, generic `name<...>` or `name::<...>` |
+| primary/postfix | `name`, literal, `(e)`, `(T){...}`, `e[a]`, `e(args)`, `e.m`, `e->m`, `e++`, `e--`, generic `name<...>` or `name::<...>` |
 | unary | `++e`, `--e`, `&e`, `*e`, `+e`, `-e`, `~e`, `!e`, `(T)e`, `sizeof e`, `sizeof(T)` |
 | multiplicative | `* / %` |
 | additive | `+ -` |
@@ -995,10 +1033,10 @@ Dereferencing a pointer is valid only when all of the following hold:
 
 - the address range is mapped for that access by a live Cross object or by a
   target, linker-script, operating-system, or device-memory contract;
-- the pointer satisfies the pointee type's alignment without its typedef
-  `aligned` request, which neither raises this requirement nor asserts
-  pointee alignment, unless the access is explicitly declared unaligned by a
-  target built-in;
+- the pointer satisfies the pointee type's alignment, unless the access is
+  explicitly declared unaligned by a target built-in; a typedef `aligned`
+  request that lowers the alignment lowers this requirement, and one that
+  raises it neither raises the requirement nor asserts pointee alignment;
 - the address space permits the requested read, write, or instruction fetch;
 - the access follows the effective-type and qualifier rules below.
 
@@ -1240,21 +1278,38 @@ other volatile objects may use any storage preserving these rules.
 
 | Attribute | Valid on | Effect |
 | --- | --- | --- |
-| `aligned(N)` | Objects, record definitions/members, typedefs, function definitions | Minimum alignment; on a function, entry alignment only. |
+| `aligned(N)` | Objects, record definitions/members, typedefs, function definitions | Minimum alignment; on a typedef, the alignment, which may be lower than natural; on a function, entry alignment only. |
 | `packed` | Complete record definitions and record members | Reduces each affected non-bit-field member's alignment to one byte unless raised by `aligned`. |
 
-`N` is a positive power-of-two integer constant expression. Effective
-alignment is the maximum of natural and requested alignments; repeated requests
-take their maximum. A type whose effective alignment exceeds its size has its
-size rounded up to that alignment, so arrays and record members of the type
-keep every element aligned; `sizeof` reports the rounded size. A typedef
-declared with `aligned` denotes a type that is distinct for layout only: its
-size and alignment follow the request, and arrays and members of it use that
-layout; its values convert, compare, and are passed and returned like the base
-type, and the request qualifies storage only. `aligned` is invalid on
-parameters, does not lower natural alignment, and does not assert a pointer's
-pointee alignment. The frame, object writer, and linker must preserve every
-accepted request or diagnose it.
+`N` is a positive power-of-two integer constant expression, and repeated
+requests, including those of an aliased typedef, take their maximum. On an
+object, record, or member, the effective alignment is the maximum of the
+natural and requested alignments. On a typedef, the request is the type's
+alignment and may be lower than its natural alignment. A type whose effective
+alignment exceeds its size has its size rounded up to that alignment, so arrays
+and record members of the type keep every element aligned; `sizeof` reports
+the rounded size. A typedef declared with `aligned` denotes a type that is
+distinct for layout only: its size and alignment follow the request, and
+objects, arrays, members, and pointer targets of it use that layout; its
+values convert, compare, and are passed and returned like the base type, and
+the request qualifies storage only. An access through a type whose request
+lowers its alignment assumes only that alignment and uses an unaligned-safe
+sequence, as a packed member access does; a request that raises the alignment
+does not assert a pointer's pointee alignment. `aligned` is invalid on
+parameters. The frame, object writer, and linker must preserve every accepted
+request or diagnose it.
+
+```x
+typedef u32 u32_any [[aligned(1)]];   // a u32 at any address
+
+$::static_assert(sizeof(u32_any) == 4uptr && $::alignof(u32_any) == 1uptr, "lowered");
+
+struct header { u8 tag; u32_any length; };   // length at offset 1, size 5
+
+global u32 read_word(in const u8 *bytes) {
+    return *(const u32_any *)bytes;
+}
+```
 
 A packed record treats each non-zero-width member as packed, but keeps the
 alignment that a member's type requests, including a typedef request and the
@@ -4690,9 +4745,12 @@ primary_expression
     | "$::alignof" "(" (type_name | expression) ")"
     | "$::offsetof" "(" type_name "," member_designator ")"
     | "$::atomic_is_lock_free" "(" (type_name | argument_list) ")"
-    | "(" expression ")" | embed_expression
+    | "(" expression ")" | compound_literal | embed_expression
     | quote_expression | syntax_invocation | macro_invocation
     | structured_expression_splice ;
+compound_literal
+    = "(" type_name ")"
+      "{" [ initializer_entry { "," initializer_entry } [ "," ] ] "}" ;
 
 member_designator
     = identifier { "." identifier | "[" constant_expression "]" } ;
@@ -4765,8 +4823,10 @@ literal
 `declaration_without_final_semicolon` is `declaration` with its final `;`
 supplied by the `for` syntax. `balanced_token_sequence` follows the same
 balancing rule as `balanced_tokens` but excludes its outer delimiter.
-Nested attribute delimiters `[[` and `]]` are one balanced-token-tree
-occurrence, not two `[` or `]` tokens. A procedural invocation's outer token
+In this grammar, `"[["` and `"]]"` denote the attribute brackets of “Source
+text and lexical structure”; an attribute bracket pair is one
+balanced-token-tree occurrence, not two nested bracket groups. A procedural
+invocation's outer token
 tree is still restricted to `(...)`, `[...]`, or `{...}`; the attribute
 alternative describes groups inside balanced sequences such as quote contents
 and attribute arguments. `structured_expression_splice` is a translation-only

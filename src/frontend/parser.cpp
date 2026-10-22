@@ -8081,6 +8081,10 @@ Parser::ExpressionTask Parser::parse_constant_expression_async() {
 Parser::ExpressionTask Parser::parse_initializer_async() {
     ProductionScope production(*this, SyntaxProduction::Initializer);
     if (!(co_await current_async()).is("{")) co_return co_await parse_assignment_async();
+    co_return co_await parse_initializer_list_async();
+}
+
+Parser::ExpressionTask Parser::parse_initializer_list_async() {
     auto result = std::make_unique<Expr>();
     result->kind = Expr::Kind::AggregateInitializer;
     result->location = (co_await current_async()).location;
@@ -8199,6 +8203,18 @@ Parser::ExpressionTask Parser::parse_binary_async(int minimum_precedence, std::u
     co_return left;
 }
 
+// `(type)` followed by a brace list is a compound literal, not a cast. Only
+// called once a type name follows the parenthesis.
+bool Parser::compound_literal_follows(std::size_t open) const {
+    std::size_t depth = 0;
+    for (auto at = open; at < tokens_.size() && tokens_[at].kind != TokenKind::End; ++at) {
+        if (tokens_[at].is("(")) ++depth;
+        else if (tokens_[at].is(")") && --depth == 0)
+            return at + 1 < tokens_.size() && tokens_[at + 1].is("{");
+    }
+    return false;
+}
+
 Parser::ExpressionTask Parser::parse_cast_async() {
     ProductionScope production(*this, SyntaxProduction::CastExpression);
     if ((co_await current_async()).is("(")) {
@@ -8208,7 +8224,7 @@ Parser::ExpressionTask Parser::parse_cast_async() {
         if (parsing_public_fragment_ && macro_start()) throw DeferredNameRecognition{};
         const bool begins_type = (co_await type_start_async(TypeProbe::ExpressionAlternative));
         index_ = saved;
-        if (begins_type) {
+        if (begins_type && !compound_literal_follows(saved)) {
             const auto location = (co_await current_async()).location;
             (co_await consume_async("("));
             TypePtr type;
@@ -8249,7 +8265,7 @@ Parser::ExpressionTask Parser::parse_unary_async() {
             if (parsing_public_fragment_ && macro_start()) throw DeferredNameRecognition{};
             const bool begins_type = (co_await type_start_async(TypeProbe::ExpressionAlternative));
             index_ = saved;
-            if (begins_type) {
+            if (begins_type && !compound_literal_follows(saved)) {
                 (co_await consume_async("("));
                 std::optional<std::string> name;
                 {
@@ -8391,6 +8407,10 @@ Parser::ExpressionTask Parser::parse_postfix_async(std::unique_ptr<Expr> seed) {
             (co_await expect_async(")"));
             parsing_generic_argument_ = previous;
             expression = std::move(call);
+            continue;
+        }
+        if ((co_await current_async()).is("[[")) {
+            (co_await misplaced_attribute_async("follow an expression"));
             continue;
         }
         if ((co_await consume_async("["))) {
@@ -8789,6 +8809,15 @@ Parser::ExpressionTask Parser::parse_primary_async() {
         parsing_generic_argument_ = previous;
         co_return result;
     }
+    if ((co_await current_async()).is("(")) {
+        const auto saved = index_;
+        ++index_;
+        (void)(co_await current_async());
+        if (parsing_public_fragment_ && macro_start()) throw DeferredNameRecognition{};
+        const bool begins_type = (co_await type_start_async(TypeProbe::ExpressionAlternative));
+        index_ = saved;
+        if (begins_type && compound_literal_follows(saved)) co_return co_await parse_compound_literal_async();
+    }
     if ((co_await consume_async("("))) {
         const bool previous = parsing_generic_argument_;
         parsing_generic_argument_ = false;
@@ -8960,6 +8989,11 @@ Parser::ExpressionTask Parser::parse_primary_async() {
             result->name_context = std::move(context);
             co_return result;
         }
+    } else if (item.is("[[")) {
+        (co_await misplaced_attribute_async("begin an expression"));
+        result->text = "0";
+        result->kind = Expr::Kind::Integer;
+        co_return result;
     } else {
         (co_await error_here_async("expected expression"));
         result->text = "0";
@@ -8967,6 +9001,40 @@ Parser::ExpressionTask Parser::parse_primary_async() {
     }
     ++index_;
     co_return result;
+}
+
+Parser::ExpressionTask Parser::parse_compound_literal_async() {
+    ProductionScope production(*this, SyntaxProduction::CompoundLiteral);
+    auto result = std::make_unique<Expr>();
+    result->kind = Expr::Kind::CompoundLiteral;
+    result->location = (co_await current_async()).location;
+    (co_await consume_async("("));
+    const bool previous = parsing_generic_argument_;
+    parsing_generic_argument_ = false;
+    std::optional<std::string> name;
+    {
+        ProductionScope type_name(*this, SyntaxProduction::TypeName);
+        result->type = co_await parse_type_async();
+        result->type = co_await parse_declarator_async(std::move(result->type), name, DeclaratorContext::TypeName);
+    }
+    if (name) diagnostics_.error(result->location, "a compound literal type name cannot declare an object");
+    (co_await expect_async(")", "after compound literal type"));
+    // An omitted bound is completed from the initializer on this literal's
+    // own type, never on a shared typedef.
+    if (result->type && result->type->kind == Type::Kind::Array && !result->type->lanes)
+        result->type = std::make_shared<Type>(*result->type);
+    result->left = co_await parse_initializer_list_async();
+    parsing_generic_argument_ = previous;
+    co_return result;
+}
+
+// C23's rule: two consecutive `[` tokens introduce an attribute and are an
+// error where none may appear. Skip the bracket pair to avoid cascades.
+EvaluationTask<void> Parser::misplaced_attribute_async(std::string_view position) {
+    (co_await error_here_async("two consecutive '[' tokens introduce an attribute, which cannot " +
+                               std::string(position)));
+    const auto end = bounded_group_end(index_);
+    index_ = end ? *end : index_ + 1;
 }
 
 } // namespace cross

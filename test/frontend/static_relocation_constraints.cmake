@@ -58,7 +58,7 @@ foreach(statement
             set(parameter "$::meta::syntax_match")
         endif()
         check(pointer_cast_${role}_${form}
-            "explicit pointer conversion discards qualifiers or uses incompatible pointee types"
+            "explicit cast cannot convert between a function pointer and an object pointer"
             "${pointer_declarations}
             ${attribute} static $::meta::tokens helper(in ${parameter} input) {
                 if (0u32) { ${statement} } return $::quote { 1u32 }; }")

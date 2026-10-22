@@ -62,7 +62,7 @@ enum class SyntaxProduction {
     MultiplicativeExpression, CastExpression, UnaryExpression,
     PostfixExpression, PrimaryExpression, ArgumentList, GenericArguments, GenericArgument,
     BuiltinName, Literal, EmbedExpression, QuoteExpression,
-    GlobalLabelDeclaration, QualifiedLabelName, QualifiedFunctionName, Count,
+    GlobalLabelDeclaration, QualifiedLabelName, QualifiedFunctionName, CompoundLiteral, Count,
 };
 std::string_view syntax_production_name(SyntaxProduction production);
 

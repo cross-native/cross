@@ -14,7 +14,9 @@ FPU, is an error rather than a hidden helper call.
 ## Lexical structure
 
 Source files are UTF-8 and use the `.x` extension. Comments, identifiers
-(ASCII only), and punctuation follow C. Compiler-provided names live under
+(ASCII only), and punctuation follow C. As in C23, two consecutive `[` tokens
+open an attribute specifier where one may appear and are an error elsewhere,
+so `a[b[i]]` closes two subscripts. Compiler-provided names live under
 `$::`, such as `$::alignof` or `$::_add`; no other identifier contains `$`,
 and no identifier is reserved for its leading underscores.
 
@@ -87,14 +89,18 @@ typedef u32 u32x4 [[vector_size(16)]];   // four u32 lanes
 An enumeration uses `i32` unless `[[underlying(T)]]` selects another integer.
 Atomic objects are written `T [[atomic]]`, and an address space
 `T [[address_space(N)]] *`. Records support `[[packed]]`. `[[aligned(N)]]`
-raises the alignment of an object, record, member, or typedef. A typedef's
-request applies to storage of its type: every object, member, and array
-element of the type is aligned, and the type's size rounds up to the
-alignment. Values of the type convert, compare, and are passed and returned
-like the base type; function types, pointer conversions, and dereferences use
-the base type. Packing does not lower a member below the alignment its type
-requests. A bit-field cannot have such a type, and a vector's lanes carry no
-request, although a vector typedef can request alignment for the whole vector.
+raises the alignment of an object, record, or member, and sets the alignment
+of a typedef, which may also lower it, as GCC's typedef `aligned` does. A
+typedef's request applies to storage of its type: every object, member, array
+element, and pointer target of the type has that alignment, and the type's
+size rounds up to it. Values of the type convert, compare, and are passed and
+returned like the base type, and function types and pointer conversions use
+the base type. A dereference through a type whose request lowers its
+alignment is unaligned-safe, like a packed member access; a raised request
+does not make a dereference assume more alignment. Packing does not lower a
+member below the alignment its type requests. A bit-field cannot have such a
+type, and a vector's lanes carry no request, although a vector typedef can
+request alignment for the whole vector.
 
 ```x
 typedef u32 line_u32 [[aligned(64)]];   // sizeof and $::alignof are both 64
@@ -106,6 +112,12 @@ struct counters {
 
 $::static_assert(sizeof(struct counters) == 128uptr, "one line per counter");
 $::static_assert($::offsetof(struct counters, misses) == 64uptr, "second line");
+
+typedef u32 u32_any [[aligned(1)]];     // a u32 at any address
+
+global void put_word(in u8 *bytes, in u32 value) {
+    *(u32_any *)(bytes + 1) = value;   // an unaligned store where required
+}
 ```
 
 `$::offsetof(type, member)` is a member's byte offset as a compile-time
@@ -163,15 +175,15 @@ $::static_assert($::offsetof(struct enemy, y) == 8, "promoted member offset");
 otherwise follow C (any object may be accessed through `u8` or `i8`). Write it
 after a typedef's name, after a record's tag in its definition
 (`struct bits [[may_alias]] { ... }`), or as a qualifier, as in
-`u32 [[may_alias]] *`.
-Converting between unrelated pointer types still goes through `void *`:
+`u32 [[may_alias]] *`. An explicit cast converts between unrelated pointer
+types:
 
 ```x
 typedef u32 any_u32 [[may_alias]];
 
 u32 float_bits(in f32 value) {
     f32 copy = value;
-    return *(any_u32 *)(void *)&copy;   // the representation of value
+    return *(any_u32 *)&copy;   // the representation of value
 }
 ```
 
@@ -319,9 +331,36 @@ Statements are C99's. The differences in expressions:
   `i = 0, j = 1;` as a statement is not.
 - Pointer comparisons with integer constant zero, differences of pointers
   that differ only in qualification, such as `const u8 *` minus `u8 *`,
-  conversions through `void *`, casts, and `(void)expression` follow C.
-  Function pointers and `void *` do not convert; see
-  [Function pointers](#function-pointers) for their casts.
+  conversions through `void *`, casts, and `(void)expression` follow C: an
+  explicit cast converts between any two object pointer types and may drop
+  `const` or `volatile`, while an implicit conversion only adds qualifiers.
+  Function pointers and object pointers, including `void *`, do not convert;
+  see [Function pointers](#function-pointers) for their casts.
+- A compound literal `(T){ ... }` is an unnamed object initialized like a
+  declaration of `T`, as in C99; an omitted array bound comes from the
+  initializer. In a function it lives until its enclosing block exits and is
+  initialized anew each time it is evaluated; outside a function it is a static
+  object. As with other brace initializers, `T` is an array, record, or union
+  type.
+
+```x
+struct range { u32 low; u32 high; };
+
+static u32 sum(in const u32 *values, in uptr count) {
+    u32 total = 0;
+    for (uptr i = 0; i < count; ++i) total += values[i];
+    return total;
+}
+
+static u32 width(in const struct range *r) { return r->high - r->low; }
+
+global const u32 *primes = (const u32[]){ 2, 3, 5, 7 };   // a static object
+
+global u32 weigh(in u32 scale) {
+    return sum((u32[]){ scale, scale * 2 }, 2) + width(&(struct range){ 1, 9 });
+}
+```
+
 - `$::assume(condition)` and `$::unreachable()` state facts the optimizer may
   use; neither adds a check.
 - `$::sqrt`, `$::fabs`, `$::copysign`, `$::fmin`, and `$::fmax` take operands

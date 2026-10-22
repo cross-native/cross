@@ -295,8 +295,9 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
         string(CONCAT body
             "const_word_row rows = (const_word_row)$::meta::data($::embed(\"payload.bin\"));\n"
             "word_row writable = (word_row)rows;\n"
+            "writable[0u32][0u32] = 1u16;\n"
             "return 0u32;")
-        set(expected "conversion without qualifier loss")
+        set(expected "translation-time evaluation cannot write through a pointer whose const was cast away")
     elseif(case STREQUAL array_frozen)
         string(CONCAT body
             "$::meta::buffer value = $::meta::alloc(4u32);\n"
@@ -345,8 +346,9 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
             "$::meta::buffer value = $::meta::alloc(sizeof(struct eval_pair));\n"
             "const struct eval_pair *readonly = (const struct eval_pair *)$::meta::data(value);\n"
             "struct eval_pair *writable = (struct eval_pair *)readonly;\n"
+            "writable->tag = 1u8;\n"
             "return 0u32;")
-        set(expected "conversion without qualifier loss")
+        set(expected "translation-time evaluation cannot write through a pointer whose const was cast away")
     elseif(case STREQUAL record_bit_field)
         string(CONCAT body
             "$::meta::buffer value = $::meta::alloc(sizeof(struct eval_bits));\n"
@@ -619,8 +621,9 @@ foreach(case unassigned_read frozen_pointer const_write view_overread integer_ca
         string(CONCAT body
             "$::meta::bytes value = $::embed(\"payload.bin\");\n"
             "const f32 **pointer = (const f32 **)$::meta::data(value);\n"
+            "*pointer = (const f32 *)0uptr;\n"
             "return 0u32;")
-        set(expected "without qualifier loss")
+        set(expected "translation-time evaluation cannot write through a pointer whose const was cast away")
     endif()
     set(input "${directory}/${case}.x")
     file(WRITE "${input}"

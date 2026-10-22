@@ -141,6 +141,8 @@ global i32 generic_pointer_entry() {
     const u32 *cached_absolute = static_pointer::<(const u32 *)0x40001000uptr>();
     const u32 *exported = explicit_pointer::<numbers>();
     const u32 *roundtrip = pointer_identity::<(const u32 *)(const void *)(numbers + 2)>();
+    // An explicit cast may discard the const that a conversion added.
+    u32 *mutable_again = typed_identity::<u32, (u32 *)(const u32 *)(numbers + 2)>();
     const u32 *absolute_math = pointer_identity::<4 + (const u32 *)0x40000ff0uptr>();
     const u32 *absolute_back = pointer_identity::<(const u32 *)0x40001004uptr - 1>();
     const u32 *cancel = pointer_identity::<&*(numbers + 2)>();
@@ -159,7 +161,7 @@ global i32 generic_pointer_entry() {
     if (negative != first || *layout != 23u32 || past != (const u32 *)(numbers + 4)) return 0;
     if (null != (const u32 *)0uptr || (uptr)absolute != 0x40001000uptr) return 0;
     if (*cached != 23u32 || cached_absolute != absolute || exported != start) return 0;
-    if (roundtrip != first || cancel != first || arrow != member || call != first ||
+    if (roundtrip != first || mutable_again != (u32 *)first || cancel != first || arrow != member || call != first ||
         recursive != first || selected != first || forced != first ||
         member_call != member || index_call != first) return 0;
     if (absolute_math != absolute || absolute_back != absolute || absolute_call != absolute) return 0;

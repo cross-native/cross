@@ -1978,6 +1978,16 @@ int main() {
         require(!parser.parse_syntax_fragment(K::Expr, 0) && limit_diagnostics.errors() != 0,
                 "nested attribute groups bypassed public-tree depth limits");
     }
+    // `(type){ entries }` is one primary_expression alternative.
+    expression = parse("((u32[]){ 1u32, [2] = 3u32, })[0]", K::Expr);
+    auto literal = production(descendant(expression, P::CompoundLiteral), P::CompoundLiteral, 9);
+    token(literal->children[0], "(");
+    require(literal->children[1]->production == P::TypeName, "compound literal lost its type name");
+    token(literal->children[2], ")");
+    token(literal->children[3], "{");
+    child(literal, 6, P::InitializerEntry, 3);
+    token(literal->children[7], ",");
+    token(literal->children[8], "}");
     expression = parse("$::quote {}", K::Expr);
     quote = production(descendant(expression, P::QuoteExpression), P::QuoteExpression, 4);
     contents = child(quote, 2, P::BalancedTokens, 0);

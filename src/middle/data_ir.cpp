@@ -784,20 +784,15 @@ ContinuationTask<std::optional<AddressValue>> address_value_async(
                     co_return value;
                 }
             }
+            // An explicit cast converts between any object pointer types, or
+            // between function pointer types, but never mixes the two.
+            const bool from_function = value->pointee
+                ? module.type(*value->pointee).kind == hir::Type::Kind::Function
+                : value->cast_pointee ? value->cast_pointee->kind == Type::Kind::Function
+                : value->address.kind == AddressKind::Function;
             if (!expression.type->pointee ||
-                (value->owner_const && !expression.type->pointee->is_const) ||
-                (value->owner_volatile && !expression.type->pointee->is_volatile) ||
-                (value->pointee &&
-                 !compatible_static_pointee(
-                     module, *value->pointee,
-                     expression.type->pointee)) ||
-                (value->cast_pointee &&
-                 !(value->cast_pointee->kind == Type::Kind::Function &&
-                   expression.type->pointee->kind == Type::Kind::Function) &&
-                 !compatible_pointee(value->cast_pointee,
-                                      expression.type->pointee))) {
+                from_function != (expression.type->pointee->kind == Type::Kind::Function))
                 co_return std::nullopt;
-            }
             value->integer = false;
             value->pointee.reset();
             value->cast_pointee = expression.type->pointee;
@@ -837,6 +832,14 @@ std::optional<AddressValue> address_value(
     const hir::Module& module, AddressScope scope,
     const Expr& expression, const Subtarget& subtarget) {
     return address_value_async(module, scope, expression, subtarget).run();
+}
+
+// Outside a function body, compound literals were lifted to static objects.
+bool contains_compound_literal(const Expr& expression) {
+    if (expression.kind == Expr::Kind::CompoundLiteral) return true;
+    for (const auto* child : {expression.left.get(), expression.right.get(), expression.third.get()})
+        if (child && contains_compound_literal(*child)) return true;
+    return false;
 }
 
 bool lower_scalar_initializer(Object& result, const hir::Module& module,
@@ -898,7 +901,9 @@ bool lower_scalar_initializer(Object& result, const hir::Module& module,
         if (!address) {
             diagnostics.error(
                 expression.location,
-                "global pointer/label initializer is not an address constant");
+                contains_compound_literal(expression)
+                    ? "a compound literal in a block has automatic storage; its address is not a static initializer"
+                    : "global pointer/label initializer is not an address constant");
             return false;
         }
         result.address = *address;
@@ -1572,8 +1577,9 @@ ContinuationTask<bool> normalize_generic_pointer_async(Program& program, std::un
             if (!from_function || !to_function ||
                 (!explicit_cast && module.intern_type(from) != module.intern_type(to)))
                 return reject(location, "generic pointer argument has an incompatible function type");
-        } else if (!compatible_static_pointee(module, module.intern_type(from->pointee),
-                                               to->pointee)) {
+        } else if (!explicit_cast &&
+                   !compatible_static_pointee(module, module.intern_type(from->pointee),
+                                              to->pointee)) {
             return reject(location,
                           "generic pointer argument has an incompatible pointed-to type or qualifiers");
         }

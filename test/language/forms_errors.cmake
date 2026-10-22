@@ -182,7 +182,7 @@ accept(cast_function_pointer
     "${callbacks}\nglobal u32 apply(in u32 value) { return value + 1; }\nglobal wide erased = (wide)apply;\nglobal uptr code = (uptr)apply;\nglobal u32 call(in wide value) { narrow restored = (narrow)value; return restored(1) + ((narrow)code)(2); }")
 reject(cast_implicit "implicit pointer conversion discards qualifiers or uses incompatible pointee types"
     "${callbacks}\nglobal wide f(in narrow value) { return value; }")
-reject(cast_object "explicit pointer conversion discards qualifiers or uses incompatible pointee types"
+reject(cast_object "explicit cast cannot convert between a function pointer and an object pointer"
     "${callbacks}\nglobal void *f(in narrow value) { return (void *)value; }")
 
 # Parsed syntax captures use the same grammar for offsetof and for-clause lists.

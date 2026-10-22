@@ -177,6 +177,7 @@ private:
     EvaluationTask<bool> expect_async(std::string_view spelling, std::string_view context = {});
     void error_here(std::string message);
     EvaluationTask<void> error_here_async(std::string message);
+    EvaluationTask<void> misplaced_attribute_async(std::string_view position);
     void synchronize_external();
     EvaluationTask<bool> parse_syntax_registration_async(Program* program);
     EvaluationTask<std::vector<SyntaxActivation>> parse_syntax_entries_async(std::string_view end);
@@ -425,6 +426,9 @@ private:
     ExpressionTask parse_expression_async(std::unique_ptr<Expr> seed = {});
     ExpressionTask parse_constant_expression_async();
     ExpressionTask parse_initializer_async();
+    ExpressionTask parse_initializer_list_async();
+    ExpressionTask parse_compound_literal_async();
+    bool compound_literal_follows(std::size_t open) const;
     ExpressionTask parse_assignment_async(std::unique_ptr<Expr> seed = {});
     ExpressionTask parse_conditional_async(std::unique_ptr<Expr> seed = {});
     ExpressionTask parse_binary_async(int minimum_precedence, std::unique_ptr<Expr> seed = {});

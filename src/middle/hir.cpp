@@ -3568,7 +3568,8 @@ std::optional<std::uint64_t> source_alignment(const Module& module, const TypePt
             scalar_alignment_limit(module, target), target.data_layout.f80_alignment);
     }
     if (!natural) return {};
-    return std::max<std::uint64_t>(*natural, type->alignment);
+    // A typedef request is the type's alignment, even below the natural one.
+    return type->alignment ? type->alignment : *natural;
 }
 
 } // namespace
@@ -3659,7 +3660,8 @@ std::optional<std::uint64_t> layout_alignment(
     const Module& module, TypeId id, const TargetInfo& target) {
     const auto alignment = natural_alignment(module, id, target);
     if (!alignment) return std::nullopt;
-    return std::max<std::uint64_t>(*alignment, module.type(id).alignment);
+    // A typedef request is the type's alignment, even below the natural one.
+    return module.type(id).alignment ? module.type(id).alignment : *alignment;
 }
 
 unsigned requested_alignment(const Module& module, TypeId id) {

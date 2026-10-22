@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "frontend/lexer.hpp"
 
+#include "frontend/ast.hpp"
+
 #include <cctype>
 #include <string>
 
@@ -14,6 +16,46 @@ bool ident_start(char ch) {
 
 bool ident_continue(char ch) {
     return ident_start(ch) || (ch >= '0' && ch <= '9');
+}
+
+bool punctuator(const Token& token, std::string_view text) {
+    return token.kind == TokenKind::Punctuator && token.text == text;
+}
+
+// Two consecutive `[` tokens open an attribute bracket and the two `]` tokens
+// that balance it close it; both pairs become the parser's `[[` and `]]`.
+// Every other bracket stays single, so `a[b[i]]` closes two subscripts, and
+// the `[` delimiting `name![...]` never pairs. An unmatched `]]`, as in a
+// lone syntax terminal, is still one closer.
+void join_attribute_brackets(std::vector<Token>& tokens) {
+    std::vector<bool> attribute;
+    std::size_t kept = 0;
+    for (std::size_t index = 0; index < tokens.size(); ++index) {
+        auto token = tokens[index];
+        const bool open = punctuator(token, "[");
+        if (open || punctuator(token, "]")) {
+            const bool delimiter = open && kept >= 2 && punctuator(tokens[kept - 1], "!") &&
+                tokens[kept - 2].kind == TokenKind::Identifier &&
+                !is_reserved_identifier(tokens[kept - 2].text);
+            const bool doubled = !delimiter && index + 1 < tokens.size() &&
+                punctuator(tokens[index + 1], token.text);
+            bool join = doubled;
+            if (open) attribute.push_back(doubled);
+            else if (!attribute.empty()) {
+                join = doubled && attribute.back();
+                attribute.pop_back();
+            }
+            if (join) {
+                const auto& next = tokens[++index];
+                const bool adjacent = next.location.file == token.location.file &&
+                    next.location.offset == token.location.offset + 1;
+                token.text = adjacent ? std::string_view(token.text.data(), 2)
+                    : open ? std::string_view("[[") : std::string_view("]]");
+            }
+        }
+        tokens[kept++] = std::move(token);
+    }
+    tokens.resize(kept);
 }
 
 } // namespace
@@ -165,7 +207,7 @@ Token Lexer::lex_punctuator() {
     static constexpr std::string_view punctuators[] = {
         "<<=", ">>=", "...", "::", "->", "==", "!=", "<=", ">=", "&&", "||",
         "++", "--", "<<", ">>", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=",
-        "[[", "]]", "##"
+        "##"
     };
     const auto start = offset_;
     const SourceLocation location{&source_, offset_, line_, column_};
@@ -209,6 +251,7 @@ std::vector<Token> Lexer::lex() {
         else if (peek() == '\'') result.push_back(lex_quoted('\'', TokenKind::Character));
         else result.push_back(lex_punctuator());
     }
+    join_attribute_brackets(result);
     return result;
 }
 

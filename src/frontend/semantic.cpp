@@ -3489,6 +3489,7 @@ private:
         case Expr::Kind::Parenthesized:
             return expression.left ? type_of(*expression.left) : TypePtr{};
         case Expr::Kind::Cast:
+        case Expr::Kind::CompoundLiteral:
             return expression.type;
         case Expr::Kind::Sizeof:
         case Expr::Kind::Alignof:
@@ -3762,6 +3763,9 @@ private:
             return;
         case Expr::Kind::Cast:
             rewrite(expression->left, expression->type);
+            return;
+        case Expr::Kind::CompoundLiteral:
+            if (expression->left) rewrite_initializer(*expression->left, expression->type);
             return;
         case Expr::Kind::AggregateInitializer:
             rewrite_initializer(*expression, destination);
@@ -4228,6 +4232,9 @@ struct EvalMetaPointer {
     // Access through a union member may reinterpret another active member's
     // representation; ordinary pointer casts do not inherit this permission.
     bool union_member_view{};
+    // An explicit cast discarded const. Whether the object itself is const is
+    // not tracked, so evaluation does not write through this pointer.
+    bool const_cast_away{};
     struct BitField {
         unsigned width{};
         unsigned offset{};
@@ -4633,6 +4640,7 @@ TypePtr infer_generic_actual_step(const Expr& expression,
                    ? type_of(*expression.left, decay)
                    : TypePtr{};
     case Expr::Kind::Cast:
+    case Expr::Kind::CompoundLiteral:
         return adjusted(expression.type);
     case Expr::Kind::Sizeof:
     case Expr::Kind::Alignof:
@@ -4815,6 +4823,7 @@ template<class TypeOf, class ObjectName>
 bool source_object_lvalue(const Expr& node, const TypeOf& type_of, const ObjectName& object_name) {
     if (node.kind == Expr::Kind::Parenthesized && node.left)
         return source_object_lvalue(*node.left, type_of, object_name);
+    if (node.kind == Expr::Kind::CompoundLiteral) return true;
     if (node.kind == Expr::Kind::Name) return object_name(node);
     if (node.kind == Expr::Kind::Unary && node.text == "*" && node.left) {
         const auto type = type_of(*node.left);
@@ -5359,20 +5368,18 @@ const char* source_conversion_error(const TypePtr& source, const TypePtr& destin
             ? "explicit pointer conversion discards qualifiers or uses incompatible pointee types"
             : "implicit pointer conversion discards qualifiers or uses incompatible pointee types";
     }
-    // Function and object pointers remain distinct even for explicit casts.
-    // Do not apply all runtime object-pointee restrictions here: translation-
-    // time byte backing permits typed views, checked by the evaluator. No
-    // registered ABI currently defines a function/object pointer bridge.
+    // An explicit cast converts between any object pointer types, but function
+    // and object pointers remain distinct: no registered ABI currently defines
+    // a bridge between them.
     const bool function_object_cast = source_pointer && destination_pointer &&
         source->pointee && destination->pointee &&
         ((source->pointee->kind == Type::Kind::Function) !=
          (destination->pointee->kind == Type::Kind::Function));
-    if (source_pointer && destination_pointer &&
-        (conversion == SourceConversion::Implicit || function_object_cast) &&
+    if (conversion == SourceConversion::Explicit && function_object_cast)
+        return "explicit cast cannot convert between a function pointer and an object pointer";
+    if (source_pointer && destination_pointer && conversion == SourceConversion::Implicit &&
         compare_pointee(source->pointee, destination->pointee) == PointeeCompatibility::Incompatible)
-        return conversion == SourceConversion::Explicit
-            ? "explicit pointer conversion discards qualifiers or uses incompatible pointee types"
-            : "implicit pointer conversion discards qualifiers or uses incompatible pointee types";
+        return "implicit pointer conversion discards qualifiers or uses incompatible pointee types";
     if (is_vector(destination)) {
         if (is_vector(source) && (source->scalable != destination->scalable ||
             (source->lanes && destination->lanes && source->lanes != destination->lanes)))
@@ -5440,6 +5447,8 @@ const char* source_meta_expression_error(const Expr& node, const TypeOf& type_of
         }
     } else if (node.kind == Expr::Kind::Call && node.left && is_meta_type(type_of(*node.left, true))) {
         return "opaque meta values are not callable";
+    } else if (node.kind == Expr::Kind::CompoundLiteral && contains_meta_type(node.type)) {
+        return "meta values cannot have compound literal storage";
     }
     return nullptr;
 }
@@ -6625,10 +6634,13 @@ private:
             [&](SourceLocation at, std::string message) { error(at, std::move(message)); });
     }
 
+    // A declaration or compound literal (`literal`) completes an omitted
+    // outer bound from its initializer.
     EvaluationTask<void> initializer(const Expr& source, const TypePtr& destination,
-                                     const VariableDecl* declaration = nullptr, bool static_storage = false) {
+                                     const VariableDecl* declaration = nullptr, bool static_storage = false,
+                                     bool literal = false) {
         if (!valid_ || !destination) co_return;
-        const bool inferred = declaration && !declaration->dynamic_array_bound &&
+        const bool inferred = ((declaration && !declaration->dynamic_array_bound) || literal) &&
             destination->kind == Type::Kind::Array && !destination->lanes && !destination->array_bound;
         if (source.kind == Expr::Kind::String && destination->kind == Type::Kind::Array &&
             destination->element && destination->element->kind == Type::Kind::Builtin &&
@@ -6884,6 +6896,9 @@ private:
             if (const auto issue = source_offsetof_error(node, program_)) error(issue->location, issue->message);
         } else if (node.kind == Expr::Kind::Cast && node.left) {
             conversion(*node.left, node.type, "cast", SourceConversion::Explicit);
+        } else if (node.kind == Expr::Kind::CompoundLiteral && node.type && node.left) {
+            object_type(node.type, node.location);
+            co_await initializer(*node.left, node.type, nullptr, false, true);
         } else if (node.kind == Expr::Kind::Assign && node.left && node.right) {
             const auto destination = type(*node.left, false);
             conversion(*node.right, destination, "assignment", SourceConversion::Implicit, node.text != "=");
@@ -8513,6 +8528,8 @@ public:
         GenericExpansionState bindings;
         collect_function_types(function, bindings);
         std::unordered_map<const Type*, VariableDecl*> inferred_arrays;
+        // A compound literal's omitted bound is prepared like a declaration's.
+        std::vector<std::unique_ptr<VariableDecl>> literals;
         std::vector<const Statement*> declarations;
         if (function.body) declarations.push_back(function.body.get());
         while (!declarations.empty()) {
@@ -8585,6 +8602,15 @@ public:
             } else if (next.expression) {
                 const auto& source = *next.expression;
                 if (!seen_expressions.insert(&source).second) continue;
+                if (program_.evaluation_initializer_types && source.kind == Expr::Kind::CompoundLiteral &&
+                    source.type && source.left && source.type->kind == Type::Kind::Array &&
+                    !source.type->lanes && !source.type->array_bound) {
+                    auto& literal = *literals.emplace_back(std::make_unique<VariableDecl>());
+                    literal.location = source.location;
+                    literal.type = source.type;
+                    literal.initializer = clone_expr(*source.left);
+                    inferred_arrays.emplace(source.type.get(), &literal);
+                }
                 type(source.type);
                 if (source.kind == Expr::Kind::Name)
                     for (const auto& [name, local_type] : bindings.local_types)
@@ -9261,13 +9287,22 @@ public:
             if (is_void_type(expression.type)) co_return EvalValue{UInt128{}, builtin_type(BuiltinType::Void)};
             co_return co_await convert_async(*value, expression.type, expression.location, true);
         }
+        case Expr::Kind::CompoundLiteral: {
+            const auto object = co_await compound_literal_async(expression);
+            if (!object) co_return std::nullopt;
+            co_return co_await read_meta_pointer_async(object_pointer(*object), expression.location);
+        }
         case Expr::Kind::Sizeof:
         case Expr::Kind::Alignof: {
-            const auto type = expression.type
+            auto type = expression.type
                                   ? expression.type
                                   : expression.left
                                         ? expression_type(*expression.left, false)
                                         : TypePtr{};
+            const Expr* operand = expression.left.get();
+            while (operand && operand->kind == Expr::Kind::Parenthesized) operand = operand->left.get();
+            if (!expression.type && operand && operand->kind == Expr::Kind::CompoundLiteral && operand->left)
+                type = co_await compound_literal_type_async(operand->type, *operand->left);
             const auto* query = expression.kind == Expr::Kind::Sizeof
                                     ? size_of_
                                     : align_of_;
@@ -10698,6 +10733,22 @@ private:
             const auto signature = source_function_type(*function);
             co_return (co_await validate_call_arguments_async(node, *signature->function));
         }
+        if (node.kind == Expr::Kind::CompoundLiteral) {
+            // The initializer plan is checked when the object is created.
+            const auto entries = [&](const auto& self, const Expr& list) -> EvaluationTask<bool> {
+                for (const auto& entry : list.initializer_entries) {
+                    for (const auto& designator : entry.designators)
+                        if (designator.index && !(co_await validate_required_tree_async(*designator.index)))
+                            co_return false;
+                    if (!entry.value) continue;
+                    if (entry.value->kind == Expr::Kind::AggregateInitializer) {
+                        if (!(co_await self(self, *entry.value))) co_return false;
+                    } else if (!(co_await validate_required_tree_async(*entry.value))) co_return false;
+                }
+                co_return true;
+            };
+            co_return node.type && node.left && (co_await entries(entries, *node.left));
+        }
         if (node.left && !(co_await validate_required_tree_async(*node.left,
                 direct_callee && node.kind == Expr::Kind::Parenthesized, source_left_use(node, use)))) co_return false;
         const bool member = node.kind == Expr::Kind::Binary &&
@@ -10913,8 +10964,7 @@ private:
         return from->kind == Type::Kind::Pointer && to->kind == Type::Kind::Pointer &&
             from->address_space == to->address_space &&
             (compatible_pointee(from->pointee, to->pointee) ||
-             (explicit_cast && from->pointee && to->pointee &&
-              (!meta_leaf_const(from->pointee) || meta_leaf_const(to->pointee))));
+             (explicit_cast && from->pointee && to->pointee));
     }
 
     EvaluationTask<bool> macro_convertible_expression_async(const Expr& source, const TypePtr& destination,
@@ -10947,6 +10997,7 @@ private:
             if (selected->kind == Expr::Kind::Call && selected->left &&
                 selected->left->kind == Expr::Kind::Name &&
                 selected->left->text == "$::meta::data") return true;
+            if (selected->kind == Expr::Kind::CompoundLiteral) return true;
             if (selected->kind == Expr::Kind::Name) {
                 const auto* cell = lookup_mutable(*selected);
                 if (cell && (cell->value.meta_pointer.has_value() ||
@@ -11034,6 +11085,10 @@ private:
         case Expr::Kind::Address:
             return expression.type;
         case Expr::Kind::Cast:
+            return expression.type;
+        case Expr::Kind::CompoundLiteral:
+            if (decay && expression.type && expression.type->kind == Type::Kind::Array)
+                return pointer_type(qualified_element_type(expression.type));
             return expression.type;
         case Expr::Kind::Sizeof:
         case Expr::Kind::Alignof:
@@ -11723,7 +11778,7 @@ private:
                 meta_volatile_or_atomic(type->pointee) ||
                 !value.type || value.type->kind != Type::Kind::Pointer ||
                 !value.type->pointee ||
-                (meta_leaf_const(value.type->pointee) &&
+                (!explicit_cast && meta_leaf_const(value.type->pointee) &&
                  !meta_leaf_const(type->pointee)) ||
                 type->address_space != value.type->address_space ||
                  (!explicit_cast &&
@@ -11731,6 +11786,8 @@ private:
                 fail(location, "meta data pointers require a compatible scalar, fixed-array, record, fixed-vector, or void pointer conversion without qualifier loss");
                 co_return std::nullopt;
             }
+            if (meta_leaf_const(value.type->pointee) && !meta_leaf_const(type->pointee))
+                value.meta_pointer->const_cast_away = true;
             if (value.meta_pointer->mutable_buffer &&
                 value.meta_pointer->mutable_buffer->frozen) {
                 fail(location, "buffer data pointer was used after freeze");
@@ -11795,9 +11852,9 @@ private:
                     fail(location, "implicit pointer conversion changes address space");
                     co_return std::nullopt;
                 }
-                if (!type->pointee || !value.type->pointee ||
-                    (value.type->pointee->is_const && !type->pointee->is_const) ||
-                    (value.type->pointee->is_volatile && !type->pointee->is_volatile)) {
+                if (!type->pointee || !value.type->pointee || (!explicit_cast &&
+                    ((value.type->pointee->is_const && !type->pointee->is_const) ||
+                     (value.type->pointee->is_volatile && !type->pointee->is_volatile)))) {
                     fail(location, "implicit pointer conversion discards qualifiers");
                     co_return std::nullopt;
                 }
@@ -12056,6 +12113,15 @@ private:
         const auto& name = expression.text;
         const auto location = expression.location;
         if (auto* cell = lookup_mutable(expression)) co_return (co_await read_cell_async(*cell, location));
+        if (const auto* object = resolve_object(program_, current_function_, expression);
+            object && object->compound_literal && object->initializer) {
+            // A read-only view of the initial value; its address stays symbolic.
+            auto value = co_await compound_literal_async(object->type, *object->initializer);
+            if (!value) co_return std::nullopt;
+            auto pointer = object_pointer(*value);
+            pointer.type->pointee->is_const = true;
+            co_return (co_await read_meta_pointer_async(pointer, location));
+        }
         if (expression.name_context && expression.name_context->label_address) {
             if (const auto* error = label_address_error(*expression.name_context->label_address)) {
                 fail(location, error);
@@ -12240,10 +12306,10 @@ private:
     }
 
     EvaluationTask<std::optional<std::size_t>> meta_object_alignment_async(TypePtr type) const {
-        // Array counts do not affect alignment; every layer's request does.
-        std::size_t requested = 1;
+        // Array counts do not affect alignment; the outermost typedef request
+        // is the alignment, even below the natural one.
         for (; type; type = type->element) {
-            requested = std::max<std::size_t>(requested, type->alignment);
+            if (type->alignment) co_return static_cast<std::size_t>(type->alignment);
             if (type->kind != Type::Kind::Array) break;
         }
         if (!type) co_return std::nullopt;
@@ -12264,7 +12330,7 @@ private:
         }
         if (!alignment || *alignment == 0 || *alignment > std::numeric_limits<std::size_t>::max())
             co_return std::nullopt;
-        co_return std::max(static_cast<std::size_t>(*alignment), requested);
+        co_return static_cast<std::size_t>(*alignment);
     }
 
     static bool same_meta_object_type(const TypePtr& left, const TypePtr& right) {
@@ -12958,11 +13024,51 @@ private:
         co_return base;
     }
 
+    // A compound literal's type; an omitted bound that source preparation has
+    // not completed comes from the initializer, whose values are not read.
+    EvaluationTask<TypePtr> compound_literal_type_async(TypePtr type, const Expr& initializer) {
+        if (!type || type->kind != Type::Kind::Array || type->lanes) co_return type;
+        auto normalized = co_await normalized_object_initializer_async(initializer);
+        if (!normalized) co_return nullptr;
+        if (!program_.evaluation_initializer_types) {
+            fail(initializer.location, "target initializer layout is unavailable during translation-time execution");
+            co_return nullptr;
+        }
+        type = clone_type(type);
+        const auto plan = co_await program_.evaluation_initializer_types.async(*normalized, type, {});
+        if (!plan.valid) {
+            fail(plan.error_location.file ? plan.error_location : initializer.location,
+                 plan.error_message.empty() ? "invalid aggregate initializer" : plan.error_message);
+            co_return nullptr;
+        }
+        if (!complete_source_array_extent(type, plan.minimum_elements, program_.address_bits,
+                initializer.location, [&](SourceLocation at, std::string message) { fail(at, std::move(message)); }))
+            co_return nullptr;
+        co_return type;
+    }
+
+    // A fresh object initialized from the brace list.
+    EvaluationTask<std::optional<EvalValue>> compound_literal_async(TypePtr type, const Expr& initializer) {
+        type = co_await compound_literal_type_async(std::move(type), initializer);
+        if (!type) co_return std::nullopt;
+        co_return co_await initialize_object_async(initializer, type);
+    }
+
+    EvaluationTask<std::optional<EvalValue>> compound_literal_async(const Expr& expression) {
+        if (!expression.type || !expression.left) co_return std::nullopt;
+        co_return co_await compound_literal_async(expression.type, *expression.left);
+    }
+
     EvaluationTask<std::optional<EvalValue>> meta_designator_pointer_async(const Expr& source) {
         const Expr* designator = &source;
         while (designator->kind == Expr::Kind::Parenthesized &&
                designator->left)
             designator = designator->left.get();
+        if (designator->kind == Expr::Kind::CompoundLiteral) {
+            const auto object = co_await compound_literal_async(*designator);
+            if (!object) co_return std::nullopt;
+            co_return object_pointer(*object);
+        }
         if (designator->kind == Expr::Kind::Name) {
             auto* cell = lookup_mutable(*designator);
             if (cell && !translation_cell(*cell, designator->location)) co_return std::nullopt;
@@ -13663,15 +13769,24 @@ private:
         co_return std::nullopt;
     }
 
+    bool meta_write_target(const EvalValue& pointer, SourceLocation location) {
+        if (pointer.meta_pointer->const_cast_away) {
+            fail(location, "translation-time evaluation cannot write through a pointer whose const was cast away");
+            return false;
+        }
+        if (!pointer.meta_pointer->mutable_buffer || pointer.type->pointee->is_const) {
+            fail(location, "meta pointer write requires mutable supported storage");
+            return false;
+        }
+        return true;
+    }
+
     EvaluationTask<std::optional<EvalValue>> store_meta_pointer_async(std::optional<EvalValue> pointer,
                                                 std::optional<EvalValue> source,
                                                 SourceLocation location) {
         bool sized = pointer && source;
         if (sized) sized = co_await sized_meta_pointer_async(*pointer, location);
-        if (!sized || !pointer->meta_pointer->mutable_buffer || pointer->type->pointee->is_const) {
-            fail(location, "meta pointer write requires mutable supported storage");
-            co_return std::nullopt;
-        }
+        if (!sized || !meta_write_target(*pointer, location)) co_return std::nullopt;
         const auto& target = *pointer->meta_pointer;
         const auto offset = (co_await meta_access_index_async(*pointer, location, true));
         if (!offset) co_return std::nullopt;
@@ -13898,12 +14013,7 @@ private:
                 co_return std::nullopt;
             }
             if (!(co_await sized_meta_pointer_async(*pointer, designator->location)) ||
-                pointer->type->pointee->is_const ||
-                !pointer->meta_pointer->mutable_buffer) {
-                fail(designator->location,
-                    "meta pointer write requires mutable supported storage");
-                co_return std::nullopt;
-            }
+                !meta_write_target(*pointer, designator->location)) co_return std::nullopt;
             const auto offset = (co_await meta_access_index_async(*pointer, designator->location, true));
             if (!offset) co_return std::nullopt;
             std::optional<EvalValue> prior_value;
@@ -16000,6 +16110,18 @@ bool contains_relocation_candidate(const Expr& expression,
             continue;
         }
         if (node->kind == Expr::Kind::Unary && node->text == "&") return true;
+        // An element of a compound literal's static object is its initial value.
+        if (node->kind == Expr::Kind::Binary && node->text == "index" && node->left) {
+            const auto* base = node->left.get();
+            while (base->kind == Expr::Kind::Parenthesized && base->left) base = base->left.get();
+            const auto selected = base->kind == Expr::Kind::Name
+                ? value_namespace(program, nullptr, *base, source_namespace) : std::nullopt;
+            if (selected && std::any_of(program.objects.begin(), program.objects.end(),
+                    [&](const auto& object) { return object->compound_literal && object->name == *selected; })) {
+                pending.push_back(node->right.get());
+                continue;
+            }
+        }
         if (node->kind == Expr::Kind::Name) {
             if (node->name_context && node->name_context->label_address) return true;
             const auto selected = value_namespace(program, nullptr, *node, source_namespace);
@@ -17819,6 +17941,93 @@ void lift_string_literals(Program& program) {
     StringPoolLifter(program).run();
 }
 
+// A compound literal in a static initializer outside a function body is an
+// unnamed static object: lift it to a hidden one. A compound literal that
+// initializes an object or member of its own type is that initializer.
+class CompoundLiteralLifter {
+public:
+    explicit CompoundLiteralLifter(Program& program) : program_(program) {}
+
+    void run() {
+        for (std::size_t index = 0; index < program_.objects.size(); ++index) {
+            auto* object = program_.objects[index].get();
+            file_scope_ = !object->lexical_function;
+            source_unit_ = object->source_unit;
+            rewrite(object->initializer, object->type);
+        }
+    }
+
+private:
+    static bool same_value_type(const TypePtr& literal, const TypePtr& destination) {
+        if (!literal || !destination || literal->kind != destination->kind ||
+            (literal->kind != Type::Kind::Record && literal->kind != Type::Kind::Vector)) return false;
+        auto left = without_alignment(literal), right = without_alignment(destination);
+        left->is_const = left->is_volatile = right->is_const = right->is_volatile = false;
+        return same_type(left, right);
+    }
+
+    void rewrite(std::unique_ptr<Expr>& expression, const TypePtr& destination = {}) {
+        if (!expression || expression->kind == Expr::Kind::Sizeof ||
+            expression->kind == Expr::Kind::Alignof) return;
+        if (expression->kind == Expr::Kind::CompoundLiteral && expression->type && expression->left) {
+            if (same_value_type(expression->type, destination)) {
+                expression = std::move(expression->left);
+                rewrite(expression, destination);
+                return;
+            }
+            if (file_scope_) {
+                auto object = std::make_unique<ObjectDecl>();
+                object->location = expression->location;
+                object->source_unit = source_unit_;
+                object->name = "$compound." + std::to_string(stable_hash(source_unit_)) + '.' +
+                    std::to_string(program_.literal_ordinals[source_unit_]++);
+                object->type = std::move(expression->type);
+                object->initializer = std::move(expression->left);
+                object->linkage = Linkage::Static;
+                object->compound_literal = true;
+                const auto name = object->name;
+                program_.objects.push_back(std::move(object));
+                expression = std::make_unique<Expr>();
+                expression->kind = Expr::Kind::Name;
+                expression->location = program_.objects.back()->location;
+                bind_exact_name(*expression, name);
+                return;
+            }
+        }
+        if (expression->kind == Expr::Kind::AggregateInitializer) {
+            std::size_t cursor{};
+            for (auto& entry : expression->initializer_entries) {
+                const auto* first = entry.designators.empty() ? nullptr : &entry.designators.front();
+                std::size_t selected = cursor;
+                if (first && first->kind == Expr::InitializerDesignator::Kind::Index && first->index &&
+                    first->index->evaluated_integer && first->index->evaluated_integer->value.high == 0)
+                    selected = static_cast<std::size_t>(first->index->evaluated_integer->value.low);
+                else if (first && first->kind == Expr::InitializerDesignator::Kind::Member &&
+                         destination && destination->kind == Type::Kind::Record)
+                    if (const auto record = program_.record_definition(destination->nominal_key()))
+                        if (const auto position = designated_position(program_, *record, first->member_name()))
+                            selected = *position;
+                auto child = initializer_child_type(program_, destination, first, selected);
+                cursor = selected + 1;
+                for (std::size_t index = first ? 1 : 0; child && index < entry.designators.size(); ++index)
+                    child = initializer_child_type(program_, child, &entry.designators[index], 0);
+                for (auto& designator : entry.designators) rewrite(designator.index);
+                rewrite(entry.value, child);
+            }
+            return;
+        }
+        rewrite(expression->left);
+        rewrite(expression->right);
+        rewrite(expression->third);
+        for (auto& argument : expression->arguments) rewrite(argument);
+        for (auto& argument : expression->generic_arguments) rewrite(argument.value);
+    }
+
+    Program& program_;
+    std::string source_unit_;
+    bool file_scope_{};
+};
+
 void lift_pointer_argument_strings(Program& program, std::unique_ptr<Expr>& expression,
                                    const FunctionDecl* caller) {
     StringPoolLifter(program).pointer_argument(expression, caller);
@@ -18195,6 +18404,7 @@ bool expand_semantics(Program& program, Diagnostics& diagnostics,
     }
     materialize_enumerators(program, diagnostics);
     lift_function_pointer_adapters(program, default_abi);
+    CompoundLiteralLifter(program).run();
     const auto remember_record_owner = [&](const FunctionDecl& function) {
         if (evaluation_only(function) && function.function_scope &&
             std::find(carried_owners.begin(), carried_owners.end(), function.function_scope) == carried_owners.end() &&

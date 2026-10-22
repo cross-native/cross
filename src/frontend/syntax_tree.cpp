@@ -93,7 +93,8 @@ std::string_view syntax_production_name(SyntaxProduction production) {
         "multiplicative_expression", "cast_expression", "unary_expression",
         "postfix_expression", "primary_expression", "argument_list", "generic_arguments", "generic_argument",
         "builtin_name", "literal", "embed_expression", "quote_expression",
-        "global_label_declaration", "qualified_label_name", "qualified_function_name"};
+        "global_label_declaration", "qualified_label_name", "qualified_function_name",
+        "compound_literal"};
     static_assert(std::size(names) == static_cast<std::size_t>(SyntaxProduction::Count));
     const auto index = static_cast<std::size_t>(production);
     return index < std::size(names) ? names[index] : std::string_view{};
@@ -119,7 +120,7 @@ bool syntax_expression_node(const SyntaxNode& node) {
     case P::AdditiveExpression: case P::MultiplicativeExpression: case P::CastExpression:
     case P::UnaryExpression: case P::PostfixExpression: case P::PrimaryExpression:
     case P::QualifiedName: case P::BuiltinName: case P::Literal:
-    case P::EmbedExpression: case P::QuoteExpression:
+    case P::EmbedExpression: case P::QuoteExpression: case P::CompoundLiteral:
         return true;
     default:
         return false;
@@ -660,9 +661,11 @@ const auto& public_tree_rules() {
         set(P::StaticAssertDeclaration, sequence({terminal("$::static_assert"), terminal("("),
             reference(P::ConstantExpression), terminal(","), string, terminal(")"), terminal(";")}));
         set(P::ForInitializer, choice({sequence({}), expressions, reference(P::DeclarationWithoutFinalSemicolon)}));
-        set(P::Initializer, choice({reference(P::AssignmentExpression), sequence({terminal("{"),
-            optional(sequence({reference(P::InitializerEntry),
-                repeated(sequence({terminal(","), reference(P::InitializerEntry)})), optional(terminal(","))})), terminal("}")})}));
+        const auto braced = sequence({terminal("{"), optional(sequence({reference(P::InitializerEntry),
+            repeated(sequence({terminal(","), reference(P::InitializerEntry)})), optional(terminal(","))})),
+            terminal("}")});
+        set(P::Initializer, choice({reference(P::AssignmentExpression), braced}));
+        set(P::CompoundLiteral, sequence({terminal("("), reference(P::TypeName), terminal(")"), braced}));
         set(P::InitializerEntry, sequence({repeated(reference(P::Designator)), optional(terminal("=")), reference(P::Initializer)}));
         set(P::Designator, choice({sequence({terminal("."), id}),
             sequence({terminal("["), reference(P::ConstantExpression), terminal("]")})}));
@@ -704,7 +707,8 @@ const auto& public_tree_rules() {
                 id, repeated(reference(P::Designator)), terminal(")")}),
             sequence({terminal("$::atomic_is_lock_free"), terminal("("),
                 choice({reference(P::TypeName), reference(P::ArgumentList)}), terminal(")")}),
-            reference(P::EmbedExpression), reference(P::QuoteExpression), opaque(P::PrimaryExpression)}));
+            reference(P::CompoundLiteral), reference(P::EmbedExpression), reference(P::QuoteExpression),
+            opaque(P::PrimaryExpression)}));
         set(P::ArgumentList, optional(sequence({reference(P::AssignmentExpression),
             repeated(sequence({terminal(","), reference(P::AssignmentExpression)}))})));
         set(P::GenericArguments, sequence({optional(terminal("::")), terminal("<"), reference(P::GenericArgument),

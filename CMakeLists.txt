@@ -5709,6 +5709,74 @@ if(BUILD_TESTING)
                 SKIP_REGULAR_EXPRESSION "skipping MIPS")
         endforeach()
     endforeach()
+    # Under-aligned typedefs and compound literals: x86-64 natively and through
+    # LLVM IR, o32 on R3000 and VR4300 and n64, each in both byte orders.
+    foreach(case underaligned_typedef compound_literals)
+        string(REPLACE "_" "-" case_path "${case}")
+        if(case STREQUAL underaligned_typedef)
+            set(case_labels "feature.layout;feature.records;feature.pointer;feature.evaluation")
+        else()
+            set(case_labels "feature.initializer;feature.records;feature.array;feature.evaluation")
+        endif()
+        foreach(level O0 O2)
+            add_test(NAME cross_runtime_${case}_${level}
+                COMMAND "${CMAKE_COMMAND}"
+                        -DCC=$<TARGET_FILE:cross_cc>
+                        -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                        -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/${case}.x
+                        -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/${case_path}-runtime-${level}
+                        -DENTRY=${case}_entry
+                        -DEXPECTED=1
+                        -DCC_FLAGS=-${level}
+                        -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+            set_tests_properties(cross_runtime_${case}_${level} PROPERTIES
+                LABELS "check.runtime;arch.x86_64;backend.native;${case_labels};opt.${level}")
+            add_test(NAME cross_runtime_${case}_llvm_${level}
+                COMMAND "${CMAKE_COMMAND}"
+                        -DCC=$<TARGET_FILE:cross_cc>
+                        -DCC_FLAGS=-${level}
+                        -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/${case}.x
+                        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/${case_path}-llvm-${level}.ll
+                        -DENTRY=${case}_entry
+                        -DEXPECTED=1
+                        -P "${CMAKE_SOURCE_DIR}/test/support/run_ir.cmake")
+            set_tests_properties(cross_runtime_${case}_llvm_${level} PROPERTIES
+                LABELS "check.runtime;arch.x86_64;backend.llvm;${case_labels};opt.${level}")
+            add_test(NAME cross_mips_${case}_o32_${level}
+                COMMAND "${CMAKE_COMMAND}"
+                        -DCC=$<TARGET_FILE:cross_cc>
+                        -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/${case}.x
+                        -DSTARTUP=${CMAKE_SOURCE_DIR}/test/backend/native/${case}_start.s
+                        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/${case_path}-o32-${level}
+                        -DEXPECTED=P "-DCC_FLAGS=-${level}"
+                        -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+            set_tests_properties(cross_mips_${case}_o32_${level} PROPERTIES
+                LABELS "check.runtime;arch.mips;backend.native;${case_labels};profile.o32;opt.${level};endian.big;endian.little"
+                SKIP_REGULAR_EXPRESSION "skipping MIPS")
+            foreach(endian big little)
+                add_test(NAME cross_mips_${case}_n64_${level}_${endian}
+                    COMMAND "${CMAKE_COMMAND}"
+                            -DCC=$<TARGET_FILE:cross_cc>
+                            -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/${case}.x
+                            -DSTARTUP=${CMAKE_SOURCE_DIR}/test/backend/native/${case}_start.s
+                            -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare-n64.ld
+                            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/${case_path}-n64-${level}-${endian}
+                            -DN64_ENDIAN=${endian} "-DEXTRA_FLAGS=-${level}"
+                            -P "${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.cmake")
+                set_tests_properties(cross_mips_${case}_n64_${level}_${endian} PROPERTIES
+                    LABELS "check.runtime;arch.mips;backend.native;${case_labels};profile.n64;opt.${level};endian.${endian}"
+                    SKIP_REGULAR_EXPRESSION "skipping MIPS")
+            endforeach()
+        endforeach()
+    endforeach()
+    add_test(NAME cross_underaligned_typedef_codegen
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/underaligned-typedef-codegen
+                -P "${CMAKE_SOURCE_DIR}/test/language/underaligned_typedef.cmake")
+    set_tests_properties(cross_underaligned_typedef_codegen PROPERTIES
+        LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;backend.native;feature.layout;feature.pointer;endian.big;endian.little")
     add_test(NAME cross_x86_64_dynamic_call_alignment
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
@@ -7358,6 +7426,27 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/language/forms_errors.cmake")
     set_tests_properties(cross_forms_errors PROPERTIES
         LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;frontend;feature.semantics;feature.attributes;feature.abi")
+    add_test(NAME cross_attribute_brackets
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/attribute-brackets
+                -P "${CMAKE_SOURCE_DIR}/test/language/attribute_brackets.cmake")
+    set_tests_properties(cross_attribute_brackets PROPERTIES
+        LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;frontend;feature.attributes;feature.syntax;feature.tokens")
+    add_test(NAME cross_pointer_casts
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/pointer-casts
+                -P "${CMAKE_SOURCE_DIR}/test/language/pointer_casts.cmake")
+    set_tests_properties(cross_pointer_casts PROPERTIES
+        LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;frontend;feature.pointer;feature.semantics;feature.evaluation")
+    add_test(NAME cross_compound_literals
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/compound-literals
+                -P "${CMAKE_SOURCE_DIR}/test/language/compound_literals.cmake")
+    set_tests_properties(cross_compound_literals PROPERTIES
+        LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;frontend;feature.initializer;feature.syntax_tree;feature.semantics")
     foreach(forms_level O0 O2)
         add_test(NAME cross_runtime_native_forms_${forms_level}
             COMMAND "${CMAKE_COMMAND}"

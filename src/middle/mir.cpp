@@ -79,10 +79,12 @@ unsigned storage_alignment(const hir::Module& module, hir::TypeId id,
 }
 
 // What a dereference may assume and an access requires: the alignment of the
-// type without its own (typedef) request.
+// type without a (typedef) request that raises it, or the lower one requested.
 unsigned access_alignment(const hir::Module& module, hir::TypeId id,
                           const TargetInfo& target) {
-    return static_cast<unsigned>(hir::natural_alignment(module, id, target).value_or(1));
+    const auto natural = static_cast<unsigned>(hir::natural_alignment(module, id, target).value_or(1));
+    const auto requested = module.type(id).alignment;
+    return requested && requested < natural ? requested : natural;
 }
 
 bool integer_type(const hir::Module& module, hir::TypeId id) {
@@ -431,6 +433,8 @@ std::optional<ParsedInteger> patch_initial(const Expr& expression,
     return value;
 }
 
+bool eligible_array_element_type(const TypePtr& type);
+
 bool eligible_expression(const Expr& expression) {
     switch (expression.kind) {
     case Expr::Kind::VoidValue: return true;
@@ -448,6 +452,11 @@ bool eligible_expression(const Expr& expression) {
         return expression.left && eligible_expression(*expression.left);
     case Expr::Kind::Cast:
         return expression.type && expression.left &&
+               eligible_expression(*expression.left);
+    case Expr::Kind::CompoundLiteral:
+        return expression.type && expression.left &&
+               (expression.type->kind != cross::Type::Kind::Array ||
+                (expression.type->lanes != 0 && eligible_array_element_type(expression.type))) &&
                eligible_expression(*expression.left);
     case Expr::Kind::Sizeof:
     case Expr::Kind::Alignof:
@@ -1682,6 +1691,22 @@ private:
             expression.left) {
             co_return co_await lower_designator_address_async(*expression.left, access);
         }
+        if (expression.kind == Expr::Kind::CompoundLiteral && expression.type && expression.left) {
+            // An unnamed object of the enclosing block, initialized anew on
+            // each evaluation.
+            const auto type = hir_.intern_type(expression.type);
+            if (!managed_object_type(hir_, type)) co_return std::nullopt;
+            const SlotId slot{static_cast<std::uint32_t>(current_.slots.size())};
+            current_.slots.push_back({slot, expression.location, type,
+                "$compound." + std::to_string(slot.value), std::nullopt,
+                expression.type->is_volatile, true, false, 1, std::nullopt});
+            scopes_.back().slots.push_back(slot);
+            (void)lifetime(ValueKind::LifetimeStart, slot, expression.location);
+            const LocalBinding binding{slot, type, std::nullopt, std::nullopt};
+            (void)initialize_aggregate(binding, *expression.left);
+            co_return DesignatorAddress{slot_address(binding, expression.location),
+                type, storage_alignment(hir_, type, target_)};
+        }
         if (expression.kind == Expr::Kind::Name) {
             if (const auto* local = find_local(name_key(expression))) {
                 if (local->dynamic_address) {
@@ -1880,6 +1905,8 @@ private:
             expression.left) {
             return designator_type(*expression.left, is_bit_field, access);
         }
+        if (expression.kind == Expr::Kind::CompoundLiteral && expression.type)
+            return hir_.intern_type(expression.type);
         if (expression.kind == Expr::Kind::Name) {
             if (const auto* local = find_local(name_key(expression))) {
                 return local->type;
@@ -2068,12 +2095,12 @@ private:
         }
 
         if (auto designator = co_await lower_designator_address_async(expression)) {
-            const auto natural = access_alignment(
-                hir_, *object_type, target_);
+            const auto natural = static_cast<unsigned>(
+                hir::natural_alignment(hir_, *object_type, target_).value_or(1));
             if (designator->alignment < natural) {
                 diagnostics_.error(
                     expression.location,
-                    "an atomic object cannot be accessed through an under-aligned packed member");
+                    "an atomic object cannot be accessed through an under-aligned packed member or type");
                 failed_ = true;
                 co_return std::nullopt;
             }
@@ -2283,6 +2310,7 @@ private:
         }
         if (atomic_object_type(hir_, *pointer.pointee)) {
             const auto pointee = *pointer.pointee;
+            if (!atomic_alignment(pointee, alignment, location)) return std::nullopt;
             const auto is_volatile = hir_.type(pointee).is_volatile;
             return atomic_operation(
                 AtomicOperation::Load,
@@ -2295,7 +2323,7 @@ private:
         auto& load = current_.values[value.value];
         load.operands = {address};
         load.is_volatile_access = hir_.type(*pointer.pointee).is_volatile;
-        load.memory_alignment = alignment;
+        load.memory_alignment = pointee_alignment(*pointer.pointee, alignment);
         return value;
     }
 
@@ -2310,6 +2338,7 @@ private:
         }
         if (atomic_object_type(hir_, *pointer.pointee)) {
             const auto pointee = *pointer.pointee;
+            if (!atomic_alignment(pointee, alignment, location)) return std::nullopt;
             const auto is_volatile = hir_.type(pointee).is_volatile;
             const auto value_type = hir_.unqualified(pointee);
             source = cast(source, value_type, location);
@@ -2324,8 +2353,26 @@ private:
         auto& store = current_.values[value.value];
         store.operands = {address, source};
         store.is_volatile_access = hir_.type(*pointer.pointee).is_volatile;
-        store.memory_alignment = alignment;
+        store.memory_alignment = pointee_alignment(*pointer.pointee, alignment);
         return value;
+    }
+
+    // An atomic access needs the natural alignment a lowered typedef gives up.
+    bool atomic_alignment(hir::TypeId pointee, unsigned alignment, SourceLocation location) {
+        if ((alignment ? alignment : access_alignment(hir_, pointee, target_)) >=
+            hir::natural_alignment(hir_, pointee, target_).value_or(1)) return true;
+        diagnostics_.error(location,
+            "an atomic object cannot be accessed through an under-aligned packed member or type");
+        failed_ = true;
+        return false;
+    }
+
+    // An access without a proven alignment assumes the pointee's, which a
+    // typedef request may lower below the natural one.
+    unsigned pointee_alignment(hir::TypeId pointee, unsigned alignment) const {
+        if (alignment) return alignment;
+        const auto access = access_alignment(hir_, pointee, target_);
+        return access < hir::natural_alignment(hir_, pointee, target_).value_or(1) ? access : 0;
     }
 
     ValueId integer_binary(BinaryOperation operation, hir::TypeId type,
@@ -3043,6 +3090,11 @@ private:
                        ? std::optional<hir::TypeId>(
                              hir_.intern_type(expression.type))
                        : std::nullopt;
+        case Expr::Kind::CompoundLiteral: {
+            if (!expression.type) return std::nullopt;
+            const auto type = hir_.intern_type(expression.type);
+            return array_type(hir_, type) ? hir_.pointer_to(qualified_array_element(type)) : type;
+        }
         case Expr::Kind::Sizeof:
         case Expr::Kind::Alignof:
         case Expr::Kind::Offsetof:
@@ -3810,6 +3862,15 @@ private:
         case Expr::Kind::Parenthesized:
             if (expression.left) result = co_await lower_expression_async(*expression.left);
             break;
+        case Expr::Kind::CompoundLiteral: {
+            const auto designator = co_await lower_designator_address_async(expression);
+            if (!designator) break;
+            result = array_type(hir_, designator->type)
+                ? std::optional<ValueId>(decay_array_address(designator->address, designator->type,
+                      expression.location))
+                : load_pointer(designator->address, expression.location, designator->alignment);
+            break;
+        }
         case Expr::Kind::Cast: {
             if (!expression.left || !expression.type) break;
             const auto destination_type = hir_.intern_type(expression.type);
@@ -3858,21 +3919,24 @@ private:
                 const auto& source_pointer_type = hir_.type(source_type);
                 const auto& destination_pointer_type =
                     hir_.type(destination_type);
-                // An explicit cast reinterprets one function pointer as another.
-                const bool functions = source_pointer_type.pointee && destination_pointer_type.pointee &&
-                    hir_.type(*source_pointer_type.pointee).kind == hir::Type::Kind::Function &&
-                    hir_.type(*destination_pointer_type.pointee).kind == hir::Type::Kind::Function;
+                // An explicit cast reinterprets one object pointer as another,
+                // or one function pointer as another, but never mixes the two.
+                const auto function_pointer = [&](const hir::Type& pointer) {
+                    return hir_.type(*pointer.pointee).kind == hir::Type::Kind::Function;
+                };
                 if (!source_pointer_type.pointee ||
                     !destination_pointer_type.pointee ||
-                    source_pointer_type.address_space !=
-                        destination_pointer_type.address_space ||
-                    (!functions && !compatible_pointer_conversion(
-                        *source_pointer_type.pointee,
-                        *destination_pointer_type.pointee))) {
+                    function_pointer(source_pointer_type) !=
+                        function_pointer(destination_pointer_type)) {
                     diagnostics_.error(
                         expression.location,
-                        "explicit pointer conversion discards qualifiers or "
-                        "uses incompatible pointee types");
+                        "explicit cast cannot convert between a function pointer and an object pointer");
+                    break;
+                }
+                if (source_pointer_type.address_space !=
+                    destination_pointer_type.address_space) {
+                    diagnostics_.error(expression.location,
+                        "explicit pointer conversion changes address space");
                     break;
                 }
             } else if ((source_pointer || destination_pointer) &&

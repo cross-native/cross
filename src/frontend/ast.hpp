@@ -275,7 +275,10 @@ struct Expr {
 
     enum class Kind {
         Integer, Floating, String, Character, Name, Unary, Binary, Assign,
-        Conditional, Call, Parenthesized, Cast, Sizeof, Alignof,
+        Conditional, Call, Parenthesized, Cast,
+        // `(type){ entries }`: an unnamed object of `type`, initialized by
+        // the brace list in `left`.
+        CompoundLiteral, Sizeof, Alignof,
         // `$::offsetof`: the record in `type`; its member designator is the
         // designator list of one initializer entry without a value.
         Offsetof,
@@ -557,6 +560,9 @@ struct ObjectDecl {
     Linkage linkage{Linkage::Group};
     // A constant the compiler created for a literal.
     bool literal{};
+    // The unnamed object of a compound literal outside a function body. No
+    // code runs before static initialization, so it holds its initializer.
+    bool compound_literal{};
 };
 
 struct EnumDecl {

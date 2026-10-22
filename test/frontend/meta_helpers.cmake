@@ -620,13 +620,14 @@ reject(steps "instruction budget exceeded"
     -feval-step-limit=256)
 
 # Constructed token trees are bounded even if the helper discards the value.
-# Keep adjacent '[' tokens separate so bracket and attribute groups are distinct.
+# Two consecutive '[' tokens open an attribute group, so nested bracket
+# groups are kept apart by a token.
 foreach(delimiter IN ITEMS paren bracket attribute brace)
     if(delimiter STREQUAL paren)
         set(open "( ")
         set(close ") ")
     elseif(delimiter STREQUAL bracket)
-        set(open "[ ")
+        set(open "[ 0, ")
         set(close "] ")
     elseif(delimiter STREQUAL attribute)
         set(open "[[ ")

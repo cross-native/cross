@@ -18,7 +18,6 @@ static u32 call<Callback F>(in u32 x) { return F(x); }
 static u32 *read_static() { return values + values[0]; }
 static u32 *escape_local() { u32 local = 1u32; return &local; }
 static u32 *uninitialized_pointer() { u32 *p; return p; }
-static u32 *bad_cast(in const u32 *p) { return (u32 *)p; }
 static u32 *indirect_pointer(in Callback only_eval) { return values + only_eval(0u32); }
 
 global u32 *pointer_error(in u32 index) {
@@ -36,8 +35,6 @@ global u32 *pointer_error(in u32 index) {
 #elif defined(NESTED)
     nested::<&cell>();
     return values;
-#elif defined(CAST_QUALIFIERS)
-    return identity::<(u32 *)(const u32 *)0uptr>();
 #elif defined(WRONG_TYPE)
     return identity::<(i32 *)0uptr>();
 #elif defined(UNKNOWN)
@@ -70,10 +67,6 @@ global u32 *pointer_error(in u32 index) {
     return identity::<uninitialized_pointer()>();
 #elif defined(INDIRECT_CALL)
     return identity::<indirect_pointer((Callback)0uptr)>();
-#elif defined(CALL_QUALIFIERS)
-    return identity::<bad_cast(&immutable)>();
-#elif defined(ROUNDTRIP_QUALIFIERS)
-    return identity::<(u32 *)(const void *)&immutable>();
 #elif defined(EVAL_ADDRESS)
     call::<only_eval>(1u32);
     return values;

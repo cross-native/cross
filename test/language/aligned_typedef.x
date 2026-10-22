@@ -22,12 +22,12 @@ typedef u16 by_enum [[aligned(1u32 << five)]];
 typedef u16 by_sizeof [[aligned(sizeof(struct triple) + 8uptr)]];
 typedef u16 by_alignof [[aligned($::alignof(wide_u32) * 4uptr)]];
 
-// Effective alignment is the largest request or the natural alignment, and
-// the size rounds up to it.
+// A typedef's alignment is its largest request, even below the natural
+// alignment, and the size rounds up to it.
 $::static_assert(sizeof(wide_u32) == 16uptr && $::alignof(wide_u32) == 16uptr, "scalar");
 $::static_assert(sizeof(wider_u32) == 32uptr && $::alignof(wider_u32) == 32uptr, "chain");
 $::static_assert(sizeof(kept_u32) == 32uptr && $::alignof(kept_u32) == 32uptr, "largest request");
-$::static_assert(sizeof(natural_u64) == 8uptr && $::alignof(natural_u64) == 8uptr, "natural");
+$::static_assert(sizeof(natural_u64) == 8uptr && $::alignof(natural_u64) == 4uptr, "lowered");
 $::static_assert(sizeof(line_u8) == 64uptr && $::alignof(line_u8) == 64uptr, "byte");
 $::static_assert(sizeof(padded_pointer) == 16uptr && $::alignof(padded_pointer) == 16uptr, "pointer");
 $::static_assert(sizeof(row4) == 32uptr && $::alignof(row4) == 32uptr, "array type");

@@ -426,8 +426,8 @@ bool stabilize_label_address(Module& module, LabelId label,
 // clone right after the function it specializes.
 [[nodiscard]] bool emitted_before(const Module& module, FunctionId left, FunctionId right);
 [[nodiscard]] std::string type_name(const Module& module, TypeId type);
-// Storage of an object of the type: its natural layout raised to the
-// alignment the type requests, with the size rounded up to that alignment.
+// Storage of an object of the type: its natural layout with the alignment the
+// type requests, which may lower it, and the size rounded up to that alignment.
 [[nodiscard]] std::optional<std::uint64_t>
 layout_size(const Module& module, TypeId type, const TargetInfo& target);
 // Prepared AST types used by raw lowering share the same storage contract.

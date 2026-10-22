@@ -238,6 +238,7 @@ std::optional<AssumptionViolation> assumption_violation(
             break;
         case Expr::Kind::VoidValue: case Expr::Kind::Quote: case Expr::Kind::ByteSequence:
         case Expr::Kind::Assign: case Expr::Kind::AggregateInitializer:
+        case Expr::Kind::CompoundLiteral:
             return AssumptionViolation{AssumptionViolation::Kind::Effects, node};
         }
     }

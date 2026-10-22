@@ -445,9 +445,14 @@ foreach(capture IN ITEMS paren bracket block group tokens_until function_raw)
     endif()
     string(REPEAT "\"${open}\" " 13 open_pattern)
     string(REPEAT "\"${close}\" " 13 close_pattern)
-    # Spaces keep consecutive bracket delimiters distinct lexical tokens.
     string(REPEAT "${open} " 13 open_input)
     string(REPEAT "${close} " 13 close_input)
+    # Two consecutive '[' tokens open an attribute group, so a token keeps
+    # nested bracket groups apart.
+    if(capture STREQUAL bracket)
+        string(REPEAT "\"[\" \"y\" " 13 open_pattern)
+        string(REPEAT "[ y " 13 open_input)
+    endif()
     set(raw "body:${capture}")
     set(exact "${open_pattern}\"x\" ${close_pattern}")
     set(input "${open_input}x ${close_input}")
