@@ -1193,9 +1193,9 @@ private:
                         state.state.value < abi->variadic_states.size()
                     ? &abi->variadic_states[state.state.value]
                     : nullptr;
-            const auto value = add_value(
-                ValueKind::VariadicState, state.type, state.location);
-            current_.values[value.value].variadic_state = state.state;
+            const auto value = state.fields.empty()
+                ? variadic_state(state.state, state.type, state.location)
+                : variadic_record(state, state_model);
             const SlotId slot{
                 static_cast<std::uint32_t>(current_.slots.size())};
             current_.slots.push_back(
@@ -1585,6 +1585,47 @@ private:
                                      hir_.pointer_to(binding.type), location);
         current_.values[value.value].slot = binding.slot;
         return value;
+    }
+
+    ValueId variadic_state(AbiStateId state, hir::TypeId type,
+                           SourceLocation location) {
+        const auto value = add_value(ValueKind::VariadicState, type, location);
+        current_.values[value.value].variadic_state = state;
+        return value;
+    }
+
+    // The address of a frame record that holds the entry values of the
+    // states of a record_address binding, each at its offset.
+    ValueId variadic_record(const hir::VariadicBinding& binding,
+                            const AbiVariadicState* state) {
+        const auto location = binding.location;
+        const auto byte = *hir_.builtin(BuiltinType::U8);
+        const SlotId slot{static_cast<std::uint32_t>(current_.slots.size())};
+        const auto type = hir_.array_of(byte, binding.record_bytes);
+        current_.slots.push_back(
+            {slot, location, type,
+             "$variadic.record." + (state ? state->canonical_name : binding.name),
+             std::nullopt, false, true, false, binding.record_alignment,
+             std::nullopt});
+        const LocalBinding record{slot, type, std::nullopt, std::nullopt};
+        scopes_.back().slots.push_back(slot);
+        (void)lifetime(ValueKind::LifetimeStart, slot, location);
+        const auto base =
+            cast(slot_address(record, location), hir_.pointer_to(byte), location);
+        for (const auto& field : binding.fields) {
+            auto address = base;
+            if (field.offset != 0) {
+                address = indexed_address(
+                    base,
+                    constant(UInt128{field.offset},
+                             *hir_.builtin(BuiltinType::Uptr), location),
+                    byte, location);
+            }
+            (void)store_pointer(
+                cast(address, hir_.pointer_to(field.type), location),
+                variadic_state(field.state, field.type, location), location);
+        }
+        return cast(base, binding.type, location);
     }
 
     ValueId global_address(const hir::Object& object,
@@ -8447,8 +8488,16 @@ bool verify_function(const ManagedFunction& function, const hir::Module& hir_mod
                     entity.variadic_bindings.begin(),
                     entity.variadic_bindings.end(),
                     [&](const hir::VariadicBinding& candidate) {
-                        return candidate.state == value.variadic_state &&
-                               candidate.type == value.type;
+                        return (candidate.fields.empty() &&
+                                candidate.state == value.variadic_state &&
+                                candidate.type == value.type) ||
+                               std::any_of(
+                                   candidate.fields.begin(),
+                                   candidate.fields.end(),
+                                   [&](const hir::VariadicBinding::Field& field) {
+                                       return field.state == value.variadic_state &&
+                                              field.type == value.type;
+                                   });
                     });
                 if (!entity.variadic || value.variadic_state.empty() ||
                     binding == entity.variadic_bindings.end() || value.slot ||

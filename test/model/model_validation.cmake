@@ -588,3 +588,33 @@ abi "a" {
     rule "integer" { match = ["integer"]; action = "direct"; bank = "integer"; }
 }
 ]=])
+# A record_address state names fields, other states of its entry, once
+# each; it has a pointer type and none of the cursor properties.
+set(record_abi_head [=[
+abi "a" {
+    architecture = "x86-64";
+    address_bits = 64;
+    stack_alignment = 16;
+    stack_slot_bytes = 8;
+    variadic_supported = true;
+    variadic_save_banks = ["integer"];
+    bank "integer" { class = "integer"; register_bits = 64; arguments = ["rdi", "rsi"]; results = ["rax"]; }
+    rule "integer" { match = ["integer"]; action = "direct"; bank = "integer"; }
+    variadic_state "offset" { type = "u32"; kind = "cursor_offset"; cursor = "integer"; stride = 8; }
+    variadic_state "area" { type = "void*"; kind = "register_save_address"; }
+]=])
+set(record_fields "ABI variadic state fields are required by, and only valid for, a record_address state")
+set(record_shape "ABI variadic record_address state requires a pointer type and takes no cursor, base, stride, limit, or llvm_va_list_offset")
+set(record_members "ABI variadic state 'list' fields must name other states once, none of kind record_address")
+function(expect_record_rejected label message state)
+    expect_rejected(${label} 12 "${message}" "${record_abi_head}    ${state}\n}\n")
+endfunction()
+expect_record_rejected(record-without-fields "${record_fields}" [=[variadic_state "list" { type = "void*"; kind = "record_address"; }]=])
+expect_record_rejected(fields-without-record "${record_fields}" [=[variadic_state "list" { type = "void*"; kind = "stack_address"; fields = ["offset"]; }]=])
+expect_record_rejected(record-empty-fields "${record_fields}" [=[variadic_state "list" { type = "void*"; kind = "record_address"; fields = []; }]=])
+expect_record_rejected(record-scalar "${record_shape}" [=[variadic_state "list" { type = "u64"; kind = "record_address"; fields = ["offset"]; }]=])
+expect_record_rejected(record-cursor "${record_shape}" [=[variadic_state "list" { type = "void*"; kind = "record_address"; cursor = "integer"; stride = 8; fields = ["offset"]; }]=])
+expect_record_rejected(record-unknown-field "${record_members}" [=[variadic_state "list" { type = "void*"; kind = "record_address"; fields = ["offset", "missing"]; }]=])
+expect_record_rejected(record-repeated-field "${record_members}" [=[variadic_state "list" { type = "void*"; kind = "record_address"; fields = ["offset", "offset"]; }]=])
+expect_record_rejected(record-of-record "${record_members}" [=[variadic_state "list" { type = "void*"; kind = "record_address"; fields = ["list"]; }]=])
+expect_accepted(record-state "${record_abi_head}    variadic_state \"list\" { type = \"void*\"; kind = \"record_address\"; fields = [\"area\", \"offset\"]; alignment = 16; }\n}\n")

@@ -124,6 +124,9 @@ struct ProfileEntry {
     std::optional<std::string> mangling;
     std::optional<std::string> optimization;
     std::optional<std::string> debug;
+    // The init_table entries of [[constructor]] and [[destructor]].
+    std::optional<std::string> constructors;
+    std::optional<std::string> destructors;
     std::vector<OptionAssignment> options;
     floating::Environment floating_environment;
 };
@@ -327,6 +330,19 @@ struct DataBaseEntry {
     bool literal{};
 };
 
+// A table of functions that a program's runtime calls, such as ELF's
+// .init_array.
+struct InitTableEntry {
+    std::string canonical_name;
+    std::string source;  // "file:line" of the declaration
+    std::string section;
+    // The start of the section names of prioritized entries.
+    std::optional<std::string> priority_section;
+    bool invert_priority{};
+    // The ABI of the calls; unset, the compilation's.
+    std::optional<std::string> abi;
+};
+
 // A cpu entry with its bases applied.
 struct ResolvedCpu {
     std::vector<std::string> features;
@@ -368,6 +384,8 @@ public:
     [[nodiscard]] const CpuEntry* find_cpu(std::string_view architecture,
                                            std::string_view name) const;
     [[nodiscard]] const DataBaseEntry* find_data_base(
+        std::string_view name) const;
+    [[nodiscard]] const InitTableEntry* find_init_table(
         std::string_view name) const;
     [[nodiscard]] ResolvedCpu resolve_cpu(const TargetInfo& target,
                                           const CpuEntry& entry) const;
@@ -411,6 +429,9 @@ public:
     [[nodiscard]] const std::vector<DataBaseEntry>& data_bases() const {
         return data_bases_;
     }
+    [[nodiscard]] const std::vector<InitTableEntry>& init_tables() const {
+        return init_tables_;
+    }
     [[nodiscard]] const std::vector<std::string>& origins() const {
         return origins_;
     }
@@ -426,6 +447,7 @@ private:
     std::vector<DebugEntry> debugs_;
     std::vector<CpuEntry> cpus_;
     std::vector<DataBaseEntry> data_bases_;
+    std::vector<InitTableEntry> init_tables_;
     std::vector<InstructionTable> instruction_tables_;
     // Instruction entries arrived since the tables were completed.
     bool instructions_pending_{};

@@ -2909,6 +2909,26 @@ ABI model forbids, unrepresentable address spaces, and scalable vectors are
 invalid. A complete manual variadic ABI must expose iterable state; a definition
 that ignores unnamed arguments may omit bindings.
 
+An ABI model may define a state that holds the value C passes for a
+`va_list` argument, built from the other states, so that a definition can
+forward its unnamed arguments to a C function that takes a `va_list`. The
+shipped C ABIs that have one name it `va_list`
+([targets.md](targets.md)):
+
+```x
+[[abi("sysv_abi")]] i32 vprintf(in const u8 *format, in void *arguments);
+
+[[abi("sysv_abi"), variadic(void *arguments "va_list")]]
+global i32 print(in const u8 *format, ...) {
+    return vprintf(format, arguments);
+}
+```
+
+Like a C `va_list` after `va_start`, the value designates the unnamed
+arguments from the first one on, until the definition returns. A callee that
+reads arguments through it may change what it designates, as `va_arg` does
+in C, so after such a call it designates unspecified arguments.
+
 Manual locations on a variadic interface overlay the automatic classification
 of the complete call as at any mixed boundary: unnamed arguments, the count
 register, and the `variadic` state follow the automatic classification, and a
@@ -3983,13 +4003,14 @@ definition in the group for which they are valid, as leading attributes: an
 attribute is valid for a declaration when its subject matches, so function
 attributes apply to functions (`abi`, `clobber`, and `stack_cleanup` also to
 typedefs and objects of function or function-pointer type), symbol attributes
-as the declaration's definition status and linkage allow, layout attributes
-to typedefs and record definitions, and `underlying` to enumerations. An
-attribute written on a declaration inside takes precedence over a region
-attribute of the same name, regions nest, and a region attribute valid for
-none of the region's declarations is an error. Like a `syntax` region, an
-attribute region is a transparent declaration group that creates no namespace
-or scope.
+as the declaration's definition status and linkage allow, `constructor` and
+`destructor` to function definitions and to initialized objects of
+function-pointer type or arrays of it, layout attributes to typedefs and
+record definitions, and `underlying` to enumerations. An attribute written
+on a declaration inside takes precedence over a region attribute of the same
+name, regions nest, and a region attribute valid for none of the region's
+declarations is an error. Like a `syntax` region, an attribute region is a
+transparent declaration group that creates no namespace or scope.
 
 ```text
 [[abi("sysv_abi")]] {
@@ -4066,6 +4087,47 @@ only the padding their alignments require; `-ffunction-sections` and
 they place in a section named after the definition's link name in the object
 format's convention.
 
+### Initializer tables
+
+`[[constructor]]` on a function definition places an entry for the function
+in the initializer table of the selected profile, whose entries a C runtime
+calls before `main`, as it does for GCC's `constructor` attribute.
+`[[destructor]]` places an entry in the profile's finalizer table, whose
+entries the runtime calls when the program exits normally. Cross adds no
+code that calls either table: the startup and exit code that the program is
+linked with does, and an entry that nothing calls never runs. The model
+entry of each table ([models.md](models.md#initializer-table-entries))
+gives its sections and the ABI of its calls; under a profile without the
+table, the attribute is an error.
+
+The function takes no parameters and returns `void`, and may have any
+linkage; its entry calls it through an adapter when its ABI differs from the
+table's. On a static-duration object with an initializer, the attribute
+places the object itself in the table. The object's type is the table's
+entry type, a pointer to a function without parameters or result under the
+table's ABI, or an array of such pointers. The attribute implies `used`. It
+is invalid on a function declaration without a body, a generic function, and
+a translation-only function, with `section`, `thread_local`, `noinit`,
+`address`, `alias`, or `weakref` on the object, and as both `constructor`
+and `destructor` on one object.
+
+An optional priority, an integer constant expression from 0 to 65535, orders
+the entries of a table: constructors with lower priorities run first, and
+destructors with lower priorities run last. An entry without a priority has
+priority 65535. The order of entries with equal priorities is unspecified. A
+priority other than 65535 is an error for a table without prioritized
+sections.
+
+```x
+[[constructor]]
+static void set_up() {
+}
+
+[[constructor(101), destructor(101)]]
+static void logging() {
+}
+```
+
 The following function and statement attributes are normative:
 
 | Attribute | Contract |
@@ -4083,6 +4145,8 @@ The following function and statement attributes are normative:
 | `operator("token")` | Binds one exact unary or binary operator signature to this ordinary function. |
 | `stack_cleanup("caller" or "callee")` | Selects ownership of a manual stack argument area. |
 | `variadic(binding, ...)` | Names incoming ABI state used to traverse variadic arguments. |
+| `constructor`, `constructor(P)` | Places the function in the profile's initializer table, which the program's runtime calls before `main`; see [Initializer tables](#initializer-tables). |
+| `destructor`, `destructor(P)` | Places the function in the profile's finalizer table, which the program's runtime calls at normal exit. |
 | `always_inline` | Every call that can legally be inlined must be inlined; otherwise diagnose. |
 | `noinline` | Calls to the function are not inlined. |
 | `cold` / `hot` | Supplies a layout and optimization-frequency hint. |

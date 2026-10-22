@@ -166,11 +166,23 @@ struct Record {
 };
 
 struct VariadicBinding {
+    // A state of a record_address binding's record, at a byte offset.
+    struct Field {
+        AbiStateId state;
+        TypeId type;
+        std::uint32_t offset{};
+    };
+
     SourceLocation location;
     std::string name;
     TypeId type;
     AbiStateId state;
     ValueBinding binding{};
+    // Nonempty for a record_address state: the binding holds the address of
+    // a frame record of record_bytes bytes that holds these states.
+    std::vector<Field> fields;
+    std::uint32_t record_bytes{};
+    std::uint32_t record_alignment{1};
 };
 
 // A Discarded definition is one that nothing reachable references: it has no
@@ -250,6 +262,8 @@ struct Object {
     Linkage linkage{Linkage::Group};
     TypeId type;
     std::optional<std::string> section;
+    // An entry of a [[constructor]] or [[destructor]] table, in `section`.
+    bool table_entry{};
     unsigned minimum_alignment{1};
     SymbolVisibility visibility{SymbolVisibility::Default};
     bool weak{};

@@ -1265,6 +1265,9 @@ VariadicStateValue variadic_state_value(
         return {VariadicStateBase::IncomingArguments, displacement};
     case AbiVariadicStateKind::RegisterSaveAddress:
         return {VariadicStateBase::SaveArea, displacement};
+    case AbiVariadicStateKind::RecordAddress:
+        // MIR builds a record from its fields; no target resolves one.
+        return {};
     case AbiVariadicStateKind::StackAddress:
         break;
     }

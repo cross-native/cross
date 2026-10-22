@@ -2525,6 +2525,51 @@ if(BUILD_TESTING)
             endforeach()
         endforeach()
     endforeach()
+    # Forwarding through the va_list state to GCC C under o32 and n64.
+    foreach(level O0 O2)
+        set(name cross_mips_variadic_va_list_o32_${level})
+        add_test(NAME ${name} COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/va_list.x
+            -DGCC_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/va_list.c
+            -DGCC_FLAGS=-G0
+            -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/variadic_start.s
+            -DCC_FLAGS=-${level} -DEXPECTED=P
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-variadic-va-list-o32-${level}
+            -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(${name} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;feature.variadic;feature.abi;feature.interop;profile.o32;isa.vr4300;isa.r3000;endian.big;endian.little;opt.${level}"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS")
+        foreach(endian big little)
+            set(name cross_mips_variadic_va_list_n64_${endian}_${level})
+            add_test(NAME ${name} COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/va_list.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/variadic_n64_start.s
+                -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare-n64.ld
+                -DN64_ENDIAN=${endian} -DEXTRA_FLAGS=-${level}
+                -DGCC_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/va_list.c
+                -DGCC_FLAGS=-G0
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-variadic-va-list-n64-${endian}-${level}
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.cmake")
+            set_tests_properties(${name} PROPERTIES
+                LABELS "check.runtime;arch.mips;backend.native;feature.variadic;feature.abi;feature.interop;profile.n64;isa.mips64;endian.${endian};opt.${level}"
+                SKIP_REGULAR_EXPRESSION "skipping MIPS n64")
+        endforeach()
+        # A bare-metal startup that walks the initializer tables.
+        set(name cross_mips_init_tables_${level})
+        add_test(NAME ${name} COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/init_tables.x
+            -DSTARTUP=${CMAKE_SOURCE_DIR}/test/target/mips/init_tables_start.s
+            -DMIPS_LINKER=${CMAKE_SOURCE_DIR}/test/target/mips/init_tables.ld
+            -DCC_FLAGS=-${level} -DEXPECTED=P
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-init-tables-${level}
+            -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(${name} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;feature.init_tables;profile.o32;isa.vr4300;isa.r3000;endian.big;endian.little;opt.${level}"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS")
+    endforeach()
     add_test(NAME cross_model_mips_abi_properties
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
@@ -3367,6 +3412,14 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/model/data_base_entries.cmake")
     set_tests_properties(cross_model_data_base_entries PROPERTIES
         LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;feature.model;feature.driver;feature.small_data")
+    add_test(NAME cross_model_init_table_entries
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DCPP=$<TARGET_FILE:cross_cpp>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/model-init-table-entries
+                -P "${CMAKE_SOURCE_DIR}/test/model/init_table_entries.cmake")
+    set_tests_properties(cross_model_init_table_entries PROPERTIES
+        LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;feature.model;feature.driver;feature.init_tables")
     add_test(NAME cross_mangling_dsl
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
@@ -7324,6 +7377,69 @@ if(BUILD_TESTING)
                     -P "${CMAKE_SOURCE_DIR}/test/backend/native/variadic/llvm.cmake")
         set_tests_properties(cross_variadics_llvm_debug PROPERTIES
             LABELS "check.compile;arch.x86_64;backend.llvm;feature.variadic")
+    endif()
+    # A user ABI's record_address state: its record's layout and alignment.
+    foreach(level O0 O2)
+        add_test(NAME cross_runtime_variadic_record_state_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/variadic/record_state.x
+                    -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/variadic-record-state-${level}
+                    -DENTRY=record_entry -DEXPECTED=0
+                    "-DCC_FLAGS=-${level};--model=${CMAKE_SOURCE_DIR}/test/backend/native/variadic/record_state.xm"
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_variadic_record_state_${level} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;feature.variadic;feature.model;opt.${level}")
+    endforeach()
+    add_test(NAME cross_init_tables_objects
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/init_tables/objects.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/init-tables-objects
+                -P "${CMAKE_SOURCE_DIR}/test/backend/native/init_tables/objects.cmake")
+    set_tests_properties(cross_init_tables_objects PROPERTIES
+        LABELS "check.compile;arch.x86_64;arch.mips;backend.native;feature.init_tables;feature.object;feature.abi;endian.big;endian.little;profile.o32;profile.n64")
+    add_test(NAME cross_init_tables_diagnostics
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/init-tables-diagnostics
+                -P "${CMAKE_SOURCE_DIR}/test/backend/native/init_tables/errors.cmake")
+    set_tests_properties(cross_init_tables_diagnostics PROPERTIES
+        LABELS "check.compile;diagnostics;arch.x86_64;feature.init_tables")
+    # Programs linked with the system C runtime (GNU ld and glibc's crt),
+    # also from the LLVM serializer's output when Clang compiles it.
+    find_program(CROSS_TEST_GCC NAMES gcc)
+    if(CROSS_TEST_GCC AND cross_default_target MATCHES "^x86_64-.*-linux")
+        set(c_runtime_labels "check.runtime;arch.x86_64;backend.native;feature.interop;opt.O0;opt.O2")
+        set(c_runtime_clang "")
+        if(CROSS_ENABLE_LLVM_TEXT)
+            find_program(CROSS_TEST_CLANG NAMES clang)
+            if(CROSS_TEST_CLANG)
+                set(c_runtime_clang -DCLANG=${CROSS_TEST_CLANG})
+                string(APPEND c_runtime_labels ";backend.llvm")
+            endif()
+        endif()
+        add_test(NAME cross_init_tables_runtime
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DGCC=${CROSS_TEST_GCC} ${c_runtime_clang}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/init_tables/tables.x
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/init-tables-runtime
+                    -P "${CMAKE_SOURCE_DIR}/test/backend/native/init_tables/runtime.cmake")
+        set_tests_properties(cross_init_tables_runtime PROPERTIES
+            LABELS "${c_runtime_labels};feature.init_tables;feature.object")
+        add_test(NAME cross_runtime_variadic_va_list
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DGCC=${CROSS_TEST_GCC} ${c_runtime_clang}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/variadic/va_list.x
+                    -DDRIVER=${CMAKE_SOURCE_DIR}/test/backend/native/variadic/va_list_driver.c
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/variadic-va-list
+                    -P "${CMAKE_SOURCE_DIR}/test/backend/native/variadic/va_list.cmake")
+        set_tests_properties(cross_runtime_variadic_va_list PROPERTIES
+            LABELS "${c_runtime_labels};feature.variadic;feature.abi")
     endif()
     add_test(NAME cross_runtime_native_automatic_call_boundary
         COMMAND "${CMAKE_COMMAND}"

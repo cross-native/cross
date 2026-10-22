@@ -37,6 +37,7 @@ const Attribute* attribute(const ObjectDecl& object, std::string_view name) {
 bool supported_attribute(std::string_view name) {
     return name == "link_name" || name == "section" || name == "aligned" ||
            name == "noinit" || name == "retain" || name == "used" ||
+           name == "constructor" || name == "destructor" ||
            name == "weak" || name == "visibility" ||
            name == "alias" || name == "weakref" ||
            name == "thread_local" || name == "tls_model" || name == "address";
@@ -1809,7 +1810,8 @@ Module lower(hir::Module& hir_module, const Subtarget& subtarget,
             hir::layout_alignment(hir_module, entity.type, subtarget.target()).value_or(1));
         object.alignment = std::max(natural, entity.minimum_alignment);
         object.retain = marker_attribute(*declaration, "retain", diagnostics);
-        object.used = marker_attribute(*declaration, "used", diagnostics);
+        object.used = marker_attribute(*declaration, "used", diagnostics) ||
+                      entity.table_entry;
         object.is_thread_local =
             marker_attribute(*declaration, "thread_local", diagnostics);
         object.tls_model =

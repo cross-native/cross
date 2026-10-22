@@ -295,6 +295,12 @@ void print_profiles() {
             std::cout << "  optimization: " << *profile.optimization;
         }
         if (profile.debug) std::cout << "  debug: " << *profile.debug;
+        if (profile.constructors) {
+            std::cout << "  constructors: " << *profile.constructors;
+        }
+        if (profile.destructors) {
+            std::cout << "  destructors: " << *profile.destructors;
+        }
         std::cout << '\n';
         for (const auto& option : profile.options) {
             std::cout << "    " << option.name << " = "
@@ -420,6 +426,18 @@ void print_data_bases() {
         }
         std::cout << (kinds.empty() ? " none" : kinds)
                   << "  source: " << entry.source << '\n';
+    }
+}
+
+void print_init_tables() {
+    for (const auto& entry : model_registry().init_tables()) {
+        std::cout << entry.canonical_name << "  section: " << entry.section;
+        if (entry.priority_section) {
+            std::cout << "  priority_section: " << *entry.priority_section
+                      << (entry.invert_priority ? " (inverted)" : "");
+        }
+        if (entry.abi) std::cout << "  abi: " << *entry.abi;
+        std::cout << "  source: " << entry.source << '\n';
     }
 }
 
@@ -1071,6 +1089,7 @@ int cc_main(int argc, char** argv) {
     if (options.print_cpus) { print_cpus(options); return 0; }
     if (options.print_costs) return print_costs(options, diagnostics) ? 0 : 1;
     if (options.print_data_bases) { print_data_bases(); return 0; }
+    if (options.print_init_tables) { print_init_tables(); return 0; }
     if (options.print_options) { print_options(options); return 0; }
     if (options.print_attributes) { print_attributes(); return 0; }
     if (options.print_registers) { print_registers(options); return 0; }
@@ -1141,6 +1160,8 @@ int cc_main(int argc, char** argv) {
     Program program;
     program.canonical_callable_abi = canonical_abi;
     program.address_bits = subtarget->abi_info().address_bits;
+    if (options.constructor_table) program.constructor_abi = options.constructor_table->abi;
+    if (options.destructor_table) program.destructor_abi = options.destructor_table->abi;
     program.evaluation_limits = {
         options.eval_byte_limit, options.eval_memory_limit,
         options.eval_step_limit, options.eval_depth_limit,

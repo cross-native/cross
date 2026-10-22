@@ -23,6 +23,31 @@ map to each format as follows:
 | `[[weakref("name")]]` | Yes | Yes | Yes |
 | `[[retain]]` | `SHF_GNU_RETAIN` | Linker include directive | `no_dead_strip` |
 
+A `[[section]]` section takes the type that its name has in the object
+format: on ELF, `.init_array`, `.fini_array`, and `.preinit_array`, also
+followed by `.` and a suffix, are SHT_INIT_ARRAY, SHT_FINI_ARRAY, and
+SHT_PREINIT_ARRAY sections, as GNU `as` makes them.
+
+The shipped profiles name these initializer tables for `[[constructor]]` and
+`[[destructor]]` ([models.md](models.md#initializer-table-entries)), where
+`NNNNN` is a priority `P` as five digits:
+
+| Profile | Constructors | Destructors | ABI |
+| --- | --- | --- | --- |
+| `x86_64-elf` (ELF) | `.init_array`, `.init_array.NNNNN` | `.fini_array`, `.fini_array.NNNNN` | `sysv_abi` |
+| `x86_64-windows` (COFF) | `.CRT$XCU`, `.CRT$XCTNNNNN` | `.dtors`, `.dtors.NNNNN` of 65535 - `P` | `ms_abi` |
+| `x86_64-darwin` (Mach-O) | `__DATA,__mod_init_func` | `__DATA,__mod_term_func` | `sysv_abi` |
+| MIPS profiles (ELF) | `.init_array`, `.init_array.NNNNN` | `.fini_array`, `.fini_array.NNNNN` | the compilation's |
+
+glibc and other ELF C runtimes call `.init_array` before `main` and
+`.fini_array` at exit. MinGW-w64's startup code calls the `.CRT$XC*`
+entries before `main`, and the exit handler that its `__main` registers
+calls `.dtors`; dyld calls the Mach-O sections. GNU `ld`'s default scripts
+order the prioritized sections of each table by priority. On bare metal,
+the program's startup code walks the ELF arrays, for example between symbols
+that its linker script defines, and calls each entry with the compilation's
+ABI. Mach-O tables have no priorities.
+
 An alias must name a compatible definition in the same compilation. An
 instance of a `global` generic goes to a COMDAT group keyed by its link name
 on ELF and COFF, and is a weak definition on Mach-O, so the linker keeps one
@@ -86,8 +111,8 @@ is an error. At run time a wider integer keeps its low address bits.
 | `x86_64-unknown-linux-gnu` | ELF | `x` |
 | `x86_64-apple-darwin` | Mach-O | `x` |
 
-`amd64-*` is accepted for `x86_64-*`. The `x86_64-windows` and `x86_64-elf`
-profiles select the first two triples. ABIs:
+`amd64-*` is accepted for `x86_64-*`. The `x86_64-windows`, `x86_64-elf`,
+and `x86_64-darwin` profiles select the three triples. ABIs:
 
 | ABI | Aliases | Use |
 | --- | --- | --- |
@@ -133,6 +158,12 @@ Disabling a feature also disables the features that depend on it, so
 `-mno-avx` disables AVX2 and AVX-512 too. 128-bit integers, `f80`, vectors,
 atomics, thread-local storage, and variadic functions are supported, but a
 variadic function or function pointer cannot use register or stack locations.
+The `va_list` state of `sysv_abi` is the address of a `__va_list_tag` that
+the definition fills in from `gp_offset`, `fp_offset`, `overflow_arg_area`,
+and `reg_save_area`, and that of `ms_abi` the address of the next argument
+slot, so a `variadic(void *arguments "va_list")` binding can be passed to a
+C function that takes a `va_list`. The Cross ABI `x` has no `va_list`
+state.
 
 `$::trap()`, like a failed `-fbounds-trap` check, executes `ud2`.
 
@@ -567,7 +598,11 @@ a call keeps every register outside the function's clobbers and interface,
 and cannot pass `out` or `inout` parameters.
 
 A variadic definition reads its unnamed arguments through the states of its
-ABI. Under `o32`, `arg_area` (`void *`) is the C `va_start` address: the
+ABI. Under `o32` and `n64`, `va_list` is the same state as `arg_area`, the
+value C passes for a `va_list`. `eabi32` has no `va_list` state: GCC's
+`va_list` there is `arg_area` without a double-precision FPU and a record
+with one, as described below. Under `o32`, `arg_area` (`void *`) is the C
+`va_start` address: the
 definition stores `a0`–`a3` in the 16 bytes that the caller reserves for them,
 so the unnamed arguments form one sequence of 4-byte slots in which `f64` and
 `i64` values start at a multiple of 8, and the pointer may be passed to a C

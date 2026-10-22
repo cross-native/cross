@@ -653,6 +653,7 @@ with `-target`, `-march`, or `-mprofile` to inspect another configuration.
 | `--print-cpus` | The target's CPU entries with their parents, features, issue widths, and function alignments where one is set. |
 | `--print-costs` | The latency, issue cost, and availability of each of the target's instructions for `-march` and `-mtune`: a `cpu: NAME  tune: NAME  issue_width: N` line, then one `INSTRUCTION  latency: N  issue: N  available: yes` (or `no`) line per instruction. |
 | `--print-data-bases` | The `data_base` entries: one `NAME  base: REGISTER  sections: LIST  max_size: N  kinds: LIST  source: FILE:LINE` line each. |
+| `--print-init-tables` | The `init_table` entries: one `NAME  section: SECTION  priority_section: PREFIX  abi: ABI  source: FILE:LINE` line each, without the parts an entry does not set and with ` (inverted)` after an inverted prefix. |
 | `--print-options[=all\|optimization\|common\|target]` | Options, values, and origins. |
 | `--print-keywords`, `--print-builtins`, `--print-attributes` | The language surface. |
 | `--print-features`, `--print-registers` | Target feature queries and register names. |

@@ -270,7 +270,7 @@ private:
         // -fzero-init-in-data keeps zero values in the file image.
         const bool zero = object.initializer == data::InitializerKind::Zero &&
                           !object.read_only && !patched &&
-                          !options_.zero_init_in_data;
+                          !options_.zero_init_in_data && !entity.table_entry;
         const bool uninitialized =
             object.initializer == data::InitializerKind::Uninitialized;
         const bool split_section = options_.data_sections || object.retain;
@@ -318,8 +318,11 @@ private:
             : uninitialized
             ? AssemblySectionKind::NoInit
             : zero ? AssemblySectionKind::ZeroFill
-            : object.read_only ? AssemblySectionKind::ReadOnlyData
-                               : AssemblySectionKind::WritableData;
+            // A table's entries share its section, writable as runtimes
+            // expect, also when an entry object is constant.
+            : object.read_only && !entity.table_entry
+                ? AssemblySectionKind::ReadOnlyData
+                : AssemblySectionKind::WritableData;
         // A data base's sections take the kinds of what the entry admits,
         // so its objects agree on each section's flags.
         if (entity.data_base) {

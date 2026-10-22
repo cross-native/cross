@@ -52,6 +52,21 @@ bool zero_fill(AssemblySectionKind kind) {
            kind == AssemblySectionKind::ThreadZeroFill;
 }
 
+// The ELF type that GNU as and LLVM give a section of this name, such as
+// .init_array.00101, or else the one its contents need.
+std::string_view elf_type(const AssemblySectionRequest& request) {
+    const auto named = [&](std::string_view prefix) {
+        return request.name == prefix ||
+               (request.name.starts_with(prefix) &&
+                request.name[prefix.size()] == '.');
+    };
+    if (zero_fill(request.kind)) return "@nobits";
+    if (named(".init_array")) return "@init_array";
+    if (named(".fini_array")) return "@fini_array";
+    if (named(".preinit_array")) return "@preinit_array";
+    return "@progbits";
+}
+
 std::optional<std::string> macho_directive(
     const AssemblySectionRequest& request, std::string& error) {
     if (request.kind == AssemblySectionKind::ThreadData ||
@@ -143,7 +158,7 @@ std::optional<std::string> assembly_section_directive(
         }
         return ".section " + quoted(request.name) + ",\"" +
                elf_flags(request) + (grouped ? "G" : "") + "\"," +
-               (zero_fill(request.kind) ? "@nobits" : "@progbits") +
+               std::string(elf_type(request)) +
                (grouped ? ',' + std::string(request.group) + ",comdat"
                         : std::string{});
     case ObjectFormat::Coff:

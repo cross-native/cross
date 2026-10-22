@@ -683,6 +683,50 @@ private:
         co_return result;
     }
 
+    // The section of an initializer-table entry: the table's own for the
+    // default priority 65535, else its prioritized section for the
+    // priority, written as five digits.
+    ContinuationTask<std::optional<std::string>> table_section_async(
+        const Attribute& attribute, const InitTableOptions& table,
+        std::string_view source_namespace) {
+        std::uint64_t priority = 65535;
+        if (!attribute.arguments.empty()) {
+            const auto failure = attribute.name + " priority must be an integer from 0 to 65535";
+            if (!attribute.expression_argument) {
+                diagnostics_.error(attribute.location, failure);
+                co_return std::nullopt;
+            }
+            auto value = attribute.expression_argument->evaluated_integer;
+            if (!value) {
+                const auto queries = record_layout_queries(attribute.location);
+                LayoutServiceScope services(*this, attribute.location);
+                value = co_await evaluate_target_integer_constant_async(program_,
+                    *attribute.expression_argument, diagnostics_, queries.first, queries.second,
+                    source_namespace);
+                if (!value) co_return std::nullopt;
+            }
+            const auto type = value->type;
+            const bool sized = type == BuiltinType::Iptr || type == BuiltinType::Uptr;
+            const auto bits = sized ? module_.address_bits : type_bits(builtin_type(type));
+            const bool negative = bits != 0 && bit(value->value, bits - 1) &&
+                (type == BuiltinType::I8 || type == BuiltinType::I16 || type == BuiltinType::I32 ||
+                 type == BuiltinType::I64 || type == BuiltinType::I128 || type == BuiltinType::Iptr);
+            if (negative || value->value.high != 0 || value->value.low > 65535) {
+                diagnostics_.error(attribute.location, failure);
+                co_return std::nullopt;
+            }
+            priority = value->value.low;
+        }
+        if (priority == 65535) co_return table.section;
+        if (table.priority_section.empty()) {
+            diagnostics_.error(attribute.location, "the " + attribute.name + " table '" +
+                table.name + "' has no priorities");
+            co_return std::nullopt;
+        }
+        const auto digits = std::to_string(table.invert_priority ? 65535 - priority : priority);
+        co_return table.priority_section + std::string(5 - digits.size(), '0') + digits;
+    }
+
     // The common address of an entity's address(N) declarations, if any.
     ContinuationTask<std::optional<std::uint64_t>> fixed_address_async(
         const std::vector<const Attribute*>& attributes, std::string_view source_namespace) {
@@ -1951,8 +1995,22 @@ private:
                                     "' requires binding type '" + state->type + "'");
                             continue;
                         }
-                        VariadicBinding binding{declaration.location, declaration.name,
-                            intern_type(declaration.type), state->id, declaration.binding};
+                        VariadicBinding binding;
+                        binding.location = declaration.location;
+                        binding.name = declaration.name;
+                        binding.type = intern_type(declaration.type);
+                        binding.state = state->id;
+                        binding.binding = declaration.binding;
+                        for (const auto& field : state->fields) {
+                            const auto& source =
+                                selected_abi->variadic_states[field.state.value];
+                            binding.fields.push_back(
+                                {field.state,
+                                 intern_type(variadic_state_type(source.type)),
+                                 field.offset});
+                        }
+                        binding.record_bytes = state->record_bytes;
+                        binding.record_alignment = state->record_alignment;
                         if (!names.insert(name_key(binding)).second ||
                             !states.insert(declaration.state).second) {
                             diagnostics_.error(
@@ -2449,6 +2507,33 @@ private:
                     object_attribute(*representative, "section"));
                 !section.empty()) {
                 object.section = section;
+            }
+            for (const auto& attribute : representative->attributes) {
+                if (attribute.name != "constructor" && attribute.name != "destructor") continue;
+                // The semantic pass diagnoses a table the profile lacks.
+                const auto& table = attribute.name == "constructor"
+                    ? options_.constructor_table : options_.destructor_table;
+                if (!table) continue;
+                // An entry, or an array of entries, the table's calls take.
+                const auto entry = intern_type(pointer_type(function_type(
+                    builtin_type(BuiltinType::Void), {}, false, table->abi)));
+                auto type = object.type;
+                if (const auto& stored = module_.type(type);
+                    stored.kind == Type::Kind::Array && stored.element)
+                    type = *stored.element;
+                if (module_.unqualified(type) != entry) {
+                    diagnostics_.error(attribute.location, "an object with attribute '" +
+                        attribute.name + "' must have the entry type of table '" + table->name +
+                        "', a pointer to a function without parameters or result under ABI '" +
+                        (table->abi.empty() ? options_.abi : table->abi) +
+                        "', or be an array of such pointers");
+                    continue;
+                }
+                if (const auto section = co_await table_section_async(
+                        attribute, *table, source_namespace(object.source_name))) {
+                    object.section = *section;
+                    object.table_entry = true;
+                }
             }
             object.minimum_alignment = co_await parse_alignment_async(
                 representative->attributes, "an object definition",

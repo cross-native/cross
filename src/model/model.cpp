@@ -284,6 +284,7 @@ struct ModelDocument {
     std::vector<DebugEntry> debugs;
     std::vector<CpuEntry> cpus;
     std::vector<DataBaseEntry> data_bases;
+    std::vector<InitTableEntry> init_tables;
     std::vector<ModelInstruction> instructions;
 };
 
@@ -301,7 +302,8 @@ public:
             if (current_.kind != ModelTokenKind::Identifier) {
                 fail(current_.line,
                      "expected model domain: abi, mangling, optimization, "
-                     "profile, debug, cpu, data_base, or instruction");
+                     "profile, debug, cpu, data_base, init_table, or "
+                     "instruction");
                 break;
             }
             const auto domain = current_.text;
@@ -310,7 +312,8 @@ public:
             if (domain != "abi" && domain != "mangling" &&
                 domain != "optimization" && domain != "profile" &&
                 domain != "debug" && domain != "cpu" &&
-                domain != "data_base" && domain != "instruction") {
+                domain != "data_base" && domain != "init_table" &&
+                domain != "instruction") {
                 fail(line, "unknown model domain '" + domain + "'");
                 break;
             }
@@ -363,6 +366,11 @@ public:
                 if (auto entry = make_data_base(name, *properties, line)) {
                     entry->source = position(line);
                     result.data_bases.push_back(std::move(*entry));
+                }
+            } else if (domain == "init_table") {
+                if (auto entry = make_init_table(name, *properties, line)) {
+                    entry->source = position(line);
+                    result.init_tables.push_back(std::move(*entry));
                 }
             } else if (domain == "instruction") {
                 ModelProblem problem;
@@ -2003,7 +2011,7 @@ private:
             if (!known_properties(
                     block.properties,
                     {"type", "kind", "cursor", "base", "stride", "limit",
-                     "alignment", "llvm_va_list_offset"})) {
+                     "alignment", "llvm_va_list_offset", "fields"})) {
                 return std::nullopt;
             }
             AbiVariadicState state;
@@ -2026,11 +2034,39 @@ private:
                 state.kind = AbiVariadicStateKind::CursorAddress;
             } else if (*kind == "register_save_address") {
                 state.kind = AbiVariadicStateKind::RegisterSaveAddress;
+            } else if (*kind == "record_address") {
+                state.kind = AbiVariadicStateKind::RecordAddress;
             } else {
                 fail(block.line,
                      "ABI variadic-state kind must be 'cursor_offset', "
-                     "'stack_address', 'cursor_address', or "
-                     "'register_save_address'");
+                     "'stack_address', 'cursor_address', "
+                     "'register_save_address', or 'record_address'");
+                return std::nullopt;
+            }
+            const bool record = state.kind == AbiVariadicStateKind::RecordAddress;
+            if (const auto fields = list_property(block.properties, "fields")) {
+                state.field_names = *fields;
+            }
+            if (record != block.properties.contains("fields") ||
+                (record && state.field_names.empty())) {
+                fail(block.line,
+                     "ABI variadic state fields are required by, and only "
+                     "valid for, a record_address state");
+                return std::nullopt;
+            }
+            static constexpr const char* cursor_properties[] = {
+                "cursor", "base", "stride", "limit", "llvm_va_list_offset"};
+            if (record &&
+                (!state.type.ends_with('*') ||
+                 std::any_of(std::begin(cursor_properties),
+                             std::end(cursor_properties),
+                             [&](const char* name) {
+                                 return block.properties.contains(name);
+                             }))) {
+                fail(block.line,
+                     "ABI variadic record_address state requires a pointer "
+                     "type and takes no cursor, base, stride, limit, or "
+                     "llvm_va_list_offset");
                 return std::nullopt;
             }
             state.cursor =
@@ -2228,6 +2264,51 @@ private:
             !abi.variadic_states.empty()) {
             abi.variadic_va_list_bytes =
                 (end + alignment - 1U) / alignment * alignment;
+        }
+        // A record_address state's record holds the other states it names,
+        // each at the next offset its type's alignment allows.
+        for (std::size_t index = 0; index < abi.variadic_states.size();
+             ++index) {
+            auto& state = abi.variadic_states[index];
+            if (state.kind != AbiVariadicStateKind::RecordAddress) continue;
+            const auto line = blocks.variadic_states[index].line;
+            auto data_layout = target.data_layout;
+            if (abi.natural_alignment_limit != 0) {
+                data_layout.natural_alignment_limit =
+                    abi.natural_alignment_limit;
+            }
+            unsigned offset{};
+            state.record_alignment = state.alignment;
+            for (const auto& name : state.field_names) {
+                const auto field = std::find_if(
+                    abi.variadic_states.begin(), abi.variadic_states.end(),
+                    [&](const AbiVariadicState& candidate) {
+                        return candidate.canonical_name == name;
+                    });
+                if (field == abi.variadic_states.end() ||
+                    field->kind == AbiVariadicStateKind::RecordAddress ||
+                    std::count(state.field_names.begin(),
+                               state.field_names.end(), name) > 1) {
+                    fail(line, "ABI variadic state '" + state.canonical_name +
+                                   "' fields must name other states once, "
+                                   "none of kind record_address");
+                    return false;
+                }
+                const auto [size, field_alignment] = *variadic_state_layout(
+                    field->type, abi.address_bits, data_layout);
+                offset = (offset + field_alignment - 1U) / field_alignment *
+                         field_alignment;
+                state.fields.push_back(
+                    {AbiStateId{static_cast<std::uint16_t>(
+                         field - abi.variadic_states.begin())},
+                     offset});
+                offset += size;
+                state.record_alignment =
+                    std::max(state.record_alignment, field_alignment);
+            }
+            state.record_bytes = (offset + state.record_alignment - 1U) /
+                                 state.record_alignment *
+                                 state.record_alignment;
         }
         return true;
     }
@@ -2726,12 +2807,14 @@ private:
         result.mangling = text_property(properties, "mangling");
         result.optimization = text_property(properties, "optimization");
         result.debug = text_property(properties, "debug");
+        result.constructors = text_property(properties, "constructors");
+        result.destructors = text_property(properties, "destructors");
         if (!floating_environment(properties, result.floating_environment) ||
             !collect_option_properties(
                 properties,
                 {"default_for", "target", "abi", "mangling", "optimization",
                  "debug", "data_bases", "fp_traps", "fp_denormal_operand",
-                 "fp_denormal_result"},
+                 "fp_denormal_result", "constructors", "destructors"},
                 result.options)) {
             return std::nullopt;
         }
@@ -2885,6 +2968,38 @@ private:
             }
         }
         if (!error_.empty()) return std::nullopt;
+        return result;
+    }
+
+    std::optional<InitTableEntry> make_init_table(
+        std::string name, const ModelProperties& properties, unsigned line) {
+        if (!known_properties(properties,
+                              {"section", "priority_section",
+                               "invert_priority", "abi"})) {
+            return std::nullopt;
+        }
+        InitTableEntry result;
+        result.canonical_name = std::move(name);
+        const auto section = text_property(properties, "section", line);
+        if (!section) return std::nullopt;
+        result.section = *section;
+        result.priority_section = text_property(properties, "priority_section");
+        result.invert_priority =
+            bool_property(properties, "invert_priority").value_or(false);
+        result.abi = text_property(properties, "abi");
+        if (!error_.empty()) return std::nullopt;
+        if (result.section.empty() ||
+            (result.priority_section && result.priority_section->empty()) ||
+            (result.abi && result.abi->empty())) {
+            fail(line, "init_table section, priority_section, and abi "
+                       "cannot be empty");
+            return std::nullopt;
+        }
+        if (result.invert_priority && !result.priority_section) {
+            fail(properties.at("invert_priority").line,
+                 "init_table invert_priority requires priority_section");
+            return std::nullopt;
+        }
         return result;
     }
 
@@ -3309,7 +3424,8 @@ bool ModelRegistry::load_text(std::string_view text, std::string origin,
                       "optimization") ||
         !unique_names(profiles_, document->profiles, "profile") ||
         !unique_names(debugs_, document->debugs, "debug") ||
-        !unique_names(data_bases_, document->data_bases, "data_base")) {
+        !unique_names(data_bases_, document->data_bases, "data_base") ||
+        !unique_names(init_tables_, document->init_tables, "init_table")) {
         return false;
     }
     // CPU names are unique per architecture.
@@ -3373,6 +3489,9 @@ bool ModelRegistry::load_text(std::string_view text, std::string origin,
     }
     for (auto& entry : document->data_bases) {
         data_bases_.push_back(std::move(entry));
+    }
+    for (auto& entry : document->init_tables) {
+        init_tables_.push_back(std::move(entry));
     }
     for (auto& entry : document->instructions) {
         auto table = std::find_if(instruction_tables_.begin(),
@@ -3535,6 +3654,14 @@ const CpuEntry* ModelRegistry::find_cpu(std::string_view architecture,
 const DataBaseEntry* ModelRegistry::find_data_base(
     std::string_view name) const {
     for (const auto& entry : data_bases_) {
+        if (entry.canonical_name == name) return &entry;
+    }
+    return nullptr;
+}
+
+const InitTableEntry* ModelRegistry::find_init_table(
+    std::string_view name) const {
+    for (const auto& entry : init_tables_) {
         if (entry.canonical_name == name) return &entry;
     }
     return nullptr;
@@ -3713,6 +3840,25 @@ bool check_cpu_options(const ModelRegistry& registry,
 // Checks the names that presets and profiles use, once every file is loaded:
 // parents, architectures, targets, ABIs, manglings, presets, and options.
 bool check_entries(const ModelRegistry& registry, Diagnostics& diagnostics) {
+    for (const auto& table : registry.init_tables()) {
+        if (table.abi &&
+            std::none_of(registry.abis().begin(), registry.abis().end(),
+                         [&](const AbiEntry& abi) {
+                             return abi.function_selectable &&
+                                    (abi.canonical_name == *table.abi ||
+                                     std::find(abi.aliases.begin(),
+                                               abi.aliases.end(),
+                                               *table.abi) !=
+                                         abi.aliases.end());
+                         })) {
+            diagnostics.file_error(table.source,
+                                   "init_table '" + table.canonical_name +
+                                       "' names unknown or not "
+                                       "function-selectable ABI '" +
+                                       *table.abi + "'");
+            return false;
+        }
+    }
     const auto& presets = registry.optimizations();
     const auto preset_base = [&](const OptimizationEntry&,
                                  std::string_view name) {
@@ -3813,6 +3959,21 @@ bool check_entries(const ModelRegistry& registry, Diagnostics& diagnostics) {
         }
         if (profile.debug && !registry.find_debug(*profile.debug)) {
             return fail("names unknown debug entry '" + *profile.debug + "'");
+        }
+        for (const auto* name : {&profile.constructors, &profile.destructors}) {
+            if (!*name) continue;
+            const auto* table = registry.find_init_table(**name);
+            if (!table) {
+                return fail("names unknown init_table '" + **name + "'");
+            }
+            if (table->abi && target &&
+                !registry.find_abi(target->architecture, *table->abi,
+                                   *profile.target)) {
+                return fail("names init_table '" + **name +
+                            "', whose ABI '" + *table->abi +
+                            "' is not an ABI of " +
+                            std::string(target->architecture));
+            }
         }
         const std::span<const TargetInfo* const> targets =
             target ? std::span<const TargetInfo* const>(&target, 1)
@@ -4151,6 +4312,38 @@ bool configure_models(CompilerOptions& options, Diagnostics& diagnostics) {
         options.abi = abi->canonical_name;
         if (!select_data_bases(registry, *target, *abi, options,
                                diagnostics)) {
+            return false;
+        }
+        // The profile's initializer tables, which check_entries found, with
+        // their ABIs resolved for the target.
+        const auto select_table = [&](const std::optional<std::string>& name,
+                                      std::optional<InitTableOptions>& selected) {
+            selected.reset();
+            if (!profile || !name) return true;
+            const auto& table = *registry.find_init_table(*name);
+            InitTableOptions result{table.canonical_name, table.section,
+                                    table.priority_section.value_or(""),
+                                    table.invert_priority, {}};
+            if (table.abi) {
+                const auto* call_abi = registry.find_abi(
+                    target->architecture, *table.abi, options.target);
+                if (!call_abi || !call_abi->function_selectable) {
+                    diagnostics.file_error(
+                        table.source,
+                        "init_table '" + table.canonical_name + "' names ABI '" +
+                            *table.abi + "', which is not a function-selectable "
+                            "ABI of target '" + options.target + "'");
+                    return false;
+                }
+                result.abi = call_abi->canonical_name;
+            }
+            selected = std::move(result);
+            return true;
+        };
+        if (!select_table(profile ? profile->constructors : std::nullopt,
+                          options.constructor_table) ||
+            !select_table(profile ? profile->destructors : std::nullopt,
+                          options.destructor_table)) {
             return false;
         }
     }

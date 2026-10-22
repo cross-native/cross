@@ -293,8 +293,20 @@ Other rules:
   compile-time evaluation it also replaces the caller's frame, so tail-call
   chains do not count toward the recursion limit.
 - Variadic functions take `...` after a named parameter, but there is no
-  `va_list`; a definition reads its arguments through
-  `[[variadic(...)]]` bindings of the target ABI's state.
+  `va_list` type; a definition reads its arguments through
+  `[[variadic(...)]]` bindings of the target ABI's state. The C ABIs'
+  `va_list` state is the value C passes for a `va_list`, so a definition can
+  forward its unnamed arguments to a C `v*` function:
+
+```x
+[[abi("sysv_abi")]] i32 vprintf(in const u8 *format, in void *arguments);
+
+[[abi("sysv_abi"), variadic(void *arguments "va_list")]]
+global i32 log_line(in const u8 *format, ...) {
+    return vprintf(format, arguments);
+}
+```
+
 - A function may define an operator for a nominal record, union, or enum type
   with `[[operator("+")]]`. There are no other overloads and no user-defined
   conversions. An enumeration with an underlying type is a distinct integer
@@ -785,6 +797,7 @@ creates a value that a loader can rewrite after linking.
 | `noinit` | Leave a static object uninitialized. |
 | `aligned(N)` | On a function definition, its entry alignment. |
 | `address(N)` | Place a declared object or function at the fixed address `N`; no storage or symbol is emitted. |
+| `constructor`, `destructor`, with an optional priority | Add a function, or an object holding function pointers, to the table that the C runtime calls before `main` or at exit, as GCC's attributes do. |
 
 A memory-mapped device is an object at a fixed address (the register layout
 here is illustrative):
@@ -801,6 +814,33 @@ global void put(in u8 byte) {
     while ((console.status & 1) == 0) {}
     console.data = byte;
 }
+```
+
+Constructors with lower priorities run first and destructors with lower
+priorities last; without a priority, an entry runs after the prioritized
+constructors and before the prioritized destructors. The profile's model
+names the tables (`cc --print-init-tables`), such as `.init_array` on ELF
+and `.CRT$XCU` for MinGW-w64, and the ABI the runtime calls them with; a
+function of another ABI is called through a wrapper. Cross itself adds no
+startup code: the runtime the program links with calls the tables. GCC
+reserves the priorities 0 to 100 for its own runtime libraries.
+
+```x
+[[abi("sysv_abi")]] typedef void (*initializer)();
+
+global u32 calls;
+
+[[constructor]]
+static void set_up() {
+    calls += 1;
+}
+
+[[abi("sysv_abi")]]
+static void set_up_first() {
+    calls += 1;
+}
+
+[[constructor(200)]] static initializer first = set_up_first;
 ```
 
 `cc --print-attributes` lists every attribute, and [targets.md](targets.md)

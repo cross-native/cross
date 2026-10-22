@@ -673,6 +673,14 @@ abi "sysv_abi" {
         llvm_va_list_offset = 8;
     }
 
+    # What C passes for a va_list: the address of its __va_list_tag.
+    variadic_state "va_list" {
+        type = "void*";
+        kind = "record_address";
+        fields = ["gp_offset", "fp_offset", "overflow_arg_area",
+                  "reg_save_area"];
+    }
+
     rule "zero" {
         match = ["zero"];
         action = "ignore";
@@ -931,6 +939,15 @@ abi "ms_abi" {
     }
 
     variadic_state "overflow_arg_area" {
+        type = "void*";
+        kind = "cursor_address";
+        cursor = "argument-slot";
+        stride = 8;
+        llvm_va_list_offset = 0;
+    }
+
+    # What C passes for a va_list: the address of the next argument slot.
+    variadic_state "va_list" {
         type = "void*";
         kind = "cursor_address";
         cursor = "argument-slot";
@@ -1885,6 +1902,44 @@ cpu "shijidadao" {
     inherits = "yongfeng";
 }
 
+# The tables that each platform's C runtime calls before main and at exit:
+# ELF runtimes such as glibc, MinGW-w64 (its startup code calls .CRT$XC*,
+# and __main's exit handler walks .dtors forward), and dyld.
+init_table "x86_64-elf-init" {
+    section = ".init_array";
+    priority_section = ".init_array.";
+    abi = "sysv_abi";
+}
+
+init_table "x86_64-elf-fini" {
+    section = ".fini_array";
+    priority_section = ".fini_array.";
+    abi = "sysv_abi";
+}
+
+init_table "x86_64-mingw-init" {
+    section = ".CRT$XCU";
+    priority_section = ".CRT$XCT";
+    abi = "ms_abi";
+}
+
+init_table "x86_64-mingw-fini" {
+    section = ".dtors";
+    priority_section = ".dtors.";
+    invert_priority = true;
+    abi = "ms_abi";
+}
+
+init_table "x86_64-darwin-init" {
+    section = "__DATA,__mod_init_func,mod_init_funcs";
+    abi = "sysv_abi";
+}
+
+init_table "x86_64-darwin-fini" {
+    section = "__DATA,__mod_term_func,mod_term_funcs";
+    abi = "sysv_abi";
+}
+
 profile "x86_64-windows" {
     default_for = [
         "x86_64-*-windows-*", "x86_64-*-mingw*",
@@ -1893,6 +1948,8 @@ profile "x86_64-windows" {
     target = "x86_64-w64-windows-gnu";
     abi = "x";
     mangling = "cross";
+    constructors = "x86_64-mingw-init";
+    destructors = "x86_64-mingw-fini";
     m.risc-cisc-balance = 100;
 }
 
@@ -1901,6 +1958,22 @@ profile "x86_64-elf" {
     target = "x86_64-unknown-linux-gnu";
     abi = "x";
     mangling = "cross";
+    constructors = "x86_64-elf-init";
+    destructors = "x86_64-elf-fini";
+    m.risc-cisc-balance = 100;
+    m.red-zone = true;
+}
+
+profile "x86_64-darwin" {
+    default_for = [
+        "x86_64-apple-*", "x86_64-*-darwin*",
+        "amd64-apple-*", "amd64-*-darwin*"
+    ];
+    target = "x86_64-apple-darwin";
+    abi = "x";
+    mangling = "cross";
+    constructors = "x86_64-darwin-init";
+    destructors = "x86_64-darwin-fini";
     m.risc-cisc-balance = 100;
     m.red-zone = true;
 }

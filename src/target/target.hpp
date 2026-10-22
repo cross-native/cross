@@ -120,6 +120,15 @@ enum class AbiVariadicStateKind {
     StackAddress,
     CursorAddress,
     RegisterSaveAddress,
+    // The address of a frame record that holds the values of other states.
+    RecordAddress,
+};
+
+// A member of a record_address state's record: another state's value at a
+// byte offset.
+struct AbiVariadicField {
+    AbiStateId state;
+    unsigned offset{};
 };
 
 struct AbiVariadicState {
@@ -133,6 +142,12 @@ struct AbiVariadicState {
     // The largest count of cursor positions the state uses, if any.
     std::optional<unsigned> limit;
     unsigned alignment{1};
+    // A record_address state: the states its record holds, as written and
+    // as laid out, and the record's size and alignment.
+    std::vector<std::string> field_names;
+    std::vector<AbiVariadicField> fields;
+    unsigned record_bytes{};
+    unsigned record_alignment{1};
     // Optional layout hook used only by the LLVM-text debug serializer.  The
     // production compiler derives the same state directly from the ABI plan.
     std::optional<unsigned> llvm_va_list_offset;

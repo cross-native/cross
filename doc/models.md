@@ -21,7 +21,8 @@ A model file contains entries of these kinds:
 - `debug`: the contents of debugging information;
 - `instruction`: a form of a machine instruction;
 - `cpu`: a processor's instruction set and instruction costs;
-- `data_base`: data reached through a base register; and
+- `data_base`: data reached through a base register;
+- `init_table`: a table of functions that a program's runtime calls; and
 - `address_space`: a pointer representation with a stored width, a base,
   and a byte order.
 
@@ -105,7 +106,7 @@ kind "name" {
 ```
 
 The kinds are `abi`, `mangling`, `optimization`, `profile`, `debug`,
-`instruction`, `cpu`, `data_base`, and `address_space`. Only `abi` entries (`bank`, `rule`, `variadic_state`, and
+`instruction`, `cpu`, `data_base`, `init_table`, and `address_space`. Only `abi` entries (`bank`, `rule`, `variadic_state`, and
 `variadic_shadow`) and `cpu` entries (`instruction`) contain blocks, and a
 block has no `;` after its closing brace. Every
 property and every mangling rule ends in `;`. `#` and `//` start comments
@@ -700,6 +701,7 @@ a `variadic_state` block of the function's ABI:
 | `limit` | integer | none | no |
 | `alignment` | integer | `1` | no |
 | `llvm_va_list_offset` | integer | none | no |
+| `fields` | list | none | see below |
 
 With `n` the number of positions of `cursor` that the named arguments use,
 but no more than `limit`, or 0 without `cursor`, the kinds are:
@@ -711,10 +713,23 @@ but no more than `limit`, or 0 without `cursor`, the kinds are:
 - `"register_save_address"`: the address `base + n * stride` in the area of
   `variadic_save_banks`, which must not be empty; and
 - `"stack_address"`: the address just past the stack arguments of the named
-  parameters, rounded up to `alignment`, plus `base`.
+  parameters, rounded up to `alignment`, plus `base`; and
+- `"record_address"`: the address of a record in the definition's frame
+  that holds the values of the states that `fields` lists, in list order,
+  each at the next offset that its type's alignment allows; the record is
+  aligned to the larger of `alignment` and its members' alignments.
 
 A state with `cursor` needs a nonzero `stride`, and one without `cursor`
 has neither `stride` nor `limit`; `base` and `stride` may be negative.
+`fields` is required by and valid only for a `"record_address"` state,
+which names in it other states of the entry, each once and none of kind
+`"record_address"`; such a state has a pointer `type` and none of
+`cursor`, `base`, `stride`, `limit`, and `llvm_va_list_offset`. The shipped
+C ABIs other than `eabi32` define a state `va_list` that holds the value C
+passes for a `va_list` argument: in `sysv_abi` a `"record_address"` state
+of `gp_offset`, `fp_offset`, `overflow_arg_area`, and `reg_save_area`, the
+address of a `__va_list_tag`, and in `ms_abi`, `o32`, and `n64` the address
+of the next argument slot.
 `cursor` names a cursor, which need not be the name of a bank. `alignment`
 is a power of two. `type` is the exact Cross scalar or pointer type, without
 qualifiers, that the binding must have: typedefs and generic arguments are
@@ -1055,6 +1070,8 @@ profile "x86_64-kernel" {
 | `f.*`, `m.*` | option value | | no |
 | `debug` | text | `dwarf` | no |
 | `data_bases` | list | `[]` | no |
+| `constructors` | text | none | no |
+| `destructors` | text | none | no |
 | `fp_traps` | list | `[]` | no |
 | `fp_denormal_operand` | text | `ieee` | no |
 | `fp_denormal_result` | text | `ieee` | no |
@@ -1073,7 +1090,10 @@ line has no `-target`. A profile chosen by `default_for` never changes the
 target. The target is fixed before the profile's `m.*` options are checked.
 
 `debug` names the entry `-g` selects, and `data_bases` the `data_base`
-entries in use ([Data-base entries](#data-base-entries)). `fp_traps` lists the distinct
+entries in use ([Data-base entries](#data-base-entries)). `constructors`
+and `destructors` name the `init_table` entries that `[[constructor]]` and
+`[[destructor]]` use ([Initializer-table entries](#initializer-table-entries));
+without one, the attribute is an error. `fp_traps` lists the distinct
 floating-point exceptions the program runs with enabled, from `invalid`, `divide-by-zero`,
 `overflow`, `underflow`, and `inexact`; `fp_denormal_operand` is `ieee` or
 `trap`; `fp_denormal_result` is `ieee` or `flush`. The language specification
@@ -1464,6 +1484,41 @@ the base register before such code runs, and the linker keeps the sections
 within the base's reach; on MIPS, `$gp` holds the address the linker gives
 `_gp` and reaches 32 KiB on either side of it.
 
+## Initializer-table entries
+
+An `init_table` entry describes a table of functions that the startup or
+exit code of a program's runtime calls, and in which `[[constructor]]` and
+`[[destructor]]` place entries ([spec.md](spec.md#initializer-tables)), as
+a profile's `constructors` and `destructors` properties select. This is the
+shipped table that MinGW-w64 calls at exit:
+
+```text
+init_table "x86_64-mingw-fini" {
+    section = ".dtors";
+    priority_section = ".dtors.";
+    invert_priority = true;
+    abi = "ms_abi";
+}
+```
+
+| Property | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `section` | text | none | Required: the section of the entries with priority 65535 and of those without a priority. |
+| `priority_section` | text | none | The start of the section names of the other entries: the name of an entry with priority `P` follows it with `P` as five decimal digits, such as `.init_array.00101`. Without it, such priorities are errors. |
+| `invert_priority` | bool | `false` | With `priority_section`: the five digits are 65535 minus `P`. |
+| `abi` | text | the compilation's | The function-selectable ABI with which the runtime calls the entries; with a profile's `target`, an ABI of its architecture. |
+
+Each entry is a pointer to a function without parameters or result under
+`abi`, at the alignment of a pointer, in a section that holds writable
+data. Section names have the object format's spelling of `section` names,
+and the section takes the type that the format gives its name, as GNU `as`
+does: on ELF, `.init_array`, `.fini_array`, and their prioritized forms are
+SHT_INIT_ARRAY and SHT_FINI_ARRAY sections, and a Mach-O name such as
+`__DATA,__mod_init_func,mod_init_funcs` gives its type. Section names are
+not checked when the file loads but where an entry uses them, as `section`
+names are. An `init_table` entry contains no block. The shipped tables are
+listed in [targets.md](targets.md#object-formats).
+
 ## Address-space entries
 
 An `address_space` entry declares a pointer representation that
@@ -1519,7 +1574,7 @@ These options list what the loaded models define:
   target's default ABI; it does not reflect `-mabi`.
 - `--print-manglings` lists the manglings.
 - `--print-profiles` lists each profile's target, ABI, mangling, preset,
-  and option settings.
+  tables, and option settings.
 - `--print-optimizations` lists each preset, its bases, and its own
   settings.
 - `--print-cpus` lists the selected target's `cpu` entries with their
@@ -1530,7 +1585,8 @@ These options list what the loaded models define:
   built-ins, then each form of an instruction table that models give, with
   its operands, the features of which it needs one and those it excludes,
   whether it is an alias or a macro, and the file and line of its entry.
-- `--print-data-bases` lists the `data_base` entries.
+- `--print-data-bases` lists the `data_base` entries, and
+  `--print-init-tables` the `init_table` entries.
 - `--print-options[=all|optimization|common|target]` lists each option
   with its value for the compilation, its origin (`default`, `preset`,
   `profile`, or `command-line`), whether presets may set it, and the model

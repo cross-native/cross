@@ -2442,6 +2442,8 @@ EvaluationTask<std::vector<Attribute>> Parser::parse_attributes_impl_async(bool 
                     (co_await expect_async(")", "after variadic state bindings"));
                 } else if (mode == AttributeParseMode::Semantic && !parsing_public_fragment_ &&
                            (attribute.name == "aligned" || attribute.name == "address" ||
+                            attribute.name == "constructor" ||
+                            attribute.name == "destructor" ||
                             is_vector_type_attribute(attribute.name))) {
                     for (;;) {
                         const auto next_token = co_await current_async();
@@ -5528,7 +5530,8 @@ void Parser::apply_region_attributes(std::vector<Attribute>& attributes, const R
                        "cold", "noreturn", "returns_twice", "interrupt", "naked", "raw_inline",
                        "runtime_only", "no_stack_protector", "no_sanitize", "section",
                        "link_name"})) return true;
-            if (among({"aligned", "used", "retain"})) return target.definition;
+            if (among({"aligned", "used", "retain", "constructor", "destructor"}))
+                return target.definition;
             if (name == "eval_only") return target.definition && !global;
             if (name == "weak") return target.definition && global;
             if (name == "visibility") return global;
@@ -5539,6 +5542,8 @@ void Parser::apply_region_attributes(std::vector<Attribute>& attributes, const R
             if (among({"aligned", "atomic", "section", "link_name", "thread_local",
                        "tls_model"})) return true;
             if (among({"used", "retain"})) return target.definition;
+            if (among({"constructor", "destructor"}))
+                return target.definition && target.initializer && target.callable;
             if (name == "noinit") return target.definition && !target.initializer;
             if (name == "weak") return target.definition && global;
             if (name == "visibility") return global;

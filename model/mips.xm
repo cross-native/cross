@@ -415,6 +415,14 @@ abi "o32" {
         stride = 4;
     }
 
+    # What C passes for a va_list: the address of the next argument slot.
+    variadic_state "va_list" {
+        type = "void*";
+        kind = "cursor_address";
+        cursor = "argument-slot";
+        stride = 4;
+    }
+
     rule "zero" {
         match = ["zero"];
         action = "ignore";
@@ -626,6 +634,16 @@ abi "n64" {
     }
 
     variadic_state "arg_area" {
+        type = "void*";
+        kind = "cursor_address";
+        cursor = "argument";
+        base = -64;
+        stride = 8;
+        llvm_va_list_offset = 0;
+    }
+
+    # What C passes for a va_list: the address of the next argument slot.
+    variadic_state "va_list" {
         type = "void*";
         kind = "cursor_address";
         cursor = "argument";
@@ -2159,11 +2177,25 @@ data_base "mips-gp" {
     kinds = ["writable"];
 }
 
+# The ELF initializer tables. Startup code that walks them calls the
+# entries with the compilation's ABI.
+init_table "mips-elf-init" {
+    section = ".init_array";
+    priority_section = ".init_array.";
+}
+
+init_table "mips-elf-fini" {
+    section = ".fini_array";
+    priority_section = ".fini_array.";
+}
+
 profile "mips-elf" {
     default_for = ["mips", "mips-*"];
     target = "mips-unknown-elf";
     abi = "x32";
     mangling = "cross";
+    constructors = "mips-elf-init";
+    destructors = "mips-elf-fini";
     m.arch = "generic";
     m.risc-cisc-balance = 0;
 }
@@ -2173,6 +2205,8 @@ profile "mipsel-elf" {
     target = "mipsel-unknown-elf";
     abi = "x32";
     mangling = "cross";
+    constructors = "mips-elf-init";
+    destructors = "mips-elf-fini";
     m.arch = "generic";
     m.risc-cisc-balance = 0;
 }
@@ -2186,6 +2220,8 @@ profile "mips64-n64" {
     target = "mips64-unknown-elf";
     abi = "x64";
     mangling = "cross";
+    constructors = "mips-elf-init";
+    destructors = "mips-elf-fini";
     m.arch = "mips64";
     m.risc-cisc-balance = 0;
 }
@@ -2195,6 +2231,8 @@ profile "mips64el-n64" {
     target = "mips64el-unknown-elf";
     abi = "x64";
     mangling = "cross";
+    constructors = "mips-elf-init";
+    destructors = "mips-elf-fini";
     m.arch = "mips64";
     m.risc-cisc-balance = 0;
 }
@@ -2203,6 +2241,8 @@ profile "vr4300-x64" {
     target = "mips-unknown-elf";
     abi = "x64";
     mangling = "cross";
+    constructors = "mips-elf-init";
+    destructors = "mips-elf-fini";
     m.arch = "vr4300";
     m.tune = "vr4300";
     m.risc-cisc-balance = 0;
@@ -2212,6 +2252,8 @@ profile "vr4300-o32" {
     target = "mips-unknown-elf";
     abi = "o32";
     mangling = "cross";
+    constructors = "mips-elf-init";
+    destructors = "mips-elf-fini";
     m.arch = "vr4300";
     m.risc-cisc-balance = 0;
 }
@@ -2222,6 +2264,8 @@ profile "n64" {
     target = "mips-unknown-elf";
     abi = "o32";
     mangling = "cross";
+    constructors = "mips-elf-init";
+    destructors = "mips-elf-fini";
     m.arch = "vr4300";
     m.tune = "vr4300";
     m.fix4300 = true;
@@ -2236,6 +2280,8 @@ profile "psp-allegrex" {
     target = "mipsallegrexel-sony-psp-elf";
     abi = "eabi32";
     mangling = "cross";
+    constructors = "mips-elf-init";
+    destructors = "mips-elf-fini";
     m.arch = "allegrex";
     m.tune = "allegrex";
     m.risc-cisc-balance = 0;
@@ -2245,6 +2291,8 @@ profile "allegrex-o32" {
     target = "mipsallegrexel-sony-psp-elf";
     abi = "o32";
     mangling = "cross";
+    constructors = "mips-elf-init";
+    destructors = "mips-elf-fini";
     m.arch = "allegrex";
     m.tune = "allegrex";
     m.risc-cisc-balance = 0;
@@ -2254,6 +2302,8 @@ profile "r3000-o32" {
     target = "mips-unknown-elf";
     abi = "o32";
     mangling = "cross";
+    constructors = "mips-elf-init";
+    destructors = "mips-elf-fini";
     m.arch = "r3000";
     m.tune = "r3000";
     m.risc-cisc-balance = 0;
@@ -2263,6 +2313,8 @@ profile "r6000-eabi" {
     target = "mips-unknown-elf";
     abi = "eabi32";
     mangling = "cross";
+    constructors = "mips-elf-init";
+    destructors = "mips-elf-fini";
     m.arch = "r6000";
     m.tune = "r6000";
     m.risc-cisc-balance = 0;

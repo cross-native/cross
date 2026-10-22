@@ -39,7 +39,8 @@ namespace cross {
 std::span<const std::string_view> core_attribute_names() {
     static constexpr std::string_view names[] = {
         "abi", "address", "address_space", "alias", "aligned", "always_inline",
-        "atomic", "clobber", "cold", "eval_only", "exhaustive", "ext_vector_type",
+        "atomic", "clobber", "cold", "constructor", "destructor", "eval_only",
+        "exhaustive", "ext_vector_type",
         "hot", "interrupt", "link_name", "macro", "may_alias",
         "musttail", "naked", "no_sanitize", "no_stack_protector", "noinit",
         "noinline", "noreturn", "operator", "packed", "raw_inline",
@@ -216,9 +217,10 @@ std::optional<std::string> function_attribute_error(const Attribute& attribute) 
 // entry/exit. Expansion functions and meta helpers have none, on any model.
 bool runtime_contract_attribute(std::string_view name) {
     static constexpr std::string_view names[] = {
-        "abi", "alias", "aligned", "clobber", "interrupt", "link_name",
-        "naked", "raw_inline", "retain", "returns_twice", "section",
-        "stack_cleanup", "used", "variadic", "visibility", "weak", "weakref",
+        "abi", "alias", "aligned", "clobber", "constructor", "destructor",
+        "interrupt", "link_name", "naked", "raw_inline", "retain",
+        "returns_twice", "section", "stack_cleanup", "used", "variadic",
+        "visibility", "weak", "weakref",
     };
     return std::find(std::begin(names), std::end(names), name) != std::end(names);
 }
@@ -257,6 +259,57 @@ const Attribute* malformed_tail_return(const Statement& statement) {
     return nullptr;
 }
 
+bool table_attribute(std::string_view name) {
+    return name == "constructor" || name == "destructor";
+}
+
+// [[constructor]] and [[destructor]] each appear once, with at most one
+// priority, on a function definition without parameters or result, or on
+// an initialized static-duration object that nothing else places.
+void validate_table_attributes(const std::vector<Attribute>& attributes,
+                               const FunctionDecl* function, const ObjectDecl* object,
+                               Diagnostics& diagnostics) {
+    const Attribute* first{};
+    for (const auto& attribute : attributes) {
+        if (!table_attribute(attribute.name)) continue;
+        const auto subject = "attribute '" + attribute.name + "'";
+        if (attribute.arguments.size() > 1) {
+            diagnostics.error(attribute.location, subject + " takes at most one priority");
+        } else if (first && (first->name == attribute.name || object)) {
+            diagnostics.error(attribute.location, first->name == attribute.name
+                ? subject + " appears more than once"
+                : "an object cannot be both a constructor and a destructor entry");
+        } else if (function && !function->generic_parameters.empty()) {
+            diagnostics.error(attribute.location, subject + " is not valid on a generic function");
+        } else if (function && evaluation_only(*function) &&
+                   !function->has_meta_signature()) {
+            diagnostics.error(attribute.location,
+                runtime_contract_error(attribute, "an eval_only function"));
+        } else if (function && !function->definition()) {
+            diagnostics.error(attribute.location, subject + " requires a function definition");
+        } else if (function && (!function->parameters.empty() || function->variadic ||
+                   !function->return_type ||
+                   function->return_type->kind != Type::Kind::Builtin ||
+                   function->return_type->builtin != BuiltinType::Void)) {
+            diagnostics.error(attribute.location,
+                "a function with " + subject + " takes no parameters and returns void");
+        } else if (object && !object->initializer) {
+            diagnostics.error(attribute.location, "an object with " + subject +
+                " requires an initializer");
+        } else if (object) {
+            for (const auto& other : attributes) {
+                if (other.name == "section" || other.name == "thread_local" ||
+                    other.name == "noinit" || other.name == "address" ||
+                    other.name == "alias" || other.name == "weakref") {
+                    diagnostics.error(other.location, "attribute '" + other.name +
+                        "' is not valid with " + subject);
+                }
+            }
+        }
+        if (!first) first = &attribute;
+    }
+}
+
 bool validate_attribute_names(const Program& program,
                               Diagnostics& diagnostics) {
     enum class Subject { General, Function, Object };
@@ -290,6 +343,7 @@ bool validate_attribute_names(const Program& program,
     }
     for (const auto& function : program.functions) {
         validate(function->attributes, Subject::Function);
+        validate_table_attributes(function->attributes, function.get(), nullptr, diagnostics);
         if (const auto error = function_attribute_conflict(*function))
             diagnostics.error(function->location, *error);
         if (function->has_meta_signature())
@@ -310,7 +364,10 @@ bool validate_attribute_names(const Program& program,
         if (function->body) visit_statement(visit_statement, *function->body);
     }
     for (const auto& label : program.global_labels) validate(label.attributes);
-    for (const auto& object : program.objects) validate(object->attributes, Subject::Object);
+    for (const auto& object : program.objects) {
+        validate(object->attributes, Subject::Object);
+        validate_table_attributes(object->attributes, nullptr, object.get(), diagnostics);
+    }
     return diagnostics.errors() == 0;
 }
 
@@ -3921,6 +3978,52 @@ private:
 void lift_function_pointer_adapters(Program& program,
                                     std::string_view default_abi) {
     FunctionPointerAdapterLifter(program, default_abi).run();
+}
+
+// A [[constructor]] or [[destructor]] function becomes the initializer of a
+// static entry object of its table, a pointer to a function without
+// parameters or result under the table's ABI, for which adapter lifting
+// bridges another ABI. HIR places such objects in the table's section.
+void lift_initializer_table_entries(Program& program, Diagnostics& diagnostics) {
+    const auto table_abi = [&](const Attribute& attribute) -> const std::optional<std::string>& {
+        return attribute.name == "constructor" ? program.constructor_abi
+                                               : program.destructor_abi;
+    };
+    const auto available = [&](const Attribute& attribute) {
+        if (table_abi(attribute)) return true;
+        diagnostics.error(attribute.location,
+            "the selected profile names no " + attribute.name + " table");
+        return false;
+    };
+    for (const auto& object : program.objects)
+        for (const auto& attribute : object->attributes)
+            if (table_attribute(attribute.name)) (void)available(attribute);
+    std::unordered_map<std::string, std::uint64_t> ordinals;
+    std::vector<std::unique_ptr<ObjectDecl>> entries;
+    for (auto& function : program.functions) {
+        for (const auto& attribute : function->attributes) {
+            if (!table_attribute(attribute.name) || !available(attribute)) continue;
+            auto entry = std::make_unique<ObjectDecl>();
+            entry->location = attribute.location;
+            entry->name = "$" + attribute.name + '.' +
+                std::to_string(stable_hash(function->source_unit)) + '.' +
+                std::to_string(ordinals[function->source_unit]++);
+            entry->source_unit = function->source_unit;
+            entry->linkage = Linkage::Static;
+            entry->type = pointer_type(function_type(
+                builtin_type(BuiltinType::Void), {}, false, *table_abi(attribute)));
+            entry->attributes.push_back(attribute);
+            entry->initializer = std::make_unique<Expr>();
+            entry->initializer->kind = Expr::Kind::Name;
+            entry->initializer->location = function->location;
+            bind_exact_name(*entry->initializer, function->name);
+            entries.push_back(std::move(entry));
+        }
+        std::erase_if(function->attributes, [](const Attribute& attribute) {
+            return table_attribute(attribute.name);
+        });
+    }
+    for (auto& entry : entries) program.objects.push_back(std::move(entry));
 }
 
 struct OperatorBinding {
@@ -18433,6 +18536,8 @@ bool expand_semantics(Program& program, Diagnostics& diagnostics,
         return false;
     }
     materialize_enumerators(program, diagnostics);
+    lift_initializer_table_entries(program, diagnostics);
+    if (diagnostics.errors() != 0) return false;
     lift_function_pointer_adapters(program, default_abi);
     CompoundLiteralLifter(program).run();
     const auto remember_record_owner = [&](const FunctionDecl& function) {

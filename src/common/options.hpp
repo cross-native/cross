@@ -103,6 +103,18 @@ struct DataBaseOptions {
     bool literal{};
 };
 
+// The contents of the init_table model entry that the profile names for
+// [[constructor]] or [[destructor]].
+struct InitTableOptions {
+    std::string name;
+    std::string section;
+    // Empty when the table has no prioritized sections.
+    std::string priority_section;
+    bool invert_priority{};
+    // The canonical ABI of the calls; empty for the compilation's.
+    std::string abi;
+};
+
 struct CompilerOptions {
     EmitKind emit{EmitKind::Link};
     std::string optimization{"O0"};
@@ -234,6 +246,8 @@ struct CompilerOptions {
     std::optional<DebugInfoOptions> debug_info;
     // In -mdata-bases order.
     std::vector<DataBaseOptions> data_bases;
+    std::optional<InitTableOptions> constructor_table;
+    std::optional<InitTableOptions> destructor_table;
 
     bool wrapv{};
     bool bounds_trap{};
@@ -251,6 +265,7 @@ struct CompilerOptions {
     bool print_cpus{};
     bool print_costs{};
     bool print_data_bases{};
+    bool print_init_tables{};
     bool print_options{};
     std::string print_options_category{"all"};
     bool print_attributes{};

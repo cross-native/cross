@@ -1139,6 +1139,7 @@ bool parse_cc_options(int argc, char** argv, CompilerOptions& options,
         if (argument == "--print-cpus") { options.print_cpus = true; continue; }
         if (argument == "--print-costs") { options.print_costs = true; continue; }
         if (argument == "--print-data-bases") { options.print_data_bases = true; continue; }
+        if (argument == "--print-init-tables") { options.print_init_tables = true; continue; }
         if (argument == "--print-options" ||
             argument.starts_with("--print-options=")) {
             options.print_options = true;
@@ -1379,6 +1380,7 @@ void print_cc_help() {
   --print-cpus          list the target's CPU entries
   --print-costs         list instruction costs for -march and -mtune
   --print-data-bases    list data_base model entries
+  --print-init-tables   list init_table model entries
   --print-options[=CATEGORY]
                         list typed effective options and origins
   --print-attributes    list contextual [[attribute]] names

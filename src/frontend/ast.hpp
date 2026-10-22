@@ -822,6 +822,11 @@ struct Program {
     // Semantic service supplied by the resolved model. An empty spelling means
     // that model's default callable ABI, not a compiler-owned default profile.
     std::function<std::optional<std::string>(std::string_view)> canonical_callable_abi;
+    // The ABI with which the runtime calls the entries of the profile's
+    // [[constructor]] and [[destructor]] tables (empty: the compilation's);
+    // unset when the profile names no such table.
+    std::optional<std::string> constructor_abi;
+    std::optional<std::string> destructor_abi;
     // Installed only while semantic instantiation is active. A reached target
     // layout dependency may need its required expressions prepared first.
     ContinuationQuery<bool(const TypePtr&, EvaluationLayoutKind)> evaluation_prepare_type;

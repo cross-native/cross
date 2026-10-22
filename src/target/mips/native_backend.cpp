@@ -631,18 +631,25 @@ bool binds_variadic_state(const hir::Function& entity) {
     return entity.variadic && !entity.variadic_bindings.empty();
 }
 
-// Whether a definition binds a state of `kind`: the home bank serves cursor
-// addresses and the save area register-save addresses.
+// Whether a definition binds a state of `kind`, also as a field of a record
+// state: the home bank serves cursor addresses and the save area
+// register-save addresses.
 bool binds_variadic_kind(const hir::Function& entity, const AbiEntry& abi,
                          AbiVariadicStateKind kind) {
+    const auto is = [&](AbiStateId state) {
+        return state.value < abi.variadic_states.size() &&
+               abi.variadic_states[state.value].kind == kind;
+    };
     return binds_variadic_state(entity) &&
            std::any_of(entity.variadic_bindings.begin(),
                        entity.variadic_bindings.end(),
                        [&](const hir::VariadicBinding& binding) {
-                           return binding.state.value <
-                                      abi.variadic_states.size() &&
-                                  abi.variadic_states[binding.state.value]
-                                          .kind == kind;
+                           return is(binding.state) ||
+                                  std::any_of(binding.fields.begin(),
+                                              binding.fields.end(),
+                                              [&](const auto& field) {
+                                                  return is(field.state);
+                                              });
                        });
 }
 
