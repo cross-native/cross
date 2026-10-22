@@ -90,7 +90,7 @@ expect(print-costs-tune "${stdout}"
     "\nlw  latency: 2  issue: 1  available: yes\n")
 run(print-costs-x86 -target x86_64-unknown-linux-gnu --print-costs)
 expect(print-costs-x86 "${stdout}"
-    "^cpu: generic  tune: generic  issue_width: 1\n"
+    "^cpu: generic  tune: generic  issue_width: 4\n"
     "\nimulq  latency: 3  issue: 1  available: yes\n"
     "\ndivq  latency: 40  issue: 1  available: yes\n"
     "\nlzcntq  latency: 3  issue: 1  available: yes\n")

@@ -66,7 +66,7 @@ expect_alignment(mips-vr4300 2 -target mips-unknown-elf -O2 -march=vr4300
 # --print-cpus shows the property where an entry or a base sets it.
 execute_process(COMMAND "${CC}" ${x86} --print-cpus OUTPUT_VARIABLE listing)
 foreach(cpu skylake cascadelake znver4)
-    if(NOT listing MATCHES "\n${cpu}  [^\n]*  issue_width: 1  function_alignment: 32  source: ")
+    if(NOT listing MATCHES "\n${cpu}  [^\n]*  issue_width: 6  function_alignment: 32  source: ")
         message(FATAL_ERROR "--print-cpus does not show ${cpu}'s function alignment")
     endif()
 endforeach()

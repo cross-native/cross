@@ -23,6 +23,90 @@ HASH(i32, 31i32, hash_i32_31)
 HASH(i32, 33i32, hash_i32_33)
 HASH(i32, 65599i32, hash_i32_65599)
 HASH(i32, 16777619i32, hash_i32_16777619)
+HASH(u32, 1313u32, hash_u32_1313)
+HASH(u32, 1103515245u32, hash_u32_lcg)
+
+// A carried chain deeper than the recurrence walk follows.
+[[noinline, runtime_only]] global u32 deep_chain(in const u8 *a, in uptr n, in u32 h) {
+    for (uptr i = 0; i < n; ++i) {
+        const u32 t = h ^ (h >> 7u32);
+        u32 r = (t + (u32)a[i]) + h;
+        r = r ^ (r >> 1u32);
+        r = r ^ (r >> 2u32);
+        r = r ^ (r >> 3u32);
+        r = r ^ (r >> 4u32);
+        r = r ^ (r >> 5u32);
+        r = r ^ (r >> 6u32);
+        r = r ^ (r >> 7u32);
+        r = r ^ (r >> 8u32);
+        r = r ^ (r >> 9u32);
+        r = r ^ (r >> 10u32);
+        r = r ^ (r >> 11u32);
+        r = r ^ (r >> 12u32);
+        r = r ^ (r >> 13u32);
+        r = r ^ (r >> 14u32);
+        r = r ^ (r >> 15u32);
+        r = r ^ (r >> 16u32);
+        r = r ^ (r >> 17u32);
+        r = r ^ (r >> 18u32);
+        r = r ^ (r >> 19u32);
+        r = r ^ (r >> 20u32);
+        r = r ^ (r >> 21u32);
+        r = r ^ (r >> 22u32);
+        r = r ^ (r >> 23u32);
+        r = r ^ (r >> 24u32);
+        r = r ^ (r >> 25u32);
+        r = r ^ (r >> 26u32);
+        r = r ^ (r >> 27u32);
+        r = r ^ (r >> 28u32);
+        r = r ^ (r >> 29u32);
+        r = r ^ (r >> 30u32);
+        r = r ^ (r >> 31u32);
+        r = r ^ (r >> 1u32);
+        r = r ^ (r >> 2u32);
+        r = r ^ (r >> 3u32);
+        r = r ^ (r >> 4u32);
+        r = r ^ (r >> 5u32);
+        r = r ^ (r >> 6u32);
+        r = r ^ (r >> 7u32);
+        r = r ^ (r >> 8u32);
+        r = r ^ (r >> 9u32);
+        r = r ^ (r >> 10u32);
+        r = r ^ (r >> 11u32);
+        r = r ^ (r >> 12u32);
+        r = r ^ (r >> 13u32);
+        r = r ^ (r >> 14u32);
+        r = r ^ (r >> 15u32);
+        r = r ^ (r >> 16u32);
+        r = r ^ (r >> 17u32);
+        r = r ^ (r >> 18u32);
+        r = r ^ (r >> 19u32);
+        r = r ^ (r >> 20u32);
+        r = r ^ (r >> 21u32);
+        r = r ^ (r >> 22u32);
+        r = r ^ (r >> 23u32);
+        r = r ^ (r >> 24u32);
+        r = r ^ (r >> 25u32);
+        r = r ^ (r >> 26u32);
+        r = r ^ (r >> 27u32);
+        r = r ^ (r >> 28u32);
+        r = r ^ (r >> 29u32);
+        r = r ^ (r >> 30u32);
+        r = r ^ (r >> 31u32);
+        h = r + t;
+    }
+    return h;
+}
+
+[[noinline, runtime_only]] global u32 reference_deep(in const u8 *a, in uptr n, in u32 h) {
+    for (uptr i = 0; i < n; ++i) {
+        const u32 t = h ^ (h >> 7u32);
+        u32 r = (t + (u32)a[i]) + h;
+        for (u32 k = 0u32; k < 62u32; ++k) r = r ^ (r >> (k % 31u32 + 1u32));
+        h = r + t;
+    }
+    return h;
+}
 
 [[noinline, runtime_only]] global u32 hash_shifted(in const u8 *a, in uptr n,
                                                  in u32 h) {
@@ -128,6 +212,12 @@ global i32 recurrence_entry() {
                 (u32)reference_hash(data, n, seed, 16777619u64)) return 32;
             if (hash_u32_9(data, n, (u32)seed) !=
                 (u32)reference_hash(data, n, seed, 9u64)) return 46;
+            if (hash_u32_1313(data, n, (u32)seed) !=
+                (u32)reference_hash(data, n, seed, 1313u64)) return 47;
+            if (hash_u32_lcg(data, n, (u32)seed) !=
+                (u32)reference_hash(data, n, seed, 1103515245u64)) return 48;
+            if (deep_chain(data, n, (u32)seed) != reference_deep(data, n, (u32)seed))
+                return 49;
             if (hash_shifted(data, n, (u32)seed) !=
                 (u32)reference_hash(data, n, seed, 33u64)) return 40;
             u32 h = (u32)seed;

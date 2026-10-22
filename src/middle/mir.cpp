@@ -11861,6 +11861,9 @@ std::unordered_set<std::uint32_t> recurrence_path_values(
     ValueId update, const UseLists& uses) {
     std::unordered_map<std::uint32_t, bool> dependent;
     std::unordered_set<std::uint32_t> path;
+    // A walk cut off by the depth limit leaves the cached answers of the
+    // values above it incomplete, so the path is then unknown.
+    bool truncated = false;
     const auto visit = [&](const auto& self, ValueId id,
                            unsigned depth) -> bool {
         if (id == phi) {
@@ -11870,8 +11873,11 @@ std::unordered_set<std::uint32_t> recurrence_path_values(
         if (const auto found = dependent.find(id.value);
             found != dependent.end()) return found->second;
         const auto definition = uses.definition_block(id);
-        if (depth >= 64 || !definition ||
-            !loop.blocks.contains(definition->value)) return false;
+        if (!definition || !loop.blocks.contains(definition->value)) return false;
+        if (depth >= 64) {
+            truncated = true;
+            return false;
+        }
         const auto& value = function.values[id.value];
         if (value.kind == ValueKind::Phi) return false;
         dependent[id.value] = false;
@@ -11884,6 +11890,7 @@ std::unordered_set<std::uint32_t> recurrence_path_values(
         return carried;
     };
     (void)visit(visit, update, 0);
+    if (truncated) path.clear();
     return path;
 }
 
@@ -12062,6 +12069,12 @@ bool reduce_constant_multiplications(ManagedFunction& function,
                     {bits, !unsigned_integer_type(hir_module, source.type),
                      options.peephole2 ? std::optional{multiplier}
                                        : std::nullopt});
+                // The CPU issues the operations issue_width at a time, so
+                // their number also bounds the expansion's time.
+                const auto width = std::max(1U, subtarget.issue_width());
+                if (latency) {
+                    latency = std::max(*latency, (cost + width - 1U) / width);
+                }
                 latency_choice = latency && multiply && *latency < *multiply;
                 if (latency && multiply && !latency_choice) {
                     rewritten.push_back(id);

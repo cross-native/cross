@@ -1168,23 +1168,29 @@ abi "ms_abi" {
 # Skylake, Skylake-AVX512, Zen 3, and the CPUs that inherit them align
 # functions to 32 bytes when they are the -mtune CPU of a speed goal; the
 # others use the target's 16.
+# Issue widths follow LLVM's scheduling models: 4 by default, 6 from Skylake,
+# Alder Lake, and Zen 3, and 2 for Bonnell, Silvermont, and Bobcat.
 cpu "generic" {
     architecture = "x86-64";
+    issue_width = 4;
     features = ["base"];
 }
 
 cpu "x86-64" {
     architecture = "x86-64";
+    issue_width = 4;
     features = ["base"];
 }
 
 cpu "x86-64-v2" {
     architecture = "x86-64";
+    issue_width = 4;
     features = ["base", "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "cx16"];
 }
 
 cpu "x86-64-v3" {
     architecture = "x86-64";
+    issue_width = 4;
     features = ["base", "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "avx",
                 "f16c", "fma", "avx2", "bmi", "bmi2", "lzcnt", "movbe",
                 "cx16", "xsave"];
@@ -1192,6 +1198,7 @@ cpu "x86-64-v3" {
 
 cpu "x86-64-v4" {
     architecture = "x86-64";
+    issue_width = 4;
     features = ["base", "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "avx",
                 "f16c", "fma", "avx2", "bmi", "bmi2", "lzcnt", "movbe",
                 "avx512f", "avx512dq", "avx512cd", "avx512bw", "avx512vl",
@@ -1295,6 +1302,7 @@ cpu "core-avx-i" {
 
 cpu "haswell" {
     architecture = "x86-64";
+    issue_width = 4;
     features = ["base", "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt",
                 "pclmul", "avx", "f16c", "fma", "avx2", "bmi", "bmi2", "lzcnt",
                 "movbe", "rdrnd", "cx16", "xsave", "xsaveopt", "fsgsbase",
@@ -1318,6 +1326,7 @@ cpu "broadwell" {
 
 cpu "skylake" {
     architecture = "x86-64";
+    issue_width = 6;
     function_alignment = 32;
     features = ["base", "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "aes",
                 "pclmul", "avx", "f16c", "fma", "avx2", "bmi", "bmi2", "lzcnt",
@@ -1328,6 +1337,7 @@ cpu "skylake" {
 
 cpu "skylake-avx512" {
     architecture = "x86-64";
+    issue_width = 6;
     function_alignment = 32;
     features = ["base", "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "aes",
                 "pclmul", "avx", "f16c", "fma", "avx2", "bmi", "bmi2", "lzcnt",
@@ -1464,6 +1474,7 @@ cpu "ext-bonnell" {
 
 cpu "bonnell" {
     architecture = "x86-64";
+    issue_width = 2;
     inherits = ["core2", "ext-bonnell"];
 }
 
@@ -1479,6 +1490,7 @@ cpu "ext-silvermont" {
 
 cpu "silvermont" {
     architecture = "x86-64";
+    issue_width = 2;
     inherits = ["westmere", "ext-silvermont"];
 }
 
@@ -1527,6 +1539,7 @@ cpu "ext-alderlake" {
 
 cpu "alderlake" {
     architecture = "x86-64";
+    issue_width = 6;
     inherits = ["goldmont-plus", "ext-alderlake"];
 }
 
@@ -1672,6 +1685,7 @@ cpu "ext-btver1" {
 
 cpu "btver1" {
     architecture = "x86-64";
+    issue_width = 2;
     inherits = ["x86-64", "ext-btver1"];
 }
 
@@ -1729,6 +1743,7 @@ cpu "bdver4" {
 
 cpu "znver1" {
     architecture = "x86-64";
+    issue_width = 4;
     features = ["base", "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "aes",
                 "pclmul", "avx", "f16c", "fma", "avx2", "bmi", "bmi2", "lzcnt",
                 "movbe", "adx", "rdrnd", "rdseed", "sha", "cx16", "xsave",
@@ -1738,6 +1753,7 @@ cpu "znver1" {
 
 cpu "znver2" {
     architecture = "x86-64";
+    issue_width = 4;
     features = ["base", "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "aes",
                 "pclmul", "avx", "f16c", "fma", "avx2", "bmi", "bmi2", "lzcnt",
                 "movbe", "adx", "rdrnd", "rdseed", "sha", "cx16", "xsave",
@@ -1747,6 +1763,7 @@ cpu "znver2" {
 
 cpu "znver3" {
     architecture = "x86-64";
+    issue_width = 6;
     function_alignment = 32;
     features = ["base", "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "aes",
                 "pclmul", "avx", "f16c", "fma", "avx2", "bmi", "bmi2", "lzcnt",
