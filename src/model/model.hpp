@@ -220,9 +220,7 @@ struct ModelExpansion {
 };
 
 struct ModelConstraint {
-    enum class Comparison : std::uint8_t {
-        LessEqual, Less, GreaterEqual, Greater, Equal, NotEqual,
-    };
+    using Comparison = InstructionConstraint::Comparison;
     std::vector<ModelTerm> terms;
     std::int64_t constant{};
     Comparison comparison{};
@@ -231,15 +229,7 @@ struct ModelConstraint {
 
     // Whether `sum`, of the terms and the constant, satisfies the constraint.
     [[nodiscard]] bool holds(std::int64_t sum) const {
-        switch (comparison) {
-        case Comparison::LessEqual: return sum <= bound;
-        case Comparison::Less: return sum < bound;
-        case Comparison::GreaterEqual: return sum >= bound;
-        case Comparison::Greater: return sum > bound;
-        case Comparison::Equal: return sum == bound;
-        case Comparison::NotEqual: return sum != bound;
-        }
-        return false;
+        return InstructionConstraint{{}, constant, comparison, bound}.holds(sum);
     }
 };
 
@@ -272,7 +262,15 @@ struct ModelInstruction {
     std::vector<HazardFact> hazard_writes;
     std::optional<unsigned> latency;
     std::optional<unsigned> issue;
-    std::string builtin;  // "$::_NAME" or empty
+    // Register operands that the form writes only in part or only on a
+    // condition, keeping the rest of their value.
+    std::vector<unsigned> keeps;
+    // The name of its built-in, "$::_NAME": `builtin`, or once the table is
+    // complete the mnemonic's; empty with `builtin = false`.
+    std::string builtin;
+    bool no_builtin{};
+    // Why the form gives no built-in, once the table is complete.
+    std::string unexposed;
     std::string alias;
     std::size_t alias_entry{};
     std::string macro;
@@ -300,8 +298,11 @@ struct InstructionTable {
     std::vector<InstructionCostId> cost_listing;
     std::vector<InstructionEntry> builtins;
     std::vector<InstructionCostId> builtin_costs;
-    // The entry of each registry form.
+    // The entry of each registry form: the alias that spells it, or the
+    // entry that encodes it.
     std::vector<std::size_t> builtin_entries;
+    // The built-in names of entries that no form gives.
+    std::vector<UnexposedInstruction> unexposed;
 };
 
 struct CpuEntry {

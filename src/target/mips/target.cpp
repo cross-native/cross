@@ -486,8 +486,8 @@ std::optional<OperandType> operand_type(std::string_view name) {
     if (name == "branch" || name == "jump") {
         OperandType result{OperandKind::Label};
         result.relocated_bits = name == "branch" ? 16 : 26;
-        // A branch built-in takes a label of its function.
-        result.exposable = name == "branch";
+        // A jump or branch built-in takes a label of its function.
+        result.exposable = true;
         result.id = id(name == "branch" ? Id::Branch : Id::Jump);
         return result;
     }
@@ -500,6 +500,9 @@ std::optional<OperandType> operand_type(std::string_view name) {
         if (name != spelling) continue;
         OperandType result{OperandKind::Label};
         result.relocated_bits = bits;
+        // A compact branch built-in takes a label of its function; a
+        // PC-relative operand names data.
+        result.exposable = type == Id::Branch21 || type == Id::Branch26;
         result.id = id(type);
         return result;
     }

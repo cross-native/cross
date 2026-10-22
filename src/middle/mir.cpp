@@ -506,12 +506,12 @@ bool eligible_expression(const Expr& expression) {
                                    return eligible_expression(*argument);
                                });
         }
-        if (expression.left->text == "$::_movabs" ||
-            expression.left->text == "$::_add" ||
-            expression.left->text == "$::_cmp") {
-            return expression.arguments.size() == 2 &&
-                   expression.arguments.front()->kind == Expr::Kind::Name &&
-                   eligible_expression(*expression.arguments[1]);
+        if ((expression.left->text == "$::_movabs" ||
+             expression.left->text == "$::_add" ||
+             expression.left->text == "$::_cmp") &&
+            expression.arguments.size() == 2 &&
+            expression.arguments.front()->kind == Expr::Kind::Name) {
+            return eligible_expression(*expression.arguments[1]);
         }
         if (expression.left->text == "$::alignof") {
             return expression.arguments.size() == 1 &&
@@ -5443,8 +5443,10 @@ private:
         const bool name = argument.kind == Expr::Kind::Name;
         if (field.allow_memory && memory_designator(argument)) {
             const auto pointee = designator_type(argument);
-            return !field.memory_bits ||
-                   (pointee && type_bits(hir_, *pointee) == field.memory_bits);
+            return (!field.memory_bits ||
+                    (pointee && type_bits(hir_, *pointee) == field.memory_bits)) &&
+                   (field.role == InstructionOperandRole::Input ||
+                    (pointee && !hir_.type(*pointee).is_const));
         }
         if (field.allow_register && name) {
             return type && !hir_.type(*type).is_atomic &&
@@ -5465,7 +5467,28 @@ private:
             {128, true, false});
         return (!value.high || (value.high == UINT64_MAX &&
                                 value.low >= (std::uint64_t{1} << 63))) &&
-               instruction_immediate_fits(value.low, field);
+               instruction_immediate_fits(value.low, field) &&
+               instruction_immediate_in_range(value.low, value.high != 0, field);
+    }
+
+    // The constant values of a call's arguments, for constraints.
+    std::vector<std::optional<std::int64_t>> machine_immediates(const Expr& call) {
+        std::vector<std::optional<std::int64_t>> result;
+        for (const auto& item : call.arguments) {
+            const auto& argument = without_parentheses(*item);
+            auto& slot = result.emplace_back();
+            if (!argument.evaluated_integer) continue;
+            const auto value = convert_integer(
+                argument.evaluated_integer->value,
+                {builtin_bits(argument.evaluated_integer->type, hir_.address_bits),
+                 builtin_signed(argument.evaluated_integer->type), false},
+                {128, true, false});
+            if (!value.high ||
+                (value.high == UINT64_MAX && value.low >= (std::uint64_t{1} << 63))) {
+                slot = static_cast<std::int64_t>(value.low);
+            }
+        }
+        return result;
     }
 
     // The available registry form a machine-instruction call names, or a
@@ -5476,7 +5499,9 @@ private:
         bool arity = false;
         bool ambiguous = false;
         std::optional<InstructionFeatureConflict> conflict;
-        for (const auto* form : find_instruction_forms(target_, name)) {
+        const auto immediates = machine_immediates(call);
+        const auto forms = find_instruction_forms(target_, name);
+        for (const auto* form : forms) {
             if (form->operands.size() != call.arguments.size()) continue;
             arity = true;
             bool matches = true;
@@ -5489,7 +5514,7 @@ private:
                     break;
                 }
             }
-            if (!matches) continue;
+            if (!matches || !instruction_constraints_hold(*form, immediates)) continue;
             if (const auto missing = subtarget_.form_conflict(*form)) {
                 if (!conflict) conflict = missing;
                 continue;
@@ -5506,6 +5531,10 @@ private:
         } else if (conflict) {
             message = prefix + instruction_conflict_reason(*conflict,
                                                            subtarget_.cpu());
+        } else if (forms.empty()) {
+            const auto* unexposed = find_unexposed_instruction(target_, name);
+            message = prefix + (unexposed ? unexposed->reason
+                                          : "is not registered for the selected target");
         } else if (!arity) {
             message = prefix + "has no form accepting " +
                       std::to_string(call.arguments.size()) + " operands";
@@ -5676,6 +5705,18 @@ private:
             break;
         case InstructionBranchCondition::GreaterThanZero:
             operation = BinaryOperation::SignedGreater;
+            break;
+        case InstructionBranchCondition::LessThan:
+            operation = BinaryOperation::SignedLess;
+            break;
+        case InstructionBranchCondition::GreaterEqual:
+            operation = BinaryOperation::SignedGreaterEqual;
+            break;
+        case InstructionBranchCondition::LessThanUnsigned:
+            operation = BinaryOperation::UnsignedLess;
+            break;
+        case InstructionBranchCondition::GreaterEqualUnsigned:
+            operation = BinaryOperation::UnsignedGreaterEqual;
             break;
         }
         const auto condition = add_value(
@@ -5970,10 +6011,13 @@ private:
                 IntrinsicOperation::MachineNop;
             co_return result;
         }
-        if (expression.left->text == "$::_movabs" ||
-            expression.left->text == "$::_add" ||
-            expression.left->text == "$::_cmp") {
-            if (expression.arguments.size() != 2) co_return std::nullopt;
+        // Targets whose managed code lowers no machine instruction, which
+        // lower naked bodies raw, take these as the operations they name.
+        if ((expression.left->text == "$::_movabs" ||
+             expression.left->text == "$::_add" ||
+             expression.left->text == "$::_cmp") &&
+            expression.arguments.size() == 2 &&
+            target_.naked_lowering == NakedLowering::Raw) {
             const auto name = local_name(*expression.arguments.front());
             const auto* found = name ? find_local(*name) : nullptr;
             if (!found || found->dynamic_address) co_return std::nullopt;

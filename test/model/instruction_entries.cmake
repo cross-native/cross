@@ -54,8 +54,13 @@ run_output("cc -S" assembly "${CC}" ${mips} -O2 "--model=${model}" -S
 expect_text("naked mix" "${assembly}" "\tvmix\t$v0,$a0,$a1\n\tjr\t$ra\n")
 string(REGEX MATCHALL "\tvmix\t" uses "${assembly}")
 list(LENGTH uses count)
-if(NOT count EQUAL 2)
-    message(FATAL_ERROR "expected vmix in mix and mixed\n${assembly}")
+if(NOT count EQUAL 3)
+    message(FATAL_ERROR "expected vmix in mix, mixed, and blended\n${assembly}")
+endif()
+# The alias is a built-in too, and the amount selects the rotation's form.
+expect_text("alias" "${assembly}" "\tvmix\t$v0,$a0,$a1\n\tjr\t$ra\n\tnop\n.end blended\n")
+if(NOT assembly MATCHES "\tvrot\t[$][a-z0-9]+,[$]a0,5\n\tvrot\t[$][a-z0-9]+,[$]a0,40\n")
+    message(FATAL_ERROR "the rotations did not take both vrot forms\n${assembly}")
 endif()
 if(NOT ASSEMBLER_TEST_SKIP)
     run_checked("cc -c" "${CC}" ${mips} -O2 "--model=${model}" -c "${FIXTURES}/vmix.x"
@@ -77,7 +82,10 @@ expect_text("--print-instructions" "${listing}" "$::_vmix instruction [mips] vol
 expect_text("--print-instructions" "${listing}"
             "vmix rd:gpr32, rs:gpr32, rt:gpr32  [mips]  $::_vmix  source: ${model}:4\n")
 expect_text("--print-instructions" "${listing}"
-            "vblend rd:gpr32, rs:gpr32, rt:gpr32  [mips]  alias of vmix  source: ${model}:24\n")
+            "vblend rd:gpr32, rs:gpr32, rt:gpr32  [mips]  alias of vmix  $::_vblend  source: ${model}:24\n")
+expect_text("--print-instructions" "${listing}"
+            "vmix rd:gpr32, rs:gpr32, value:imm  [mips]  macro  source: ${model}:16\n")
+expect_text("--print-instructions" "${listing}" "$::_vrot instruction [mips]\n")
 run_output("--print-costs" costs "${CC}" ${mips} "--model=${model}" --print-costs)
 expect_text("default costs" "${costs}" "vmix  latency: 4  issue: 1  available: yes\n")
 run_output("--print-costs" costs "${CC}" -target mips-unknown-elf -march=vr4300-cop2
@@ -239,16 +247,56 @@ instruction "frob" {
     otherwise = ["addu rd, rd, rd"];
 }
 ]=])
-expect_rejected(builtin 6 "operand 'target:jump' cannot be an operand of a machine instruction built-in" [=[
+expect_rejected(builtin 6 "instruction 'frob' cannot be a built-in: its operand 'cc:fcc' cannot be a built-in operand" [=[
+instruction "frob" {
+    architecture = "mips";
+    operands = ["cc:fcc"];
+    encoding = "011101 cc:3 00000000000000000000000";
+    reads = ["fcsr"];
+    builtin = "frob";
+}
+]=])
+expect_rejected(builtin-link 8 "instruction 'frob' cannot be a built-in: it writes 'ra' as it transfers control" [=[
 instruction "frob" {
     architecture = "mips";
     operands = ["target:jump"];
     encoding = "011101 target:26";
+    writes = ["ra"];
     control = "jump";
+    delay_slot = true;
     builtin = "frob";
 }
 ]=])
-expect_rejected(condition 5 "condition must be 'equal', 'not-equal', 'less-than-zero', 'greater-equal-zero', 'less-equal-zero', or 'greater-than-zero', on a 'branch'" [=[
+expect_rejected(builtin-true 5 "model property 'builtin' must be text or false" [=[
+instruction "frob" {
+    architecture = "mips";
+    operands = ["rd:gpr"];
+    encoding = "011100 00000 00000 rd:5 00000 111110";
+    builtin = true;
+}
+]=])
+expect_rejected(keeps 7 "'keeps' names 'rs', which is not a register operand that the form writes" [=[
+instruction "frob" {
+    architecture = "mips";
+    operands = ["rd:gpr", "rs:gpr"];
+    encoding = "011100 rs:5 00000 rd:5 00000 111110";
+    reads = ["rs"];
+    writes = ["rd"];
+    keeps = ["rs"];
+}
+]=])
+expect_rejected(condition-operands 8 "condition 'less-than' does not compare the form's 1 register operands" [=[
+instruction "frob" {
+    architecture = "mips";
+    operands = ["rs:gpr", "target:branch"];
+    encoding = "011100 rs:5 00000 target:16";
+    reads = ["rs"];
+    control = "branch";
+    delay_slot = true;
+    condition = "less-than";
+}
+]=])
+expect_rejected(condition 5 "condition must be 'equal', 'not-equal', 'less-than-zero', 'greater-equal-zero', 'less-equal-zero', 'greater-than-zero', 'less-than', 'greater-equal', 'less-than-unsigned', or 'greater-equal-unsigned', on a 'branch'" [=[
 instruction "frob" {
     architecture = "mips";
     encoding = "011100 00000 00000 00000 00000 111111";

@@ -105,9 +105,23 @@ foreach(symbol allegrex_nonzero allegrex_zero)
     string(SUBSTRING "${body}" 0 ${end} body)
     if(body MATCHES "[\t ](sltu|sltiu|xori)[\t ]" OR
        body MATCHES "[$]1[^0-9]" OR
-       NOT body MATCHES "\\.word[^\n]*# mov[nz] [$]2,[$][0-9]+,[$]4\n")
+       NOT body MATCHES "\\.word[^\n]*# mov[nz] [$]2,[$][0-9]+,[$]4(\n|$)")
         message(FATAL_ERROR
             "Allegrex select against zero did not move on the integer\n${body}")
+    endif()
+endforeach()
+# A function that ends in a conditional move or a rotation returns with
+# its word in the delay slot.
+foreach(case "allegrex_choose|movn" "allegrex_rotr|rotrv")
+    string(REPLACE "|" ";" parts "${case}")
+    list(GET parts 0 symbol)
+    list(GET parts 1 mnemonic)
+    string(FIND "${assembly}" "\n${symbol}:" start)
+    string(SUBSTRING "${assembly}" ${start} -1 body)
+    string(FIND "${body}" "\n.end ${symbol}" end)
+    string(SUBSTRING "${body}" 0 ${end} body)
+    if(NOT body MATCHES "\tjr\t[$]31\n\t[.]word\t0x[0-9a-f]+\t# ${mnemonic} [^\n]*$")
+        message(FATAL_ERROR "${symbol} did not fill its return's delay slot\n${body}")
     endif()
 endforeach()
 

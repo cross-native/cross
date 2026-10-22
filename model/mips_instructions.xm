@@ -532,6 +532,7 @@ instruction "rdhwr" {
     encoding = "011111 00000 rt:5 rd:5 00000 111011";
     features = ["mips32r2", "mips64r2"];
     writes = ["rt"];
+    volatile = true;
 }
 
 instruction "wsbw" {
@@ -547,10 +548,11 @@ instruction "movn" {
     architecture = "mips";
     operands = ["rd:gpr", "rs:gpr", "rt:gpr"];
     encoding = "000000 rs:5 rt:5 rd:5 00000 001011";
-    features = ["mips4", "mips32", "mips64"];
+    features = ["mips4", "mips32", "mips64", "allegrex"];
     excludes = ["mips32r6", "mips64r6"];
     reads = ["rs", "rt"];
     writes = ["rd"];
+    keeps = ["rd"];
 }
 
 instruction "mult" {
@@ -752,6 +754,7 @@ instruction "lwl" {
     excludes = ["mips32r6", "mips64r6"];
     reads = ["memory"];
     writes = ["rt"];
+    keeps = ["rt"];
     hazards = ["load"];
     latency = 3;
 }
@@ -763,6 +766,7 @@ instruction "lwr" {
     excludes = ["mips32r6", "mips64r6"];
     reads = ["memory"];
     writes = ["rt"];
+    keeps = ["rt"];
     hazards = ["load"];
     latency = 3;
 }
@@ -775,6 +779,7 @@ instruction "ldl" {
     excludes = ["mips32r6", "mips64r6"];
     reads = ["memory"];
     writes = ["rt"];
+    keeps = ["rt"];
     hazards = ["load"];
     latency = 3;
 }
@@ -787,6 +792,7 @@ instruction "ldr" {
     excludes = ["mips32r6", "mips64r6"];
     reads = ["memory"];
     writes = ["rt"];
+    keeps = ["rt"];
     hazards = ["load"];
     latency = 3;
 }
@@ -1128,6 +1134,7 @@ instruction "beql" {
     excludes = ["mips32r6", "mips64r6"];
     reads = ["rs", "rt"];
     control = "branch";
+    condition = "equal";
     delay_slot = true;
     likely = true;
 }
@@ -1140,6 +1147,7 @@ instruction "bnel" {
     excludes = ["mips32r6", "mips64r6"];
     reads = ["rs", "rt"];
     control = "branch";
+    condition = "not-equal";
     delay_slot = true;
     likely = true;
 }
@@ -1152,6 +1160,7 @@ instruction "beqzl" {
     excludes = ["mips32r6", "mips64r6"];
     reads = ["rs"];
     control = "branch";
+    condition = "equal";
     delay_slot = true;
     likely = true;
 }
@@ -1164,6 +1173,7 @@ instruction "bnezl" {
     excludes = ["mips32r6", "mips64r6"];
     reads = ["rs"];
     control = "branch";
+    condition = "not-equal";
     delay_slot = true;
     likely = true;
 }
@@ -1176,6 +1186,7 @@ instruction "bltzl" {
     excludes = ["mips32r6", "mips64r6"];
     reads = ["rs"];
     control = "branch";
+    condition = "less-than-zero";
     delay_slot = true;
     likely = true;
 }
@@ -1188,6 +1199,7 @@ instruction "bgezl" {
     excludes = ["mips32r6", "mips64r6"];
     reads = ["rs"];
     control = "branch";
+    condition = "greater-equal-zero";
     delay_slot = true;
     likely = true;
 }
@@ -1200,6 +1212,7 @@ instruction "blezl" {
     excludes = ["mips32r6", "mips64r6"];
     reads = ["rs"];
     control = "branch";
+    condition = "less-equal-zero";
     delay_slot = true;
     likely = true;
 }
@@ -1212,6 +1225,7 @@ instruction "bgtzl" {
     excludes = ["mips32r6", "mips64r6"];
     reads = ["rs"];
     control = "branch";
+    condition = "greater-than-zero";
     delay_slot = true;
     likely = true;
 }
@@ -1849,6 +1863,7 @@ instruction "mthc1" {
     features = ["mips32r2", "mips64r2"];
     reads = ["rt"];
     writes = ["fs"];
+    keeps = ["fs"];
     hazards = ["to-coprocessor"];
 }
 
@@ -2138,6 +2153,7 @@ instruction "movn.s" {
     excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "rt"];
     writes = ["fd"];
+    keeps = ["fd"];
 }
 
 instruction "movn.d" {
@@ -2148,6 +2164,7 @@ instruction "movn.d" {
     excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "rt"];
     writes = ["fd"];
+    keeps = ["fd"];
 }
 
 instruction "movz.s" {
@@ -2158,6 +2175,7 @@ instruction "movz.s" {
     excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "rt"];
     writes = ["fd"];
+    keeps = ["fd"];
 }
 
 instruction "movz.d" {
@@ -2168,6 +2186,7 @@ instruction "movz.d" {
     excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "rt"];
     writes = ["fd"];
+    keeps = ["fd"];
 }
 
 instruction "movt.s" {
@@ -2178,6 +2197,7 @@ instruction "movt.s" {
     excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "fcsr"];
     writes = ["fd"];
+    keeps = ["fd"];
     hazards = ["condition-read"];
 }
 
@@ -2189,6 +2209,7 @@ instruction "movt.d" {
     excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "fcsr"];
     writes = ["fd"];
+    keeps = ["fd"];
     hazards = ["condition-read"];
 }
 
@@ -2200,6 +2221,7 @@ instruction "movf.s" {
     excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "fcsr"];
     writes = ["fd"];
+    keeps = ["fd"];
     hazards = ["condition-read"];
 }
 
@@ -2211,6 +2233,7 @@ instruction "movf.d" {
     excludes = ["mips32r6", "mips64r6"];
     reads = ["fs", "fcsr"];
     writes = ["fd"];
+    keeps = ["fd"];
     hazards = ["condition-read"];
 }
 
@@ -2218,10 +2241,11 @@ instruction "movz" {
     architecture = "mips";
     operands = ["rd:gpr", "rs:gpr", "rt:gpr"];
     encoding = "000000 rs:5 rt:5 rd:5 00000 001010";
-    features = ["mips4", "mips32", "mips64"];
+    features = ["mips4", "mips32", "mips64", "allegrex"];
     excludes = ["mips32r6", "mips64r6"];
     reads = ["rs", "rt"];
     writes = ["rd"];
+    keeps = ["rd"];
 }
 
 instruction "movf" {
@@ -2232,6 +2256,7 @@ instruction "movf" {
     excludes = ["mips32r6", "mips64r6"];
     reads = ["rs", "fcsr"];
     writes = ["rd"];
+    keeps = ["rd"];
     hazards = ["condition-read"];
 }
 
@@ -2243,6 +2268,7 @@ instruction "movt" {
     excludes = ["mips32r6", "mips64r6"];
     reads = ["rs", "fcsr"];
     writes = ["rd"];
+    keeps = ["rd"];
     hazards = ["condition-read"];
 }
 
@@ -2250,8 +2276,9 @@ instruction "add" {
     architecture = "mips";
     operands = ["rd:gpr32", "rs:gpr32", "rt:gpr32"];
     encoding = "000000 rs:5 rt:5 rd:5 00000 100000";
-    reads = ["rs", "rt"];
-    writes = ["rd"];
+    reads = ["rs", "rt", "memory"];
+    writes = ["rd", "memory"];
+    volatile = true;
 }
 
 instruction "add/immediate" {
@@ -2268,16 +2295,18 @@ instruction "addi" {
     operands = ["rt:gpr32", "rs:gpr32", "imm:simm16"];
     encoding = "001000 rs:5 rt:5 imm:16";
     excludes = ["mips32r6", "mips64r6"];
-    reads = ["rs"];
-    writes = ["rt"];
+    reads = ["rs", "memory"];
+    writes = ["rt", "memory"];
+    volatile = true;
 }
 
 instruction "sub" {
     architecture = "mips";
     operands = ["rd:gpr32", "rs:gpr32", "rt:gpr32"];
     encoding = "000000 rs:5 rt:5 rd:5 00000 100010";
-    reads = ["rs", "rt"];
-    writes = ["rd"];
+    reads = ["rs", "rt", "memory"];
+    writes = ["rd", "memory"];
+    volatile = true;
 }
 
 instruction "sub/immediate" {
@@ -2294,8 +2323,9 @@ instruction "dadd" {
     operands = ["rd:gpr64", "rs:gpr64", "rt:gpr64"];
     encoding = "000000 rs:5 rt:5 rd:5 00000 101100";
     features = ["mips3"];
-    reads = ["rs", "rt"];
-    writes = ["rd"];
+    reads = ["rs", "rt", "memory"];
+    writes = ["rd", "memory"];
+    volatile = true;
 }
 
 instruction "dadd/immediate" {
@@ -2314,8 +2344,9 @@ instruction "daddi" {
     encoding = "011000 rs:5 rt:5 imm:16";
     features = ["mips3"];
     excludes = ["mips32r6", "mips64r6"];
-    reads = ["rs"];
-    writes = ["rt"];
+    reads = ["rs", "memory"];
+    writes = ["rt", "memory"];
+    volatile = true;
 }
 
 instruction "dsub" {
@@ -2323,8 +2354,9 @@ instruction "dsub" {
     operands = ["rd:gpr64", "rs:gpr64", "rt:gpr64"];
     encoding = "000000 rs:5 rt:5 rd:5 00000 101110";
     features = ["mips3"];
-    reads = ["rs", "rt"];
-    writes = ["rd"];
+    reads = ["rs", "rt", "memory"];
+    writes = ["rd", "memory"];
+    volatile = true;
 }
 
 instruction "dsub/immediate" {
@@ -2349,8 +2381,9 @@ instruction "neg" {
     architecture = "mips";
     operands = ["rd:gpr32", "rs:gpr32=rd"];
     encoding = "000000 zero:5 rs:5 rd:5 00000 100010";
-    reads = ["rs"];
-    writes = ["rd"];
+    reads = ["rs", "memory"];
+    writes = ["rd", "memory"];
+    volatile = true;
 }
 
 instruction "not" {
@@ -2393,6 +2426,7 @@ instruction "wait/mips3" {
     writes = ["memory"];
     privileged = true;
     volatile = true;
+    builtin = false;
 }
 
 instruction "teq" {
@@ -2401,8 +2435,10 @@ instruction "teq" {
     encoding = "000000 rs:5 rt:5 code:10 110100";
     features = ["mips2"];
     excludes = ["allegrex"];
-    reads = ["rs", "rt"];
+    reads = ["rs", "rt", "memory"];
+    writes = ["memory"];
     hazards = ["no-delay-slot"];
+    volatile = true;
 }
 
 instruction "teq/immediate" {
@@ -2421,8 +2457,10 @@ instruction "tne" {
     encoding = "000000 rs:5 rt:5 code:10 110110";
     features = ["mips2"];
     excludes = ["allegrex"];
-    reads = ["rs", "rt"];
+    reads = ["rs", "rt", "memory"];
+    writes = ["memory"];
     hazards = ["no-delay-slot"];
+    volatile = true;
 }
 
 instruction "tne/immediate" {
@@ -2441,8 +2479,10 @@ instruction "tge" {
     encoding = "000000 rs:5 rt:5 code:10 110000";
     features = ["mips2"];
     excludes = ["allegrex"];
-    reads = ["rs", "rt"];
+    reads = ["rs", "rt", "memory"];
+    writes = ["memory"];
     hazards = ["no-delay-slot"];
+    volatile = true;
 }
 
 instruction "tge/immediate" {
@@ -2461,8 +2501,10 @@ instruction "tgeu" {
     encoding = "000000 rs:5 rt:5 code:10 110001";
     features = ["mips2"];
     excludes = ["allegrex"];
-    reads = ["rs", "rt"];
+    reads = ["rs", "rt", "memory"];
+    writes = ["memory"];
     hazards = ["no-delay-slot"];
+    volatile = true;
 }
 
 instruction "tgeu/immediate" {
@@ -2481,8 +2523,10 @@ instruction "tlt" {
     encoding = "000000 rs:5 rt:5 code:10 110010";
     features = ["mips2"];
     excludes = ["allegrex"];
-    reads = ["rs", "rt"];
+    reads = ["rs", "rt", "memory"];
+    writes = ["memory"];
     hazards = ["no-delay-slot"];
+    volatile = true;
 }
 
 instruction "tlt/immediate" {
@@ -2501,8 +2545,10 @@ instruction "tltu" {
     encoding = "000000 rs:5 rt:5 code:10 110011";
     features = ["mips2"];
     excludes = ["allegrex"];
-    reads = ["rs", "rt"];
+    reads = ["rs", "rt", "memory"];
+    writes = ["memory"];
     hazards = ["no-delay-slot"];
+    volatile = true;
 }
 
 instruction "tltu/immediate" {
@@ -2521,8 +2567,10 @@ instruction "teqi" {
     encoding = "000001 rs:5 01100 imm:16";
     features = ["mips2"];
     excludes = ["allegrex", "mips32r6", "mips64r6"];
-    reads = ["rs"];
+    reads = ["rs", "memory"];
+    writes = ["memory"];
     hazards = ["no-delay-slot"];
+    volatile = true;
 }
 
 instruction "tnei" {
@@ -2531,8 +2579,10 @@ instruction "tnei" {
     encoding = "000001 rs:5 01110 imm:16";
     features = ["mips2"];
     excludes = ["allegrex", "mips32r6", "mips64r6"];
-    reads = ["rs"];
+    reads = ["rs", "memory"];
+    writes = ["memory"];
     hazards = ["no-delay-slot"];
+    volatile = true;
 }
 
 instruction "tgei" {
@@ -2541,8 +2591,10 @@ instruction "tgei" {
     encoding = "000001 rs:5 01000 imm:16";
     features = ["mips2"];
     excludes = ["allegrex", "mips32r6", "mips64r6"];
-    reads = ["rs"];
+    reads = ["rs", "memory"];
+    writes = ["memory"];
     hazards = ["no-delay-slot"];
+    volatile = true;
 }
 
 instruction "tgeiu" {
@@ -2551,8 +2603,10 @@ instruction "tgeiu" {
     encoding = "000001 rs:5 01001 imm:16";
     features = ["mips2"];
     excludes = ["allegrex", "mips32r6", "mips64r6"];
-    reads = ["rs"];
+    reads = ["rs", "memory"];
+    writes = ["memory"];
     hazards = ["no-delay-slot"];
+    volatile = true;
 }
 
 instruction "tlti" {
@@ -2561,8 +2615,10 @@ instruction "tlti" {
     encoding = "000001 rs:5 01010 imm:16";
     features = ["mips2"];
     excludes = ["allegrex", "mips32r6", "mips64r6"];
-    reads = ["rs"];
+    reads = ["rs", "memory"];
+    writes = ["memory"];
     hazards = ["no-delay-slot"];
+    volatile = true;
 }
 
 instruction "tltiu" {
@@ -2571,8 +2627,10 @@ instruction "tltiu" {
     encoding = "000001 rs:5 01011 imm:16";
     features = ["mips2"];
     excludes = ["allegrex", "mips32r6", "mips64r6"];
-    reads = ["rs"];
+    reads = ["rs", "memory"];
+    writes = ["memory"];
     hazards = ["no-delay-slot"];
+    volatile = true;
 }
 
 instruction "mul" {
@@ -2760,7 +2818,9 @@ instruction "mfic" {
     operands = ["rt:gpr32", "rd:cp0"];
     encoding = "011100 00000 rt:5 rd:5 00000 100100";
     features = ["allegrex"];
+    reads = ["ic"];
     writes = ["rt"];
+    volatile = true;
 }
 
 instruction "mtic" {
@@ -2769,6 +2829,8 @@ instruction "mtic" {
     encoding = "011100 00000 rt:5 rd:5 00000 100110";
     features = ["allegrex"];
     reads = ["rt"];
+    writes = ["ic"];
+    volatile = true;
 }
 
 instruction "cvt.w.s" {
@@ -4365,6 +4427,7 @@ instruction "beqzc" {
     constraints = ["rs != 0"];
     reads = ["rs"];
     control = "branch";
+    condition = "equal";
     hazards = ["no-delay-slot"];
 }
 
@@ -4376,6 +4439,7 @@ instruction "bnezc" {
     constraints = ["rs != 0"];
     reads = ["rs"];
     control = "branch";
+    condition = "not-equal";
     hazards = ["no-delay-slot"];
 }
 
@@ -4418,6 +4482,7 @@ instruction "beqc" {
     constraints = ["rs != 0", "rt-rs > 0"];
     reads = ["rs", "rt"];
     control = "branch";
+    condition = "equal";
     hazards = ["no-delay-slot"];
 }
 
@@ -4430,6 +4495,7 @@ instruction "beqc/swapped" {
     constraints = ["rt != 0", "rs-rt > 0"];
     reads = ["rs", "rt"];
     control = "branch";
+    condition = "equal";
     hazards = ["no-delay-slot"];
 }
 
@@ -4441,6 +4507,7 @@ instruction "bnec" {
     constraints = ["rs != 0", "rt-rs > 0"];
     reads = ["rs", "rt"];
     control = "branch";
+    condition = "not-equal";
     hazards = ["no-delay-slot"];
 }
 
@@ -4453,6 +4520,7 @@ instruction "bnec/swapped" {
     constraints = ["rt != 0", "rs-rt > 0"];
     reads = ["rs", "rt"];
     control = "branch";
+    condition = "not-equal";
     hazards = ["no-delay-slot"];
 }
 
@@ -4510,6 +4578,7 @@ instruction "bltc" {
     constraints = ["rs != 0", "rt != 0", "rs-rt != 0"];
     reads = ["rs", "rt"];
     control = "branch";
+    condition = "less-than";
     hazards = ["no-delay-slot"];
 }
 
@@ -4521,6 +4590,7 @@ instruction "bgec" {
     constraints = ["rs != 0", "rt != 0", "rs-rt != 0"];
     reads = ["rs", "rt"];
     control = "branch";
+    condition = "greater-equal";
     hazards = ["no-delay-slot"];
 }
 
@@ -4532,6 +4602,7 @@ instruction "bltuc" {
     constraints = ["rs != 0", "rt != 0", "rs-rt != 0"];
     reads = ["rs", "rt"];
     control = "branch";
+    condition = "less-than-unsigned";
     hazards = ["no-delay-slot"];
 }
 
@@ -4543,6 +4614,7 @@ instruction "bgeuc" {
     constraints = ["rs != 0", "rt != 0", "rs-rt != 0"];
     reads = ["rs", "rt"];
     control = "branch";
+    condition = "greater-equal-unsigned";
     hazards = ["no-delay-slot"];
 }
 
@@ -4554,6 +4626,7 @@ instruction "bltzc" {
     constraints = ["rt != 0"];
     reads = ["rt"];
     control = "branch";
+    condition = "less-than-zero";
     hazards = ["no-delay-slot"];
 }
 
@@ -4565,6 +4638,7 @@ instruction "bgezc" {
     constraints = ["rt != 0"];
     reads = ["rt"];
     control = "branch";
+    condition = "greater-equal-zero";
     hazards = ["no-delay-slot"];
 }
 
@@ -4576,6 +4650,7 @@ instruction "blezc" {
     constraints = ["rt != 0"];
     reads = ["rt"];
     control = "branch";
+    condition = "less-equal-zero";
     hazards = ["no-delay-slot"];
 }
 
@@ -4587,6 +4662,7 @@ instruction "bgtzc" {
     constraints = ["rt != 0"];
     reads = ["rt"];
     control = "branch";
+    condition = "greater-than-zero";
     hazards = ["no-delay-slot"];
 }
 
@@ -4711,6 +4787,7 @@ instruction "auipc" {
     encoding = "111011 rs:5 11110 imm:16";
     features = ["mips32r6", "mips64r6"];
     writes = ["rs"];
+    volatile = true;
 }
 
 instruction "aluipc" {
@@ -4719,6 +4796,7 @@ instruction "aluipc" {
     encoding = "111011 rs:5 11111 imm:16";
     features = ["mips32r6", "mips64r6"];
     writes = ["rs"];
+    volatile = true;
 }
 
 instruction "lsa" {

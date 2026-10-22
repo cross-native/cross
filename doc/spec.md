@@ -3580,7 +3580,9 @@ call is never raw-compatible.
 ## Machine instruction built-ins
 
 Every instruction family available under the selected target/`-march` has one
-or more typed, non-linker built-in forms named `$::_mnemonic`. Conceptual forms:
+or more typed, non-linker built-in forms named `$::_mnemonic`, with `_` for each
+`.` of the mnemonic, as `$::_add_s` for `add.s`; the target's instruction table
+may give a form another name. Conceptual forms:
 
 ```text
 void $::_movabs(out u64 destination, in u64 source);

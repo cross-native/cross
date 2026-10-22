@@ -256,8 +256,8 @@ I-V, MIPS32, and MIPS64 Releases 1, 2, and 6, the instructions Release 6
 removes rejected there, with multiply-accumulate, `mul`,
 `ext`, `ins`, `seb`, `seh`, traps, `pref`, every rounding conversion and FPU
 comparison, and the Allegrex instructions (`clz`, `clo`, `max`, `min`,
-`bitrev`, `wsbw`, `mfic`, `mtic`, and its own multiply-accumulate
-encodings); coprocessor 2, MIPS16, and microMIPS are not in it, and a model
+`bitrev`, `wsbw`, `mfic`, `mtic`, `movn`, `movz`, and its own
+multiply-accumulate encodings); coprocessor 2, MIPS16, and microMIPS are not in it, and a model
 may add instructions. As in GNU as, a condition code operand, `$fcc0` too,
 needs MIPS IV or MIPS32, and a `sync` type or a coprocessor 0 register
 select MIPS32 or MIPS64. A floating-point register may be written `$N` in a
@@ -657,7 +657,7 @@ with `-target`, `-march`, or `-mprofile` to inspect another configuration.
 | `--print-options[=all\|optimization\|common\|target]` | Options, values, and origins. |
 | `--print-keywords`, `--print-builtins`, `--print-attributes` | The language surface. |
 | `--print-features`, `--print-registers` | Target feature queries and register names. |
-| `--print-instructions` | The machine-instruction built-ins with their feature gates and whether they are privileged or volatile, then, for a target whose instruction table models give, each instruction form: `MNEMONIC OPERANDS  [FEATURES]` (the features of which the form needs one, then `!NAME` for each it excludes), `alias of NAME` or `macro` where it is one, its built-in, and `source: FILE:LINE`. |
+| `--print-instructions` | The machine-instruction built-ins with their feature gates and whether they are privileged or volatile, then, for a target whose instruction table models give, each instruction form: `MNEMONIC OPERANDS  [FEATURES]` (the features of which the form needs one, then `!NAME` for each it excludes), `alias of NAME` or `macro` where it is one, its built-in or `no built-in (REASON)`, and `source: FILE:LINE`. |
 
 ## Diagnostics
 

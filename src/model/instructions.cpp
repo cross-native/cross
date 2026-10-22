@@ -89,9 +89,9 @@ std::string_view control_name(InstructionControlEffect control) {
 
 constexpr std::string_view instruction_properties[] = {
     "architecture", "mnemonic", "operands", "encoding", "features", "excludes",
-    "reads", "writes", "hazards", "control", "condition", "delay_slot", "likely",
-    "privileged", "volatile", "hazard_uses", "hazard_writes", "latency", "issue",
-    "builtin", "alias", "macro", "expands", "otherwise", "constraints"};
+    "reads", "writes", "keeps", "hazards", "control", "condition", "delay_slot",
+    "likely", "privileged", "volatile", "hazard_uses", "hazard_writes", "latency",
+    "issue", "builtin", "alias", "macro", "expands", "otherwise", "constraints"};
 
 // The comparisons of `condition`, by InstructionBranchCondition.
 constexpr std::pair<std::string_view, InstructionBranchCondition> branch_conditions[] = {
@@ -101,6 +101,10 @@ constexpr std::pair<std::string_view, InstructionBranchCondition> branch_conditi
     {"greater-equal-zero", InstructionBranchCondition::GreaterEqualZero},
     {"less-equal-zero", InstructionBranchCondition::LessEqualZero},
     {"greater-than-zero", InstructionBranchCondition::GreaterThanZero},
+    {"less-than", InstructionBranchCondition::LessThan},
+    {"greater-equal", InstructionBranchCondition::GreaterEqual},
+    {"less-than-unsigned", InstructionBranchCondition::LessThanUnsigned},
+    {"greater-equal-unsigned", InstructionBranchCondition::GreaterEqualUnsigned},
 };
 
 constexpr std::size_t property_index(std::string_view name) {
@@ -569,6 +573,30 @@ public:
         return !reader_.failed();
     }
 
+    // `keeps`: register operands that the form writes.
+    bool keeps() {
+        const auto line = reader_.line("keeps");
+        for (const auto& name : reader_.list("keeps")) {
+            const auto* operand = find_operand(name);
+            const auto index =
+                operand ? static_cast<unsigned>(operand - entry_.operands.data()) : 0U;
+            if (!operand || operand->type.kind != OperandKind::Register ||
+                std::none_of(entry_.writes.begin(), entry_.writes.end(),
+                             [&](const ModelEffect& effect) {
+                                 return effect.kind == ModelEffect::Kind::Operand &&
+                                        effect.operand == index;
+                             })) {
+                return fail(line, "'keeps' names '" + name +
+                                      "', which is not a register operand that the form writes");
+            }
+            if (std::find(entry_.keeps.begin(), entry_.keeps.end(), index) != entry_.keeps.end()) {
+                return fail(line, "model property 'keeps' lists '" + name + "' twice");
+            }
+            entry_.keeps.push_back(index);
+        }
+        return !reader_.failed();
+    }
+
     bool hazard_facts() {
         // Resource names first, so that the facts can refer to them.
         std::vector<std::tuple<std::string, unsigned, std::optional<unsigned>,
@@ -858,16 +886,96 @@ bool expansion_matches(const ModelInstruction& macro, const ModelExpansion& line
     return true;
 }
 
-InstructionOperandRole operand_role(const ModelInstruction& entry, unsigned index) {
-    const auto names = [&](const std::vector<ModelEffect>& effects) {
-        return std::any_of(effects.begin(), effects.end(), [&](const ModelEffect& effect) {
-            return effect.kind == ModelEffect::Kind::Operand && effect.operand == index;
-        });
-    };
-    const bool read = names(entry.reads);
-    const bool written = names(entry.writes);
+bool names_operand(const std::vector<ModelEffect>& effects, unsigned index) {
+    return std::any_of(effects.begin(), effects.end(), [&](const ModelEffect& effect) {
+        return effect.kind == ModelEffect::Kind::Operand && effect.operand == index;
+    });
+}
+
+bool names_resource(const std::vector<ModelEffect>& effects, std::string_view name) {
+    return std::any_of(effects.begin(), effects.end(), [&](const ModelEffect& effect) {
+        return effect.kind != ModelEffect::Kind::Operand && effect.name == name;
+    });
+}
+
+// The role of operand `index` in a form of `count` operands: a register
+// that it writes is an output, one whose value it also reads or keeps, or
+// that an omitted operand reads through its default, is both; a memory
+// operand follows the form's effects on memory.
+InstructionOperandRole operand_role(const ModelInstruction& entry, unsigned index,
+                                    std::size_t count) {
+    bool read = false;
+    bool written = false;
+    if (entry.operands[index].type.kind == OperandKind::Memory) {
+        read = names_resource(entry.reads, "memory");
+        written = names_resource(entry.writes, "memory");
+    } else {
+        read = names_operand(entry.reads, index) ||
+               std::find(entry.keeps.begin(), entry.keeps.end(), index) != entry.keeps.end();
+        written = names_operand(entry.writes, index);
+        for (auto omitted = count; omitted < entry.operands.size(); ++omitted) {
+            if (entry.operands[omitted].default_operand != index) continue;
+            read = read || names_operand(entry.reads, static_cast<unsigned>(omitted));
+            written = written || names_operand(entry.writes, static_cast<unsigned>(omitted));
+        }
+    }
     if (read && written) return InstructionOperandRole::InOut;
     return written ? InstructionOperandRole::Output : InstructionOperandRole::Input;
+}
+
+// Why an encoded entry gives no built-in form, completing "has no built-in
+// form: "; empty when it gives forms.
+std::string builtin_unavailability(const ModelInstruction& entry) {
+    const bool transfers = entry.control == InstructionControlEffect::UnconditionalBranch ||
+                           entry.control == InstructionControlEffect::ConditionalBranch;
+    bool label = false;
+    for (const auto& operand : entry.operands) {
+        if (operand.name.empty()) continue;
+        if (!operand.type.exposable) {
+            return "its operand '" + operand.spelling + "' cannot be a built-in operand";
+        }
+        if (operand.type.kind == OperandKind::Label) {
+            if (!transfers) {
+                return "its label operand '" + operand.spelling + "' needs a jump or a branch";
+            }
+            label = true;
+        }
+    }
+    if (!transfers) {
+        for (const auto& constraint : entry.constraints) {
+            for (const auto& term : constraint.terms) {
+                if (entry.operands[term.operand].type.kind == OperandKind::Register) {
+                    return "its register operands must satisfy '" + constraint.text +
+                           "', which register allocation does not arrange";
+                }
+            }
+        }
+        return {};
+    }
+    // A branch built-in is a comparison and a branch to a label, whatever
+    // instruction does them: anything else that the form does is lost.
+    if (!label) return "it transfers control to an address in a register";
+    if (!entry.writes.empty()) {
+        return "it writes '" + entry.writes.front().name + "' as it transfers control";
+    }
+    if (entry.control == InstructionControlEffect::ConditionalBranch &&
+        entry.branch_condition == InstructionBranchCondition::None) {
+        return "it branches on a condition that its entry does not state";
+    }
+    for (const auto& effect : entry.reads) {
+        if (effect.kind != ModelEffect::Kind::Operand) {
+            return "it reads '" + effect.name + "' as it transfers control";
+        }
+    }
+    return {};
+}
+
+// The built-in name of a mnemonic: `$::_` and the mnemonic with `_` for
+// each `.`, as `$::_add_s` for `add.s`.
+std::string builtin_name(std::string_view mnemonic) {
+    std::string result = "$::_";
+    for (const char c : mnemonic) result.push_back(c == '.' ? '_' : c);
+    return result;
 }
 
 // Whether `feature` gives `other` through the prerequisites of the target's
@@ -882,11 +990,14 @@ bool implies(const TargetInfo& target, std::string_view feature, std::string_vie
     return false;
 }
 
-// The registry forms of an entry with `builtin`: one for each feature that
-// has the instruction, each register width that its operands take (one
-// width for all of them), and each number of its optional operands.
-void add_builtin_forms(const TargetInfo& target, const ModelInstruction& entry,
-                       InstructionCostId cost, std::size_t index, InstructionTable& table) {
+// The registry forms named `name` of the encoded entry `entry`, which entry
+// `index` spells: one for each feature that has the instruction, each
+// register width that its operands take (one width for all of them), and
+// each number of its optional operands. Literal registers are no built-in
+// operands; the forms print them.
+void add_builtin_forms(const TargetInfo& target, std::string_view name,
+                       const ModelInstruction& entry, InstructionCostId cost, std::size_t index,
+                       InstructionTable& table) {
     std::vector<std::string_view> alternatives;
     for (const auto& feature : entry.features) alternatives.push_back(feature);
     if (alternatives.empty()) alternatives.push_back(target.architecture);
@@ -900,15 +1011,23 @@ void add_builtin_forms(const TargetInfo& target, const ModelInstruction& entry,
         for (std::size_t width = 0; width < widths; ++width) {
             for (auto count = required; count <= entry.operands.size(); ++count) {
                 InstructionEntry form;
-                form.name = entry.builtin;
+                form.name = name;
                 form.assembly_mnemonic = entry.mnemonic;
                 std::vector<std::string_view> required_features;
                 std::vector<std::string_view> forbidden(entry.excludes.begin(),
                                                         entry.excludes.end());
+                // The built-in operand of each entry operand.
+                std::vector<std::optional<unsigned>> positions(entry.operands.size());
                 for (std::size_t slot = 0; slot < count; ++slot) {
-                    const auto& type = entry.operands[slot].type;
+                    const auto& operand = entry.operands[slot];
+                    const auto& type = operand.type;
+                    if (operand.name.empty()) {
+                        form.assembly_literals.push_back(
+                            {static_cast<unsigned>(form.operands.size()), operand.spelling});
+                        continue;
+                    }
                     InstructionOperandEntry field;
-                    field.role = operand_role(entry, static_cast<unsigned>(slot));
+                    field.role = operand_role(entry, static_cast<unsigned>(slot), count);
                     switch (type.kind) {
                     case OperandKind::Register: {
                         field.allow_register = true;
@@ -928,6 +1047,9 @@ void add_builtin_forms(const TargetInfo& target, const ModelInstruction& entry,
                         field.allow_immediate = true;
                         field.immediate_bits = value_bits(type.minimum, type.maximum);
                         field.immediate_signed = type.minimum < 0;
+                        field.immediate_range = true;
+                        field.immediate_minimum = type.minimum;
+                        field.immediate_maximum = type.maximum;
                         field.assembly_register_number = type.register_syntax;
                         break;
                     case OperandKind::Memory:
@@ -948,7 +1070,34 @@ void add_builtin_forms(const TargetInfo& target, const ModelInstruction& entry,
                                              type.required_features.end());
                     forbidden.insert(forbidden.end(), type.forbidden_features.begin(),
                                      type.forbidden_features.end());
+                    positions[slot] = static_cast<unsigned>(form.operands.size());
                     form.operands.push_back(field);
+                }
+                // Omitted operands keep their defaults in the constraints;
+                // a branch's constraints on its registers concern only its
+                // own encoding.
+                for (const auto& constraint : entry.constraints) {
+                    if (std::any_of(constraint.terms.begin(), constraint.terms.end(),
+                                    [&](const ModelTerm& term) {
+                                        return entry.operands[term.operand].type.kind ==
+                                               OperandKind::Register;
+                                    })) {
+                        continue;
+                    }
+                    InstructionConstraint relation;
+                    relation.constant = constraint.constant;
+                    relation.comparison = constraint.comparison;
+                    relation.bound = constraint.bound;
+                    for (const auto& term : constraint.terms) {
+                        if (const auto position = positions[term.operand]) {
+                            relation.terms.emplace_back(*position, term.negative);
+                        } else {
+                            const auto value =
+                                entry.operands[term.operand].default_value.value_or(0);
+                            relation.constant += term.negative ? -value : value;
+                        }
+                    }
+                    form.constraints.push_back(std::move(relation));
                 }
                 std::vector<std::string_view> unique;
                 for (const auto feature : required_features) {
@@ -984,8 +1133,22 @@ void add_builtin_forms(const TargetInfo& target, const ModelInstruction& entry,
                 form.branch_condition = entry.branch_condition;
                 form.privileged = entry.privileged;
                 form.volatile_effect = entry.volatile_effect;
-                form.hazard_uses = entry.hazard_uses;
-                form.hazard_writes = entry.hazard_writes;
+                // Hazard facts name the built-in's operands; a form that
+                // leaves out an operand they name has none.
+                bool facts = true;
+                const auto remap = [&](std::vector<HazardFact> items) {
+                    for (auto& fact : items) {
+                        for (auto* operand : {&fact.operand, &fact.when_operand}) {
+                            if (!*operand) continue;
+                            facts = facts && positions[**operand].has_value();
+                            if (positions[**operand]) *operand = *positions[**operand];
+                        }
+                    }
+                    return items;
+                };
+                form.hazard_uses = remap(entry.hazard_uses);
+                form.hazard_writes = remap(entry.hazard_writes);
+                if (!facts) continue;
                 form.delay_slot = entry.delay_slot;
                 table.builtins.push_back(std::move(form));
                 table.builtin_costs.push_back(cost);
@@ -1010,6 +1173,7 @@ bool complete_table(const TargetInfo& target, InstructionTable& table,
     table.builtins.clear();
     table.builtin_costs.clear();
     table.builtin_entries.clear();
+    table.unexposed.clear();
     auto& entries = table.entries;
     std::unordered_map<std::string_view, std::size_t> names;
     for (std::size_t index = 0; index < entries.size(); ++index) {
@@ -1200,40 +1364,109 @@ bool complete_table(const TargetInfo& target, InstructionTable& table,
             table.cost_listing.push_back(costs.at(entry.mnemonic));
         }
     }
+    // Every encoded form gives a built-in, named after its mnemonic unless
+    // `builtin` names it, where its operands and effects allow one.
     for (std::size_t index = 0; index < entries.size(); ++index) {
-        const auto& entry = entries[index];
-        if (!entry.builtin.empty()) {
-            add_builtin_forms(target, entry, costs.at(entry.mnemonic), index, table);
+        auto& entry = entries[index];
+        const auto& form = spelled_entry(table, entry);
+        entry.unexposed.clear();
+        if (entry.no_builtin) {
+            entry.builtin = builtin_name(entry.mnemonic);
+            entry.unexposed = "has no built-in form: its instruction entry gives none";
+            continue;
         }
+        if (entry.builtin.empty()) entry.builtin = builtin_name(entry.mnemonic);
+        if (!form.encoded) {
+            entry.unexposed = "is an assembler macro, not a machine instruction";
+            continue;
+        }
+        if (auto reason = builtin_unavailability(form); !reason.empty()) {
+            entry.unexposed = "has no built-in form: " + reason;
+            continue;
+        }
+        add_builtin_forms(target, entry.builtin, form, costs.at(form.mnemonic), index, table);
     }
     // Forms of one built-in that take the same operands under the same
     // features would be ambiguous.
-    for (std::size_t later = 1; later < table.builtins.size(); ++later) {
-        for (std::size_t earlier = 0; earlier < later; ++earlier) {
-            const auto& a = table.builtins[earlier];
-            const auto& b = table.builtins[later];
-            const auto same_operands = [&] {
-                if (a.operands.size() != b.operands.size()) return false;
-                for (std::size_t slot = 0; slot < a.operands.size(); ++slot) {
-                    const auto& x = a.operands[slot];
-                    const auto& y = b.operands[slot];
-                    if (x.allow_register != y.allow_register || x.allow_immediate != y.allow_immediate ||
-                        x.allow_memory != y.allow_memory || x.allow_label != y.allow_label ||
-                        x.register_class != y.register_class ||
-                        x.value_bits != y.value_bits || x.memory_bits != y.memory_bits) {
-                        return false;
-                    }
+    std::unordered_map<std::string_view, std::vector<std::size_t>> by_name;
+    for (std::size_t index = 0; index < table.builtins.size(); ++index) {
+        by_name[table.builtins[index].name].push_back(index);
+    }
+    const auto same_forms = [](const InstructionEntry& a, const InstructionEntry& b) {
+        if (a.feature != b.feature || a.required_features != b.required_features ||
+            a.forbidden_features != b.forbidden_features ||
+            a.operands.size() != b.operands.size() ||
+            a.constraints.size() != b.constraints.size()) {
+            return false;
+        }
+        for (std::size_t slot = 0; slot < a.operands.size(); ++slot) {
+            const auto& x = a.operands[slot];
+            const auto& y = b.operands[slot];
+            if (x.allow_register != y.allow_register || x.allow_immediate != y.allow_immediate ||
+                x.allow_memory != y.allow_memory || x.allow_label != y.allow_label ||
+                x.register_class != y.register_class || x.value_bits != y.value_bits ||
+                x.memory_bits != y.memory_bits || x.immediate_minimum != y.immediate_minimum ||
+                x.immediate_maximum != y.immediate_maximum) {
+                return false;
+            }
+        }
+        for (std::size_t index = 0; index < a.constraints.size(); ++index) {
+            const auto& x = a.constraints[index];
+            const auto& y = b.constraints[index];
+            if (x.terms != y.terms || x.constant != y.constant ||
+                x.comparison != y.comparison || x.bound != y.bound) {
+                return false;
+            }
+        }
+        return true;
+    };
+    // Branch forms that differ only in the register constraints of their
+    // encodings, such as Release 6 BEQC with its operands either way round,
+    // compare and branch alike: the first stands for them.
+    const auto same_branch = [](const InstructionEntry& a, const InstructionEntry& b) {
+        return a.control != InstructionControlEffect::None && a.control == b.control &&
+               a.branch_condition == b.branch_condition &&
+               a.implicit_reads == b.implicit_reads && a.implicit_writes == b.implicit_writes;
+    };
+    std::vector<bool> redundant(table.builtins.size());
+    for (const auto& [name, indices] : by_name) {
+        for (std::size_t later = 1; later < indices.size(); ++later) {
+            for (std::size_t earlier = 0; earlier < later; ++earlier) {
+                const auto& first = table.builtins[indices[earlier]];
+                const auto& second = table.builtins[indices[later]];
+                if (redundant[indices[earlier]] || !same_forms(first, second)) continue;
+                if (same_branch(first, second)) {
+                    redundant[indices[later]] = true;
+                    break;
                 }
-                return true;
-            };
-            if (a.name == b.name && a.feature == b.feature && a.required_features == b.required_features &&
-                a.forbidden_features == b.forbidden_features && same_operands()) {
-                return fail(entries[table.builtin_entries[later]].position("builtin"),
-                            "instruction '" + entries[table.builtin_entries[later]].name +
-                                "' gives '" + std::string(b.name) +
+                const auto& entry = entries[table.builtin_entries[indices[later]]];
+                return fail(entry.position("builtin"),
+                            "instruction '" + entry.name + "' gives '" + std::string(name) +
                                 "' a form that another entry gives it");
             }
         }
+    }
+    std::size_t kept = 0;
+    for (std::size_t index = 0; index < table.builtins.size(); ++index) {
+        if (redundant[index]) continue;
+        if (kept != index) {
+            table.builtins[kept] = std::move(table.builtins[index]);
+            table.builtin_costs[kept] = table.builtin_costs[index];
+            table.builtin_entries[kept] = table.builtin_entries[index];
+        }
+        ++kept;
+    }
+    table.builtins.resize(kept);
+    table.builtin_costs.resize(kept);
+    table.builtin_entries.resize(kept);
+    // The names that no form gives, with the reason of their first entry.
+    std::unordered_set<std::string_view> reported;
+    for (const auto& entry : entries) {
+        if (entry.unexposed.empty() || by_name.contains(entry.builtin) ||
+            !reported.insert(entry.builtin).second) {
+            continue;
+        }
+        table.unexposed.push_back({entry.builtin, entry.unexposed});
     }
     for (const auto& intrinsic : target.intrinsic_forms) {
         if (std::none_of(table.builtins.begin(), table.builtins.end(),
@@ -1380,9 +1613,9 @@ std::optional<ModelInstruction> make_instruction(std::string name, unsigned line
     const bool encoded = entry.macro.empty() && !expansion;
     if (!encoded) {
         for (const auto property :
-             {"encoding", "reads", "writes", "hazards", "control", "condition", "delay_slot",
-              "likely", "privileged", "volatile", "hazard_uses", "hazard_writes", "builtin",
-              "constraints"}) {
+             {"encoding", "reads", "writes", "keeps", "hazards", "control", "condition",
+              "delay_slot", "likely", "privileged", "volatile", "hazard_uses", "hazard_writes",
+              "builtin", "constraints"}) {
             if (reader.find(property)) {
                 reader.fail(reader.line(property),
                             std::string("a macro has no '") + property +
@@ -1406,7 +1639,8 @@ std::optional<ModelInstruction> make_instruction(std::string name, unsigned line
         }
     }
     if (!maker.features("features", entry.features) || !maker.features("excludes", entry.excludes) ||
-        !maker.effects("reads", entry.reads) || !maker.effects("writes", entry.writes)) {
+        !maker.effects("reads", entry.reads) || !maker.effects("writes", entry.writes) ||
+        !maker.keeps()) {
         return std::nullopt;
     }
     for (const auto& hazard : reader.list("hazards")) {
@@ -1436,8 +1670,31 @@ std::optional<ModelInstruction> make_instruction(std::string name, unsigned line
             entry.control != InstructionControlEffect::ConditionalBranch) {
             reader.fail(reader.line("condition"),
                         "condition must be 'equal', 'not-equal', 'less-than-zero', "
-                        "'greater-equal-zero', 'less-equal-zero', or 'greater-than-zero', "
-                        "on a 'branch'");
+                        "'greater-equal-zero', 'less-equal-zero', 'greater-than-zero', "
+                        "'less-than', 'greater-equal', 'less-than-unsigned', or "
+                        "'greater-equal-unsigned', on a 'branch'");
+            return std::nullopt;
+        }
+        // A comparison with zero takes one register, an ordering of two
+        // registers two, and an equality either.
+        const auto registers = std::count_if(
+            entry.operands.begin(), entry.operands.end(), [](const ModelOperand& operand) {
+                return !operand.name.empty() && operand.type.kind == OperandKind::Register;
+            });
+        using Condition = InstructionBranchCondition;
+        const auto compared = found->second == Condition::Equal ||
+                                      found->second == Condition::NotEqual
+                                  ? registers == 1 || registers == 2
+                              : found->second == Condition::LessThan ||
+                                      found->second == Condition::GreaterEqual ||
+                                      found->second == Condition::LessThanUnsigned ||
+                                      found->second == Condition::GreaterEqualUnsigned
+                                  ? registers == 2
+                                  : registers == 1;
+        if (!compared) {
+            reader.fail(reader.line("condition"),
+                        "condition '" + *condition + "' does not compare the form's " +
+                            std::to_string(registers) + " register operands");
             return std::nullopt;
         }
         entry.branch_condition = found->second;
@@ -1455,21 +1712,22 @@ std::optional<ModelInstruction> make_instruction(std::string name, unsigned line
     if (reader.failed() || !maker.hazard_facts() || !maker.constraints()) return std::nullopt;
     entry.latency = reader.integer("latency", 0, 65535);
     entry.issue = reader.integer("issue", 1, 65535);
-    if (const auto builtin = reader.text("builtin")) {
+    if (const auto* property = reader.find("builtin");
+        property && property->value.kind == ModelValue::Kind::Boolean) {
+        if (property->value.boolean) {
+            reader.fail(property->line, "model property 'builtin' must be text or false");
+            return std::nullopt;
+        }
+        entry.no_builtin = true;
+    } else if (const auto builtin = reader.text("builtin")) {
         if (!identifier(*builtin)) {
             reader.fail(reader.line("builtin"), "invalid built-in name '" + *builtin + "'");
             return std::nullopt;
         }
-        for (const auto& operand : entry.operands) {
-            if (operand.name.empty() || !operand.type.exposable ||
-                (operand.type.kind == OperandKind::Label &&
-                 entry.control != InstructionControlEffect::UnconditionalBranch &&
-                 entry.control != InstructionControlEffect::ConditionalBranch)) {
-                reader.fail(reader.line("builtin"),
-                            "operand '" + operand.spelling +
-                                "' cannot be an operand of a machine instruction built-in");
-                return std::nullopt;
-            }
+        if (const auto reason = builtin_unavailability(entry); !reason.empty()) {
+            reader.fail(reader.line("builtin"),
+                        "instruction '" + entry.name + "' cannot be a built-in: " + reason);
+            return std::nullopt;
         }
         entry.builtin = "$::_" + *builtin;
     }
@@ -1544,6 +1802,7 @@ void ModelRegistry::install_instruction_tables() const {
             installed.instruction_costs = table.costs;
             installed.form_instructions = table.builtin_costs;
             installed.cost_listing = table.cost_listing;
+            installed.unexposed_instructions = table.unexposed;
         }
     }
 }

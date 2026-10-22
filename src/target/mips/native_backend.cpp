@@ -128,15 +128,42 @@ std::optional<machine::PhysicalRegisterId> gpr_id(std::string_view name) {
         static_cast<std::uint32_t>(found - gpr_names.begin())};
 }
 
-// The word of an R-type instruction whose register fields name `rs`, `rt`,
-// and `rd`; Allegrex encodings unknown to generic assemblers are words.
-std::uint32_t register_word(std::uint32_t base, std::string_view rs,
-                            std::string_view rt, std::string_view rd) {
-    const auto field = [](std::string_view name) {
-        const auto id = gpr_id(name);
-        return id ? id->value : 0U;
+// The word of an instruction table entry from the values of its operands
+// in assembler order: register numbers, immediates, and the offsets of
+// memory operands, whose bases are in `bases`. Encodings that generic
+// assemblers do not know, such as Allegrex's, are emitted as words.
+std::uint32_t encode_entry(const ModelInstruction& entry,
+                           std::span<const std::int64_t> values,
+                           std::span<const std::int64_t> bases = {}) {
+    auto word = static_cast<std::uint32_t>(entry.fixed_bits);
+    for (const auto& field : entry.fields) {
+        std::int64_t value =
+            field.register_number ? *field.register_number : field.constant;
+        for (const auto& term : field.terms) {
+            const auto part =
+                term.part == 1 ? bases[term.operand] : values[term.operand];
+            value += term.negative ? -part : part;
+        }
+        const auto mask =
+            field.width >= 32 ? 0xffffffffU : (1U << field.width) - 1U;
+        word |= (static_cast<std::uint32_t>(
+                     static_cast<std::uint64_t>(value) >> field.low) &
+                 mask)
+                << field.shift;
+    }
+    return word;
+}
+
+// Whether a registry form reads or writes HI or LO, which compiled
+// multiplies and divides use too.
+bool form_uses_hilo(const InstructionEntry& form) {
+    const auto names = [](const std::vector<std::string_view>& resources) {
+        return std::any_of(resources.begin(), resources.end(),
+                           [](std::string_view name) {
+                               return name == "hi" || name == "lo";
+                           });
     };
-    return base | field(rs) << 21U | field(rt) << 16U | field(rd) << 11U;
+    return names(form.implicit_reads) || names(form.implicit_writes);
 }
 
 std::string_view gpr_name(machine::PhysicalRegisterId id) {
@@ -2714,12 +2741,14 @@ private:
             instruction_form_id(target, *form).value, 0, machine::i32));
         std::size_t next = 0;
         for (const auto& field : form->operands) {
+            // The result; a register that the form also reads takes its
+            // input value as the next operand.
             if (field.allow_register &&
-                field.role == InstructionOperandRole::Output) {
+                field.role != InstructionOperandRole::Input) {
                 const auto output = reg(value.id);
                 result.operands.push_back(register_operand(output));
                 result.defs.push_back(output);
-                continue;
+                if (field.role == InstructionOperandRole::Output) continue;
             }
             if (next >= value.operands.size()) {
                 diagnostics_.error(value.location,
@@ -2730,11 +2759,6 @@ private:
             const auto operand = value.operands[next++];
             const auto& source = source_->values[operand.value];
             if (field.allow_register || field.allow_memory) {
-                if (field.role == InstructionOperandRole::InOut) {
-                    diagnostics_.error(value.location,
-                                       "MIPS registry forms have no in-place "
-                                       "operands");
-                }
                 const auto input = reg(operand);
                 result.operands.push_back(register_operand(input));
                 result.uses.push_back(input);
@@ -2762,6 +2786,15 @@ private:
         result.has_side_effects =
             value.kind != mir::ValueKind::MachineInstruction ||
             !mir::pure_instruction_form(*form);
+        // General and floating registers that the form writes implicitly
+        // hold no value across it.
+        for (const auto name : form->implicit_writes) {
+            const auto physical = physical_register_id(name);
+            if (physical && physical->value != 0) {
+                result.clobbers.push_back(machine::Register::physical_register(
+                    *physical, machine::i64));
+            }
+        }
         return result;
     }
 
@@ -5375,7 +5408,9 @@ private:
         std::size_t next = 1;
         for (const auto& field : form.operands) {
             if (!field.allow_memory) {
-                ++next;
+                // A register that the form reads and writes takes two.
+                next += field.allow_register &&
+                        field.role == InstructionOperandRole::InOut ? 2 : 1;
                 continue;
             }
             auto& base = std::get<machine::RegisterOperand>(
@@ -9144,6 +9179,11 @@ private:
 
     bool atomic_hilo_operation(const machine::Instruction& instruction) const {
         const auto opcode = decode_opcode(instruction.opcode);
+        if (opcode == Opcode::Machine) {
+            return form_uses_hilo(subtarget_.target().instructions.at(
+                std::get<machine::ImmediateOperand>(instruction.operands.front())
+                    .value));
+        }
         return opcode == Opcode::Mul || opcode == Opcode::Sdiv ||
             opcode == Opcode::Udiv || opcode == Opcode::Srem ||
             opcode == Opcode::Urem || opcode == Opcode::Sdivrem ||
@@ -10329,11 +10369,18 @@ private:
         // event, which the hazard model times from the store's position.
         ordered_stores_ = std::none_of(
             function.blocks.begin(), function.blocks.end(),
-            [](const machine::Block& block) {
+            [&](const machine::Block& block) {
                 return std::any_of(
                     block.instructions.begin(), block.instructions.end(),
-                    [](const machine::Instruction& value) {
-                        return decode_opcode(value.opcode) == Opcode::Machine;
+                    [&](const machine::Instruction& value) {
+                        if (decode_opcode(value.opcode) != Opcode::Machine) {
+                            return false;
+                        }
+                        const auto& form = subtarget_.target().instructions.at(
+                            std::get<machine::ImmediateOperand>(
+                                value.operands.front()).value);
+                        return !form.hazard_uses.empty() ||
+                               !form.hazard_writes.empty();
                     });
             });
         latency_schedules_ = true;
@@ -11973,12 +12020,31 @@ private:
         return result;
     }
 
+    // Prints an instruction, as `word` when it has one. The caller of a
+    // `registry_form` instruction keeps its naked-contract and HI/LO
+    // effects.
     void raw_instruction(std::string_view opcode,
-                         std::string_view operands = {}) {
+                         std::string_view operands = {},
+                         std::optional<std::uint32_t> word = {},
+                         bool registry_form = false) {
         count_hazard_separation(opcode);
-        audit_naked_write(opcode, operands);
+        if (!registry_form) {
+            audit_naked_write(opcode, operands);
+            if (writes_hilo(opcode) || opcode == "jal" || opcode == "jalr" ||
+                opcode == "bal" || opcode == "bgezal" || opcode == "bltzal") {
+                hilo_state_.fill(HiloState::Changed);
+            }
+        }
         watch_short_loops(opcode, operands);
         if (debug_) debug_->row(output_, pending_location_, pending_site_);
+        if (word) {
+            output_ << "\t.word\t0x" << std::hex << std::setw(8)
+                    << std::setfill('0') << *word << std::dec
+                    << std::setfill(' ') << "\t# " << opcode;
+            if (!operands.empty()) output_ << ' ' << respell_registers(operands);
+            output_ << '\n';
+            return;
+        }
         output_ << '\t' << opcode;
         if (!operands.empty()) {
             output_ << '\t';
@@ -12129,64 +12195,317 @@ private:
                         : input_gpr(function, value, scratch, location);
     }
 
+    // The instruction table's entry that encodes a registry form.
+    const ModelInstruction& encoded_entry(const InstructionEntry& form) const {
+        const auto& target = subtarget_.target();
+        const auto& table = *model_registry().instruction_table(target.architecture);
+        const auto& entry = table.entries[table.builtin_entries[
+            instruction_form_id(target, form).value]];
+        return entry.is_alias() ? table.entries[entry.alias_entry] : entry;
+    }
+
+    // The ISA level of a function's `.set` directive: the CPU's, except
+    // that MIPS II code with odd single-precision registers, which MIPS II
+    // lacks, leaves the ISA to the assembler's CPU.
+    std::string_view set_level() const {
+        static constexpr std::array<std::pair<Feature, std::string_view>, 11> levels{{
+            {Feature::Mips64r6, "mips64r6"}, {Feature::Mips32r6, "mips32r6"},
+            {Feature::Mips64r2, "mips64r2"}, {Feature::Mips64, "mips64"},
+            {Feature::Mips5, "mips5"},       {Feature::Mips4, "mips4"},
+            {Feature::Mips3, "mips3"},       {Feature::Mips32r2, "mips32r2"},
+            {Feature::Mips32, "mips32"},     {Feature::Mips2, "mips2"},
+            {Feature::Mips1, "mips1"}}};
+        for (const auto& [feature, name] : levels) {
+            if (!subtarget_.has_feature(feature)) continue;
+            if (feature == Feature::Mips2 && odd_single_fprs(subtarget_)) return {};
+            return name;
+        }
+        return "mips1";
+    }
+
+    // Whether ISA level `level` has `feature` through its prerequisites.
+    bool level_gives(std::string_view level, std::string_view feature) const {
+        if (level == feature) return true;
+        for (const auto& item : subtarget_.target().subtargets->features) {
+            if (item.name != level) continue;
+            return std::any_of(item.prerequisites.begin(), item.prerequisites.end(),
+                               [&](std::string_view next) {
+                                   return level_gives(next, feature);
+                               });
+        }
+        return false;
+    }
+
+    // Whether the function's ISA level lacks `entry`, which the CPU then
+    // has through an extension such as Allegrex's: the form is a word, as
+    // an assembler of that level needs.
+    bool extension_entry(const ModelInstruction& entry) const {
+        auto level = set_level();
+        if (level.empty()) level = "mips2";
+        return !entry.features.empty() &&
+            std::none_of(entry.features.begin(), entry.features.end(),
+                         [&](const std::string& feature) {
+                             return level_gives(level, feature);
+                         });
+    }
+
+    // A scratch register for a form's operand that it reads and writes, of
+    // the bank of `floating`, other than `taken`: one of the emitter's own,
+    // or in a naked function one of its clobbers.
+    std::string_view form_scratch(bool floating,
+                                  std::span<const std::string_view> taken) const {
+        const auto free = [&](std::string_view name) {
+            return std::find(taken.begin(), taken.end(), name) == taken.end() &&
+                (!naked_writable_ ||
+                 naked_writable_->contains(std::string(name)));
+        };
+        if (floating) {
+            for (const std::string_view name : {"f4", "f2", "f0"}) {
+                if (free(name)) return name;
+            }
+            if (naked_writable_) {
+                for (const auto name : fpr_names) {
+                    if (free(name)) return name;
+                }
+            }
+            return "f4";
+        }
+        for (const std::string_view name : {"t2", "t3", "t1", "t0"}) {
+            if (free(name)) return name;
+        }
+        if (naked_writable_) {
+            for (const auto name : gpr_names) {
+                if (name != "zero" && name != "at" && free(name)) return name;
+            }
+        }
+        return "at";
+    }
+
     void emit_machine_form(const machine::Function& function,
                            const machine::Instruction& value) {
         const auto& form = machine_form(value);
-        std::string operands;
+        const auto& entry = encoded_entry(form);
+        std::vector<std::string> texts;
         std::vector<std::uint64_t> immediates(form.operands.size());
-        std::size_t next = 1;
-        unsigned gpr_inputs = 0;
-        unsigned fpr_inputs = 0;
+        // Register numbers, immediates, and memory offsets by operand of
+        // the form, and the bases of its memory operands.
+        std::vector<std::int64_t> numbers(form.operands.size());
+        std::vector<std::int64_t> bases(form.operands.size());
+        std::vector<std::string_view> inputs;
         std::optional<machine::Register> output;
         std::string_view output_name;
         bool floating_output = false;
+        // The operand that the form reads and writes, and its input.
+        std::optional<std::size_t> tied;
+        std::string_view tied_input;
+        const auto number = [](std::string_view name) -> std::int64_t {
+            if (const auto gpr = gpr_id(name)) return gpr->value;
+            const auto fpr = fpr_id(name);
+            return fpr ? fpr->value - fpr_physical_base : 0;
+        };
+        // The registers of the operands, by operand: the result, the input
+        // of an operand that the form also reads, and the others' inputs.
+        struct Registers {
+            std::optional<machine::Register> result;
+            std::optional<machine::Register> input;
+        };
+        std::vector<Registers> registers(form.operands.size());
+        std::size_t next = 1;
         for (std::size_t index = 0; index < form.operands.size(); ++index) {
             const auto& field = form.operands[index];
-            if (!operands.empty()) operands += ',';
-            if (field.allow_register || field.allow_memory) {
-                const auto reg = std::get<machine::RegisterOperand>(
-                                     value.operands[next++])
-                                     .value;
-                const bool floating = field.register_class == "floating";
-                const bool is_output =
-                    field.role == InstructionOperandRole::Output;
-                const std::string_view scratch =
-                    is_output ? (floating ? "f2" : "t1")
-                    : floating ? (fpr_inputs++ == 0 ? "f0" : "f2")
-                               : (gpr_inputs++ == 0 ? "t0" : "t1");
-                const auto name = form_register(function, reg, floating,
-                                                is_output, scratch,
-                                                value.location);
-                if (is_output) {
-                    output = reg;
-                    output_name = name;
-                    floating_output = floating;
-                }
+            const auto take = [&] {
+                return std::get<machine::RegisterOperand>(value.operands[next++]).value;
+            };
+            if (field.allow_register && field.role != InstructionOperandRole::Input) {
+                registers[index].result = take();
+                if (field.role == InstructionOperandRole::InOut) registers[index].input = take();
+            } else if (field.allow_register || field.allow_memory) {
+                registers[index].input = take();
                 if (field.allow_memory) {
-                    const auto& displacement =
-                        std::get<machine::ImmediateOperand>(
-                            value.operands[next++]);
-                    operands += memory(
-                        static_cast<std::int64_t>(displacement.value), name);
-                } else {
-                    operands += reg_name(name);
+                    numbers[index] = static_cast<std::int64_t>(
+                        std::get<machine::ImmediateOperand>(value.operands[next++]).value);
                 }
-                continue;
+            } else {
+                const auto& immediate =
+                    std::get<machine::ImmediateOperand>(value.operands[next++]);
+                immediates[index] = immediate.value;
+                numbers[index] = static_cast<std::int64_t>(immediate.value);
             }
-            const auto& immediate =
-                std::get<machine::ImmediateOperand>(value.operands[next++]);
-            immediates[index] = immediate.value;
-            operands += field.assembly_register_number
-                            ? "$" + std::to_string(immediate.value)
-                            : std::to_string(immediate.value);
+        }
+        // Inputs without a color take distinct scratches, which functions
+        // with registry forms leave uncolored. A result without one takes
+        // its tied input's scratch, or t1 or f2: an instruction reads its
+        // inputs before it writes.
+        std::vector<std::string_view> used;
+        const auto scratch = [&](bool floating) -> std::string_view {
+            static constexpr std::array<std::string_view, 4> gprs{"t0", "t1", "t2", "t3"};
+            static constexpr std::array<std::string_view, 3> fprs{"f0", "f2", "f4"};
+            const auto pick = [&](const auto& pool) {
+                for (const auto name : pool) {
+                    if (std::find(used.begin(), used.end(), name) == used.end()) return name;
+                }
+                return pool.front();
+            };
+            return floating ? pick(fprs) : pick(gprs);
+        };
+        const auto colored = [&](machine::Register reg, bool floating) {
+            return reg.kind == machine::RegisterKind::Physical ||
+                (floating ? assigned_fpr(function, reg).has_value()
+                          : assigned_gpr(function, reg).has_value());
+        };
+        std::vector<std::string_view> input_names(form.operands.size());
+        for (std::size_t index = 0; index < form.operands.size(); ++index) {
+            const auto& input = registers[index].input;
+            if (!input) continue;
+            const bool floating = form.operands[index].register_class == "floating";
+            input_names[index] = form_register(function, *input, floating, false,
+                                               scratch(floating), value.location);
+            used.push_back(input_names[index]);
+            if (registers[index].result) {
+                tied = index;
+                tied_input = input_names[index];
+            } else {
+                inputs.push_back(input_names[index]);
+            }
+        }
+        for (std::size_t index = 0; index < form.operands.size(); ++index) {
+            const auto& field = form.operands[index];
+            if (const auto& result = registers[index].result) {
+                const bool floating = field.register_class == "floating";
+                const bool reuse = tied == index &&
+                    !colored(*registers[index].input, floating);
+                output = *result;
+                output_name = form_register(function, *result, floating, true,
+                                            reuse ? tied_input
+                                            : floating ? std::string_view{"f2"}
+                                                       : std::string_view{"t1"},
+                                            value.location);
+                floating_output = floating;
+                numbers[index] = number(output_name);
+                texts.push_back(reg_name(output_name));
+            } else if (field.allow_memory) {
+                bases[index] = number(input_names[index]);
+                texts.push_back(memory(numbers[index], input_names[index]));
+            } else if (field.allow_register) {
+                numbers[index] = number(input_names[index]);
+                texts.push_back(reg_name(input_names[index]));
+            } else {
+                texts.push_back(field.assembly_register_number
+                                    ? "$" + std::to_string(immediates[index])
+                                    : std::to_string(immediates[index]));
+            }
+        }
+        // The register that the form reads and writes starts as its input;
+        // where another operand reads the output register, a scratch works.
+        std::string_view work = output_name;
+        if (tied && tied_input != output_name) {
+            const auto& field = form.operands[*tied];
+            const bool floating = field.register_class == "floating";
+            if (std::find(inputs.begin(), inputs.end(), output_name) != inputs.end()) {
+                std::vector<std::string_view> taken = inputs;
+                taken.push_back(output_name);
+                taken.push_back(tied_input);
+                work = form_scratch(floating, taken);
+                texts[*tied] = reg_name(work);
+                numbers[*tied] = number(work);
+            }
+            instruction(floating ? (field.value_bits > 32 ? "mov.d" : "mov.s")
+                                 : "move",
+                        reg_name(work) + "," + reg_name(tied_input));
+        }
+        std::string operands;
+        const auto literals = [&](std::size_t position) {
+            for (const auto& literal : form.assembly_literals) {
+                if (literal.position != position) continue;
+                if (!operands.empty()) operands += ',';
+                operands += literal.text;
+            }
+        };
+        for (std::size_t index = 0; index < texts.size(); ++index) {
+            literals(index);
+            if (!operands.empty()) operands += ',';
+            operands += texts[index];
+        }
+        literals(texts.size());
+        // A naked function writes only its contract's registers.
+        if (naked_writable_) {
+            std::vector<std::string> written;
+            if (output) written.emplace_back(work);
+            for (const auto name : form.implicit_writes) {
+                if (find_register(subtarget_.target(), name)) written.emplace_back(name);
+            }
+            audit_naked_registers(written, form.assembly_mnemonic, operands);
+        }
+        std::optional<std::uint32_t> word;
+        if (extension_entry(entry)) {
+            // The entry's operands in order: literals, the form's operands,
+            // and the defaults of those it leaves out.
+            std::vector<std::int64_t> values(entry.operands.size());
+            std::vector<std::int64_t> entry_bases(entry.operands.size());
+            std::size_t position = 0;
+            for (std::size_t slot = 0; slot < entry.operands.size(); ++slot) {
+                const auto& operand = entry.operands[slot];
+                if (operand.name.empty()) {
+                    values[slot] = operand.literal_number;
+                } else if (position < numbers.size()) {
+                    values[slot] = numbers[position];
+                    entry_bases[slot] = bases[position];
+                    ++position;
+                } else if (operand.default_operand) {
+                    values[slot] = values[*operand.default_operand];
+                } else {
+                    values[slot] = operand.default_value.value_or(0);
+                }
+            }
+            word = encode_entry(entry, values, entry_bases);
+        }
+        // HI and LO hold a built-in's value only until compiled code, a
+        // call, or the end of the block.
+        const auto names = [](const std::vector<std::string_view>& resources,
+                              std::string_view name) {
+            return std::find(resources.begin(), resources.end(), name) !=
+                   resources.end();
+        };
+        for (const auto [index, name] :
+             {std::pair<std::size_t, std::string_view>{0, "hi"}, {1, "lo"}}) {
+            if (names(form.implicit_reads, name) &&
+                hilo_state_[index] == HiloState::Changed) {
+                diagnostics_.error(
+                    value.location,
+                    "target instruction '" + std::string(form.name) +
+                        "' reads '" + std::string(name) +
+                        "', which a multiplication, division, call, or "
+                        "branch of the function may change after the "
+                        "built-in that writes it");
+            }
         }
         hazard_form_ = &form;
         hazard_immediates_ = std::move(immediates);
-        instruction(form.assembly_mnemonic, operands);
+        instruction(form.assembly_mnemonic, operands, false, word, true);
+        for (const auto [index, name] :
+             {std::pair<std::size_t, std::string_view>{0, "hi"}, {1, "lo"}}) {
+            if (names(form.implicit_writes, name)) {
+                hilo_state_[index] = HiloState::Kept;
+            }
+        }
+        // A load without load interlocks: the next instruction must not read
+        // the register (memory_load's instructions follow this already).
+        if (output && !subtarget_.has_feature(Feature::LoadInterlocks) &&
+            !memory_load(form.assembly_mnemonic) &&
+            std::find(entry.hazards.begin(), entry.hazards.end(), "load") !=
+                entry.hazards.end()) {
+            delayed_register_ = std::string(work);
+        }
         // A raw jump has a delay slot, which RFE fills in the exception
         // return of MIPS I and II; ERET has none.
         if (form.control != InstructionControlEffect::None && form.delay_slot) {
             instruction(form.name == "$::_rfe" ? "rfe" : "nop");
+        }
+        if (work != output_name) {
+            instruction(floating_output
+                            ? (form.operands[*tied].value_bits > 32 ? "mov.d" : "mov.s")
+                            : "move",
+                        reg_name(output_name) + "," + reg_name(work));
         }
         if (output && output->kind == machine::RegisterKind::Virtual) {
             if (floating_output) {
@@ -12302,7 +12621,14 @@ private:
     void audit_naked_write(std::string_view opcode,
                            std::string_view operands) {
         if (!naked_writable_) return;
-        for (const auto& name : written_registers(opcode, operands)) {
+        audit_naked_registers(written_registers(opcode, operands), opcode,
+                              operands);
+    }
+
+    void audit_naked_registers(const std::vector<std::string>& written,
+                               std::string_view opcode,
+                               std::string_view operands) {
+        for (const auto& name : written) {
             if (naked_writable_->contains(name)) continue;
             diagnostics_.error(
                 function_location_,
@@ -12602,7 +12928,9 @@ private:
 
     void instruction(std::string_view opcode,
                      std::string_view operands = {},
-                     bool defer_load_delay = false) {
+                     bool defer_load_delay = false,
+                     std::optional<std::uint32_t> word = {},
+                     bool registry_form = false) {
         if (split_doubleword_coprocessor_access(opcode, operands)) return;
         if (unavailable_.contains(opcode)) diagnose_unavailable(opcode);
         const auto* form = std::exchange(hazard_form_, nullptr);
@@ -12654,7 +12982,7 @@ private:
             fcsr_transfer_pending_ = false;
         }
 
-        raw_instruction(opcode, operands);
+        raw_instruction(opcode, operands, word, registry_form);
         record_hazard_writes(opcode, form);
         // Without load interlocks the next instruction must not read the
         // loaded register; like a transfer delay, the hazard stays pending
@@ -12743,6 +13071,37 @@ private:
             if (!subtarget_.has_instruction(likely)) return false;
         }
         return true;
+    }
+
+    static std::int64_t gpr_number(std::string_view name) {
+        const auto id = gpr_id(name);
+        return id ? id->value : 0;
+    }
+
+    // The word of the instruction table's form of `mnemonic` that the
+    // -march CPU has, from its operands' values in assembler order. A CPU
+    // whose features select an instruction its table entry does not list,
+    // such as the rotations of the `rotate` feature, takes the first form.
+    std::uint32_t table_word(std::string_view mnemonic,
+                             std::initializer_list<std::int64_t> values) const {
+        const auto& table =
+            *model_registry().instruction_table(subtarget_.target().architecture);
+        const ModelInstruction* chosen = nullptr;
+        for (const auto index : table.forms.at(mnemonic)) {
+            const auto& entry = table.entries[index];
+            if (!entry.encoded || entry.operands.size() != values.size()) continue;
+            const auto has = [&](const std::string& feature) {
+                return subtarget_.has_feature(feature);
+            };
+            if ((entry.features.empty() ||
+                 std::any_of(entry.features.begin(), entry.features.end(), has)) &&
+                std::none_of(entry.excludes.begin(), entry.excludes.end(), has)) {
+                chosen = &entry;
+                break;
+            }
+            if (!chosen) chosen = &entry;
+        }
+        return encode_entry(*chosen, {values.begin(), values.size()});
     }
 
     void encoded(std::uint32_t word, std::string_view comment) {
@@ -13223,6 +13582,66 @@ private:
                          block) != function.layout.end() &&
             !skipped_layout_.contains(block.value) &&
             !layout_successor(function, block);
+    }
+
+    // A conditional move whose result holds neither arm is a move of one
+    // arm and a MOVN of the other; as two instructions, a delay slot can
+    // take the MOVN. The arm moves into a value of the result's color.
+    void split_conditional_moves(machine::Function& function) const {
+        if (!selects_cond_move()) return;
+        const auto color = [&](machine::Register value)
+            -> std::optional<machine::PhysicalRegisterId> {
+            if (value.kind != machine::RegisterKind::Virtual ||
+                value.id >= function.virtual_register_assignments.size() ||
+                function.virtual_register_classes[value.id] !=
+                    machine::VirtualRegisterClass::Integer) {
+                return std::nullopt;
+            }
+            return function.virtual_register_assignments[value.id];
+        };
+        for (auto& block : function.blocks) {
+            for (std::size_t index = 0; index < block.instructions.size(); ++index) {
+                auto& select = block.instructions[index];
+                if (select.kind != machine::InstructionKind::Target ||
+                    decode_opcode(select.opcode) != Opcode::Select ||
+                    !select.condition_predicate.empty() ||
+                    select.uses.size() != 3 || select.defs.size() != 1 ||
+                    select.defs.front().mode.bits > 32) {
+                    continue;
+                }
+                const auto result = color(select.defs.front());
+                const auto condition = color(select.uses[0]);
+                const auto yes = color(select.uses[1]);
+                const auto no = color(select.uses[2]);
+                if (!result || !condition || !yes || !no || result == condition ||
+                    result == yes || result == no) {
+                    continue;
+                }
+                const machine::VirtualRegisterId id{
+                    static_cast<std::uint32_t>(function.virtual_registers.size())};
+                const auto mode = select.defs.front().mode;
+                function.virtual_registers.push_back(mode);
+                function.virtual_register_classes.push_back(
+                    machine::VirtualRegisterClass::Integer);
+                function.virtual_register_assignments.push_back(result);
+                function.rematerialized_immediates.push_back(std::nullopt);
+                const auto arm = machine::Register::virtual_register(id, mode);
+                machine::Instruction copy;
+                copy.kind = machine::InstructionKind::Copy;
+                copy.location = select.location;
+                copy.inline_site = select.inline_site;
+                copy.defs = {arm};
+                copy.uses = {select.uses[2]};
+                select.uses[2] = arm;
+                if (select.operands.size() == 3) {
+                    select.operands[2] = machine::RegisterOperand{arm};
+                }
+                block.instructions.insert(block.instructions.begin() +
+                                              static_cast<std::ptrdiff_t>(index),
+                                          std::move(copy));
+                ++index;
+            }
+        }
     }
 
     bool same_physical_assignment(const machine::Function& function,
@@ -14305,10 +14724,10 @@ private:
             }
         };
         // SEB and SEH, which Allegrex code gives as words.
-        const auto sign_extend = [&](std::uint32_t word,
-                                     std::string_view mnemonic) {
+        const auto sign_extend = [&](std::string_view mnemonic) {
             if (subtarget_.has_feature(Feature::Allegrex)) {
-                encoded(register_word(word, "zero", source, target),
+                encoded(table_word(mnemonic, {gpr_number(target),
+                                              gpr_number(source)}),
                         std::string(mnemonic) + " " + reg_name(target) + "," +
                             reg_name(source));
             } else {
@@ -14319,11 +14738,11 @@ private:
             if (sign) shift("sll", {}, "0");
             else shift("dsll32", "dsrl32", "0");
         } else if (bits == 16) {
-            if (sign && selects_sign_extension(subtarget_)) sign_extend(0x7c000620U, "seh");
+            if (sign && selects_sign_extension(subtarget_)) sign_extend("seh");
             else if (sign) shift("sll", "sra", "16");
             else shift("andi", {}, "65535");
         } else if (bits <= 8) {
-            if (sign && selects_sign_extension(subtarget_)) sign_extend(0x7c000420U, "seb");
+            if (sign && selects_sign_extension(subtarget_)) sign_extend("seb");
             else if (sign) shift("sll", "sra", "24");
             else shift("andi", {}, "255");
         } else if (target != source) {
@@ -17431,6 +17850,58 @@ private:
         }
         // EXT and DEXT are one instruction.
         if (opcode == Opcode::Extract) return true;
+        // A pure registry form is one instruction where each operand that
+        // it reads and writes already holds its result's register. Hazard
+        // classes and -mfix4300's multiply separation stay in place.
+        if (opcode == Opcode::Machine) {
+            const auto& form = machine_form(candidate);
+            const auto& entry = encoded_entry(form);
+            if (!entry.hazards.empty() ||
+                (subtarget_.has_feature(Feature::Fix4300) &&
+                 form.assembly_mnemonic.starts_with("mul."))) {
+                return false;
+            }
+            std::size_t next = 1;
+            for (const auto& field : form.operands) {
+                if (field.allow_register &&
+                    field.role == InstructionOperandRole::InOut) {
+                    const auto output = std::get<machine::RegisterOperand>(
+                        candidate.operands[next]).value;
+                    const auto input = std::get<machine::RegisterOperand>(
+                        candidate.operands[next + 1]).value;
+                    if (!same_physical_assignment(function, output, input)) {
+                        return false;
+                    }
+                    ++next;
+                }
+                next += field.allow_memory ? 2 : 1;
+            }
+            return true;
+        }
+        // MOVN or MOVZ alone, where the result already holds one arm.
+        if (opcode == Opcode::Select) {
+            return candidate.uses.size() == 3 &&
+                candidate.defs.front().mode.bits <= 32 &&
+                selects_cond_move() &&
+                (same_physical_assignment(function, candidate.defs.front(),
+                                          candidate.uses[1]) ||
+                 same_physical_assignment(function, candidate.defs.front(),
+                                          candidate.uses[2]));
+        }
+        // ROTR and ROTRV.
+        if (opcode == Opcode::Rotl || opcode == Opcode::Rotr) {
+            const auto* amount = candidate.operands.size() >= 2
+                ? std::get_if<machine::ImmediateOperand>(&candidate.operands[1])
+                : nullptr;
+            return candidate.defs.front().mode.bits <= 32 && selects_rotate() &&
+                (amount ? amount->value % 32U != 0 : opcode == Opcode::Rotr);
+        }
+        // CLZ, CLO, DCLZ, and DCLO, and Allegrex's WSBW for 32 bits.
+        if (opcode == Opcode::Clz || opcode == Opcode::Clo) return true;
+        if (opcode == Opcode::Bswap) {
+            return candidate.uses.front().mode.bits == 32 &&
+                subtarget_.has_feature(Feature::Allegrex);
+        }
         // An unscaled indexed address is one add.
         if (opcode == Opcode::IndexedAddress) {
             const auto* scale = candidate.operands.empty()
@@ -18176,7 +18647,7 @@ private:
             }
         }
         const auto count = function.blocks.size();
-        if (naked_writable_ || !hazard_forms_.empty()) return;
+        if (naked_writable_ || !hazard_forms_.empty() || opaque_forms_) return;
         for (const auto& block : function.blocks) {
             if (block.id.value >= count) return;
             if (std::find(block.successors.begin(), block.successors.end(),
@@ -19217,11 +19688,19 @@ private:
         bool class_write{};
     };
     std::vector<PendingHazard> pending_hazards_;
-    // Registry forms in the function being emitted, and the form (with its
-    // immediate operand values) the next instruction() emits.
+    // The registry forms with hazard facts in the function being emitted,
+    // whether any of its forms reads or writes registers outside its
+    // operands, and the form (with its immediate operand values) the next
+    // instruction() emits.
     std::vector<const InstructionEntry*> hazard_forms_;
+    bool opaque_forms_{};
     const InstructionEntry* hazard_form_{};
     std::vector<std::uint64_t> hazard_immediates_;
+    // What HI and LO hold for the built-ins that read them: what the
+    // function received, what a built-in left there, or what compiled
+    // code may have changed.
+    enum class HiloState : std::uint8_t { Entry, Kept, Changed };
+    std::array<HiloState, 2> hilo_state_{};
     unsigned call_return_countdown_{};
     // Registers a naked function being emitted may write.
     std::optional<std::unordered_set<std::string>> naked_writable_;
@@ -19841,8 +20320,8 @@ void AssemblyEmitter::emit_integer_binary(
                 instruction("move", reg_name(target_gpr) + "," + reg_name(left_gpr));
             }
         } else if (!wide && selects_rotate()) {
-            encoded(register_word(0x00200002U | rightward << 6U, "zero", left_gpr,
-                                  target_gpr),
+            encoded(table_word("rotr", {gpr_number(target_gpr),
+                                        gpr_number(left_gpr), rightward}),
                     "rotr " + reg_name(target_gpr) + "," + reg_name(left_gpr) +
                         "," + std::to_string(rightward));
         } else if (wide && selects_doubleword_rotate(subtarget_)) {
@@ -19974,7 +20453,8 @@ void AssemblyEmitter::emit_integer_binary(
             // ROTRV by the negated count; Allegrex shares the MIPS32
             // Release 2 word, which generic assemblers do not know.
             instruction("subu", "$t3,$zero," + reg_name(right_gpr));
-            encoded(register_word(0x00000046U, "t3", left_gpr, target_gpr),
+            encoded(table_word("rotrv", {gpr_number(target_gpr),
+                                         gpr_number(left_gpr), gpr_number("t3")}),
                     "rotrv " + reg_name(target_gpr) + "," + reg_name(left_gpr) +
                         ",$t3");
         } else if (wide && selects_doubleword_rotate(subtarget_)) {
@@ -19999,7 +20479,9 @@ void AssemblyEmitter::emit_integer_binary(
         break;
     case Opcode::Rotr:
         if (!wide && selects_rotate()) {
-            encoded(register_word(0x00000046U, right_gpr, left_gpr, target_gpr),
+            encoded(table_word("rotrv", {gpr_number(target_gpr),
+                                         gpr_number(left_gpr),
+                                         gpr_number(right_gpr)}),
                     "rotrv " + reg_name(target_gpr) + "," + reg_name(left_gpr) +
                         "," + reg_name(right_gpr));
         } else if (wide && selects_doubleword_rotate(subtarget_)) {
@@ -20152,8 +20634,8 @@ void AssemblyEmitter::emit_bit_operation(const machine::Function& function,
         if (bits > 32) {
             instruction(ones ? "dclo" : "dclz", operands);
         } else if (allegrex) {
-            encoded(register_word(ones ? 0x00000017U : 0x00000016U, input,
-                                  "zero", output),
+            encoded(table_word(ones ? "clo" : "clz",
+                               {gpr_number(output), gpr_number(input)}),
                     (ones ? "clo " : "clz ") + operands);
         } else {
             instruction(ones ? "clo" : "clz", operands);
@@ -20163,7 +20645,7 @@ void AssemblyEmitter::emit_bit_operation(const machine::Function& function,
         instruction("dshd", reg_name(output) + "," + reg_name(output));
     } else if (bits == 16 || !allegrex) {
         if (allegrex) {
-            encoded(register_word(0x7c0000a0U, "zero", input, output),
+            encoded(table_word("wsbh", {gpr_number(output), gpr_number(input)}),
                     "wsbh " + operands);
         } else {
             instruction("wsbh", operands);
@@ -20174,7 +20656,7 @@ void AssemblyEmitter::emit_bit_operation(const machine::Function& function,
             instruction("rotr", reg_name(output) + "," + reg_name(output) + ",16");
         }
     } else {
-        encoded(register_word(0x7c0000e0U, "zero", input, output),
+        encoded(table_word("wsbw", {gpr_number(output), gpr_number(input)}),
                 "wsbw " + operands);
     }
     commit_gpr(function, target, output, value.location);
@@ -21666,11 +22148,10 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
                 instruction("move", reg_name(work) + "," + reg_name(base));
             }
         }
-        const auto high = insert ? end - 1 : size - 1;
         if (!wide && subtarget_.has_feature(Feature::Allegrex)) {
-            encoded(register_word((insert ? 0x7c000004U : 0x7c000000U) |
-                                      (high << 11U) | (position << 6U),
-                                  source, work, "zero"),
+            encoded(table_word(insert ? "ins" : "ext",
+                               {gpr_number(work), gpr_number(source), position,
+                                size}),
                     std::string(insert ? "ins " : "ext ") + reg_name(work) +
                         "," + reg_name(source) + "," +
                         std::to_string(position) + "," + std::to_string(size));
@@ -21786,8 +22267,9 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
             // not know, so the instruction is a word.
             const auto move_if = [&](bool nonzero, std::string_view to,
                                      std::string_view from) {
-                encoded(register_word(nonzero ? 0x0000000bU : 0x0000000aU,
-                                      from, condition, to),
+                encoded(table_word(nonzero ? "movn" : "movz",
+                                   {gpr_number(to), gpr_number(from),
+                                    gpr_number(condition)}),
                         std::string(nonzero ? "movn " : "movz ") +
                             reg_name(to) + "," + reg_name(from) + "," +
                             reg_name(condition));
@@ -22683,11 +23165,24 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
     short_loop_branch_.reset();
     pending_hazards_.clear();
     call_return_countdown_ = 0;
+    split_conditional_moves(function);
     hazard_forms_.clear();
+    opaque_forms_ = false;
     for (const auto& block : function.blocks) {
         for (const auto& instruction : block.instructions) {
-            if (decode_opcode(instruction.opcode) == Opcode::Machine) {
-                hazard_forms_.push_back(&machine_form(instruction));
+            if (decode_opcode(instruction.opcode) != Opcode::Machine) continue;
+            const auto& form = machine_form(instruction);
+            if (!form.hazard_uses.empty() || !form.hazard_writes.empty()) {
+                hazard_forms_.push_back(&form);
+            }
+            // General or floating registers that a form reads or writes
+            // without operands.
+            for (const auto* names : {&form.implicit_reads, &form.implicit_writes}) {
+                opaque_forms_ = opaque_forms_ ||
+                    std::any_of(names->begin(), names->end(),
+                                [](std::string_view name) {
+                                    return physical_register_id(name).has_value();
+                                });
             }
         }
     }
@@ -22784,23 +23279,13 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
     // and floating-point options apply again after it.
     output_ << ".set push\n.set noreorder\n.set noat\n";
     if (pic_ == PicModel::None) output_ << ".option pic0\n";
-    if (subtarget_.has_feature(Feature::Mips64r6)) output_ << ".set mips64r6\n";
-    else if (subtarget_.has_feature(Feature::Mips32r6)) output_ << ".set mips32r6\n";
-    else if (subtarget_.has_feature(Feature::Mips64r2)) output_ << ".set mips64r2\n";
-    else if (subtarget_.has_feature(Feature::Mips64)) output_ << ".set mips64\n";
-    else if (subtarget_.has_feature(Feature::Mips5)) output_ << ".set mips5\n";
-    else if (subtarget_.has_feature(Feature::Mips4)) output_ << ".set mips4\n";
-    else if (subtarget_.has_feature(Feature::Mips3)) output_ << ".set mips3\n";
-    else if (subtarget_.has_feature(Feature::Mips32r2)) {
+    if (const auto level = set_level(); !level.empty()) {
+        output_ << ".set " << level << '\n';
         // `.set mips32r2` also selects 32-bit FPRs, as in GNU as.
-        output_ << ".set mips32r2\n";
-        if (subtarget_.has_feature(Feature::Fp64)) output_ << ".set fp=64\n";
-    } else if (subtarget_.has_feature(Feature::Mips32)) output_ << ".set mips32\n";
-    // MIPS II has no odd single-precision arithmetic registers; code that
-    // uses them leaves the ISA to the assembler's CPU.
-    else if (subtarget_.has_feature(Feature::Mips2)) {
-        if (!odd_single_fprs(subtarget_)) output_ << ".set mips2\n";
-    } else output_ << ".set mips1\n";
+        if (level == "mips32r2" && subtarget_.has_feature(Feature::Fp64)) {
+            output_ << ".set fp=64\n";
+        }
+    }
     unsigned alignment_power = 2;
     if (options_.function_alignment != 0) {
         alignment_power = static_cast<unsigned>(
@@ -22980,6 +23465,10 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
         }
         emitting_block_ = found->id.value;
         place_label(block_label(function, found->id));
+        // A built-in's HI and LO values do not cross blocks.
+        hilo_state_.fill(found->id == function.entry && found->predecessors.empty()
+                             ? HiloState::Entry
+                             : HiloState::Changed);
         call_saved_homes_.clear();
         for (const auto& label : function.labels) {
             if (label.block == found->id) {

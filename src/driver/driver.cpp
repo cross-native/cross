@@ -571,7 +571,8 @@ void print_builtins(const CompilerOptions& options) {
 }
 
 // Each instruction form of a table that models give: its mnemonic and
-// operands, the features of which it needs any, and what defines it.
+// operands, the features of which it needs any, its built-in, and what
+// defines it.
 void print_model_instructions(const TargetInfo& target) {
     const auto* table = model_registry().instruction_table(target.architecture);
     if (!table) return;
@@ -588,12 +589,18 @@ void print_model_instructions(const TargetInfo& target) {
         }
         for (const auto& feature : form.excludes) std::cout << ",!" << feature;
         std::cout << ']';
-        if (entry.is_alias()) {
-            std::cout << "  alias of " << entry.alias;
-        } else if (!entry.encoded) {
+        if (entry.is_alias()) std::cout << "  alias of " << entry.alias;
+        if (!form.encoded) {
             std::cout << "  macro";
-        } else if (!entry.builtin.empty()) {
+        } else if (entry.unexposed.empty()) {
             std::cout << "  " << entry.builtin;
+        } else {
+            // "has no built-in form: REASON"
+            const auto colon = entry.unexposed.find(": ");
+            std::cout << "  no built-in ("
+                      << (colon == std::string::npos ? entry.unexposed
+                                                     : entry.unexposed.substr(colon + 2))
+                      << ')';
         }
         std::cout << "  source: " << entry.position() << '\n';
     }

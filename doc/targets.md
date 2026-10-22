@@ -516,41 +516,80 @@ argument in a register, cannot target a variadic function or leave a function
 that binds variadic state, and neither function may have `out` or `inout`
 parameters.
 
-Machine-instruction built-ins (`--print-instructions` lists each form with
-its feature gates and whether it is privileged or volatile). The entries of
-the instruction table `model/mips_instructions.xm` give them, and a model
-can add others ([models.md](models.md#instruction-entries)):
+Machine-instruction built-ins. Every instruction of the table
+`model/mips_instructions.xm` is a built-in named after its mnemonic, with `_`
+for each `.`, whose operands are the instruction's in assembler order:
+`$::_addu(d, a, b)` is `addu rd, rs, rt`, `$::_lw(v, p[1])` is
+`lw rt, 4(base)`, and `$::_c_eq_s(a, b)` is `c.eq.s`. A model can add others
+([models.md](models.md#instruction-entries)). `cc --print-instructions` lists
+each form with its feature gates and whether it is privileged or volatile, and
+names each table entry's built-in or why it has none. Register operands are
+objects of the instruction's width: `u32` or `i32`, `u64` or `i64` from
+MIPS III for an instruction on 64-bit registers, and `f32` or `f64` for an
+FPR. Immediates, coprocessor register numbers, selects, codes, and cache
+operations are constants of the instruction's range, and bit fields satisfy
+its constraints (`$::_ext(d, s, 30, 4)` is an error). Memory operands are
+lvalues `*pointer` or `pointer[index]`, whose offset the instruction takes,
+and a store's lvalue is writable. A destination that the instruction writes
+only in part or on a condition, as for `lwl`, `lwr`, `movn`, `movz`, `ins`,
+and `mthc1`, starts as its object's value. The `$zero` of `div`, `divu`,
+`ddiv`, and `ddivu` is no operand: `$::_divu(a, b)`.
+
+Names other than the mnemonic:
 
 | Built-in | Instruction | Needs |
 | --- | --- | --- |
-| `$::_mfc0(out u32 value, n)`, `$::_mtc0(in u32 value, n)` | `mfc0`, `mtc0` of coprocessor 0 register `n` | |
-| `$::_mfc0(out u32 value, n, sel)`, `$::_mtc0(in u32 value, n, sel)` | `mfc0`, `mtc0` of register `n` with select `sel` | MIPS32 or MIPS64 |
-| `$::_dmfc0`, `$::_dmtc0` with `u64` | `dmfc0`, `dmtc0`, with an optional select | MIPS III; with a select MIPS64 |
-| `$::_tlbp()`, `$::_tlbr()`, `$::_tlbwi()`, `$::_tlbwr()` | TLB probe, read, and writes | |
-| `$::_cache(operation, object)` | `cache operation` on the line that holds `object` (`*pointer` or `pointer[index]`) | MIPS III, MIPS32, or Allegrex |
-| `$::_sync()` | `sync` | MIPS II |
-| `$::_syscall()`, `$::_syscall(code)`, `$::_break()`, `$::_break(code)`, `$::_break(code, code2)` | `syscall` with a 20-bit code, `break` with one or two 10-bit codes | |
-| `$::_wait()` | `wait` | MIPS32 or MIPS64 |
-| `$::_cfc1(out u32 value, n)`, `$::_ctc1(in u32 value, n)` | FPU control register `n`; 31 is the FCSR | hard float |
-| `$::_sqrt`, `$::_abs`, `$::_neg` with `f32` or `f64` operands | `sqrt.s`/`.d`, `abs.s`/`.d`, `neg.s`/`.d` | hard float; `sqrt` MIPS II; `f64` not with `-msingle-float` |
-| `$::_eret()` | `eret`; naked functions only | MIPS III, MIPS32, or Allegrex |
-| `$::_rfe(in u32 value)` | `jr` through a register with `rfe` in its delay slot; naked functions only | MIPS I and II |
-| `$::_jr(in value)` | `jr` through a register; naked functions only | |
-| `$::_b(label)` | branch to a label of the function; naked functions only | |
-| `$::_beq(in a, in b, label)`, `$::_bne(in a, in b, label)` | branch if two registers are equal or differ; naked functions only | |
-| `$::_beqz`, `$::_bnez`, `$::_bltz`, `$::_bgez`, `$::_blez`, `$::_bgtz` with `(in a, label)` | branch on a register compared with zero, as a signed integer for an ordering; naked functions only | |
-| `$::_nop()` | `nop` | |
+| `$::_sqrt`, `$::_abs`, `$::_neg` with `f32` or `f64` operands | `sqrt.s`/`.d`, `abs.s`/`.d`, `neg.s`/`.d`; `$::_neg` of a `u32` is `neg`, which traps | hard float; `sqrt` MIPS II; `f64` not with `-msingle-float` |
+| `$::_rfe(in u32 value)` | `jr` through a register with `rfe` in its delay slot; naked functions only (`$::_rfe()` is `rfe` alone) | MIPS I and II |
 
-Register numbers, selects, codes, and cache operations are constants.
-Coprocessor 0, TLB, cache, `sync`, `syscall`, `break`, `wait`, and FCSR
-forms are kept, in order with memory accesses and each other; every
-coprocessor 0 and FCSR read is volatile, since Count, Random, Cause, and the
-FCSR flags change without a write. An exception handler that `syscall` or
-`break` enters from managed code must preserve every register. Branch forms
-take `u32` and `i32` or, from MIPS III, `u64` and `i64` operands, and the
-compiler fills their delay slots. `sqrt`, `abs`, and `neg`
-are optimized like arithmetic. Floating-point operations are not ordered
-against `$::_ctc1` or `$::_cfc1`.
+These have no built-in, and using one is an error that says why: the
+assembler macros (`li`, `dli`, and the forms of `addu`, `and`, `teq`, and
+others with an immediate that `as` expands), the instructions that link
+(`jal`, `jalr`, `bal`, `bltzal`, `bgezal`, and Release 6's `balc`, `jialc`,
+and `beqzalc` to `bltzalc`), branches on the FPU condition (`bc1t`, `bc1f`,
+their likely forms, `bc1eqz`, and `bc1nez`) and Release 6's overflow branches
+(`bovc`, `bnvc`), instructions with an `$fccN` operand (`movt`, `movf`, and
+the condition-code forms of `c.cond.fmt`), Release 6's PC-relative loads and
+additions (`addiupc`, `lapc`, `lwpc`, `lwupc`, `ldpc`), and Release 6's
+`daui`, `dahi`, and `dati`, whose registers must be other than `$zero` or
+equal. `$::_wait` needs MIPS32 or MIPS64, though `as` accepts `wait` for
+MIPS III.
+
+An instruction whose only effect is its register result is optimized like
+arithmetic: equal ones merge, an unused one goes, and one fills a delay slot.
+The others stay in order with memory accesses and each other: loads and
+stores, coprocessor 0, TLB, cache, `sync`, `syscall`, `break`, `wait`, the
+traps (`teq` and the others, and `add`, `addi`, `sub`, `dadd`, `daddi`,
+`dsub`, and `neg`, which trap on overflow), FPU control moves, the FPU
+compares `c.cond.fmt`, which write the condition, and Allegrex's `mfic` and
+`mtic`. Every
+coprocessor 0, FCSR, and hardware register read is volatile, since Count,
+Random, Cause, the FCSR flags, and the cycle counter change without a write,
+and so are Release 6's `auipc` and `aluipc`, whose results depend on where
+they are. An exception handler that a trap, `syscall`, or `break` enters from
+managed code must preserve every register. Floating-point operations are not
+ordered against `$::_ctc1` or `$::_cfc1`.
+
+`$::_mult`, `$::_div`, `$::_madd`, `$::_mthi`, and the others that write `hi`
+and `lo` leave their results there for `$::_mfhi` and `$::_mflo`. Compiled
+multiplication, division, and remainder, calls, and branches change `hi` and
+`lo`, so a built-in that reads them follows the built-in that wrote them in
+straight-line code without those between, or reads what the function
+received, as an exception handler that saves them does; otherwise it is an
+error.
+
+Branch and jump built-ins (`$::_b`, `$::_j`, `$::_beq`, and the other
+comparisons, including the likely forms and Release 6's compact branches)
+branch to a label of a naked function; the compiler chooses the branch
+instruction and fills its delay slot. In managed code they and the exits
+(`$::_jr`, `$::_eret`, `$::_rfe`, and Release 6's `$::_jrc` and `$::_jic`)
+are errors.
+
+An instruction that the CPU has only through an extension that the function's
+ISA level lacks, such as Allegrex's `max`, `min`, `bitrev`, `wsbw`, `clz`,
+`ext`, `ins`, `movn`, `cache`, and `eret`, is written as `.word` with its
+mnemonic in a comment, as the compiler writes its own Allegrex instructions,
+so that an assembler without the CPU takes it.
 
 Coprocessor 0 and the TLB are not interlocked. The compiler keeps the
 distances of the R4000 hazard table, which the VR4300 keeps: two instructions

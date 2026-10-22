@@ -7,6 +7,7 @@
 #include "frontend/preprocessor_expression.hpp"
 #include "frontend/semantic.hpp"
 #include "model/model.hpp"
+#include "target/subtarget.hpp"
 #include "target/target.hpp"
 
 #include <algorithm>
@@ -436,10 +437,31 @@ std::string Preprocessor::evaluate_query(
     const auto address_bits = abi && abi->address_bits != 0
                                   ? abi->address_bits
                                   : 64U;
+    // The -march CPU entry decides which instructions its features allow.
+    const auto* cpu = target
+        ? model_registry().find_cpu(target->architecture, options_.cpu)
+        : nullptr;
+    std::optional<ResolvedCpu> cpu_model;
+    const auto resolved_cpu = [&]() -> const ResolvedCpu& {
+        if (!cpu_model) cpu_model = model_registry().resolve_cpu(*target, *cpu);
+        return *cpu_model;
+    };
     const auto feature_enabled = [&](std::string_view feature) {
         if (feature.empty() || feature == "base" ||
             (target && feature == target->architecture)) {
             return true;
+        }
+        // CPU facts, such as Allegrex or Release 6, are no options.
+        const auto* table = target ? subtarget_table_for(*target) : nullptr;
+        const auto fact = table && std::any_of(
+            table->features.begin(), table->features.end(),
+            [&](const SubtargetFeature& item) {
+                return item.name == feature && !item.selectable;
+            });
+        if (fact) {
+            if (!cpu) return false;
+            const auto& features = resolved_cpu().features;
+            return std::find(features.begin(), features.end(), feature) != features.end();
         }
         bool enabled = false;
         for (const std::string_view selected : options_.target_features) {
@@ -448,19 +470,13 @@ std::string Preprocessor::evaluate_query(
         }
         return enabled;
     };
-    // The -march CPU entry decides which instructions its features allow.
-    const auto* cpu = target
-        ? model_registry().find_cpu(target->architecture, options_.cpu)
-        : nullptr;
-    std::optional<ResolvedCpu> cpu_model;
     const auto instruction_enabled = [&](const InstructionEntry& instruction) {
         if (instruction_feature_conflict(instruction, feature_enabled)) {
             return false;
         }
         if (!cpu) return true;
-        if (!cpu_model) cpu_model = model_registry().resolve_cpu(*target, *cpu);
-        return cpu_model
-            ->instructions[target->form_instructions[instruction_form_id(
+        return resolved_cpu()
+            .instructions[target->form_instructions[instruction_form_id(
                                *target, instruction).value].value]
             .available;
     };

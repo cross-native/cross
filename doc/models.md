@@ -1142,8 +1142,8 @@ no block.
 An `instruction` entry describes one form of a machine instruction: how the
 assembler, `as` and `cc -c` alike, parses and encodes it; the effects that
 the assembler's reordering and the compiler follow; its default costs; and
-whether a machine instruction built-in (`$::_NAME`,
-[spec.md](spec.md#machine-instruction-built-ins)) exposes it. The entries of
+the machine instruction built-in (`$::_NAME`,
+[spec.md](spec.md#machine-instruction-built-ins)) that exposes it. The entries of
 an architecture form its instruction table, which the assembler, the
 built-ins, `cpu` entries, `cc --print-instructions`, and `cc --print-costs`
 share. Architectures whose instructions have one width take entries: MIPS,
@@ -1169,9 +1169,10 @@ instruction "addu" {
 | `features` | list | `[]` | The form exists on a CPU with any one of these features, or on every CPU of the architecture without any. |
 | `excludes` | list | `[]` | A CPU with any one of these features lacks the form. |
 | `reads`, `writes` | list | `[]` | The operands, registers, and other resources that the form reads and writes ([Effects](#effects)). |
+| `keeps` | list | `[]` | Register operands that the form writes only in part or only on a condition, keeping the rest of their value. |
 | `hazards` | list | `[]` | The target's hazard classes of the form. |
 | `control` | text | none | A control transfer: `jump`, `branch`, `exit`, or `trap`. |
-| `condition` | text | none | The comparison of a `branch`: of its two register operands, or of its one with zero, as signed integers for an ordering: `equal`, `not-equal`, `less-than-zero`, `greater-equal-zero`, `less-equal-zero`, or `greater-than-zero`. |
+| `condition` | text | none | The comparison of a `branch`: of its one register operand with zero, `equal`, `not-equal`, `less-than-zero`, `greater-equal-zero`, `less-equal-zero`, or `greater-than-zero`, an ordering as a signed integer; or of its two, `equal`, `not-equal`, `less-than` and `greater-equal` as signed integers, or `less-than-unsigned` and `greater-equal-unsigned`. |
 | `delay_slot` | bool | `false` | The next instruction executes before the transfer. |
 | `likely` | bool | `false` | A `branch` whose delay slot executes only when it is taken. |
 | `privileged` | bool | `false` | The form executes only in a privileged mode. |
@@ -1179,7 +1180,7 @@ instruction "addu" {
 | `hazard_uses`, `hazard_writes` | list | `[]` | Pipeline facts of resources that the hardware does not interlock ([Effects](#effects)). |
 | `latency`, `issue` | integer | `1` | The default costs, from 0 and from 1 to 65535, that `cpu` entries replace. |
 | `constraints` | list | `[]` | Relations that operands keep, immediates by value and general registers by number, such as `"pos+size <= 32"` or `"rt-rs > 0"`: a sum of operands and integers compared with an integer by `<=`, `<`, `>=`, `>`, `==`, or `!=`. |
-| `builtin` | text | none | Exposes the form as the built-in `$::_NAME`. |
+| `builtin` | text or `false` | the mnemonic | The name of the form's built-in, `$::_NAME` ([Machine instruction built-ins](#machine-instruction-built-ins)); `false` gives it none. |
 | `alias` | text | none | Another entry, which this one spells under its own mnemonic ([Aliases and macros](#aliases-and-macros)). |
 | `macro` | text | none | A macro of the target's assembler that the form expands to. |
 | `expands`, `otherwise` | list | `[]` | The instructions that the form expands to. |
@@ -1239,7 +1240,11 @@ names. Fields cannot overlap.
 `cc --print-registers` lists them, and other resources: any other name,
 such as `memory` or a coprocessor's state. A memory operand's base register
 is read. A `clobber` attribute ([spec.md](spec.md)) may name a resource that
-the entry of a built-in names.
+the entry of a built-in names. A register operand in `keeps` is one that
+`writes` names and whose old value can survive the form, such as the
+destination of a conditional move or of a load that merges into its
+register: its built-in reads it, and the assembler's reordering, as GNU as
+does, does not count that as a read.
 
 `control` makes the form a control transfer: `jump` transfers
 unconditionally, calls included, and `branch` conditionally; `exit` leaves
@@ -1282,17 +1287,35 @@ a later form cannot state costs.
 
 ### Machine instruction built-ins
 
-`builtin = "NAME"` exposes a form as `$::_NAME`, whose operands are the
-form's operands in order: a register operand that the form writes is an
-output, one it reads and writes is both, and the others are inputs;
-immediate operands are constants, memory operands lvalues, and label
-operands labels of the function. Entries can give one built-in forms that
-differ in their operand types. A form of the built-in exists for each
-feature in `features`, for each register width that its operand types take,
-one width for all of them, with the features those types need, and for each
-number of its optional operands. A form whose
-operand types cannot be built-in operands, or that has a literal register,
-cannot have `builtin`, and neither can a macro.
+Each form gives a machine instruction built-in, named `$::_` and its
+mnemonic with `_` for each `.`, as `$::_add_s` for `add.s`, or `$::_NAME`
+with `builtin = "NAME"`; an alias gives the forms of the entry that it
+spells under its own mnemonic. The built-in's operands are the form's
+operands in order without its literal registers, which it prints: a
+register operand that the form writes is an output, one that it also reads
+or keeps, or whose value an omitted operand takes as its default, is both,
+and the others are inputs; an immediate operand is a constant in the range
+of its type that satisfies the form's constraints; a memory operand is an
+lvalue, which must be writable where the form writes `memory`; and a label
+operand is a label of the function. A form of the built-in exists for each
+feature in `features`, for each register width that its operand types
+take, one width for all of them, with the features those types need, and
+for each number of its optional operands. The forms of one built-in may
+differ in their operand types and immediate ranges; two that take the same
+operands under the same features are an error, unless both are branches
+that compare and branch alike, such as forms whose register constraints
+choose an encoding, and the first stands for both.
+
+No built-in is given by a macro or an expansion; by a form whose operand
+types cannot be built-in operands; by a `jump` or `branch` without a label
+operand, with effects other than reading the registers it compares, or, for
+a `branch`, without a `condition`; by a form other than a branch whose
+constraints name its registers, which register allocation does not
+arrange; or by a form with `builtin = false`. A built-in of a branch is a
+comparison and a branch to a label, whatever instruction does them, so its
+register constraints do not apply. Calling a name that no form gives is an
+error that says why, and so is `builtin = "NAME"` on such a form.
+`cc --print-instructions` lists each form's built-in or why it has none.
 
 ### MIPS instructions
 
@@ -1310,8 +1333,8 @@ MIPS instructions have 32 bits. The operand types:
 | `imm` | An integer of up to 64 bits. | Macros only. | None. |
 | `mem`, `mem8`, `mem16`, `mem32`, `mem64` | `offset(base)`, `(base)`, or an absolute `offset`, whose base is `$zero`; the offset is signed 16 bits. | Parts `.base` and `.offset`. | An lvalue of any width, or of that width. |
 | `mem_simmK`, `memN_simmK` | As `mem` and `memN`, with a signed offset of `K` bits, from 1 to 16, that takes no relocation operator. | Parts `.base` and `.offset`. | As `mem` and `memN`. |
-| `branch`, `jump` | A label, reached PC-relative in 16 bits, or in the current 256 MB region in 26. | The relocated value. | For `branch`, a label of the function; none for `jump`. |
-| `branch21`, `branch26` | A label, reached PC-relative in 21 or 26 bits, as a `branch` counting words from the next instruction. | The relocated value. | None. |
+| `branch`, `jump` | A label, reached PC-relative in 16 bits, or in the current 256 MB region in 26. | The relocated value. | A label of the function. |
+| `branch21`, `branch26` | A label, reached PC-relative in 21 or 26 bits, as a `branch` counting words from the next instruction. | The relocated value. | A label of the function. |
 | `pcrel19s2`, `pcrel18s3` | A label, or a byte offset that is a multiple of 4 or 8, reached from the instruction in 19 bits of words or 18 bits of doublewords; the doubleword's counts from the instruction's doubleword. | The relocated value, or the offset in words or doublewords. | None. |
 
 `simm16`, `uimm16`, and memory offsets also take `%hi`, `%lo`, `%gp_rel`,
@@ -1348,7 +1371,7 @@ cannot use. Under `.set nomacro` a statement that expands to several
 instructions draws a warning.
 
 This user model adds a coprocessor 2 instruction that `as` assembles, and
-that a naked function calls as `$::_vmix(d, a, b)`:
+that code calls as `$::_vmix(d, a, b)`:
 
 ```text
 instruction "vmix" {
@@ -1359,7 +1382,6 @@ instruction "vmix" {
     writes = ["rd"];
     volatile = true;
     latency = 4;
-    builtin = "vmix";
 }
 ```
 

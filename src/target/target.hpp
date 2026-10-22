@@ -341,6 +341,12 @@ struct InstructionOperandEntry {
     // Exact scalar source types accepted by this patch field. This is distinct
     // from the range accepted for an ordinary (non-patch) immediate operand.
     std::vector<std::string_view> patch_types{};
+    // With `immediate_range`, an immediate holds exactly the values from
+    // `immediate_minimum` to `immediate_maximum`, which can be fewer than
+    // its bits hold (such as a MIPS bit field size of 1 to 32).
+    bool immediate_range{};
+    std::int64_t immediate_minimum{};
+    std::int64_t immediate_maximum{};
     PatchAddressRepresentation patch_address{PatchAddressRepresentation::Unavailable};
     bool patch_supports_symbol_relocation{};
     // A direct label field can impose an owner constraint independently of
@@ -402,8 +408,9 @@ enum class InstructionControlEffect {
 };
 
 // The comparison of a compare-and-branch form: of its two register operands,
-// or of its one with zero, where an ordering compares signed integers. A
-// target that lowers naked functions as managed code branches on it.
+// or of its one with zero, where an ordering compares signed integers unless
+// it says unsigned. A target that lowers naked functions as managed code
+// branches on it.
 enum class InstructionBranchCondition {
     None,
     Equal,
@@ -412,6 +419,44 @@ enum class InstructionBranchCondition {
     GreaterEqualZero,
     LessEqualZero,
     GreaterThanZero,
+    LessThan,
+    GreaterEqual,
+    LessThanUnsigned,
+    GreaterEqualUnsigned,
+};
+
+// A relation that a form's immediate operands keep: the sum of the
+// operands `terms` names (each negated where it says so) and `constant`,
+// compared with `bound`, such as pos+size <= 32.
+struct InstructionConstraint {
+    enum class Comparison : std::uint8_t {
+        LessEqual, Less, GreaterEqual, Greater, Equal, NotEqual,
+    };
+    std::vector<std::pair<unsigned, bool>> terms;
+    std::int64_t constant{};
+    Comparison comparison{};
+    std::int64_t bound{};
+
+    // Whether `sum`, of the terms and the constant, satisfies it.
+    [[nodiscard]] bool holds(std::int64_t sum) const {
+        switch (comparison) {
+        case Comparison::LessEqual: return sum <= bound;
+        case Comparison::Less: return sum < bound;
+        case Comparison::GreaterEqual: return sum >= bound;
+        case Comparison::Greater: return sum > bound;
+        case Comparison::Equal: return sum == bound;
+        case Comparison::NotEqual: return sum != bound;
+        }
+        return false;
+    }
+};
+
+// An operand of the assembler spelling that the built-in does not take,
+// such as the `$zero` of MIPS `div $zero, rs, rt`: printed before the
+// built-in's operand `position`.
+struct AssemblyLiteral {
+    unsigned position{};
+    std::string_view text;
 };
 
 struct InstructionEntry {
@@ -459,6 +504,9 @@ struct InstructionEntry {
         InstructionBranchCondition::None};
     // The instruction after a control transfer executes before it.
     bool delay_slot{};
+    // Relations of the immediate operands that the form needs.
+    std::vector<InstructionConstraint> constraints{};
+    std::vector<AssemblyLiteral> assembly_literals{};
 
     InstructionEntry() = default;
 
@@ -843,6 +891,14 @@ struct InstructionModel {
     std::vector<SelectedInstruction> selected;
 };
 
+// A machine instruction built-in name that no form gives, and why: an
+// assembler macro, or an instruction whose operands or effects no built-in
+// can express. `reason` completes "target instruction 'NAME' ".
+struct UnexposedInstruction {
+    std::string_view name;
+    std::string reason;
+};
+
 // A target-triple prefix and the address width of the objects its triples
 // produce, such as ELF32 for 32 and ELF64 for 64.
 struct TriplePrefix {
@@ -881,6 +937,8 @@ struct TargetInfo {
     std::vector<InstructionCostEntry> instruction_costs{};
     // The instruction of each registry form, by InstructionFormId.
     std::vector<InstructionCostId> form_instructions{};
+    // Names of a model table's instructions that no form gives.
+    std::vector<UnexposedInstruction> unexposed_instructions{};
     // The order in which `--print-costs` lists `instruction_costs`; empty
     // lists them in table order.
     std::vector<InstructionCostId> cost_listing{};

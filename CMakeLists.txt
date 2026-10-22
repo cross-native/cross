@@ -1734,7 +1734,7 @@ if(BUILD_TESTING)
     add_test(NAME cross_mips_gnu_as
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
-                "-DSOURCES=${CMAKE_SOURCE_DIR}/test/target/mips/gnu_as.x;${CMAKE_SOURCE_DIR}/test/language/semantics/mips.x;${CMAKE_SOURCE_DIR}/test/language/semantics/subscripts.x;${CMAKE_SOURCE_DIR}/test/target/mips/i64_pair.x;${CMAKE_SOURCE_DIR}/test/target/mips/vla.x;${CMAKE_SOURCE_DIR}/test/target/mips/preserved_width.x;${CMAKE_SOURCE_DIR}/test/language/semantics/bit_intrinsics.x;${CMAKE_SOURCE_DIR}/test/target/mips/fpr_allocation_single.x"
+                "-DSOURCES=${CMAKE_SOURCE_DIR}/test/target/mips/gnu_as.x;${CMAKE_SOURCE_DIR}/test/language/semantics/mips.x;${CMAKE_SOURCE_DIR}/test/language/semantics/subscripts.x;${CMAKE_SOURCE_DIR}/test/target/mips/i64_pair.x;${CMAKE_SOURCE_DIR}/test/target/mips/vla.x;${CMAKE_SOURCE_DIR}/test/target/mips/preserved_width.x;${CMAKE_SOURCE_DIR}/test/language/semantics/bit_intrinsics.x;${CMAKE_SOURCE_DIR}/test/target/mips/fpr_allocation_single.x;${CMAKE_SOURCE_DIR}/test/target/mips/instruction_builtins.x"
                 -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-gnu-as/output
                 -P "${CMAKE_SOURCE_DIR}/test/target/mips/gnu_as.cmake")
     set_tests_properties(cross_mips_gnu_as PROPERTIES
@@ -1930,6 +1930,7 @@ if(BUILD_TESTING)
                     -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/allegrex.x
                     -DPAIR_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/i64_pair.x
                     -DBIT_SOURCE=${CMAKE_SOURCE_DIR}/test/language/semantics/bit_intrinsics.x
+                    -DBUILTIN_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/psp/builtins.x
                     -DRUNTIME=${CMAKE_SOURCE_DIR}/test/target/mips/psp/runtime.x
                     -DMODULE_INFO=${CMAKE_SOURCE_DIR}/test/target/mips/psp/module_info.s
                     -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/psp/link.ld
@@ -2052,6 +2053,47 @@ if(BUILD_TESTING)
         set_tests_properties(${name} PROPERTIES
             LABELS "check.runtime;arch.mips;backend.native;feature.raw;isa.vr4300;endian.big;endian.little;opt.${level}"
             SKIP_REGULAR_EXPRESSION "skipping MIPS")
+    endforeach()
+    # The built-ins that every instruction table entry gives: their code,
+    # availability, listing, and diagnostics, and their results under QEMU
+    # on MIPS I and MIPS III, MIPS32 Release 2, and MIPS32 Release 6 CPUs.
+    add_test(NAME cross_mips_instruction_builtins COMMAND "${CMAKE_COMMAND}"
+        -DCC=$<TARGET_FILE:cross_cc>
+        -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/instruction_builtins.x
+        -DERROR_SOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/instruction_builtins_errors.x
+        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-instruction-builtins/case
+        -P "${CMAKE_SOURCE_DIR}/test/target/mips/instruction_builtins.cmake")
+    set_tests_properties(cross_mips_instruction_builtins PROPERTIES
+        LABELS "check.compile;arch.mips;backend.native;feature.raw;feature.model;diagnostics;isa.r3000;isa.vr4300;isa.mips32r2;isa.allegrex;isa.mips32r6;isa.mips64r6;opt.O2")
+    foreach(level O0 O2)
+        foreach(builtin_case "vr4300|vr4300,r3000|R4000|OFF|-fno-eval-calls"
+                             "mips32r2|mips32r2|MIPS64R2-generic|OFF|-fno-eval-calls,-mfp32"
+                             "mips32r6|mips32r6|mips32r6-generic|ON|-fno-eval-calls")
+            string(REPLACE "|" ";" builtin_fields "${builtin_case}")
+            list(GET builtin_fields 0 builtin_name)
+            list(GET builtin_fields 1 builtin_cpus)
+            list(GET builtin_fields 2 builtin_qemu)
+            list(GET builtin_fields 3 builtin_release6)
+            list(GET builtin_fields 4 builtin_options)
+            string(REPLACE "," ";" builtin_cpus "${builtin_cpus}")
+            string(REPLACE "," ";" builtin_options "${builtin_options}")
+            set(name cross_mips_instruction_builtins_runtime_${builtin_name}_${level})
+            add_test(NAME ${name} COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/instruction_builtins_runtime.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-instruction-builtins-${builtin_name}-${level}
+                -DEXPECTED=P "-DCC_FLAGS=-${level};${builtin_options}"
+                "-DMIPS_CPUS=${builtin_cpus}" -DQEMU_CPU=${builtin_qemu}
+                -DMIPS_RELEASE6=${builtin_release6}
+                -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+            set(builtin_labels "check.runtime;arch.mips;backend.native;feature.raw;endian.big;endian.little;opt.${level}")
+            foreach(builtin_cpu IN LISTS builtin_cpus)
+                list(APPEND builtin_labels "isa.${builtin_cpu}")
+            endforeach()
+            set_tests_properties(${name} PROPERTIES LABELS "${builtin_labels}"
+                SKIP_REGULAR_EXPRESSION "skipping MIPS")
+        endforeach()
     endforeach()
     # o32 record arguments start at a slot of their alignment; Cross and a
     # Clang-compiled C reference call each other.

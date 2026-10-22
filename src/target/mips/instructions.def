@@ -176,21 +176,21 @@ X(Bc1t, "bc1t",
 X(Bc1f, "bc1f",
   "target:branch | reads=fcsr hazards=condition-read control=branch delay_slot")
 X(Beql, "beql",
-  "rs:gpr, rt:gpr, target:branch | reads=rs,rt control=branch delay_slot likely")
+  "rs:gpr, rt:gpr, target:branch | reads=rs,rt control=branch condition=equal delay_slot likely")
 X(Bnel, "bnel",
-  "rs:gpr, rt:gpr, target:branch | reads=rs,rt control=branch delay_slot likely")
+  "rs:gpr, rt:gpr, target:branch | reads=rs,rt control=branch condition=not-equal delay_slot likely")
 X(Beqzl, "beqzl",
-  "rs:gpr, target:branch | reads=rs control=branch delay_slot likely")
+  "rs:gpr, target:branch | reads=rs control=branch condition=equal delay_slot likely")
 X(Bnezl, "bnezl",
-  "rs:gpr, target:branch | reads=rs control=branch delay_slot likely")
+  "rs:gpr, target:branch | reads=rs control=branch condition=not-equal delay_slot likely")
 X(Bltzl, "bltzl",
-  "rs:gpr, target:branch | reads=rs control=branch delay_slot likely")
+  "rs:gpr, target:branch | reads=rs control=branch condition=less-than-zero delay_slot likely")
 X(Bgezl, "bgezl",
-  "rs:gpr, target:branch | reads=rs control=branch delay_slot likely")
+  "rs:gpr, target:branch | reads=rs control=branch condition=greater-equal-zero delay_slot likely")
 X(Blezl, "blezl",
-  "rs:gpr, target:branch | reads=rs control=branch delay_slot likely")
+  "rs:gpr, target:branch | reads=rs control=branch condition=less-equal-zero delay_slot likely")
 X(Bgtzl, "bgtzl",
-  "rs:gpr, target:branch | reads=rs control=branch delay_slot likely")
+  "rs:gpr, target:branch | reads=rs control=branch condition=greater-than-zero delay_slot likely")
 X(Bc1tl, "bc1tl",
   "target:branch | reads=fcsr hazards=condition-read control=branch delay_slot likely")
 X(Bc1fl, "bc1fl",

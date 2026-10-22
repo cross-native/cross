@@ -134,6 +134,37 @@ bool instruction_immediate_fits(std::uint64_t value, const InstructionOperandEnt
         (operand.allow_register && operand.register_bits == bits && unsigned_fits);
 }
 
+bool instruction_immediate_in_range(std::uint64_t value, bool negative,
+                                    const InstructionOperandEntry& operand) {
+    if (!operand.immediate_range) return true;
+    if (!negative && value > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+        return false;
+    }
+    const auto signed_value = static_cast<std::int64_t>(value);
+    return signed_value >= operand.immediate_minimum && signed_value <= operand.immediate_maximum;
+}
+
+bool instruction_constraints_hold(const InstructionEntry& form,
+                                  std::span<const std::optional<std::int64_t>> immediates) {
+    return std::all_of(form.constraints.begin(), form.constraints.end(),
+                       [&](const InstructionConstraint& constraint) {
+        std::int64_t sum = constraint.constant;
+        for (const auto& [operand, negated] : constraint.terms) {
+            if (operand >= immediates.size() || !immediates[operand]) return true;
+            sum += negated ? -*immediates[operand] : *immediates[operand];
+        }
+        return constraint.holds(sum);
+    });
+}
+
+const UnexposedInstruction* find_unexposed_instruction(const TargetInfo& target,
+                                                       std::string_view name) {
+    for (const auto& entry : target.unexposed_instructions) {
+        if (entry.name == name) return &entry;
+    }
+    return nullptr;
+}
+
 InstructionAddressSelection select_instruction_address(const TargetInfo& target, const Subtarget& subtarget,
     const EvaluationInstructionOperand::Memory& source) {
     using Shape = EvaluationInstructionOperand::Memory::Shape;
@@ -203,7 +234,12 @@ std::optional<std::string> instruction_source_error(const TargetInfo& target, co
     std::string_view name, std::span<const EvaluationInstructionOperand> arguments) {
     const auto forms = find_instruction_forms(target, name);
     const auto prefix = "target instruction '" + std::string(name) + "' ";
-    if (forms.empty()) return prefix + "is not registered for the selected target";
+    if (forms.empty()) {
+        if (const auto* unexposed = find_unexposed_instruction(target, name)) {
+            return prefix + unexposed->reason;
+        }
+        return prefix + "is not registered for the selected target";
+    }
     std::optional<std::string> memory_error;
     bool label_scope_error{};
     const auto register_matches = [&](const RegisterEntry& reg, const InstructionOperandEntry& field) {
@@ -260,8 +296,23 @@ std::optional<std::string> instruction_source_error(const TargetInfo& target, co
         const auto value = convert_integer(source.integer->value,
             {source.integer_bits, source.integer_signed, false}, {128, true, false});
         if (value.high && (value.high != UINT64_MAX || value.low < (std::uint64_t{1} << 63))) return false;
-        return instruction_immediate_fits(value.low, field);
+        return instruction_immediate_fits(value.low, field) &&
+            instruction_immediate_in_range(value.low, value.high != 0, field);
     };
+    // The known values of the immediates, for constraints.
+    std::vector<std::optional<std::int64_t>> immediates(arguments.size());
+    for (std::size_t i = 0; i < arguments.size(); ++i) {
+        const auto& source = arguments[i];
+        if (source.kind != EvaluationInstructionOperand::Kind::Immediate || source.deferred ||
+            !source.integer) {
+            continue;
+        }
+        const auto value = convert_integer(source.integer->value,
+            {source.integer_bits, source.integer_signed, false}, {128, true, false});
+        if (!value.high || (value.high == UINT64_MAX && value.low >= (std::uint64_t{1} << 63))) {
+            immediates[i] = static_cast<std::int64_t>(value.low);
+        }
+    }
     unsigned matches{};
     bool arity{};
     std::optional<InstructionFeatureConflict> feature_conflict;
@@ -272,7 +323,7 @@ std::optional<std::string> instruction_source_error(const TargetInfo& target, co
         bool match = true;
         for (std::size_t i = 0; i < arguments.size(); ++i)
             if (!operand_matches(arguments[i], form->operands[i], id)) { match = false; break; }
-        if (!match) continue;
+        if (!match || !instruction_constraints_hold(*form, immediates)) continue;
         const auto conflict = subtarget.form_conflict(*form);
         if (conflict) { if (!feature_conflict) feature_conflict = conflict; }
         else ++matches;

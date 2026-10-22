@@ -1,7 +1,8 @@
 # Copyright (C) 2026 Cross contributors
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-foreach(required CC SOURCE PAIR_SOURCE BIT_SOURCE RUNTIME MODULE_INFO LINKER OUTPUT)
+foreach(required CC SOURCE PAIR_SOURCE BIT_SOURCE BUILTIN_SOURCE RUNTIME MODULE_INFO LINKER
+                 OUTPUT)
     if(NOT DEFINED ${required} OR "${${required}}" STREQUAL "")
         message(FATAL_ERROR "${required} must name a path")
     endif()
@@ -55,6 +56,7 @@ endfunction()
 set(functions "${OUTPUT}.functions.o")
 set(pairs "${OUTPUT}.pairs.o")
 set(bits "${OUTPUT}.bits.o")
+set(builtins "${OUTPUT}.builtins.o")
 set(runtime "${OUTPUT}.runtime.o")
 set(metadata_object "${OUTPUT}.metadata.o")
 set(metadata_binary "${OUTPUT}.metadata.bin")
@@ -66,6 +68,8 @@ run_checked(cross-pairs "${CC}" -c -O2 -mprofile=psp-allegrex
             "${PAIR_SOURCE}" -o "${pairs}")
 run_checked(cross-bits "${CC}" -c -O2 -mprofile=psp-allegrex
             "${BIT_SOURCE}" -o "${bits}")
+run_checked(cross-builtins "${CC}" -c -O2 -mprofile=psp-allegrex
+            "${BUILTIN_SOURCE}" -o "${builtins}")
 run_checked(cross-runtime "${CC}" -c -O2 -mprofile=psp-allegrex
             "${RUNTIME}" -o "${runtime}")
 run_checked(module-metadata "${LLVM_MC}" --filetype=obj
@@ -75,7 +79,7 @@ run_checked(flatten-module-metadata "${LLVM_OBJCOPY}"
             "--dump-section=.rodata.sceModuleInfo=${metadata_binary}"
             "${metadata_object}")
 run_checked(link "${LLD}" -m elf32ltsmip -T "${LINKER}"
-            "${runtime}" "${functions}" "${pairs}" "${bits}"
+            "${runtime}" "${functions}" "${pairs}" "${bits}" "${builtins}"
             --format=binary "${metadata_binary}"
             -o "${executable}")
 

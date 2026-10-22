@@ -15,6 +15,16 @@ std::optional<std::string> instruction_source_error(const TargetInfo&, const Sub
     std::string_view name, std::span<const EvaluationInstructionOperand>);
 
 bool instruction_immediate_fits(std::uint64_t value, const InstructionOperandEntry&);
+// Whether an immediate, `value` read as negative or not, is in the range an
+// operand states; every value is where it states none.
+bool instruction_immediate_in_range(std::uint64_t value, bool negative,
+                                    const InstructionOperandEntry&);
+// Whether the immediate operands of `form`, where they are known, satisfy
+// its constraints.
+bool instruction_constraints_hold(const InstructionEntry& form,
+                                  std::span<const std::optional<std::int64_t>> immediates);
+// Why no form gives the built-in `name`, when a model table says.
+const UnexposedInstruction* find_unexposed_instruction(const TargetInfo&, std::string_view name);
 
 inline bool instruction_label_accepts(const InstructionOperandEntry& field, bool same_function) {
     return field.allow_label &&
