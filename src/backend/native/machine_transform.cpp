@@ -302,17 +302,24 @@ bool duplicate_branch_blocks(machine::Function& function,
                 // The tested block moves after another block that jumps to
                 // it and is laid out before one of its targets, so that
                 // block no longer jumps and the tested one still falls
-                // through.
+                // through; failing that, after any other block that jumps
+                // to it, whose jump then becomes the tested block's second
+                // one, on the path into the loop.
                 std::optional<std::uint32_t> host;
+                std::optional<std::uint32_t> jumping;
                 for (const auto other : predecessors) {
-                    if (other.value != source && other.value < count &&
-                        jump_target(other.value) == tested &&
-                        next(other.value) != tested &&
-                        target(next(other.value))) {
+                    if (other.value == source || other.value >= count ||
+                        jump_target(other.value) != tested ||
+                        next(other.value) == tested) {
+                        continue;
+                    }
+                    if (target(next(other.value))) {
                         host = other.value;
                         break;
                     }
+                    if (!jumping) jumping = other.value;
                 }
+                if (!host) host = jumping;
                 if (!host) continue;
 
                 // The source passes its own incoming value where the tested

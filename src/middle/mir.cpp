@@ -14846,6 +14846,195 @@ bool select_unit_induction_exits(
     return changed;
 }
 
+// An unsigned induction that only counts passes (its header tests it for
+// equality with an invariant bound, and nothing else reads it or its
+// update) counts the remaining passes down to zero instead: `i != bound`
+// with `i = phi(start, i + step)` becomes `r != 0` with `r = phi(bound -
+// start, r - step)`. Equality holds modulo the type's range, so wrapping
+// changes nothing; the loop then keeps one value fewer live when the bound
+// has no other reader, and the test needs no bound register.
+bool count_passes_down(ManagedFunction& function,
+                       const hir::Module& hir_module,
+                       std::span<const CanonicalLoop> loops) {
+    const auto definition_blocks = value_definition_blocks(function);
+    // Parameters belong to no block.
+    const auto invariant = [&](const CanonicalLoop& loop, ValueId id) {
+        return id.value < definition_blocks.size() &&
+            (function.values[id.value].kind == ValueKind::ConstantInteger ||
+             !definition_blocks[id.value] ||
+             !loop.blocks.contains(definition_blocks[id.value]->value));
+    };
+    const auto append = [&](ManagedValue value) {
+        value.id = ValueId{static_cast<std::uint32_t>(function.values.size())};
+        const auto id = value.id;
+        function.values.push_back(std::move(value));
+        return id;
+    };
+    bool changed = false;
+    for (const auto& loop : loops) {
+        if (loop.header.value >= function.blocks.size() ||
+            loop.preheader.value >= function.blocks.size()) {
+            continue;
+        }
+        auto& header = function.blocks[loop.header.value];
+        if (header.predecessors.size() != 2 || !header.terminator.value ||
+            header.terminator.value->value >= function.values.size()) {
+            continue;
+        }
+        const auto latch = header.predecessors[0] == loop.preheader
+            ? header.predecessors[1] : header.predecessors[0];
+        if (!loop.blocks.contains(latch.value)) continue;
+        const auto condition_id = *header.terminator.value;
+        const auto& condition = function.values[condition_id.value];
+        if (condition.kind != ValueKind::Binary ||
+            (condition.binary != BinaryOperation::NotEqual &&
+             condition.binary != BinaryOperation::Equal) ||
+            condition.operands.size() != 2) {
+            continue;
+        }
+        // The induction is a PHI of the header on one side.
+        std::optional<std::size_t> side;
+        for (std::size_t index = 0; index < 2; ++index) {
+            const auto operand = condition.operands[index];
+            if (operand.value < definition_blocks.size() &&
+                definition_blocks[operand.value] == loop.header &&
+                function.values[operand.value].kind == ValueKind::Phi) {
+                side = index;
+            }
+        }
+        if (!side) continue;
+        const auto induction_id = condition.operands[*side];
+        const auto bound_id = condition.operands[1 - *side];
+        const auto& induction = function.values[induction_id.value];
+        if (!unsigned_integer_type(hir_module, induction.type) ||
+            induction.incoming.size() != 2 || !invariant(loop, bound_id) ||
+            function.values[bound_id.value].type != induction.type) {
+            continue;
+        }
+        const auto start = phi_value_from(induction, loop.preheader);
+        const auto update_id = phi_value_from(induction, latch);
+        if (!start || !update_id ||
+            update_id->value >= function.values.size()) {
+            continue;
+        }
+        const auto& update = function.values[update_id->value];
+        if (update.kind != ValueKind::Binary ||
+            (update.binary != BinaryOperation::Add &&
+             update.binary != BinaryOperation::Subtract) ||
+            update.operands.size() != 2 || update.type != induction.type ||
+            !(update.operands[0] == induction_id ||
+              (update.binary == BinaryOperation::Add &&
+               update.operands[1] == induction_id))) {
+            continue;
+        }
+        const auto step_id = update.operands[0] == induction_id
+            ? update.operands[1] : update.operands[0];
+        if (step_id == induction_id || !invariant(loop, step_id)) continue;
+        // Nothing but the test and the update reads the induction, nothing
+        // but the induction reads the update, and only the header's branch
+        // reads the test; values that nothing reads do not count.
+        const UseLists uses(function);
+        const auto dead = [&](ValueId id) {
+            std::vector<ValueId> pending{id};
+            std::unordered_set<std::uint32_t> seen{id.value};
+            while (!pending.empty()) {
+                const auto current = pending.back();
+                pending.pop_back();
+                const auto& value = function.values[current.value];
+                if (is_effectful_value(value) || value.kind == ValueKind::Phi) {
+                    return false;
+                }
+                for (const auto& use : uses.uses(current)) {
+                    if (!use.user) return false;
+                    if (seen.insert(use.user->value).second) {
+                        pending.push_back(*use.user);
+                    }
+                }
+            }
+            return true;
+        };
+        const auto read_only_by = [&](ValueId id,
+                                      std::initializer_list<ValueId> readers,
+                                      bool branch) {
+            std::size_t live = 0;
+            for (const auto& use : uses.uses(id)) {
+                if (!use.user ? branch && use.kind == UseKind::Terminator
+                              : std::find(readers.begin(), readers.end(),
+                                          *use.user) != readers.end()) {
+                    ++live;
+                } else if (!use.user || !dead(*use.user)) {
+                    return false;
+                }
+            }
+            return live == readers.size() + (branch ? 1U : 0U);
+        };
+        if (!read_only_by(induction_id, {condition_id, *update_id}, false) ||
+            !read_only_by(*update_id, {induction_id}, false) ||
+            !read_only_by(condition_id, {}, true)) {
+            continue;
+        }
+
+        // The remaining count starts at `bound - start` in the preheader. A
+        // constant may be defined in any block, so constants are copied
+        // there, a difference of two folded.
+        const auto type = induction.type;
+        const auto location = induction.location;
+        const auto inline_site = induction.inline_site;
+        const auto counts_up = update.binary == BinaryOperation::Add;
+        const auto bits = type_bits(hir_module, type);
+        const auto constant_of = [&](ValueId id) -> std::optional<UInt128> {
+            const auto& value = function.values[id.value];
+            if (value.kind != ValueKind::ConstantInteger) return std::nullopt;
+            return UInt128{value.integer, value.integer_high};
+        };
+        const auto bound_constant = constant_of(bound_id);
+        const auto start_constant = constant_of(*start);
+        auto& preheader = function.blocks[loop.preheader.value].values;
+        const auto materialize = [&](UInt128 integer) {
+            ManagedValue constant;
+            constant.location = location;
+            constant.inline_site = inline_site;
+            constant.type = type;
+            make_integer_constant(constant, mask_to(integer, bits));
+            const auto id = append(std::move(constant));
+            preheader.push_back(id);
+            return id;
+        };
+        ValueId remaining;
+        if (bound_constant && start_constant) {
+            remaining =
+                materialize(subtract(*bound_constant, *start_constant));
+        } else if (start_constant && *start_constant == UInt128{}) {
+            remaining = bound_id;
+        } else {
+            ManagedValue difference;
+            difference.location = location;
+            difference.inline_site = inline_site;
+            difference.type = type;
+            difference.kind = ValueKind::Binary;
+            difference.binary = BinaryOperation::Subtract;
+            difference.operands = {
+                bound_constant ? materialize(*bound_constant) : bound_id,
+                start_constant ? materialize(*start_constant) : *start};
+            remaining = append(std::move(difference));
+            preheader.push_back(remaining);
+        }
+        const auto zero_id = materialize(UInt128{});
+        for (auto& incoming : function.values[induction_id.value].incoming) {
+            if (incoming.predecessor == loop.preheader) {
+                incoming.value = remaining;
+            }
+        }
+        auto& step = function.values[update_id->value];
+        step.binary =
+            counts_up ? BinaryOperation::Subtract : BinaryOperation::Add;
+        step.operands = {induction_id, step_id};
+        function.values[condition_id.value].operands = {induction_id, zero_id};
+        changed = true;
+    }
+    return changed;
+}
+
 void coalesce_equivalent_inductions(ManagedFunction& function,
                                     const hir::Module& hir_module,
                                     std::span<const CanonicalLoop> loops,
@@ -22540,6 +22729,17 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
                     analyses.loops().canonical_loops());
                 return changed ? PassResult::changed_values()
                                : PassResult::unchanged();
+            });
+        // After the address recurrences, which may leave an index that
+        // only counts passes.
+        pipeline.add(
+            PassId::UnitInductionExitSelection,
+            [&](ManagedFunction& function,
+                FunctionAnalysisManager& analyses) {
+                return count_passes_down(function, hir_module,
+                                         analyses.loops().canonical_loops())
+                    ? PassResult::changed_values()
+                    : PassResult::unchanged();
             });
     }
     // After vectorization and the induction passes, which match neighboring

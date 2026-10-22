@@ -3163,6 +3163,10 @@ private:
                 integer_colors.push_back({10});
                 integer_colors.push_back({11});
             }
+            if (low_scratch_colors_) {
+                integer_colors.push_back({8});
+                integer_colors.push_back({9});
+            }
         }
         for (std::uint32_t id = 16; id <= 23; ++id) {
             if (function.frame.cfa_anchor_register &&
@@ -3287,9 +3291,8 @@ private:
     // A function may color t2 and t3 when no ABI it uses carries values in
     // them, and neither a registry instruction nor a hard-bound object
     // names registers of its own: then only the expansions above write
-    // them, and those clobber them. Any value left without a color would be
-    // reloaded through them, so such an allocation is redone without them.
-    bool allocate_with_scratch_colors(machine::Function& function) {
+    // them, and those clobber them.
+    bool scratch_colors_eligible(const machine::Function& function) const {
         const auto carries = [](const AbiEntry* abi) {
             if (!abi) return true;
             for (const auto& bank : abi->banks) {
@@ -3322,45 +3325,211 @@ private:
                 }
             }
         }
-        if (!eligible) return allocate_registers(function);
-        auto unchanged = function;
-        for (auto& block : function.blocks) {
-            for (auto& value : block.instructions) {
-                if (!uses_scratch_colors(value)) continue;
-                for (const auto id : {10U, 11U}) {
-                    const auto scratch = machine::Register::physical_register(
-                        {id}, subtarget_.has_feature(Feature::Mips3)
-                                  ? machine::i64 : machine::i32);
-                    if (std::find(value.clobbers.begin(), value.clobbers.end(),
-                                  scratch) == value.clobbers.end()) {
-                        value.clobbers.push_back(scratch);
+        return eligible;
+    }
+
+    // Whether a value takes a register when allocation succeeds.
+    bool colorable_value(const machine::Function& function,
+                         std::uint32_t id) const {
+        if (id >= function.virtual_registers.size()) return false;
+        const auto kind = function.virtual_register_classes[id];
+        const auto bits = function.virtual_registers[id].bits;
+        return (kind == machine::VirtualRegisterClass::Integer &&
+                (bits <= 32 || subtarget_.has_feature(Feature::Mips3))) ||
+               (kind == machine::VirtualRegisterClass::Floating &&
+                colorable_floating(subtarget_, bits));
+    }
+
+    // Whether the expansion of `value` leaves t0 and t1 alone when every
+    // value it reads or writes has a color: integer arithmetic,
+    // comparisons, and multiplies, word constants, addresses, loads and
+    // stores through a register or the frame, integer and floating
+    // reinterpretations, floating arithmetic, register copies, and
+    // branches. Other expansions may use them as scratches, and calls
+    // place results through them.
+    bool keeps_low_scratches(const machine::Function& function,
+                             const machine::Instruction& value) const {
+        // HI/LO tokens take no register; every other operand needs one.
+        const auto registers_colorable = [&](bool tokens) {
+            for (const auto* list : {&value.uses, &value.defs}) {
+                for (const auto& operand : *list) {
+                    const auto& classes = function.virtual_register_classes;
+                    if (operand.kind != machine::RegisterKind::Virtual ||
+                        operand.id >= classes.size()) {
+                        return false;
+                    }
+                    if (tokens && classes[operand.id] ==
+                                      machine::VirtualRegisterClass::Memory) {
+                        continue;
+                    }
+                    if (!colorable_value(function, operand.id)) return false;
+                }
+            }
+            return true;
+        };
+        if (value.patch) return false;
+        switch (value.kind) {
+        case machine::InstructionKind::Copy: return registers_colorable(false);
+        case machine::InstructionKind::Branch:
+        case machine::InstructionKind::ConditionalBranch:
+            return registers_colorable(false);
+        case machine::InstructionKind::Target: break;
+        default: return false;
+        }
+        const auto opcode = decode_opcode(value.opcode);
+        if (opcode == Opcode::Phi || opcode == Opcode::LifetimeStart ||
+            opcode == Opcode::LifetimeEnd || opcode == Opcode::IntrinsicNoop) {
+            return true;
+        }
+        if (!registers_colorable(true)) return false;
+        if ((opcode >= Opcode::Add && opcode <= Opcode::CmpUge) ||
+            (opcode >= Opcode::Fadd && opcode <= Opcode::FcmpGe) ||
+            (opcode >= Opcode::Sext && opcode <= Opcode::Ftruncate)) {
+            return true;
+        }
+        switch (opcode) {
+        case Opcode::Neg:
+        case Opcode::Not:
+        case Opcode::Iszero:
+        case Opcode::GlobalHigh:
+        case Opcode::StackAddress:
+        case Opcode::IndexedAddress:
+        case Opcode::PointerOffset:
+        case Opcode::LoadSigned:
+        case Opcode::LoadUnsigned:
+        case Opcode::Fload:
+        case Opcode::Store:
+        case Opcode::Fstore:
+        case Opcode::PointerLoadSigned:
+        case Opcode::PointerLoadUnsigned:
+        case Opcode::FpointerLoad:
+        case Opcode::PointerStore:
+        case Opcode::FpointerStore:
+        case Opcode::IndexedLoadSigned:
+        case Opcode::IndexedLoadUnsigned:
+        case Opcode::MulStart:
+        case Opcode::MoveFromLo:
+            return true;
+        case Opcode::Constant:
+            return value.defs.size() == 1 && value.defs.front().mode.bits <= 32;
+        case Opcode::GlobalAddress: {
+            const auto* symbol = value.operands.empty()
+                ? nullptr
+                : std::get_if<machine::SymbolOperand>(&value.operands.front());
+            return symbol && pic_ == PicModel::None &&
+                !thread_local_object(hir_, *symbol);
+        }
+        default: return false;
+        }
+    }
+
+    // t0 and t1 also take values where no ABI the function uses carries
+    // values in them and the function is not position-independent; every
+    // instruction whose expansion may use them as scratches clobbers them,
+    // and calls take no operand in them.
+    bool low_scratch_colors_eligible(const machine::Function& function) const {
+        const auto carries = [](const AbiEntry* abi) {
+            if (!abi) return true;
+            for (const auto& bank : abi->banks) {
+                for (const auto* registers : {&bank.arguments, &bank.results}) {
+                    for (const auto& name : *registers) {
+                        if (name == "t0" || name == "t1") return true;
                     }
                 }
             }
+            return false;
+        };
+        if (pic_ != PicModel::None ||
+            carries(managed_abi_model(hir_, hir_.function(function.source),
+                                      subtarget_, options_))) {
+            return false;
+        }
+        for (const auto& block : function.blocks) {
+            for (const auto& value : block.instructions) {
+                if (value.kind != machine::InstructionKind::Call) continue;
+                const auto signature = hir::call_signature(
+                    hir_, value.direct_callee, value.call_signature);
+                const auto* abi = value.direct_callee
+                    ? managed_abi_model(
+                          hir_, hir_.function(*value.direct_callee),
+                          subtarget_, options_)
+                    : signature ? abi_model(signature->abi) : nullptr;
+                if (carries(abi)) return false;
+            }
+        }
+        return true;
+    }
+
+    bool allocate_with_scratch_colors(machine::Function& function) {
+        if (!scratch_colors_eligible(function)) {
+            return allocate_registers(function);
+        }
+        auto unchanged = function;
+        const auto clobber = [&](machine::Instruction& value,
+                                 std::initializer_list<std::uint32_t> ids) {
+            for (const auto id : ids) {
+                const auto scratch = machine::Register::physical_register(
+                    {id}, subtarget_.has_feature(Feature::Mips3)
+                              ? machine::i64 : machine::i32);
+                if (std::find(value.clobbers.begin(), value.clobbers.end(),
+                              scratch) == value.clobbers.end()) {
+                    value.clobbers.push_back(scratch);
+                }
+            }
+        };
+        for (auto& block : function.blocks) {
+            for (auto& value : block.instructions) {
+                if (uses_scratch_colors(value)) clobber(value, {10U, 11U});
+            }
+        }
+        // Any value left without a color would be reloaded through the
+        // scratches, so such an allocation is redone without them: without
+        // t0 and t1 first, then without t2 and t3 as well. The expansions
+        // also write a result without a color through t0 or t1.
+        const auto fully_colored = [&](bool results) {
+            const auto& colors = function.virtual_register_assignments;
+            for (const auto& block : function.blocks) {
+                for (const auto& value : block.instructions) {
+                    for (const auto* list : {&value.uses, &value.defs}) {
+                        if (list == &value.defs && !results) continue;
+                        for (const auto& operand : *list) {
+                            if (operand.kind ==
+                                    machine::RegisterKind::Virtual &&
+                                operand.id < colors.size() &&
+                                colorable_value(function, operand.id) &&
+                                !colors[operand.id]) {
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+            return true;
+        };
+        if (low_scratch_colors_eligible(function)) {
+            auto scratched = function;
+            for (auto& block : function.blocks) {
+                for (auto& value : block.instructions) {
+                    if (value.kind != machine::InstructionKind::Call &&
+                        !keeps_low_scratches(function, value)) {
+                        clobber(value, {8U, 9U});
+                    }
+                }
+            }
+            scratch_colors_ = true;
+            low_scratch_colors_ = true;
+            const auto changed = allocate_registers(function);
+            scratch_colors_ = false;
+            low_scratch_colors_ = false;
+            if (fully_colored(true)) return changed;
+            function = std::move(scratched);
         }
         scratch_colors_ = true;
         auto changed = allocate_registers(function);
         scratch_colors_ = false;
-        const auto colorable = [&](std::uint32_t id) {
-            const auto kind = function.virtual_register_classes[id];
-            const auto bits = function.virtual_registers[id].bits;
-            return (kind == machine::VirtualRegisterClass::Integer &&
-                    (bits <= 32 || subtarget_.has_feature(Feature::Mips3))) ||
-                   (kind == machine::VirtualRegisterClass::Floating &&
-                    colorable_floating(subtarget_, bits));
-        };
-        for (const auto& block : function.blocks) {
-            for (const auto& value : block.instructions) {
-                for (const auto& use : value.uses) {
-                    if (use.kind == machine::RegisterKind::Virtual &&
-                        use.id < function.virtual_register_assignments.size() &&
-                        colorable(use.id) &&
-                        !function.virtual_register_assignments[use.id]) {
-                        function = std::move(unchanged);
-                        return allocate_registers(function);
-                    }
-                }
-            }
+        if (!fully_colored(false)) {
+            function = std::move(unchanged);
+            return allocate_registers(function);
         }
         return changed;
     }
@@ -3961,6 +4130,18 @@ private:
             auto live = live_out[block.id.value];
             for (auto item = block.instructions.rbegin();
                  item != block.instructions.rend(); ++item) {
+                // A call places its results through t0 and t1.
+                if (low_scratch_colors_ &&
+                    item->kind == machine::InstructionKind::Call) {
+                    for (const auto* registers : {&item->uses, &item->defs}) {
+                        for (const auto& value : *registers) {
+                            if (const auto id = virtual_id(value)) {
+                                hard_forbidden_colors[*id].insert(8U);
+                                hard_forbidden_colors[*id].insert(9U);
+                            }
+                        }
+                    }
+                }
                 // Another instruction's clobbers are its expansion's
                 // scratches, written before its operands are read: no value
                 // live across it and none of its operands may hold them.
@@ -8019,17 +8200,54 @@ private:
                                       name) != abi->call_clobbers.end();
                     }));
             };
-        const auto gprs = colors(allocatable_gprs(function));
+        // The allocator colors t2 and t3 too where they are free, and t0
+        // and t1 where no expansion needs them, which only the trial
+        // allocation of the headroom shows.
+        scratch_colors_ = scratch_colors_eligible(function);
+        const auto palette = allocatable_gprs(function);
+        low_scratch_colors_ =
+            scratch_colors_ && low_scratch_colors_eligible(function);
+        const auto widest = allocatable_gprs(function);
+        scratch_colors_ = false;
+        low_scratch_colors_ = false;
+        const auto gprs = colors(palette);
         const auto fprs = colors(allocatable_fprs());
         policy.capacity = {gprs > 3U ? gprs - 3U : 0U,
                            fprs > 2U ? fprs - 2U : 0U};
-        policy.colors = {
-            static_cast<unsigned>(allocatable_gprs(function).size()),
-            static_cast<unsigned>(allocatable_fprs().size())};
+        policy.colors = {static_cast<unsigned>(palette.size()),
+                         static_cast<unsigned>(allocatable_fprs().size())};
         const bool changed = native::hoist_loop_constants(function, policy);
         // The headroom takes only constants that cost an instruction where
-        // they are: one that heads its block, or that its block's branch
-        // follows without reading it, can run in a delay slot instead.
+        // they are: one that heads its block, or that its block's
+        // conditional branch follows without reading it, can run in a delay
+        // slot instead (an unconditional branch's slot can take its
+        // target's first operation). A block's head runs in the slot of a
+        // predecessor whose operations all feed its branch, unless that
+        // branch's other edge stays in a loop the block leaves: the loop's
+        // path takes the slot.
+        const auto depths = native::loop_depths(function);
+        const auto head_fills_slot = [&](const machine::Block& block) {
+            return std::any_of(
+                block.predecessors.begin(), block.predecessors.end(),
+                [&](machine::BlockId id) {
+                    if (id.value >= function.blocks.size() ||
+                        id.value >= depths.size() ||
+                        block.id.value >= depths.size() ||
+                        !slot_needs_operation(function.blocks[id.value])) {
+                        return false;
+                    }
+                    const auto& successors =
+                        function.blocks[id.value].successors;
+                    return std::none_of(
+                        successors.begin(), successors.end(),
+                        [&](machine::BlockId other) {
+                            return other != block.id &&
+                                other.value < depths.size() &&
+                                depths[other.value] >= depths[id.value] &&
+                                depths[block.id.value] < depths[id.value];
+                        });
+                });
+        };
         std::unordered_set<std::uint32_t> slot_constants;
         for (const auto& block : function.blocks) {
             const auto& instructions = block.instructions;
@@ -8062,13 +8280,14 @@ private:
                 }
                 slot_constants.insert(value.defs.front().id);
             };
-            if (first != instructions.end()) slot(*first);
+            if (first != instructions.end() && head_fills_slot(block)) {
+                slot(*first);
+            }
             if (instructions.size() >= 2) {
                 const auto& branch = instructions.back();
                 const auto& last = instructions[instructions.size() - 2];
-                if ((branch.kind == machine::InstructionKind::Branch ||
-                     branch.kind ==
-                         machine::InstructionKind::ConditionalBranch) &&
+                if (branch.kind ==
+                        machine::InstructionKind::ConditionalBranch &&
                     !last.defs.empty() &&
                     std::find(branch.uses.begin(), branch.uses.end(),
                               last.defs.front()) == branch.uses.end()) {
@@ -8077,7 +8296,8 @@ private:
             }
         }
         auto headroom = policy;
-        headroom.capacity = {gprs, fprs};
+        headroom.capacity = {colors(widest), fprs};
+        headroom.colors.front() = static_cast<unsigned>(widest.size());
         headroom.is_constant = [&](const machine::Instruction& value) {
             return policy.is_constant(value) &&
                 !(value.defs.size() == 1 &&
@@ -11231,6 +11451,7 @@ private:
     // The allocation may color t2 and t3, which the instructions whose
     // expansions use them as scratches clobber.
     bool scratch_colors_{};
+    bool low_scratch_colors_{};
     // The function's values may take odd FPRs (permits_odd_fpr_colors).
     bool odd_fpr_colors_{};
     // Instructions that the instruction being selected needs before it,
@@ -17701,28 +17922,18 @@ private:
     // (plan_successor_delay_slots). When that operation cannot run in a
     // slot, the first later one of the target that can, and that may move
     // before every operation ahead of it, leads the target instead.
-    void lead_branch_targets(machine::Function& function) {
-        if (!options_.schedule_insns2 || !selects_branch_likely()) return;
-        const auto registers = [&](const std::vector<machine::Register>& list) {
-            PhysicalSet result;
-            for (const auto& value : list) {
-                result |= physical_registers(function, value);
-            }
-            return result;
-        };
-        const auto opcode_of = [](const machine::Instruction& value) {
-            return value.kind == machine::InstructionKind::Target
-                ? decode_opcode(value.opcode) : Opcode::None;
-        };
-        // HI and LO are ordered through value tokens, not registers.
-        const auto token = [&](const machine::Register& value) {
-            return value.kind == machine::RegisterKind::Virtual &&
-                value.id < function.virtual_register_classes.size() &&
-                function.virtual_register_classes[value.id] ==
+    // Whether an operation reads or writes HI or LO, which value tokens
+    // rather than registers order.
+    static bool hilo_access(const machine::Function& function,
+                            const machine::Instruction& value) {
+        const auto token = [&](const machine::Register& register_value) {
+            return register_value.kind == machine::RegisterKind::Virtual &&
+                register_value.id < function.virtual_register_classes.size() &&
+                function.virtual_register_classes[register_value.id] ==
                     machine::VirtualRegisterClass::Memory;
         };
-        const auto hilo = [&](const machine::Instruction& value) {
-            switch (opcode_of(value)) {
+        if (value.kind == machine::InstructionKind::Target) {
+            switch (decode_opcode(value.opcode)) {
             case Opcode::MulStart:
             case Opcode::MoveFromLo:
             case Opcode::Mul:
@@ -17735,33 +17946,82 @@ private:
             case Opcode::Sdivrem:
             case Opcode::Udivrem:
                 return true;
-            default:
-                return std::any_of(value.uses.begin(), value.uses.end(),
-                                   token) ||
-                    std::any_of(value.defs.begin(), value.defs.end(), token);
+            default: break;
             }
+        }
+        return std::any_of(value.uses.begin(), value.uses.end(), token) ||
+            std::any_of(value.defs.begin(), value.defs.end(), token);
+    }
+
+    // Whether an operation separates two that the emitter would otherwise
+    // separate with a NOP: floating multiplies under -mfix4300, an FPU
+    // transfer and a reader of its register, and HI/LO accesses.
+    bool separates_hazard(const machine::Function& function,
+                          const machine::Instruction& before,
+                          const machine::Instruction& after) const {
+        if (hilo_access(function, before) || hilo_access(function, after)) {
+            return true;
+        }
+        const auto opcode_of = [](const machine::Instruction& value) {
+            return value.kind == machine::InstructionKind::Target
+                ? decode_opcode(value.opcode) : Opcode::None;
         };
-        // Whether an operation separates two that the emitter would
-        // otherwise separate with a NOP: floating multiplies under
-        // -mfix4300, an FPU transfer and a reader of its register, and
-        // HI/LO accesses.
-        const auto separates = [&](const machine::Instruction& before,
-                                   const machine::Instruction& after) {
-            if (hilo(before) || hilo(after)) return true;
-            const auto first = opcode_of(before);
-            if (first == Opcode::Fmul && opcode_of(after) == Opcode::Fmul) {
-                return subtarget_.has_feature(Feature::Fix4300);
+        const auto first = opcode_of(before);
+        if (first == Opcode::Fmul && opcode_of(after) == Opcode::Fmul) {
+            return subtarget_.has_feature(Feature::Fix4300);
+        }
+        return (first == Opcode::Freinterpret || first == Opcode::Fconstant) &&
+            !subtarget_.has_feature(Feature::FpuTransferInterlocks) &&
+            std::any_of(after.uses.begin(), after.uses.end(),
+                        [&](const machine::Register& use) {
+                            return std::find(before.defs.begin(),
+                                             before.defs.end(),
+                                             use) != before.defs.end();
+                        });
+    }
+
+    // Whether `instructions[candidate]` may run before the operations from
+    // `first` up to it: it reads no register they write and writes none
+    // they read or write, they neither store nor have side effects, a load
+    // passes nothing that may trap, and it neither touches HI/LO nor
+    // separates two operations whose NOP it saves.
+    bool may_lead(const machine::Function& function,
+                  const std::vector<machine::Instruction>& instructions,
+                  std::size_t first, std::size_t candidate) const {
+        const auto registers = [&](const std::vector<machine::Register>& list) {
+            PhysicalSet result;
+            for (const auto& value : list) {
+                result |= physical_registers(function, value);
             }
-            return (first == Opcode::Freinterpret ||
-                    first == Opcode::Fconstant) &&
-                !subtarget_.has_feature(Feature::FpuTransferInterlocks) &&
-                std::any_of(after.uses.begin(), after.uses.end(),
-                            [&](const machine::Register& use) {
-                                return std::find(before.defs.begin(),
-                                                 before.defs.end(),
-                                                 use) != before.defs.end();
-                            });
+            return result;
         };
+        const auto& value = instructions[candidate];
+        if (hilo_access(function, value) ||
+            (candidate > first && candidate + 1 < instructions.size() &&
+             separates_hazard(function, instructions[candidate - 1],
+                              instructions[candidate + 1]))) {
+            return false;
+        }
+        const auto reads = registers(value.uses);
+        const auto writes = registers(value.defs);
+        for (auto passed = first; passed < candidate; ++passed) {
+            const auto& other = instructions[passed];
+            const auto other_writes =
+                registers(other.defs) | registers(other.clobbers);
+            if ((other.kind != machine::InstructionKind::Target &&
+                 other.kind != machine::InstructionKind::Copy) ||
+                other.has_side_effects || other.patch || other.may_store ||
+                (value.may_load && trap_only(other)) ||
+                (reads & other_writes).any() ||
+                (writes & (other_writes | registers(other.uses))).any()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void lead_branch_targets(machine::Function& function) {
+        if (!options_.schedule_insns2 || !selects_branch_likely()) return;
         std::vector<bool> led(function.blocks.size());
         for (const auto& source : function.blocks) {
             if (source.instructions.empty()) continue;
@@ -17797,32 +18057,11 @@ private:
                 }
                 for (auto candidate = first + 1;
                      candidate + 1 < instructions.size(); ++candidate) {
-                    const auto& value = instructions[candidate];
-                    if (!single_delay_slot_instruction(function, value) ||
-                        hilo(value) ||
-                        separates(instructions[candidate - 1],
-                                  instructions[candidate + 1])) {
+                    if (!single_delay_slot_instruction(
+                            function, instructions[candidate]) ||
+                        !may_lead(function, instructions, first, candidate)) {
                         continue;
                     }
-                    const auto reads = registers(value.uses);
-                    const auto writes = registers(value.defs);
-                    bool movable = true;
-                    for (auto passed = first; passed < candidate && movable;
-                         ++passed) {
-                        const auto& other = instructions[passed];
-                        const auto other_writes =
-                            registers(other.defs) | registers(other.clobbers);
-                        movable =
-                            (other.kind == machine::InstructionKind::Target ||
-                             other.kind == machine::InstructionKind::Copy) &&
-                            !other.has_side_effects && !other.patch &&
-                            !other.may_store &&
-                            !(value.may_load && trap_only(other)) &&
-                            !(reads & other_writes).any() &&
-                            !(writes & (other_writes | registers(other.uses)))
-                                 .any();
-                    }
-                    if (!movable) continue;
                     auto moved = std::move(instructions[candidate]);
                     instructions.erase(instructions.begin() +
                                        static_cast<std::ptrdiff_t>(candidate));
@@ -18113,29 +18352,38 @@ private:
                 !exits) {
                 continue;
             }
-            std::size_t index = 0;
-            while (index < fallthrough->instructions.size() &&
-                   no_output_prefix(fallthrough->instructions[index])) {
-                ++index;
+            std::size_t first = 0;
+            const auto& instructions = fallthrough->instructions;
+            while (first < instructions.size() &&
+                   no_output_prefix(instructions[first])) {
+                ++first;
             }
-            if (index + 1 >= fallthrough->instructions.size()) continue;
-            const auto& candidate = fallthrough->instructions[index];
-            if (!speculative_delay_instruction(function, candidate) ||
-                (decode_opcode(candidate.opcode) == Opcode::MulStart &&
-                 !hilo_writer_fits_slot(function, block.id)) ||
-                (physical_registers(function, candidate.defs.front()) &
-                 live_on_edge(function, block.id, taken)).any()) {
-                continue;
+            const auto own = delay_slot_plan(function, *fallthrough);
+            const auto given = given_delay_instruction(fallthrough->id);
+            const auto live_taken = live_on_edge(function, block.id, taken);
+            // The first operation, or a later one that may run before the
+            // operations ahead of it.
+            for (auto index = first; index + 1 < instructions.size();
+                 ++index) {
+                const auto& candidate = instructions[index];
+                if (!speculative_delay_instruction(function, candidate) ||
+                    (decode_opcode(candidate.opcode) == Opcode::MulStart &&
+                     !hilo_writer_fits_slot(function, block.id)) ||
+                    (physical_registers(function, candidate.defs.front()) &
+                     live_taken).any() ||
+                    (index > first &&
+                     !may_lead(function, instructions, first, index))) {
+                    continue;
+                }
+                // The operation may already fill the fallthrough block's
+                // own slot or one of its successor's.
+                if ((own && own->candidate == index) || given == index) {
+                    continue;
+                }
+                fallthrough_delays_.emplace(block.id.value,
+                                            FallthroughDelay{*next, index});
+                break;
             }
-            // The operation may already fill the fallthrough block's own
-            // slot or one of its successor's.
-            if (const auto own = delay_slot_plan(function, *fallthrough);
-                (own && own->candidate == index) ||
-                given_delay_instruction(fallthrough->id) == index) {
-                continue;
-            }
-            fallthrough_delays_.emplace(block.id.value,
-                                        FallthroughDelay{*next, index});
         }
     }
 
@@ -18161,6 +18409,92 @@ private:
             (void)branch;
             lent_delays_.emplace(delay.block.value, delay.instruction);
         }
+    }
+
+    // A block that jumps to a block nothing falls into takes the chain of
+    // blocks that block heads, each falling into the next, right after it,
+    // so it no longer jumps. Skipped blocks leave such heads: a latch that
+    // its header's branch-likely slot absorbs keeps the place before the
+    // header that the layout gave it. No fallthrough is lost, since the
+    // chain's last block and the jumping block both end in a transfer.
+    bool place_jump_targets(machine::Function& function) const {
+        if (!options_.reorder_blocks) return false;
+        // Whether `block` ends with a branch that may fall into `next`.
+        const auto falls_into = [&](machine::BlockId block,
+                                    machine::BlockId next) {
+            const auto* value = find_block(function, block);
+            if (!value || value->instructions.empty()) return false;
+            const auto& last = value->instructions.back();
+            return (last.kind == machine::InstructionKind::Branch ||
+                    last.kind == machine::InstructionKind::ConditionalBranch) &&
+                std::any_of(last.operands.begin(), last.operands.end(),
+                            [&](const machine::Operand& operand) {
+                                const auto* target =
+                                    std::get_if<machine::BlockOperand>(
+                                        &operand);
+                                return target && target->target == next;
+                            });
+        };
+        bool changed = false;
+        for (bool moved = true; moved;) {
+            moved = false;
+            for (const auto source : function.layout) {
+                const auto* block = find_block(function, source);
+                if (!block || skipped_layout_.contains(source.value) ||
+                    labeled_block(function, source) ||
+                    block->instructions.empty() ||
+                    block->instructions.back().kind !=
+                        machine::InstructionKind::Branch) {
+                    continue;
+                }
+                const auto& jump = block->instructions.back();
+                const auto* operand = jump.operands.empty()
+                    ? nullptr
+                    : std::get_if<machine::BlockOperand>(
+                          &jump.operands.front());
+                if (!operand) continue;
+                const auto target = operand->target;
+                const auto before = layout_predecessor(function, target);
+                if (target == source || target == function.entry ||
+                    skipped_layout_.contains(target.value) ||
+                    layout_successor(function, source) == target ||
+                    (before && falls_into(*before, target))) {
+                    continue;
+                }
+                std::vector<machine::BlockId> chain{target};
+                while (const auto next =
+                           layout_successor(function, chain.back())) {
+                    if (!falls_into(chain.back(), *next)) break;
+                    chain.push_back(*next);
+                }
+                const auto* last = find_block(function, chain.back());
+                if (!last || last->instructions.empty() ||
+                    last->instructions.back().kind ==
+                        machine::InstructionKind::Return ||
+                    std::any_of(chain.begin(), chain.end(),
+                                [&](machine::BlockId id) {
+                                    return id == source ||
+                                        labeled_block(function, id);
+                                })) {
+                    continue;
+                }
+                // The chain's layout run, skipped blocks among it included,
+                // moves after the jumping block.
+                const auto first = std::find(function.layout.begin(),
+                                             function.layout.end(), target);
+                const auto end = std::find(first, function.layout.end(),
+                                           chain.back()) + 1;
+                std::vector<machine::BlockId> run(first, end);
+                function.layout.erase(first, end);
+                const auto at = std::find(function.layout.begin(),
+                                          function.layout.end(), source);
+                function.layout.insert(at + 1, run.begin(), run.end());
+                moved = true;
+                changed = true;
+                break;
+            }
+        }
+        return changed;
     }
 
     // The cross-block candidate that `block` gives away, if any.
@@ -22573,19 +22907,26 @@ void AssemblyEmitter::emit_function(machine::Function& function) {
     skipped_layout_.clear();
     lead_branch_targets(function);
     compute_physical_liveness(function);
-    for (unsigned round = 0;; ++round) {
-        plan_cross_block_delays(function);
-        if (round < 3) forward_fallthrough_arms(function);
-        fallthrough_delays_.clear();
-        plan_successor_delay_slots(function);
-        plan_fallthrough_delays(function);
-        if (!fallthrough_delays_.empty()) plan_successor_delay_slots(function);
-        if (forwarded_blocks_ == skipped_layout_ ||
-            (round >= 3 && skipped_layout_.empty())) {
-            break;
+    // Jump targets that the skipped blocks leave without a fallthrough
+    // predecessor move after the block that jumps to them; then plan again.
+    for (unsigned placement = 0;; ++placement) {
+        for (unsigned round = 0;; ++round) {
+            plan_cross_block_delays(function);
+            if (round < 3) forward_fallthrough_arms(function);
+            fallthrough_delays_.clear();
+            plan_successor_delay_slots(function);
+            plan_fallthrough_delays(function);
+            if (!fallthrough_delays_.empty()) {
+                plan_successor_delay_slots(function);
+            }
+            if (forwarded_blocks_ == skipped_layout_ ||
+                (round >= 3 && skipped_layout_.empty())) {
+                break;
+            }
+            if (round >= 3) skipped_layout_.clear();
+            else skipped_layout_ = forwarded_blocks_;
         }
-        if (round >= 3) skipped_layout_.clear();
-        else skipped_layout_ = forwarded_blocks_;
+        if (placement >= 2 || !place_jump_targets(function)) break;
     }
     plan_elided_returns(function);
     settle_fallthrough_delays(function);

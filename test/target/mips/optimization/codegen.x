@@ -1302,3 +1302,76 @@ global u32 classify_chain(in const u32 *data, in u32 count) {
     }
     return result;
 }
+
+// A counter that only counts passes counts the remaining passes down to
+// zero, so the loop keeps no bound register.
+global u32 mips_count_down(in const u32 *data, in uptr iterations) {
+    u32 sum = 0u32;
+    for (uptr n = 0; n < iterations; ++n) {
+        sum = sum * 3u32 + data[0];
+    }
+    return sum;
+}
+
+// A top-tested search whose body starts with a load: no block that jumps to
+// the test is laid out before one of its targets, so the test moves after
+// the block that enters the loop, and the latch tests at the bottom.
+global u32 mips_linear_find(in const u32 *data, in u32 count, in u32 target,
+                            in u32 rounds) {
+    u32 result = 0u32;
+    for (u32 round = 0u32; round < rounds; ++round) {
+        u32 index = 0u32;
+        while (index < count && data[index] < target) {
+            index = index + 1u32;
+        }
+        result = result + (index ^ target);
+        target = target + 97u32;
+    }
+    return result;
+}
+
+// A slot allocator: the word search's latch runs in its header's
+// branch-likely slot, so the block that enters the search falls into the
+// header, and the loop's constants take the colors t0 to t3 at -Oz.
+global u32 mips_slot_words[8];
+global u16 mips_slot_live[64];
+
+global u32 mips_slot_cycle(in u32 state, in u32 iterations) {
+    for (u32 w = 0u32; w < 8u32; ++w) {
+        mips_slot_words[w] = 0u32;
+    }
+    u32 seed = state ^ 2654435769u32;
+    u32 live = 0u32;
+    u32 checksum = 0u32;
+    for (u32 n = 0u32; n < iterations; ++n) {
+        seed = seed * 1664525u32 + 1013904223u32;
+        if (live < 64u32 && ((seed >> 16) & 3u32) != 0u32) {
+            u32 w = 0u32;
+            while (mips_slot_words[w] == 4294967295u32) {
+                ++w;
+            }
+            u32 word = mips_slot_words[w];
+            u32 bit = 0u32;
+            while (((word >> bit) & 1u32) != 0u32) {
+                ++bit;
+            }
+            mips_slot_words[w] = word | (1u32 << bit);
+            u32 slot = w * 32u32 + bit;
+            mips_slot_live[live] = (u16)slot;
+            live = live + 1u32;
+            checksum = checksum * 31u32 + slot;
+        } else if (live != 0u32) {
+            u32 pick = (seed >> 8) & 63u32;
+            while (pick >= live) {
+                pick = pick - live;
+            }
+            u32 slot = mips_slot_live[pick];
+            mips_slot_words[slot >> 5] =
+                mips_slot_words[slot >> 5] & ~(1u32 << (slot & 31u32));
+            live = live - 1u32;
+            mips_slot_live[pick] = mips_slot_live[live];
+            checksum = checksum ^ (slot << 3);
+        }
+    }
+    return checksum ^ live;
+}

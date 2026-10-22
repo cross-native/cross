@@ -49,8 +49,10 @@ struct BranchDuplicationPolicy {
 // branches out of it, and whose edge needs no PHI copies, ends with a copy
 // of that branch instead, so the loop tests at its bottom. The header moves
 // after another predecessor that jumps to it and is laid out before one of
-// the branch's targets, so that predecessor falls through. The targets gain
-// the latch as a predecessor with the values the header passed them.
+// the branch's targets, so that predecessor falls through, or else after
+// any predecessor that jumps to it, whose jump the header then makes. The
+// targets gain the latch as a predecessor with the values the header passed
+// them.
 [[nodiscard]] bool duplicate_branch_blocks(
     machine::Function& function, const BranchDuplicationPolicy& policy);
 

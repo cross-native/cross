@@ -1166,3 +1166,144 @@ global u32 k_q_classify_chain(in u32 a, in u32 b, in u32 c) {
     }
     return result;
 }
+
+// Counters that only count passes count the remaining passes down: from
+// zero to a bound that may be zero, from a nonzero start, by a step of four,
+// and a pointer-sized counter.
+[[abi("@ABI@"), noinline]]
+global u32 k_q_count_down(in u32 a, in u32 b, in u32 c) {
+    u32 total = a;
+    const u32 passes = b & 31u32;
+    for (u32 n = 0u32; n < passes; ++n) {
+        total = total * 33u32 + c;
+    }
+    const u32 first = a & 7u32;
+    for (u32 n = first; n != first + (c & 15u32); ++n) {
+        total = (total << 3) ^ (total >> 5);
+    }
+    for (u32 n = 0u32; n != (b & 7u32) * 4u32; n = n + 4u32) {
+        total = total + 2654435769u32;
+    }
+    for (uptr n = 0; n < (uptr)(c & 3u32); ++n) {
+        total = total ^ (total >> 7);
+    }
+    return total;
+}
+
+// A top-tested search whose body starts with a load and whose test no
+// block can host: the test moves into the latch and the block that enters
+// the loop.
+[[noinline]]
+static u32 q_find_rounds(in const u32* data, in u32 count, in u32 target) {
+    u32 result = 0u32;
+    for (u32 round = 0u32; round < 6u32; ++round) {
+        u32 index = 0u32;
+        while (index < count && data[index] < target) {
+            index = index + 1u32;
+        }
+        result = result * 7u32 + (index ^ target);
+        target = target + 41u32;
+        if (target >= 250u32) {
+            target = target - 250u32;
+        }
+    }
+    return result;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_linear_find(in u32 a, in u32 b, in u32 c) {
+    u32 data[48];
+    for (u32 i = 0u32; i < 48u32; ++i) {
+        data[i] = i * 5u32 + (a & 3u32);
+    }
+    return q_find_rounds(data, (b & 31u32) + (c & 7u32), c % 250u32);
+}
+
+// A slot allocator at a size goal: a word search whose latch runs in its
+// header's branch-likely slot, a bit scan, and loop constants that take t0
+// to t3.
+global u32 q_slot_words[8];
+global u16 q_slot_live[64];
+
+[[abi("@ABI@"), noinline]]
+global u32 k_q_slot_cycle(in u32 a, in u32 b, in u32 c) {
+    for (u32 w = 0u32; w < 8u32; ++w) {
+        q_slot_words[w] = 0u32;
+    }
+    u32 seed = a ^ 2654435769u32;
+    u32 live = 0u32;
+    u32 checksum = b;
+    for (u32 n = 0u32; n < 150u32 + (c & 127u32); ++n) {
+        seed = seed * 1664525u32 + 1013904223u32;
+        if (live < 64u32 && ((seed >> 16) & 3u32) != 0u32) {
+            u32 w = 0u32;
+            while (q_slot_words[w] == 4294967295u32) {
+                ++w;
+            }
+            u32 word = q_slot_words[w];
+            u32 bit = 0u32;
+            while (((word >> bit) & 1u32) != 0u32) {
+                ++bit;
+            }
+            q_slot_words[w] = word | (1u32 << bit);
+            u32 slot = w * 32u32 + bit;
+            q_slot_live[live] = (u16)slot;
+            live = live + 1u32;
+            checksum = checksum * 31u32 + slot;
+        } else if (live != 0u32) {
+            u32 pick = (seed >> 8) & 63u32;
+            while (pick >= live) {
+                pick = pick - live;
+            }
+            u32 slot = q_slot_live[pick];
+            q_slot_words[slot >> 5] =
+                q_slot_words[slot >> 5] & ~(1u32 << (slot & 31u32));
+            live = live - 1u32;
+            q_slot_live[pick] = q_slot_live[live];
+            checksum = checksum ^ (slot << 3);
+        }
+    }
+    return checksum ^ (live << 24);
+}
+
+// Sixteen values live through an integer loop body, with an unsigned
+// conversion and a division between passes, so t0 and t1 hold values
+// only where no expansion needs them.
+[[abi("@ABI@"), noinline]]
+global u32 k_q_low_scratches(in u32 a, in u32 b, in u32 c) {
+    u32 s0 = a;
+    u32 s1 = b;
+    u32 s2 = c;
+    u32 s3 = a ^ b;
+    u32 s4 = b ^ c;
+    u32 s5 = a + c;
+    u32 s6 = a * 3u32;
+    u32 s7 = b * 5u32;
+    u32 s8 = c * 7u32;
+    u32 s9 = a >> 3;
+    u32 s10 = b >> 5;
+    u32 s11 = c >> 7;
+    f64 scale = 0.0f64;
+    for (u32 n = 0u32; n < 40u32 + (a & 15u32); ++n) {
+        s0 = s0 * 1664525u32 + 1013904223u32;
+        s1 = s1 + (s0 >> 13) + 196608u32;
+        s2 = s2 ^ (s1 << 3) ^ 4294967295u32;
+        s3 = s3 + (s2 & 65535u32) + s11;
+        s4 = s4 ^ (s3 >> 7) ^ s10;
+        s5 = s5 + s4 * 9u32 + s9;
+        s6 = s6 ^ (s5 >> 11) ^ s8;
+        s7 = s7 + (s6 & 1023u32) + s0;
+        s8 = s8 ^ (s7 << 5);
+        s9 = s9 + (s8 >> 3);
+        s10 = s10 ^ (s9 * 3u32);
+        s11 = s11 + (s10 >> 9) + 1u32;
+        if ((n & 7u32) == 7u32) {
+            scale = scale + (f64)(s11 & 255u32);
+            s0 = s0 + s9 / ((s4 & 15u32) + 1u32);
+        }
+    }
+    union QBits bits;
+    bits.value = scale;
+    return s0 ^ s1 ^ s2 ^ s3 ^ s4 ^ s5 ^ s6 ^ s7 ^ s8 ^ s9 ^ s10 ^ s11 ^
+        (u32)bits.bits ^ (u32)(bits.bits >> 32);
+}

@@ -1577,3 +1577,71 @@ if(NOT classify_slots MATCHES "${classify_speculated}" OR
         "its delay slot, or -fno-schedule-insns2 did\n"
         "O2:\n${classify_slots}\nno delay slots:\n${classify_unfilled}")
 endif()
+# A counter that only counts passes counts down to zero; -fno-ivopts keeps
+# it counting up to its bound.
+function_body("${OUTPUT}.enabled.s" mips_count_down count_down)
+function_body("${OUTPUT}.no_ivopts.s" mips_count_down count_up)
+set(count_down_test
+    "addiu[\t ]+\\$[a-z0-9]+,\\$[a-z0-9]+,-1\n[\t ]+bnel?[\t ]+\\$[a-z0-9]+,\\$zero,")
+if(NOT count_down MATCHES "${count_down_test}" OR
+   count_up MATCHES "${count_down_test}")
+    message(FATAL_ERROR
+        "a pass counter did not count down to zero, or -fno-ivopts did\n"
+        "O2:\n${count_down}\nno IVOPTs:\n${count_up}")
+endif()
+# A top-tested search that no block can host moves its test after the block
+# that enters the loop: the latch tests at the bottom, so the loop branch's
+# target begins with the copied test. -fno-reorder-blocks keeps the test in
+# the header.
+function_body("${OUTPUT}.enabled.s" mips_linear_find linear_rotated)
+function_body("${OUTPUT}.no_reorder.s" mips_linear_find linear_unrotated)
+foreach(variant rotated unrotated)
+    string(REGEX MATCH
+           "bnel[\t ]+\\$at,\\$zero,(\\.Lcross[.]mips[.][0-9_]+[.][a-z]+[.][0-9]+)\n"
+           linear_branch "${linear_${variant}}")
+    set(linear_target_${variant} "${CMAKE_MATCH_1}")
+    string(FIND "${linear_${variant}}" "${linear_target_${variant}}:\n\tbeq\t"
+           linear_tested_${variant})
+endforeach()
+if(linear_target_rotated STREQUAL "" OR linear_tested_rotated EQUAL -1 OR
+   NOT linear_tested_unrotated EQUAL -1)
+    message(FATAL_ERROR
+        "a top-tested search without a host block did not test at its "
+        "latch, or -fno-reorder-blocks did\n"
+        "O2:\n${linear_rotated}\nno reordering:\n${linear_unrotated}")
+endif()
+# At -Oz the word search's latch runs in its header's branch-likely slot,
+# and the block that enters the search falls into the header instead of
+# jumping to it. The loop's constants take t0 to t3 and leave the loop;
+# -fno-move-loop-invariants keeps the mask in it.
+function_body("${OUTPUT}.size.s" mips_slot_cycle slot_cycle)
+function_body("${OUTPUT}.size_no_licm.s" mips_slot_cycle slot_cycle_no_licm)
+string(REGEX MATCH
+       "lw[\t ][^\n]*\n[\t ]+beql[\t ]+\\$[a-z0-9]+,\\$[a-z0-9]+,(\\.Lcross[.]mips[.][0-9_]+[.]bb[.][0-9]+)\n"
+       slot_search "${slot_cycle}")
+set(slot_header "${CMAKE_MATCH_1}")
+string(FIND "${slot_cycle}" "\tb\t${slot_header}\n" slot_header_jump)
+string(FIND "${slot_cycle}" "\tmult\t" slot_loop)
+string(FIND "${slot_cycle}" ",196608\n" slot_mask)
+string(REGEX MATCH "\\$t[01][,\n]" slot_low "${slot_cycle}")
+string(FIND "${slot_cycle_no_licm}" "\tmflo\t" slot_loop_no_licm)
+string(FIND "${slot_cycle_no_licm}" ",196608\n" slot_mask_no_licm)
+if(slot_header STREQUAL "" OR NOT slot_header_jump EQUAL -1 OR
+   slot_mask EQUAL -1 OR NOT slot_mask LESS slot_loop OR
+   slot_low STREQUAL "" OR
+   slot_mask_no_licm LESS slot_loop_no_licm)
+    message(FATAL_ERROR
+        "at -Oz the block entering the word search jumped to its header, "
+        "or the loop's mask stayed in the loop without t0 to t3, or "
+        "-fno-move-loop-invariants hoisted it\n"
+        "Oz:\n${slot_cycle}\nno LICM:\n${slot_cycle_no_licm}")
+endif()
+# Without branch-likely forms (R3000), a test whose fallthrough block starts
+# with a load, which a MIPS I slot cannot take, runs that block's next
+# operation, the index shift, in its slot.
+function_body("${OUTPUT}.size_r3000.s" mips_inner_exit_test inner_exit_r3000)
+if(NOT inner_exit_r3000 MATCHES "[\t ]beq[\t ][^\n]*\n[\t ]+sll[\t ]")
+    message(FATAL_ERROR
+        "an R3000 test did not lend its fallthrough block's shift to its "
+        "slot\n${inner_exit_r3000}")
+endif()
