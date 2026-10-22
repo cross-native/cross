@@ -24,6 +24,9 @@ $::static_assert(sizeof(struct framed) == 10uptr && $::offsetof(struct framed, t
 
 static u8 bytes[40];
 global struct word global_word = {7u8, 0x11223344u32};
+// An object of a lowered type may follow a byte at any address.
+global u8 lead_byte = 1u8;
+global u32_any after_byte = 0x55667788u32;
 
 [[noinline]] static void store32(in u8 *p, in u32 v) { *(u32_any *)p = v; }
 [[noinline]] static u32 load32(in const u8 *p) { return *(const u32_any *)p; }
@@ -123,6 +126,8 @@ global i32 underaligned_typedef_entry() {
         return 10;
     global_word.value ^= 0xffu32;
     if (global_word.value != 0x112233bbu32 || global_word.tag != 7u8) return 11;
+    after_byte += 1u32;
+    if (after_byte != 0x55667789u32 || lead_byte != 1u8) return 14;
     u32_any local = 41u32;
     local += 1u32;
     if (local != 42u32) return 12;

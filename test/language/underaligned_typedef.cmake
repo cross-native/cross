@@ -28,6 +28,10 @@ global u32 get32(in const u8 *p) { return *(const u32_any *)p; }
 global void put64(in u8 *p, in u64 v) { *(u64_any *)p = v; }
 global u64 get64(in const u8 *p) { return *(const u64_any *)p; }
 global u32_any *member(in struct framed *f) { return &f->value; }
+global u8 lead;
+global u32_any word;
+global u32 getglobal() { return word; }
+global void putglobal(in u32 v) { word = v; }
 ]=])
 
 # Extract one function's assembly.
@@ -66,7 +70,7 @@ foreach(target mips-unknown-elf mipsel-unknown-elf "mips64-unknown-elf -mabi=n64
         message(FATAL_ERROR "${target}: unexpected diagnostics\n${diagnostics}")
     endif()
     file(READ "${OUTPUT}/${name}.s" assembly)
-    foreach(function put32 get32 put64 get64)
+    foreach(function put32 get32 put64 get64 getglobal putglobal)
         function_body("${assembly}" ${function} body)
         require_unaligned("${target} ${function}" "${body}")
     endforeach()

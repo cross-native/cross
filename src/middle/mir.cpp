@@ -2222,7 +2222,9 @@ private:
     }
 
     ValueId load_global(const hir::Object& object, SourceLocation location) {
-        if (object.fixed_address)
+        // A fixed address, or a type whose alignment a typedef lowers, is
+        // accessed through the object's address, which carries it.
+        if (object.fixed_address || pointee_alignment(object.type, 0) != 0)
             return *load_pointer(global_address(object, location), location);
         if (atomic_object_type(hir_, object.type)) {
             return atomic_operation(
@@ -2240,7 +2242,7 @@ private:
 
     ValueId store_global(const hir::Object& object, ValueId source,
                          SourceLocation location) {
-        if (object.fixed_address)
+        if (object.fixed_address || pointee_alignment(object.type, 0) != 0)
             return *store_pointer(global_address(object, location), source, location);
         if (atomic_object_type(hir_, object.type)) {
             const auto value_type = hir_.unqualified(object.type);
