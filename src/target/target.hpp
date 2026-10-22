@@ -616,6 +616,10 @@ struct IntegerConstantCostQuery {
 };
 
 enum class CostedIntegerOperation {
+    Add,
+    Subtract,
+    ShiftLeft,
+    Negate,
     // The low half of the product.
     Multiply,
     // The high half of the double-width product.
@@ -627,6 +631,8 @@ enum class CostedIntegerOperation {
 struct IntegerOperationCostQuery {
     unsigned bits{};
     bool is_signed{};
+    // An immediate selected by the target, when that form is enabled.
+    std::optional<std::uint64_t> immediate{};
 };
 
 // Bit operations on an unsigned operand, which MIR lowers to the target's

@@ -4188,6 +4188,77 @@ if(BUILD_TESTING)
             LABELS "check.runtime;arch.mips;backend.native;middle;feature.optimization;feature.model;isa.vr4300;endian.big;endian.little;opt.${multiplication_level}"
             SKIP_REGULAR_EXPRESSION "skipping MIPS")
     endforeach()
+    # Carried constant products and modular recurrence reassociation.
+    foreach(recurrence_mode O0 O2 O3 O2-v3 O3-v3 Os no-slsr no-reassoc fastmul slowshift slowmul slowadd slowsub)
+        set(recurrence_flags "-O2;-fwrapv;-fno-eval-calls")
+        set(recurrence_level O2)
+        if(recurrence_mode MATCHES "^(O0|O2|O3|Os)$")
+            set(recurrence_flags "-${recurrence_mode};-fwrapv;-fno-eval-calls")
+            set(recurrence_level ${recurrence_mode})
+        elseif(recurrence_mode MATCHES "^(O2|O3)-v3$")
+            set(recurrence_level ${CMAKE_MATCH_1})
+            set(recurrence_flags "-${recurrence_level};-fwrapv;-fno-eval-calls;-march=x86-64-v3")
+        elseif(recurrence_mode STREQUAL "no-slsr")
+            list(APPEND recurrence_flags -fno-tree-slsr)
+        elseif(recurrence_mode STREQUAL "no-reassoc")
+            list(APPEND recurrence_flags -fno-tree-reassoc)
+        elseif(recurrence_mode STREQUAL "fastmul")
+            list(APPEND recurrence_flags "--model=${multiplication_model}" -mtune=fastmul)
+        elseif(recurrence_mode MATCHES "^slow(shift|mul|add|sub)$")
+            list(APPEND recurrence_flags
+                "--model=${CMAKE_SOURCE_DIR}/test/middle/recurrence_costs.xm"
+                -mtune=${recurrence_mode})
+        endif()
+        add_test(NAME cross_runtime_constant_recurrences_${recurrence_mode}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/constant_recurrences.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-recurrences-${recurrence_mode}
+                -DENTRY=recurrence_entry -DEXPECTED=0
+                "-DCC_FLAGS=-target;x86_64-unknown-linux-gnu;${recurrence_flags}"
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_constant_recurrences_${recurrence_mode} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;middle;feature.optimization;feature.model;opt.${recurrence_level}")
+    endforeach()
+    foreach(recurrence_cpu vr4300 r3000)
+        foreach(recurrence_endian b l)
+            if(recurrence_endian STREQUAL "b")
+                set(recurrence_byte_order big)
+            else()
+                set(recurrence_byte_order little)
+            endif()
+            foreach(recurrence_level O2 O3)
+                set(recurrence_name ${recurrence_cpu}_${recurrence_endian}_${recurrence_level})
+                add_test(NAME cross_runtime_constant_recurrences_${recurrence_name}
+                    COMMAND "${CMAKE_COMMAND}"
+                        -DCC=$<TARGET_FILE:cross_cc>
+                        -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/constant_recurrences.x
+                        -DSTARTUP=${CMAKE_SOURCE_DIR}/test/middle/constant_recurrences_start.s
+                        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-recurrences-${recurrence_name}
+                        -DEXPECTED=P "-DCC_FLAGS=-${recurrence_level};-fwrapv;-fno-eval-calls"
+                        -DMIPS_CPUS=${recurrence_cpu} -DMIPS_ENDIANS=${recurrence_endian}
+                        -DMIPS_SINGLE_CASE=ON
+                        -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+                set_tests_properties(cross_runtime_constant_recurrences_${recurrence_name} PROPERTIES
+                    LABELS "check.runtime;arch.mips;backend.native;middle;feature.optimization;isa.${recurrence_cpu};endian.${recurrence_byte_order};opt.${recurrence_level}"
+                    SKIP_REGULAR_EXPRESSION "skipping MIPS")
+            endforeach()
+        endforeach()
+    endforeach()
+    foreach(recurrence_arch x86_64 mips)
+        add_test(NAME cross_constant_recurrences_codegen_${recurrence_arch}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/constant_recurrences.x
+                -DMODEL=${CMAKE_SOURCE_DIR}/test/middle/recurrence_costs.xm
+                -DFAST_MODEL=${multiplication_model}
+                -DARCH=${recurrence_arch}
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/recurrences-codegen-${recurrence_arch}
+                -P "${CMAKE_SOURCE_DIR}/test/middle/constant_recurrences.cmake")
+        set_tests_properties(cross_constant_recurrences_codegen_${recurrence_arch} PROPERTIES
+            LABELS "check.codegen;arch.${recurrence_arch};backend.native;middle;feature.optimization;feature.model")
+    endforeach()
     # Floating constant folding, constant-object reads, memory value
     # forwarding, conditional replacement, and shared store addresses.
     add_test(NAME cross_mir_folding_codegen

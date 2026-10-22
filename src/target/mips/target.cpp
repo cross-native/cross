@@ -198,6 +198,7 @@ std::vector<InstructionCostId> integer_operation_instructions(
     const Subtarget& subtarget, CostedIntegerOperation operation,
     const IntegerOperationCostQuery& query) {
     using mips::Instruction;
+    if (query.bits > 64) return {};
     const bool wide = query.bits == 64;
     // Release 6 computes each result in one instruction.
     const bool r6 = mips::release6(subtarget);
@@ -215,6 +216,16 @@ std::vector<InstructionCostId> integer_operation_instructions(
                 Instruction::Multu, Instruction::Mflo};
     }
     switch (operation) {
+    case CostedIntegerOperation::Add:
+        return {wide ? Instruction::Daddu : Instruction::Addu};
+    case CostedIntegerOperation::Subtract:
+    case CostedIntegerOperation::Negate:
+        return {wide ? Instruction::Dsubu : Instruction::Subu};
+    case CostedIntegerOperation::ShiftLeft:
+        if (!query.immediate) return {};
+        return {wide ? (*query.immediate >= 32 ? Instruction::Dsll32
+                                              : Instruction::Dsll)
+                     : Instruction::Sll};
     case CostedIntegerOperation::Multiply:
         if (query.bits > 64) return {};
         if (!wide && mips::selects_three_operand_multiply(subtarget)) {

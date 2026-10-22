@@ -11761,16 +11761,68 @@ std::optional<hir::TypeId> modular_multiply_type(const hir::Module& module,
     }
 }
 
+// Values that lie on a path from a header PHI to its backedge input.
+// Other PHIs end the walk; their next-iteration dependencies are not assumed.
+std::unordered_set<std::uint32_t> recurrence_path_values(
+    const ManagedFunction& function, const CanonicalLoop& loop, ValueId phi,
+    ValueId update, const UseLists& uses) {
+    std::unordered_map<std::uint32_t, bool> dependent;
+    std::unordered_set<std::uint32_t> path;
+    const auto visit = [&](const auto& self, ValueId id,
+                           unsigned depth) -> bool {
+        if (id == phi) {
+            path.insert(id.value);
+            return true;
+        }
+        if (const auto found = dependent.find(id.value);
+            found != dependent.end()) return found->second;
+        const auto definition = uses.definition_block(id);
+        if (depth >= 64 || !definition ||
+            !loop.blocks.contains(definition->value)) return false;
+        const auto& value = function.values[id.value];
+        if (value.kind == ValueKind::Phi) return false;
+        dependent[id.value] = false;
+        bool carried = false;
+        for (const auto operand : value.operands) {
+            carried = self(self, operand, depth + 1U) || carried;
+        }
+        dependent[id.value] = carried;
+        if (carried) path.insert(id.value);
+        return carried;
+    };
+    (void)visit(visit, update, 0);
+    return path;
+}
+
 bool reduce_constant_multiplications(ManagedFunction& function,
                                      const hir::Module& hir_module,
                                      const Subtarget& subtarget,
-                                     const CompilerOptions& options) {
+                                     const CompilerOptions& options,
+                                     std::span<const CanonicalLoop> loops,
+                                     const UseLists& uses) {
     const auto balance = std::min(options.risc_cisc_balance, 100U);
     const auto risc_weight = 100U - balance;
     const bool speed = options.optimize_for == OptimizationGoal::Speed;
     const unsigned risc_budget = speed ? 5U : 2U;
     const auto operation_budget = risc_budget * risc_weight / 100U;
-    if (operation_budget == 0) return false;
+    std::unordered_set<std::uint32_t> carried;
+    if (speed) {
+        for (const auto& loop : loops) {
+            for (const auto phi_id : function.blocks[loop.header.value].values) {
+                const auto& phi = function.values[phi_id.value];
+                if (phi.kind != ValueKind::Phi) continue;
+                for (const auto& incoming : phi.incoming) {
+                    if (!loop.blocks.contains(incoming.predecessor.value)) {
+                        continue;
+                    }
+                    const auto path = recurrence_path_values(
+                        function, loop, phi_id, incoming.value, uses);
+                    carried.insert(path.begin(), path.end());
+                }
+            }
+        }
+    }
+    if (operation_budget == 0 && carried.empty()) return false;
 
     struct Digit {
         unsigned shift{};
@@ -11799,7 +11851,8 @@ bool reduce_constant_multiplications(ManagedFunction& function,
                         source.operands.size() == 2
                     ? modular_multiply_type(hir_module, source.type)
                     : std::nullopt;
-            if (!domain) {
+            if (!domain || (operation_budget == 0 &&
+                            !carried.contains(id.value))) {
                 rewritten.push_back(id);
                 continue;
             }
@@ -11879,19 +11932,62 @@ bool reduce_constant_multiplications(ManagedFunction& function,
             for (const auto digit : digits) {
                 if (digit.shift != 0) ++cost;
             }
-            if (cost == 0 || cost > operation_budget) {
-                rewritten.push_back(id);
-                continue;
-            }
-            // For speed, each shift and addition counts one cycle against
-            // the -mtune latency of the multiply it replaces.
-            if (speed) {
+            bool latency_choice = false;
+            if (speed && carried.contains(id.value)) {
+                const IntegerOperationCostQuery query{bits, false};
+                auto latency = std::optional<unsigned>{0};
+                for (std::size_t index = 0; index < digits.size(); ++index) {
+                    const auto digit = digits[index];
+                    auto term = digit.shift == 0
+                        ? std::optional<unsigned>{0}
+                        : subtarget.integer_operation_cost(
+                              CostedIntegerOperation::ShiftLeft,
+                              {bits, false, digit.shift});
+                    if (!term || !latency) {
+                        latency.reset();
+                        break;
+                    }
+                    if (index == 0) {
+                        latency = *term;
+                        if (negated) {
+                            const auto negate = subtarget.integer_operation_cost(
+                                CostedIntegerOperation::Negate, query);
+                            if (!negate) latency.reset();
+                            else *latency += *negate;
+                        }
+                    } else {
+                        const auto combine = subtarget.integer_operation_cost(
+                            digit.subtract ? CostedIntegerOperation::Subtract
+                                           : CostedIntegerOperation::Add,
+                            query);
+                        if (!combine) latency.reset();
+                        else *latency = std::max(*latency, *term) + *combine;
+                    }
+                }
                 const auto multiply = subtarget.integer_operation_cost(
                     CostedIntegerOperation::Multiply,
-                    {bits, !unsigned_integer_type(hir_module, source.type)});
-                if (multiply && cost >= *multiply) {
+                    {bits, !unsigned_integer_type(hir_module, source.type),
+                     options.peephole2 ? std::optional{multiplier}
+                                       : std::nullopt});
+                latency_choice = latency && multiply && *latency < *multiply;
+                if (latency && multiply && !latency_choice) {
                     rewritten.push_back(id);
                     continue;
+                }
+            }
+            if (!latency_choice) {
+                if (cost == 0 || cost > operation_budget) {
+                    rewritten.push_back(id);
+                    continue;
+                }
+                if (speed) {
+                    const auto multiply = subtarget.integer_operation_cost(
+                        CostedIntegerOperation::Multiply,
+                        {bits, !unsigned_integer_type(hir_module, source.type)});
+                    if (multiply && cost >= *multiply) {
+                        rewritten.push_back(id);
+                        continue;
+                    }
                 }
             }
 
@@ -18423,6 +18519,236 @@ bool rebalance_unsigned_add_recurrences(
     return !candidates.empty();
 }
 
+// Balance modular sums by their distance from the carried PHI. Independent
+// terms combine first; shorter carried paths then meet the longer paths.
+bool rebalance_recurrence_expressions(
+    ManagedFunction& function, const hir::Module& hir_module,
+    const Subtarget& subtarget, const CompilerOptions& options,
+    std::span<const CanonicalLoop> loops) {
+    // This is the existing recurrence pressure blend at native width:
+    // dependency benefit (1, 3) must exceed live-range cost (3, 1).
+    const auto balance = std::min(options.risc_cisc_balance, 100U);
+    if ((100U - balance) + 3U * balance <=
+        3U * (100U - balance) + balance) return false;
+    bool changed = false;
+    for (const auto& loop : loops) {
+        const auto header_values = function.blocks[loop.header.value].values;
+        for (const auto phi_id : header_values) {
+            const auto phi = function.values[phi_id.value];
+            const auto domain = modular_multiply_type(hir_module, phi.type);
+            const auto bits = type_bits(hir_module, phi.type);
+            if (phi.kind != ValueKind::Phi || !domain ||
+                (!unsigned_integer_type(hir_module, phi.type) && !options.wrapv) ||
+                bits > subtarget.integer_register_bits()) continue;
+            for (std::size_t edge = 0; edge < phi.incoming.size(); ++edge) {
+                const auto incoming = phi.incoming[edge];
+                if (!loop.blocks.contains(incoming.predecessor.value)) continue;
+                const UseLists initial_uses(function);
+                const auto initial_path = recurrence_path_values(
+                    function, loop, phi_id, incoming.value, initial_uses);
+                std::vector<ValueId> roots;
+                for (const auto& block : function.blocks) {
+                    if (loop.blocks.contains(block.id.value)) {
+                        for (const auto id : block.values) {
+                            if (initial_path.contains(id.value)) roots.push_back(id);
+                        }
+                    }
+                }
+                for (const auto root : roots) {
+                    const auto source = function.values[root.value];
+                    if (source.kind != ValueKind::Binary ||
+                        (source.binary != BinaryOperation::Add &&
+                         source.binary != BinaryOperation::Subtract) ||
+                        type_bits(hir_module, source.type) != bits ||
+                        (!unsigned_integer_type(hir_module, source.type) &&
+                         !options.wrapv)) continue;
+                    const UseLists uses(function);
+                    const auto root_block = *uses.definition_block(root);
+                    const auto path = recurrence_path_values(
+                        function, loop, phi_id, incoming.value, uses);
+                    if (!path.contains(root.value)) continue;
+                    std::unordered_map<std::uint32_t, std::optional<unsigned>> memo;
+                    const auto latency = [&](const auto& self, ValueId id)
+                        -> std::optional<unsigned> {
+                        if (id == phi_id || !path.contains(id.value)) return 0;
+                        if (const auto found = memo.find(id.value);
+                            found != memo.end()) return found->second;
+                        const auto& value = function.values[id.value];
+                        if (type_bits(hir_module, value.type) != bits) {
+                            return memo[id.value] = std::nullopt;
+                        }
+                        unsigned longest = 0;
+                        for (const auto operand : value.operands) {
+                            const auto cost = self(self, operand);
+                            if (!cost) return memo[id.value] = std::nullopt;
+                            longest = std::max(longest, *cost);
+                        }
+                        if (value.kind == ValueKind::Cast &&
+                            value.cast == CastOperation::Reinterpret) {
+                            return memo[id.value] = longest;
+                        }
+                        std::optional<CostedIntegerOperation> operation;
+                        IntegerOperationCostQuery query{bits, false};
+                        if (value.kind == ValueKind::Binary) {
+                            switch (value.binary) {
+                            case BinaryOperation::Add:
+                                operation = CostedIntegerOperation::Add;
+                                break;
+                            case BinaryOperation::Subtract:
+                                operation = CostedIntegerOperation::Subtract;
+                                break;
+                            case BinaryOperation::Multiply:
+                                operation = CostedIntegerOperation::Multiply;
+                                query.is_signed = !unsigned_integer_type(
+                                    hir_module, value.type);
+                                if (options.peephole2) {
+                                    for (const auto operand : value.operands) {
+                                        const auto constant = folded_integer_constant(
+                                            function, hir_module, operand);
+                                        if (constant) query.immediate = constant->low;
+                                    }
+                                }
+                                break;
+                            case BinaryOperation::ShiftLeft: {
+                                operation = CostedIntegerOperation::ShiftLeft;
+                                const auto amount = folded_integer_constant(
+                                    function, hir_module, value.operands[1]);
+                                if (amount) query.immediate = amount->low % bits;
+                                break;
+                            }
+                            default: break;
+                            }
+                        }
+                        if (value.kind == ValueKind::Unary &&
+                            value.unary == UnaryOperation::Negate) {
+                            operation = CostedIntegerOperation::Negate;
+                        }
+                        if (!operation) return memo[id.value] = std::nullopt;
+                        const auto cost = subtarget.integer_operation_cost(
+                            *operation, query);
+                        return memo[id.value] = cost
+                            ? std::optional{longest + *cost} : std::nullopt;
+                    };
+                    const auto original_latency = latency(latency, root);
+                    if (!original_latency) continue;
+                    struct Node {
+                        ValueId value;
+                        bool subtract{};
+                        bool carried{};
+                        unsigned latency{};
+                        std::optional<std::pair<std::size_t, std::size_t>> children;
+                    };
+                    std::vector<Node> nodes;
+                    const auto flatten = [&](const auto& self, ValueId id,
+                                             bool subtract, unsigned depth) -> void {
+                        const auto& value = function.values[id.value];
+                        const bool local = uses.definition_block(id) ==
+                                root_block &&
+                            (id == root || uses.uses(id).size() == 1) &&
+                            !is_effectful_value(value) &&
+                            type_bits(hir_module, value.type) == bits &&
+                            (unsigned_integer_type(hir_module, value.type) ||
+                             (options.wrapv && modular_multiply_type(
+                                 hir_module, value.type)));
+                        if (depth < 64 && local && value.kind == ValueKind::Cast &&
+                            value.cast == CastOperation::Reinterpret) {
+                            self(self, value.operands.front(), subtract, depth + 1U);
+                        } else if (depth < 64 && local && value.kind == ValueKind::Binary &&
+                                   (value.binary == BinaryOperation::Add ||
+                                    value.binary == BinaryOperation::Subtract)) {
+                            self(self, value.operands[0], subtract, depth + 1U);
+                            self(self, value.operands[1], subtract !=
+                                 (value.binary == BinaryOperation::Subtract), depth + 1U);
+                        } else {
+                            nodes.push_back({id, subtract, path.contains(id.value),
+                                             *latency(latency, id), std::nullopt});
+                        }
+                    };
+                    flatten(flatten, root, false, 0);
+                    if (nodes.size() < 3) continue;
+                    std::vector<std::size_t> layer;
+                    for (std::size_t i = 0; i < nodes.size(); ++i) layer.push_back(i);
+                    bool valid = true;
+                    while (layer.size() > 1) {
+                        std::stable_sort(layer.begin(), layer.end(),
+                            [&](std::size_t a, std::size_t b) {
+                                return std::pair{nodes[a].carried, nodes[a].latency} <
+                                       std::pair{nodes[b].carried, nodes[b].latency};
+                            });
+                        auto a = layer[0];
+                        auto b = layer[1];
+                        const bool subtract = nodes[a].subtract == nodes[b].subtract
+                            ? nodes[a].subtract : false;
+                        const bool difference = nodes[a].subtract != nodes[b].subtract;
+                        if (difference && nodes[a].subtract) std::swap(a, b);
+                        const auto cost = subtarget.integer_operation_cost(
+                            difference ? CostedIntegerOperation::Subtract
+                                       : CostedIntegerOperation::Add,
+                            {bits, false});
+                        if (!cost) { valid = false; break; }
+                        const bool carried = nodes[a].carried || nodes[b].carried;
+                        nodes.push_back({{}, subtract, carried,
+                            carried ? std::max(nodes[a].latency, nodes[b].latency) +
+                                          *cost : 0U,
+                            std::pair{a, b}});
+                        layer.erase(layer.begin(), layer.begin() + 2);
+                        layer.push_back(nodes.size() - 1U);
+                    }
+                    if (!valid || nodes.back().subtract ||
+                        nodes.back().latency >= *original_latency) continue;
+                    std::vector<ValueId> added;
+                    const auto append = [&](ManagedValue value) {
+                        value.id = {static_cast<std::uint32_t>(function.values.size())};
+                        value.type = *domain;
+                        value.location = source.location;
+                        value.inline_site = source.inline_site;
+                        function.values.push_back(std::move(value));
+                        const auto id = function.values.back().id;
+                        added.push_back(id);
+                        return id;
+                    };
+                    for (auto& node : nodes) {
+                        if (!node.children) {
+                            if (function.values[node.value.value].type == *domain) continue;
+                            ManagedValue cast;
+                            cast.kind = ValueKind::Cast;
+                            cast.cast = CastOperation::Reinterpret;
+                            cast.operands = {node.value};
+                            node.value = append(std::move(cast));
+                        } else {
+                            const auto [a, b] = *node.children;
+                            ManagedValue sum;
+                            sum.kind = ValueKind::Binary;
+                            sum.binary = nodes[a].subtract != nodes[b].subtract
+                                ? BinaryOperation::Subtract : BinaryOperation::Add;
+                            sum.operands = {nodes[a].value, nodes[b].value};
+                            if (&node == &nodes.back() && source.type == *domain) {
+                                auto& replacement = function.values[root.value];
+                                replacement.binary = sum.binary;
+                                replacement.operands = std::move(sum.operands);
+                                node.value = root;
+                            } else {
+                                node.value = append(std::move(sum));
+                            }
+                        }
+                    }
+                    if (source.type != *domain) {
+                        auto& replacement = function.values[root.value];
+                        replacement.kind = ValueKind::Cast;
+                        replacement.cast = CastOperation::Reinterpret;
+                        replacement.operands = {nodes.back().value};
+                    }
+                    auto& values = function.blocks[root_block.value].values;
+                    const auto position = std::find(values.begin(), values.end(), root);
+                    values.insert(position, added.begin(), added.end());
+                    changed = true;
+                }
+            }
+        }
+    }
+    return changed;
+}
+
 // An access indexes by the induction or its extension to address width.
 // A sign extension also needs the caller's nonnegative-induction proof.
 bool is_vector_address_index(const ManagedFunction& function,
@@ -22737,9 +23063,21 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
     if (options.tree_slsr) {
         pipeline.add(
             PassId::StraightLineStrengthReduction,
-            [&](ManagedFunction& function, FunctionAnalysisManager&) {
+            [&](ManagedFunction& function, FunctionAnalysisManager& analyses) {
                 return reduce_constant_multiplications(
-                           function, hir_module, subtarget, options)
+                           function, hir_module, subtarget, options,
+                           analyses.loops().canonical_loops(), analyses.uses())
+                    ? PassResult::changed_values()
+                    : PassResult::unchanged();
+            });
+    }
+    if (options.tree_reassoc) {
+        pipeline.add(
+            PassId::RecurrenceRebalancing,
+            [&](ManagedFunction& function, FunctionAnalysisManager& analyses) {
+                return rebalance_recurrence_expressions(
+                           function, hir_module, subtarget, options,
+                           analyses.loops().canonical_loops())
                     ? PassResult::changed_values()
                     : PassResult::unchanged();
             });

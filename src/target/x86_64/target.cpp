@@ -84,8 +84,25 @@ std::vector<InstructionCostId> integer_operation_instructions(
     using x86_64::Instruction;
     const bool wide = query.bits == 64;
     switch (operation) {
+    case CostedIntegerOperation::Add:
+        if (query.bits != 32 && !wide) return {};
+        return {wide ? Instruction::Addq : Instruction::Addl};
+    case CostedIntegerOperation::Subtract:
+        if (query.bits != 32 && !wide) return {};
+        return {wide ? Instruction::Subq : Instruction::Subl};
+    case CostedIntegerOperation::ShiftLeft:
+        if ((query.bits != 32 && !wide) || !query.immediate) return {};
+        return {wide ? Instruction::Shlq : Instruction::Shll};
+    case CostedIntegerOperation::Negate:
+        if (query.bits != 32 && !wide) return {};
+        return {wide ? Instruction::Negq : Instruction::Negl};
     case CostedIntegerOperation::Multiply:
         if (query.bits > 64) return {};
+        if (query.immediate && (query.bits == 32 || wide) &&
+            (*query.immediate == 3 || *query.immediate == 5 ||
+             *query.immediate == 9)) {
+            return {wide ? Instruction::Leaq : Instruction::Leal};
+        }
         return {wide ? Instruction::Imulq
                 : query.bits == 16 ? Instruction::Imulw
                                    : Instruction::Imull};
