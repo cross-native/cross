@@ -118,6 +118,11 @@ int main() {
     channel.result_location = "*r9";
     module.functions.push_back(std::move(channel));
 
+    auto discarded = function(6, i32_id);
+    discarded.result_location = "eax";
+    discarded.ownership = hir::BodyOwnership::Discarded;
+    module.functions.push_back(std::move(discarded));
+
     // The pointed-to type of an indirect call is planned like a function,
     // including its own cleanup rule and extra clobbers.
     hir::FunctionSignature pointer_signature;
@@ -160,7 +165,7 @@ int main() {
     if (diagnostics.errors() != 0) {
         return fail("unexpected planner diagnostic", diagnostic_text);
     }
-    if (plans.entries().size() != 7) {
+    if (plans.entries().size() != 7 || plans.find(hir::FunctionId{6})) {
         return fail("unexpected number of manual plans", diagnostic_text);
     }
 

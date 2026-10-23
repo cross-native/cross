@@ -476,7 +476,8 @@ public:
     ManualAbiPlans run(const mir::ManagedModule* managed) {
         std::vector<ManualAbiPlan> entries;
         for (const auto& function : module_.functions) {
-            if (!is_manual(function.parameters, function.result_location)) {
+            if (function.ownership == hir::BodyOwnership::Discarded ||
+                !is_manual(function.parameters, function.result_location)) {
                 continue;
             }
             entries.push_back(plan_function(function));

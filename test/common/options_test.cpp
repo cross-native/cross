@@ -192,6 +192,29 @@ int main() {
                 "direct optimization controls are gated by O0") &&
          ok;
 
+    for (const auto* level : {"-O0", "-Og", "-O1", "-O2", "-O3", "-Os", "-Oz"}) {
+        const auto preset = parse({"cc", level});
+        const bool enabled = std::string(level) != "-O0" && std::string(level) != "-Og";
+        const auto before = parse({"cc", "-fno-inline-functions-called-once", level});
+        const auto after = parse({"cc", level, "-fno-inline-functions-called-once"});
+        const auto forced = parse({"cc", "-finline-functions-called-once", level});
+        const auto ordinary_off = parse({"cc", "-fno-inline-functions", level});
+        const auto all_off = parse({"cc", "-fno-inline", level});
+        ok = expect(preset && before && after && forced && ordinary_off && all_off &&
+                        preset->inline_functions_called_once == enabled &&
+                        !before->inline_functions_called_once &&
+                        !after->inline_functions_called_once &&
+                        forced->inline_functions_called_once &&
+                        !ordinary_off->inline_functions &&
+                        ordinary_off->inline_functions_called_once == enabled &&
+                        !all_off->inline_functions && !all_off->inline_functions_called_once,
+                    "called-once presets or independent overrides failed") && ok;
+    }
+
+    const auto inline_alias = parse({"cc", "-finline", "-O0"});
+    ok = expect(inline_alias && inline_alias->inline_functions,
+                "-finline no longer enables ordinary inlining") && ok;
+
     const auto mips_policy = parse(
         {"cc", "-O2", "-mprofile=vr4300-o32"});
     const auto mips1_policy = parse(

@@ -148,8 +148,9 @@ Properties of `optimization` and `profile` entries whose names begin with
 `cc --print-options=all` lists ([invoke.md](invoke.md),
 [targets.md](targets.md)): `f.tree-ccp = true` means `-ftree-ccp`,
 `m.red-zone = false` means `-mno-red-zone`, and `w.all = true` means
-`-Wall`. Models use canonical option names, not aliases such as `f.inline`
-for `f.inline-functions`. Presets cannot set warnings.
+`-Wall`. Models use canonical option names. `f.inline` gates discretionary inlining;
+`f.inline-functions` and `f.inline-functions-called-once` independently
+select the small-callee and single-call rules. Presets cannot set warnings.
 
 A value must suit its option: `true` or `false` for an on/off option, an
 integer in the option's range, or one of the option's text values. An

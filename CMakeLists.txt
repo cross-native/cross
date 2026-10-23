@@ -4382,6 +4382,56 @@ if(BUILD_TESTING)
                 SKIP_REGULAR_EXPRESSION "skipping MIPS")
         endforeach()
     endforeach()
+    foreach(arch x86_64 mips)
+        add_test(NAME cross_inline_once_codegen_${arch}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/inline_once.x
+                -DTARGET=${arch}
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/inline-once-${arch}
+                -P "${CMAKE_SOURCE_DIR}/test/middle/inline_once.cmake")
+        set_tests_properties(cross_inline_once_codegen_${arch} PROPERTIES
+            LABELS "check.compile;arch.${arch};middle;backend.native;feature.optimization;feature.calls")
+    endforeach()
+    foreach(mode O1 O2 O3 Oz disabled independent)
+        if(mode STREQUAL "disabled")
+            set(once_flags "-O2;-fno-inline-functions-called-once")
+        elseif(mode STREQUAL "independent")
+            set(once_flags "-O2;-fno-inline-functions")
+        else()
+            set(once_flags "-${mode}")
+        endif()
+        list(APPEND once_flags -finline-limit=0 -fno-eval-calls)
+        add_test(NAME cross_inline_once_runtime_x86_64_${mode}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc> -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/inline_once.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/inline-once-runtime-x86_64-${mode}
+                -DENTRY=test_entry -DEXPECTED=0 "-DCC_FLAGS=${once_flags}"
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_inline_once_runtime_x86_64_${mode} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;middle;backend.native;feature.optimization;feature.calls;opt.${mode}")
+        foreach(endian b l)
+            if(endian STREQUAL b)
+                set(endian_label big)
+            else()
+                set(endian_label little)
+            endif()
+            add_test(NAME cross_inline_once_runtime_mips_${endian}_${mode}
+                COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/inline_once.x
+                    -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/inline-once-runtime-mips-${endian}-${mode}
+                    -DMIPS_CPUS=vr4300 -DMIPS_ENDIANS=${endian} -DMIPS_SINGLE_CASE=ON
+                    -DEXPECTED=P "-DCC_FLAGS=${once_flags}"
+                    -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+            set_tests_properties(cross_inline_once_runtime_mips_${endian}_${mode} PROPERTIES
+                LABELS "check.runtime;arch.mips;middle;backend.native;feature.optimization;feature.calls;profile.o32;isa.vr4300;endian.${endian_label};opt.${mode}"
+                SKIP_REGULAR_EXPRESSION "skipping MIPS")
+        endforeach()
+    endforeach()
     add_test(NAME cross_call_cloning
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

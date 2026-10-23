@@ -604,7 +604,13 @@ std::span<const OptionDefinition> common_option_definitions() {
         {"f.peephole2", {}, OptionValueKind::Boolean, false, {}, 0, 0,
          OptionCategory::Optimization, true, OptionImplementation::Partial,
          "apply verified target machine peepholes"},
-        {"f.inline-functions", {"f.inline"}, OptionValueKind::Boolean, false,
+        {"f.inline", {}, OptionValueKind::Boolean, true,
+         {}, 0, 0, OptionCategory::Optimization, true,
+         OptionImplementation::Implemented, "permit discretionary inlining"},
+        {"f.inline-functions-called-once", {}, OptionValueKind::Boolean, false,
+         {}, 0, 0, OptionCategory::Optimization, true,
+         OptionImplementation::Implemented, "inline removable single-call functions"},
+        {"f.inline-functions", {}, OptionValueKind::Boolean, false,
          {}, 0, 0, OptionCategory::Optimization, true,
          OptionImplementation::Implemented, "managed-function inlining"},
         {"f.inline-limit", {}, OptionValueKind::Unsigned, std::uint64_t{96},
@@ -886,6 +892,14 @@ bool resolve_registered_options(
                                     OptionOrigin origin,
                                     bool allow_alias) {
         apply(assignment, origin, allow_alias, false);
+        if (assignment.name == "f.inline") {
+            const auto found = options.resolved_options.find("f.inline");
+            if (found != options.resolved_options.end() &&
+                std::get_if<bool>(&found->second.value) &&
+                std::get<bool>(found->second.value))
+                apply({"f.inline-functions", true, assignment.source},
+                      origin, false, false);
+        }
         if (assignment.name != "f.fast-math") return;
         const auto found = options.resolved_options.find("f.fast-math");
         if (found == options.resolved_options.end()) return;
@@ -1053,7 +1067,11 @@ bool resolve_registered_options(
         resolved_bool(options, "f.cprop-registers");
     options.peephole2 = resolved_bool(options, "f.peephole2");
     options.inline_functions =
+        resolved_bool(options, "f.inline") &&
         resolved_bool(options, "f.inline-functions");
+    options.inline_functions_called_once =
+        resolved_bool(options, "f.inline") &&
+        resolved_bool(options, "f.inline-functions-called-once");
     options.inline_unit_limit = static_cast<unsigned>(
         resolved_unsigned(options, "f.inline-limit", 96));
     options.omit_frame_pointer =

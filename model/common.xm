@@ -54,6 +54,7 @@ optimization "O0" {
     f.cprop-registers = false;
     f.peephole2 = false;
     f.inline-functions = false;
+    f.inline-functions-called-once = false;
     f.inline-limit = 96;
     f.omit-frame-pointer = false;
     f.elide-noreturn-saves = false;
@@ -86,6 +87,7 @@ optimization "O1" {
     f.tree-dce = true;
     f.tree-dse = true;
     f.inline-functions = true;
+    f.inline-functions-called-once = true;
     f.inline-limit = 32;
     f.omit-frame-pointer = true;
     f.elide-noreturn-saves = true;

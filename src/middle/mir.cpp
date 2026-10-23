@@ -9870,6 +9870,153 @@ void inline_managed_calls(ManagedModule& module,
     }
 }
 
+struct InlineSize {
+    std::uint64_t operations{};
+    std::uint64_t stack{};
+};
+
+InlineSize inline_size(const ManagedFunction& function,
+                       const hir::Module& hir_module, const TargetInfo& target) {
+    InlineSize size{inline_cost(function)};
+    for (const auto& slot : function.slots) {
+        const auto alignment = std::max<std::uint64_t>(
+            slot.minimum_alignment, storage_alignment(hir_module, slot.type, target));
+        size.stack = (size.stack + alignment - 1) / alignment * alignment;
+        size.stack += storage_size(hir_module, slot.type, target);
+    }
+    return size;
+}
+
+// GCC's caller_growth_limits: size grows from the largest original body,
+// including the callee; stack grows from the original caller frame chain.
+// MIR slots conservatively include scalar cells and sibling inline frames.
+bool inline_once_growth(const ManagedFunction& caller, const ManagedValue& call,
+                        const InlineSize& callee, hir::FunctionId callee_id,
+                        const std::vector<InlineSize>& original,
+                        const hir::Module& hir_module, const TargetInfo& target) {
+    auto largest = original[caller.source.value];
+    for (auto site = call.inline_site; site; site = caller.inline_sites[site->value].parent) {
+        const auto& frame = original[caller.inline_sites[site->value].callee.value];
+        largest.operations = std::max(largest.operations, frame.operations);
+        largest.stack = std::max(largest.stack, frame.stack);
+    }
+    largest.operations = std::max(largest.operations, original[callee_id.value].operations);
+    const auto current = inline_size(caller, hir_module, target);
+    const auto operations = current.operations + callee.operations - 1;
+    if (operations >= callee.operations && operations > 2700 &&
+        operations > largest.operations * 2) return false;
+    const auto stack = current.stack + callee.stack;
+    return !callee.stack || stack <= 256 || stack <= largest.stack * 11 ||
+           stack <= current.stack;
+}
+
+void inline_single_call_functions(ManagedModule& module, hir::Module& hir_module,
+                                  const data::Module& data_module,
+                                  const TargetInfo& target,
+                                  const std::vector<InlineSize>& original) {
+    // Remove obsolete ordinary-inline copies before counting sites. Repeat
+    // after every substitution: copying a body also copies its outgoing calls.
+    for (;;) {
+        discard_unreferenced_functions(module, hir_module, data_module);
+        std::vector<unsigned> calls(hir_module.functions.size());
+        std::vector<bool> kept(hir_module.functions.size());
+        std::vector<std::vector<hir::FunctionId>> edges(hir_module.functions.size());
+        std::unordered_set<std::string_view> aliases;
+        for (const auto& function : hir_module.functions) {
+            if (function.alias_target) aliases.insert(*function.alias_target);
+            if (function.weakref_target) aliases.insert(*function.weakref_target);
+        }
+        for (const auto& object : hir_module.objects) {
+            if (object.alias_target) aliases.insert(*object.alias_target);
+            if (object.weakref_target) aliases.insert(*object.weakref_target);
+        }
+        const auto keep_address = [&](const data::AddressConstant& address) {
+            if (address.function) kept[address.function->value] = true;
+            if (address.label) kept[hir_module.labels[address.label->value].owner.value] = true;
+        };
+        for (const auto& object : data_module.objects) {
+            if (object.address) keep_address(*object.address);
+            for (const auto& relocation : object.relocations) keep_address(relocation.address);
+        }
+        for (const auto& label : hir_module.labels)
+            if (label.is_global) kept[label.owner.value] = true;
+        for (const auto& function : module.functions) {
+            const auto& entity = hir_module.function(function.source);
+            kept[function.source.value] = kept[function.source.value] ||
+                entity.linkage == Linkage::Global || entity.used || entity.retain ||
+                entity.weak || entity.fixed_address || aliases.contains(entity.link_symbol);
+            for (const auto& block : function.blocks) {
+                for (const auto id : block.values) {
+                    const auto& value = function.values[id.value];
+                    if (value.callee) {
+                        if (value.kind == ValueKind::Call) {
+                            ++calls[value.callee->value];
+                            edges[function.source.value].push_back(*value.callee);
+                        } else {
+                            kept[value.callee->value] = true;
+                        }
+                    }
+                    if (value.label) kept[hir_module.labels[value.label->value].owner.value] = true;
+                    if (value.patch_sink) kept[function.source.value] = true;
+                    if (value.patch_initial_address) keep_address(*value.patch_initial_address);
+                }
+            }
+        }
+        const auto recursive = [&](hir::FunctionId start) {
+            std::vector<bool> seen(edges.size());
+            std::vector<hir::FunctionId> pending{start};
+            while (!pending.empty()) {
+                const auto id = pending.back();
+                pending.pop_back();
+                if (seen[id.value]) continue;
+                seen[id.value] = true;
+                for (const auto next : edges[id.value]) {
+                    if (next == start) return true;
+                    pending.push_back(next);
+                }
+            }
+            return false;
+        };
+        bool changed = false;
+        for (auto& caller : module.functions) {
+            if (hir_module.function(caller.source).naked) continue;
+            for (const auto& block : caller.blocks) {
+                for (std::size_t position = 0; position < block.values.size(); ++position) {
+                    const auto& call = caller.values[block.values[position].value];
+                    if (call.kind != ValueKind::Call || !call.callee || call.must_tail ||
+                        calls[call.callee->value] != 1 || kept[call.callee->value]) continue;
+                    const auto& entity = hir_module.function(*call.callee);
+                    const auto* callee = module.find(*call.callee);
+                    if (!callee || has_function_attribute(entity, "noinline") ||
+                        inline_blocker(*callee, entity, hir_module, false, false) ||
+                        allocates_dynamic_stack(*callee) || recursive(*call.callee)) continue;
+                    bool in_frame = caller.source == *call.callee;
+                    for (auto site = call.inline_site; site; site = caller.inline_sites[site->value].parent)
+                        in_frame |= caller.inline_sites[site->value].callee == *call.callee;
+                    if (in_frame || !inline_once_growth(caller, call,
+                            inline_size(*callee, hir_module, target), *call.callee,
+                            original, hir_module, target)) continue;
+                    std::vector<BlockId> layout;
+                    for (const auto& current : caller.blocks) layout.push_back(current.id);
+                    const auto site = block.id;
+                    const auto added = inline_call(caller, site, position, *callee, hir_module);
+                    layout.insert(std::find(layout.begin(), layout.end(), site) + 1,
+                                  added.begin(), added.end());
+                    reorder_blocks(caller, layout);
+                    prune_unreachable_blocks(caller);
+                    compact_effects(caller);
+                    compact_managed_values(caller);
+                    changed = true;
+                    break;
+                }
+                if (changed) break;
+            }
+            if (changed) break;
+        }
+        if (!changed) break;
+    }
+}
+
 // A floating operation that may raise a trapped exception stays even when
 // its result is unused.
 void eliminate_dead_values(ManagedFunction& function,
@@ -22756,7 +22903,18 @@ bool promote_native_induction_views(ManagedModule& module,
 void optimize(ManagedModule& module, hir::Module& hir_module,
               const Subtarget& subtarget, const CompilerOptions& options,
               Diagnostics& diagnostics, const data::Module* data_module) {
+    std::vector<InlineSize> original;
+    if (options.inline_functions_called_once && data_module) {
+        original.resize(hir_module.functions.size());
+        for (const auto& function : module.functions)
+            original[function.source.value] = inline_size(function, hir_module, subtarget.target());
+    }
     inline_managed_calls(module, hir_module, options, diagnostics);
+    // Specialization cleanup has no complete data-reference graph and must
+    // leave the function set intact until its ABI plans have been rebuilt.
+    if (options.inline_functions_called_once && data_module)
+        inline_single_call_functions(module, hir_module, *data_module,
+                                     subtarget.target(), original);
 
     // Scalar cells are a source-language ownership device, not a mandate for
     // machine stack traffic. Promote eligible cells before the remaining SSA

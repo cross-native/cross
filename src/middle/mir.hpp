@@ -359,8 +359,8 @@ ManagedModule lower_managed(hir::Module& hir_module,
                             Diagnostics& diagnostics);
 bool verify(const ManagedModule& module, const hir::Module& hir_module,
             Diagnostics& diagnostics);
-// `data_module`, when given, supplies the initial values of const objects
-// whose reads may fold.
+// `data_module` supplies const initializers and the complete data-reference
+// graph for called-once inlining. Without it, cleanup keeps the function set.
 void optimize(ManagedModule& module, hir::Module& hir_module,
               const Subtarget& subtarget, const CompilerOptions& options,
               Diagnostics& diagnostics,

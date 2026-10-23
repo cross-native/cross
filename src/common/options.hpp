@@ -251,6 +251,7 @@ struct CompilerOptions {
     bool cprop_registers{};
     bool peephole2{};
     bool inline_functions{};
+    bool inline_functions_called_once{};
     bool ipa_ra{};
     bool ipa_pure_const{};
     bool ipa_reference_addressable{};

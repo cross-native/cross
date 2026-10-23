@@ -43,7 +43,7 @@ endfunction()
 
 compile_ir(O2 -O2)
 compile_ir(no-inline -O0 -fno-inline)
-compile_ir(O2-no-inline -O2 -fno-inline-functions)
+compile_ir(O2-no-inline -O2 -fno-inline-functions -fno-inline-functions-called-once)
 compile_ir(explicit -O0 -finline-functions)
 
 check_calls(O2 retained_add retained_magnitude)
