@@ -13,12 +13,12 @@ namespace cross::linker {
 namespace {
 
 constexpr std::uint16_t shn_abs = 0xfff1;
+constexpr std::uint16_t et_exec = 2;
+constexpr std::uint16_t et_dyn = 3;
 
 class SectionContext final : public RelocationContext {
 public:
-    SectionContext(const Link& link, const InputSection& section, std::optional<std::uint64_t> gp,
-                   Diagnostics& diagnostics)
-        : link_(link), section_(section), gp_(gp), diagnostics_(diagnostics) {}
+    SectionContext(Link& link, const InputSection& section) : link_(link), section_(section) {}
 
     [[nodiscard]] SymbolValue symbol(std::uint32_t index) const override {
         return link_.symbol_value(*section_.file, index);
@@ -26,9 +26,12 @@ public:
     [[nodiscard]] std::uint64_t place(std::uint64_t offset) const override {
         return link_.mask(link_.address(section_) + offset);
     }
-    [[nodiscard]] std::optional<std::uint64_t> gp() const override { return gp_; }
-    [[nodiscard]] std::optional<std::uint64_t> tls_base() const override {
-        return link_.tls_base();
+    [[nodiscard]] std::optional<std::uint64_t> gp() const override { return link_.gp(); }
+    [[nodiscard]] std::optional<std::uint64_t> tls_base() const override { return link_.tls_base(); }
+    [[nodiscard]] std::uint64_t tls_alignment() const override { return link_.tls_alignment(); }
+    [[nodiscard]] bool position_independent() const override { return link_.position_independent(); }
+    void relative(std::uint64_t offset, std::uint64_t value, std::string_view what) const override {
+        link_.add_relative(section_, offset, value, what);
     }
     [[nodiscard]] std::uint64_t merged(const InputSection& section,
                                        std::uint64_t offset) const override {
@@ -36,17 +39,15 @@ public:
     }
     [[nodiscard]] const InputSection& section() const override { return section_; }
     void error(std::uint64_t offset, std::string_view message) const override {
-        diagnostics_.command_error(section_.location(offset) + ": " + std::string(message));
+        link_.diagnostics().command_error(section_.location(offset) + ": " + std::string(message));
     }
     void warning(std::uint64_t offset, std::string_view message) const override {
-        diagnostics_.warning({}, section_.location(offset) + ": " + std::string(message));
+        link_.diagnostics().warning({}, section_.location(offset) + ": " + std::string(message));
     }
 
 private:
-    const Link& link_;
+    Link& link_;
     const InputSection& section_;
-    std::optional<std::uint64_t> gp_;
-    Diagnostics& diagnostics_;
 };
 
 // The name GNU ld gives the FILE symbol of an input without one.
@@ -80,11 +81,14 @@ bool Link::contributes(const InputFile& file) const {
     });
 }
 
+std::unique_ptr<RelocationContext> Link::context(const InputSection& section) {
+    return std::make_unique<SectionContext>(*this, section);
+}
+
 bool Link::write_contents() {
-    const auto pointer = gp();
-    target_->fill_sections(included_sections(), [&](const InputSection& section) {
-        return std::make_unique<SectionContext>(*this, section, pointer, diagnostics_);
-    });
+    relatives_.clear();
+    target_->fill_sections(included_sections(),
+                           [this](const InputSection& section) { return context(section); });
     for (const auto& step : steps_) {
         auto* placement = step.placement;
         if (!placement || !placement->output || !placement->emitted) continue;
@@ -119,13 +123,14 @@ bool Link::write_contents() {
         if (output.name == ".eh_frame") patch_frame_pointers(output);
         for (const auto* section : output.sections) {
             if (section->relocations.empty() || section->nobits()) continue;
-            const SectionContext context(*this, *section, pointer, diagnostics_);
-            target_->relocate(context, std::span<std::uint8_t>(output.data).subspan(section->offset,
-                                                                                  section->size));
+            const SectionContext view(*this, *section);
+            target_->relocate(view, std::span<std::uint8_t>(output.data).subspan(section->offset,
+                                                                               section->size));
         }
     }
     // The .eh_frame_hdr table reads the relocated FDEs.
     if (auto* frames = output_named(".eh_frame"); frames && frame_header_) write_frame_header(*frames);
+    if (dynamic_) write_dynamic_sections();
     return diagnostics_.errors() == 0;
 }
 
@@ -167,6 +172,11 @@ bool Link::write_executable() {
         section.flags = output->flags;
         section.alignment = output->alignment;
         section.entry_size = output->entry_size;
+        // Initializer tables hold addresses (BFD's elf_fake_sections).
+        if (section.type == elf::sht_init_array || section.type == elf::sht_fini_array ||
+            section.type == elf::sht_preinit_array) {
+            section.entry_size = object_.elf64 ? 8 : 4;
+        }
         target_->finish_output_section(output->name, options_.format, section.type, section.flags,
                                        section.entry_size);
         section.address = output->address;
@@ -178,6 +188,19 @@ bool Link::write_executable() {
         }
         sections.push_back(std::move(section));
     }
+    // A dynamic section names the section its entries refer to.
+    const auto link_to = [&](const InputSection* from, const InputSection* to, std::uint32_t info) {
+        if (!from || !to || !from->included() || !to->included() || !from->output || !to->output ||
+            from->output->index == 0 || to->output->index == 0) {
+            return;
+        }
+        auto& header = sections[from->output->index - 1];
+        header.link = to->output->index;
+        header.info = info;
+    };
+    link_to(dynamic_, dynamic_strings_, 0);
+    link_to(dynamic_symbols_, dynamic_strings_, 1);
+    link_to(dynamic_relocations_, dynamic_symbols_, 0);
 
     const bool wide = object_.elf64;
     assembler::ByteWriter symtab(object_.big_endian);
@@ -336,6 +359,7 @@ bool Link::write_executable() {
     sections.back().data = names.data();
 
     assembler::ElfExecutable executable;
+    executable.type = options_.pie ? et_dyn : et_exec;
     executable.entry = entry_address();
     for (const auto& segment : segments_) {
         assembler::ElfSegment header;

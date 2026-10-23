@@ -88,6 +88,7 @@ enum : std::uint32_t {
     r_aarch64_tlsle_ldst128_tprel_lo12_nc = 0x23b,
     r_aarch64_tlsld_ldst128_dtprel_lo12 = 0x23c,
     r_aarch64_tlsld_ldst128_dtprel_lo12_nc = 0x23d,
+    r_aarch64_relative = 0x403,
 };
 
 } // namespace cross::aarch64

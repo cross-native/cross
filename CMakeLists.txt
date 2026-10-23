@@ -107,6 +107,7 @@ target_link_libraries(cross_assembler PUBLIC cross_common)
 cross_component(cross_assembler)
 
 add_library(cross_linker
+    src/linker/dynamic.cpp
     src/linker/eh_frame.cpp
     src/linker/input.cpp
     src/linker/layout.cpp
@@ -172,6 +173,7 @@ add_library(cross_targets
     src/target/subtarget.cpp
     src/target/aarch64/assembler.cpp
     src/target/aarch64/instructions.cpp
+    src/target/aarch64/linker.cpp
     src/target/aarch64/target.cpp
     src/target/mips/assembler.cpp
     src/target/mips/linker.cpp
@@ -3550,6 +3552,62 @@ if(BUILD_TESTING)
                 -P "${aarch64_assembler}/link.cmake")
     set_tests_properties(cross_aarch64_assembler_link PROPERTIES
         LABELS "feature.assembler;feature.linker;arch.aarch64;check.runtime;feature.tls;feature.pic;feature.floating;feature.atomics")
+    # The Cross ld for AArch64: each relocation family against ld.lld and
+    # GNU ld with the objects of Cross as, llvm-mc, and GNU as; veneers;
+    # static PIE; link errors; the default layout and options; and the
+    # bare-metal program on QEMU.
+    set(aarch64_linker ${CMAKE_SOURCE_DIR}/test/target/aarch64/linker)
+    foreach(family data page branch move got tls tls_checked divergent)
+        add_test(NAME cross_aarch64_linker_relocations_${family}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DAS=$<TARGET_FILE:cross_as>
+                    -DLD=$<TARGET_FILE:cross_ld>
+                    -DFAMILY=${family}
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aarch64-linker/relocations-${family}
+                    -P "${aarch64_linker}/relocations.cmake")
+        set_tests_properties(cross_aarch64_linker_relocations_${family} PROPERTIES
+            LABELS "feature.linker;arch.aarch64;check.compile;endian.little")
+    endforeach()
+    set_property(TEST cross_aarch64_linker_relocations_got APPEND PROPERTY LABELS feature.pic)
+    set_property(TEST cross_aarch64_linker_relocations_tls cross_aarch64_linker_relocations_tls_checked
+                 APPEND PROPERTY LABELS feature.tls)
+    foreach(linker_test veneers pie errors layout)
+        add_test(NAME cross_aarch64_linker_${linker_test}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DAS=$<TARGET_FILE:cross_as>
+                    -DLD=$<TARGET_FILE:cross_ld>
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aarch64-linker/${linker_test}
+                    -P "${aarch64_linker}/${linker_test}.cmake")
+    endforeach()
+    set_tests_properties(cross_aarch64_linker_veneers PROPERTIES
+        LABELS "feature.linker;arch.aarch64;check.runtime;endian.little")
+    set_tests_properties(cross_aarch64_linker_pie PROPERTIES
+        LABELS "feature.linker;feature.pic;feature.tls;arch.aarch64;check.runtime;endian.little")
+    set_tests_properties(cross_aarch64_linker_errors PROPERTIES
+        LABELS "feature.linker;feature.pic;feature.tls;arch.aarch64;arch.mips;diagnostics")
+    set_tests_properties(cross_aarch64_linker_layout PROPERTIES
+        LABELS "feature.linker;feature.debug;arch.aarch64;check.compile;endian.little")
+    add_test(NAME cross_aarch64_linker_runtime
+        COMMAND "${CMAKE_COMMAND}"
+                -DAS=$<TARGET_FILE:cross_as>
+                -DLD=$<TARGET_FILE:cross_ld>
+                -DSOURCE=${aarch64_assembler}/link.s
+                -DSCRIPT=${aarch64_assembler}/bare.ld
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aarch64-linker/runtime
+                -P "${aarch64_linker}/runtime.cmake")
+    set_tests_properties(cross_aarch64_linker_runtime PROPERTIES
+        LABELS "feature.linker;arch.aarch64;check.runtime;feature.tls;feature.pic;feature.floating;feature.atomics")
+    # Clang-compiled freestanding C, static and position-independent.
+    find_program(CROSS_TEST_CLANG NAMES clang)
+    add_test(NAME cross_aarch64_linker_clang
+        COMMAND "${CMAKE_COMMAND}"
+                -DAS=$<TARGET_FILE:cross_as>
+                -DLD=$<TARGET_FILE:cross_ld>
+                -DCLANG=${CROSS_TEST_CLANG}
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aarch64-linker/clang
+                -P "${aarch64_linker}/clang.cmake")
+    set_tests_properties(cross_aarch64_linker_clang PROPERTIES
+        LABELS "feature.linker;feature.interop;feature.pic;feature.tls;arch.aarch64;check.runtime;opt.O0;opt.O2")
     add_test(NAME cross_aarch64_instruction_entries
         COMMAND "${CMAKE_COMMAND}"
                 -DAS=$<TARGET_FILE:cross_as>

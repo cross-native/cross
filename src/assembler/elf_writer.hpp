@@ -100,6 +100,8 @@ struct ElfSegment {
 // The header facts of an executable, whose program headers follow the ELF
 // header.
 struct ElfExecutable {
+    // ET_EXEC, or ET_DYN for a position-independent executable.
+    std::uint16_t type{2};
     std::uint64_t entry{};
     std::vector<ElfSegment> segments;
 };

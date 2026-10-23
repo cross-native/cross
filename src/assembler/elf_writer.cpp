@@ -150,7 +150,7 @@ std::vector<std::uint8_t> write_elf(const ObjectInfo& object,
     header.u8(object.big_endian ? 2 : 1);
     header.u8(1);
     for (unsigned index = 0; index < 9; ++index) header.u8(0);
-    header.u16(executable ? 2 : 1); // ET_EXEC or ET_REL
+    header.u16(executable ? executable->type : 1); // ET_REL for an object
     header.u16(object.machine);
     header.u32(1);
     const std::uint64_t entry = executable ? executable->entry : 0;

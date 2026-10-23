@@ -145,6 +145,13 @@ public:
                                                 std::uint64_t offset) const;
     [[nodiscard]] std::optional<std::uint64_t> gp() const;
     [[nodiscard]] std::optional<std::uint64_t> tls_base() const;
+    [[nodiscard]] std::uint64_t tls_alignment() const;
+    [[nodiscard]] bool position_independent() const { return options_.pie; }
+    // Records a relative dynamic relocation of a field in a section.
+    void add_relative(const InputSection& section, std::uint64_t offset, std::uint64_t value,
+                      std::string_view what);
+    // The relocation view of an included section.
+    [[nodiscard]] std::unique_ptr<RelocationContext> context(const InputSection& section);
     // Whether a relocation's symbol is code that `file` does not contribute.
     [[nodiscard]] bool foreign(const InputFile& file, std::uint32_t index) const;
     [[nodiscard]] std::uint64_t mask(std::uint64_t value) const {
@@ -173,6 +180,12 @@ private:
     void merge_sections();
     void prune_records();
     bool check_undefined();
+    // Position-independent executables (dynamic.cpp).
+    void create_dynamic_sections();
+    void size_dynamic_relocations(std::size_t count);
+    void write_dynamic_sections();
+    // Range-extension thunks: places a section after an included one.
+    void insert_section(InputSection& after, std::unique_ptr<InputSection> section);
     void report_duplicate(const Symbol& existing, const InputFile& file, const FileSymbol& symbol);
     [[nodiscard]] std::vector<InputSection*> included_sections() const;
     [[nodiscard]] InputSection* defining_section(const InputFile& file, std::uint32_t index) const;
@@ -266,6 +279,14 @@ private:
     std::unordered_map<const InputSection*, std::vector<std::pair<InputSection*, std::size_t>>> fdes_;
     bool frame_table_{true};
     InputSection* frame_header_{};
+    // A position-independent executable's dynamic sections, the relative
+    // relocations they hold, and how many the layout made room for.
+    InputSection* dynamic_{};
+    InputSection* dynamic_relocations_{};
+    InputSection* dynamic_symbols_{};
+    InputSection* dynamic_strings_{};
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> relatives_;
+    std::size_t relative_count_{};
 
     // Layout pass state.
     std::uint64_t dot_{};

@@ -577,8 +577,8 @@ public:
         }
     }
 
-    [[nodiscard]] std::string default_script(bool relocatable) const override {
-        if (relocatable) {
+    [[nodiscard]] std::string default_script(linker::OutputKind kind) const override {
+        if (kind == linker::OutputKind::Relocatable) {
             // GNU ld's relocatable layout for the MIPS emulations.
             return "SECTIONS\n{\n"
                    "  .MIPS.abiflags : { *(.MIPS.abiflags) }\n"

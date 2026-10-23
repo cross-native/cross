@@ -37,7 +37,7 @@ bool Link::write_relocatable() {
     std::vector<std::pair<std::string, std::vector<InputSection*>>> layout;
     std::unordered_set<const InputSection*> assigned;
     script::Script relocatable;
-    const auto* layout_script = sources_.add("<relocatable script>", target_->default_script(true));
+    const auto* layout_script = sources_.add("<relocatable script>", target_->default_script(OutputKind::Relocatable));
     if (!script::parse(*layout_script, relocatable, {}, sources_, diagnostics_)) return false;
     for (const auto& command : relocatable.commands) {
         const auto* statement = std::get_if<script::OutputSection>(&command);
@@ -369,6 +369,11 @@ bool Link::write_relocatable() {
         header.flags = output->flags;
         header.alignment = output->alignment;
         header.entry_size = output->entry_size;
+        // Initializer tables hold addresses (BFD's elf_fake_sections).
+        if (header.type == elf::sht_init_array || header.type == elf::sht_fini_array ||
+            header.type == elf::sht_preinit_array) {
+            header.entry_size = wide ? 8 : 4;
+        }
         target_->finish_output_section(output->name, options_.format, header.type, header.flags,
                                        header.entry_size);
         if (output->nobits()) {

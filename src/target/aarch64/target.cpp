@@ -4,7 +4,9 @@
 
 #include "common/options.hpp"
 #include "target/aarch64/assembler.hpp"
+#include "target/aarch64/elf.hpp"
 #include "target/aarch64/instructions.hpp"
+#include "target/aarch64/linker.hpp"
 #include "target/subtarget.hpp"
 #include "target/target.hpp"
 
@@ -208,6 +210,8 @@ TargetInfo make_target() {
     // encodes.
     result.instruction_model = &instruction_model;
     result.integrated_assembler = &aarch64::assemble;
+    result.elf_machine = aarch64::em_aarch64;
+    result.linker = &aarch64::make_linker_target;
     return result;
 }
 

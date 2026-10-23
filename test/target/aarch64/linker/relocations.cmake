@@ -1,0 +1,101 @@
+# Copyright (C) 2026 Cross contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# One family of AArch64 relocations (FAMILY): the objects of Cross as,
+# llvm-mc, and GNU as (where installed) link into the same image, which
+# equals the image of ld.lld --no-relax and, for the families where GNU ld
+# agrees, GNU ld's code and data.
+
+include("${CMAKE_CURRENT_LIST_DIR}/common.cmake")
+if(LINKER_TEST_SKIP)
+    return()
+endif()
+# Each family: the sources every assembler takes, those only llvm-mc
+# takes, and the reference linkers.
+set(mc_sources "")
+set(references lld gnu)
+set(gnu_without_mc FALSE)
+if(FAMILY STREQUAL "data")
+    set(family_sources relocations_data)
+    set(mc_sources relocations_data_mc)
+elseif(FAMILY STREQUAL "page" OR FAMILY STREQUAL "branch" OR FAMILY STREQUAL "move")
+    set(family_sources relocations_${FAMILY})
+elseif(FAMILY STREQUAL "got")
+    # GNU ld's GOT starts with a reserved entry and has .got.plt.
+    set(family_sources relocations_got)
+    set(references lld)
+elseif(FAMILY STREQUAL "tls")
+    # GNU ld has no R_AARCH64_TLSLE_LDST128_TPREL_LO12 forms.
+    set(family_sources relocations_tls)
+    set(mc_sources relocations_tls_mc)
+    set(gnu_without_mc TRUE)
+elseif(FAMILY STREQUAL "tls_checked")
+    # ld.lld 21 has no checked R_AARCH64_TLSLE_*_TPREL_LO12 forms.
+    set(family_sources relocations_tls relocations_tls_checked)
+    set(references gnu)
+elseif(FAMILY STREQUAL "divergent")
+    set(family_sources relocations_divergent)
+    set(references lld)
+else()
+    message(FATAL_ERROR "unknown relocation family '${FAMILY}'")
+endif()
+set(script "${sources}/relocations.ld")
+set(assemblers cross mc)
+if(GNU_AS)
+    list(APPEND assemblers gnu)
+endif()
+set(extra "")
+foreach(source IN LISTS mc_sources)
+    assemble(mc "${sources}/${source}.s" "${OUTPUT}/${source}.o")
+    list(APPEND extra "${OUTPUT}/${source}.o")
+endforeach()
+foreach(assembler IN LISTS assemblers)
+    set(objects_${assembler} "")
+    foreach(source symbols ${family_sources})
+        assemble(${assembler} "${sources}/${source}.s" "${OUTPUT}/${source}-${assembler}.o")
+        list(APPEND objects_${assembler} "${OUTPUT}/${source}-${assembler}.o")
+    endforeach()
+    run_checked("ld of the ${assembler} objects" "${LD}" -T "${script}" ${objects_${assembler}} ${extra}
+                -o "${OUTPUT}/${assembler}.elf")
+    if(NOT assembler STREQUAL "cross")
+        same_images("the images of the cross and ${assembler} objects" "${OUTPUT}/cross.elf"
+                    "${OUTPUT}/${assembler}.elf")
+    endif()
+endforeach()
+set(objects ${objects_cross} ${extra})
+if("lld" IN_LIST references)
+    if(LLD)
+        run_checked("ld.lld" "${LLD}" --no-relax -T "${script}" ${objects} -o "${OUTPUT}/lld.elf")
+        same_images("the images of ld and ld.lld" "${OUTPUT}/cross.elf" "${OUTPUT}/lld.elf")
+    else()
+        message(STATUS "ld.lld not found")
+    endif()
+endif()
+if("gnu" IN_LIST references)
+    if(GNU_LD)
+        if(gnu_without_mc)
+            set(objects ${objects_cross})
+        endif()
+        run_checked("GNU ld" "${GNU_LD}" -T "${script}" ${objects} -o "${OUTPUT}/gnu.elf")
+        same_images("the code and data of ld and GNU ld" "${OUTPUT}/cross.elf" "${OUTPUT}/gnu.elf"
+                    .text .rodata .data .tdata .tbss .bss)
+    else()
+        message(STATUS "GNU ld not found")
+    endif()
+endif()
+if(FAMILY STREQUAL "tls")
+    # The checked 128-bit form encodes what the _NC form does.
+    assemble(mc "${sources}/relocations_tls_mc_checked.s" "${OUTPUT}/checked.o")
+    run_checked("ld with the checked form" "${LD}" -T "${script}" ${objects_cross} ${extra} "${OUTPUT}/checked.o"
+                -o "${OUTPUT}/checked.elf")
+    foreach(offset 0 4)
+        foreach(symbol tls128 tls128_checked)
+            run_checked("the word at ${symbol}+${offset}" "${PYTHON}" "${images}" word "${OUTPUT}/checked.elf"
+                        ${symbol} ${offset})
+            string(STRIP "${run_stdout}" ${symbol})
+        endforeach()
+        if(NOT tls128 STREQUAL tls128_checked)
+            message(FATAL_ERROR "the checked form at +${offset} is ${tls128_checked}, the _NC form ${tls128}")
+        endif()
+    endforeach()
+endif()

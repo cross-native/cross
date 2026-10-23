@@ -24,13 +24,15 @@ struct Format {
     bool traditional;
 };
 
-// GNU ld's MIPS emulations and output formats.
+// GNU ld's MIPS and AArch64 emulations and output formats.
 constexpr std::array emulations{
     Format{"elf32btsmip", false, true, 0x10000, true}, Format{"elf32ltsmip", false, false, 0x10000, true},
     Format{"elf32ebmip", false, true, 0x1000, false},  Format{"elf32elmip", false, false, 0x1000, false},
     Format{"elf64btsmip", true, true, 0x10000, true},  Format{"elf64ltsmip", true, false, 0x10000, true},
+    Format{"aarch64linux", true, false, 0x10000, false}, Format{"aarch64elf", true, false, 0x10000, false},
 };
 constexpr std::array output_formats{
+    Format{"elf64-littleaarch64", true, false, 0x10000, false},
     Format{"elf32-tradbigmips", false, true, 0x10000, true},
     Format{"elf32-tradlittlemips", false, false, 0x10000, true},
     Format{"elf32-bigmips", false, true, 0x1000, false},
@@ -61,14 +63,20 @@ void print_help() {
   --print-gc-sections     list the sections --gc-sections removes
   --gc-keep-exported      keep sections with global symbols of default or
                           protected visibility (with -r, the roots)
+  -pie, --pie             write a position-independent executable
+  -no-pie, --no-pie       write an executable for its link addresses (the
+                          default)
+  --no-dynamic-linker     accepted; images name no dynamic linker
   -d, -dc, -dp            allocate common symbols even with -r
   --eh-frame-hdr          write .eh_frame_hdr and PT_GNU_EH_FRAME
   --no-eh-frame-hdr       do not (the default)
   -nostdlib               accepted; there are no default library directories
   -Map FILE, -M           write a link map to FILE, or to standard output
   -m EMULATION            select the output: elf32btsmip, elf32ltsmip,
-                          elf32ebmip, elf32elmip, elf64btsmip, elf64ltsmip
+                          elf32ebmip, elf32elmip, elf64btsmip, elf64ltsmip,
+                          aarch64linux, aarch64elf
   --oformat=FORMAT        select the output by BFD name, such as elf32-bigmips
+                          or elf64-littleaarch64
   -EB, -EL                select big- or little-endian output
   -z max-page-size=SIZE   align loadable segments in the file to SIZE
   -s, --strip-all         omit the symbol table
@@ -117,6 +125,12 @@ public:
                 options.big_endian = argument == "-EB";
             } else if (argument == "-r" || argument == "-i" || argument == "--relocatable") {
                 options.relocatable = true;
+            } else if (argument == "-pie" || argument == "--pie") {
+                options.pie = true;
+            } else if (argument == "-no-pie" || argument == "--no-pie") {
+                options.pie = false;
+            } else if (argument == "--no-dynamic-linker") {
+                // Images never name a dynamic linker.
             } else if (argument == "-s" || argument == "--strip-all") {
                 options.strip_all = true;
             } else if (argument == "--gc-sections") {

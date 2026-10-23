@@ -11,7 +11,8 @@ ld [options] file ...
 files. `cpp` only preprocesses, writing Cross to standard output or to `-o`.
 `as` assembles hand-written assembly into an object file
 ([Assembling](#assembling)) -- GNU-syntax MIPS or AT&T-syntax x86-64 -- and
-`ld` links MIPS objects into a static executable ([Linking](#linking)).
+`ld` links MIPS and AArch64 objects into a static executable
+([Linking](#linking)).
 `cc --help`, `cpp --help`, `as --help`, and
 `ld --help` list every option. Options of `cc`, `cpp`, and `as` taking a value
 accept it joined or separate (`-oout.s`, `-o out.s`).
@@ -477,9 +478,11 @@ not available.
 `ld` links ELF relocatable objects, archives, raw binary files, and the
 symbol addresses of other images into one static ELF executable, laid out by
 a GNU ld linker script. It links MIPS objects of either class and byte order
-(o32, n64, and EABI32, from `cc -c`, `as`, GNU as, GCC, and Clang); objects of
-other machines are rejected. It accepts GNU ld's spelling of the options
-below, and runs no other program.
+(o32, n64, and EABI32, from `cc -c`, `as`, GNU as, GCC, and Clang) and
+little-endian ELF64 AArch64 objects (from `as`, GNU as, and llvm-mc), the
+latter also into position-independent executables; objects of other
+machines are rejected. It accepts GNU ld's spelling of the options below,
+and runs no other program.
 
 | Option | Selects |
 | --- | --- |
@@ -493,17 +496,19 @@ below, and runs no other program.
 | `--defsym SYMBOL=EXPRESSION` | Define SYMBOL with a script expression. |
 | `-Ttext=ADDRESS`, `-Tdata=ADDRESS`, `-Tbss=ADDRESS`, `--section-start=NAME=ADDRESS` | Place an output section at ADDRESS, read as hexadecimal. |
 | `-r`, `--relocatable` | Write a relocatable object instead of an executable. |
+| `-pie`, `--pie`, `-no-pie`, `--no-pie` | Write a position-independent executable, or (the default) an executable for its link addresses. |
 | `-d`, `-dc`, `-dp` | Allocate common symbols with `-r` too. |
 | `--gc-sections`, `--print-gc-sections` | Remove the sections that nothing reaches, and report each one removed. With `-r`, `-e` or `-u` must name a defined symbol, or `--gc-keep-exported` must be given. |
 | `--gc-keep-exported` | Keep the sections that define global symbols of default or protected visibility. |
 | `--eh-frame-hdr`, `--no-eh-frame-hdr` | Write, or do not write (the default), an `.eh_frame_hdr` search table and its `PT_GNU_EH_FRAME` header. |
 | `-Map FILE`, `-M` | Write a link map to FILE, or to standard output. |
-| `-m EMULATION`, `--oformat=FORMAT`, `-EB`, `-EL` | The output class and byte order instead of the first object's: the emulations `elf32btsmip`, `elf32ltsmip`, `elf32ebmip`, `elf32elmip`, `elf64btsmip`, and `elf64ltsmip`, or the formats `elf32-bigmips`, `elf32-littlemips`, `elf32-tradbigmips`, `elf32-tradlittlemips`, and their `elf64-` counterparts. |
+| `-m EMULATION`, `--oformat=FORMAT`, `-EB`, `-EL` | The output class and byte order instead of the first object's: the emulations `elf32btsmip`, `elf32ltsmip`, `elf32ebmip`, `elf32elmip`, `elf64btsmip`, `elf64ltsmip`, `aarch64linux`, and `aarch64elf`, or the formats `elf32-bigmips`, `elf32-littlemips`, `elf32-tradbigmips`, `elf32-tradlittlemips`, their `elf64-` counterparts, and `elf64-littleaarch64`. |
 | `-z max-page-size=SIZE` | The alignment of loadable segments in the file: by default 64 KiB for ELF64 and for the `ts` emulations and `trad` formats, otherwise 4 KiB. |
 | `-s`, `--strip-all` | Omit the symbol table. |
 | `--fatal-warnings` | Treat warnings as errors. |
 | `--start-group`, `--end-group` | Accepted; archives are searched in any order. |
 | `-nostdlib` | Accepted; there are no default library directories. |
+| `--no-dynamic-linker` | Accepted; images name no dynamic linker. |
 
 **Symbols.** A symbol has at most one strong definition. A strong definition
 replaces weak and common ones, a common symbol replaces a weak definition,
@@ -614,7 +619,15 @@ sections and code at 0x400000 (0x120000000 for ELF64), `.eh_frame_hdr`,
 writable, before the data), the data placed by `DATA_SEGMENT_ALIGN`, `_gp`
 32 KiB past the start of the small data, `_etext`, `_edata`, `__bss_start`,
 and `_end`, then `.comment`, the debugging sections, and `.gnu.attributes`
-at address 0.
+at address 0. For AArch64 it is GNU ld's `aarch64linux` default without
+RELRO (as GNU ld lays out with `-z norelro`): the file and program headers
+at 0x400000 (at 0 with `-pie`), then the dynamic symbol, string, and
+relocation tables, `.init`, `.text`, `.fini`, `.rodata`, `.eh_frame_hdr`,
+`.eh_frame`, and `.gcc_except_table`, then from `DATA_SEGMENT_ALIGN` the TLS
+sections, the initializer tables, `.data.rel.ro`, `.dynamic`, `.got`,
+`.data`, and `.bss`, with `__executable_start`, `_etext`, `__tdata_start`,
+`_edata`, `__bss_start`, `__end__`, and `_end`, and the debugging sections at
+address 0.
 
 **Segments.** Without `PHDRS`, allocated sections share a loadable segment
 unless a section's load and virtual addresses differ by another amount, it
@@ -628,10 +641,29 @@ segment's entry has `FILEHDR` or `PHDRS`. A loadable segment is aligned to
 the page size or to its most aligned section; one without file contents gets
 an offset within the first page. A `.MIPS.abiflags` or `.reginfo` output
 section also gets a `PT_MIPS_ABIFLAGS` or `PT_MIPS_REGINFO` header, and the
-output section holding `.eh_frame_hdr` a `PT_GNU_EH_FRAME` header. Once an
-input has a `.note.GNU-stack` section, a `PT_GNU_STACK` header tells whether
-the stack is executable: it is when an input's note asks for it or an input
-has no note.
+output section holding `.eh_frame_hdr` a `PT_GNU_EH_FRAME` header, and the
+one holding `.dynamic` a `PT_DYNAMIC` header. Once an input has a
+`.note.GNU-stack` section, a `PT_GNU_STACK` header tells whether the stack
+is executable: it is when an input's note asks for it or, for MIPS (as in
+GNU ld), an input has no note.
+
+**Position-independent executables.** With `-pie`, the output is a static
+position-independent executable (ELF type `ET_DYN`) that names no dynamic
+linker: the program or its loader adds the load address to the addresses
+the image holds, as static-pie startup code and Nintendo Switch homebrew
+loaders do. `ld` adds `.dynsym` (with only the null symbol), `.dynstr`,
+`.rela.dyn`, and `.dynamic` input sections to the first object, and a hidden
+`_DYNAMIC` symbol at the start of `.dynamic`, which holds `DT_FLAGS_1`
+(`DF_1_PIE`), `DT_DEBUG`, `DT_RELA`, `DT_RELASZ`, `DT_RELAENT`,
+`DT_RELACOUNT`, `DT_SYMTAB`, `DT_SYMENT`, `DT_STRTAB`, and `DT_STRSZ`, also
+when there are no relocations. `.rela.dyn` holds a relative relocation for
+each address-sized absolute address of a symbol that moves with the image,
+in a GOT entry or in an allocated section, in address order; each field also
+holds its value at the link addresses. Absolute and undefined weak symbols
+take none. Such an address in a read-only section, other absolute
+relocations of what moves, and PC-relative relocations of absolute symbols
+are errors in allocated sections. There are no hash tables, `PT_PHDR`, or
+`PT_GNU_RELRO` header. Only AArch64 objects link this way.
 
 **Unwind tables.** The input sections of the `.eh_frame` output section are
 edited as GNU ld edits them: an FDE whose function is in a removed section
@@ -706,6 +738,49 @@ IRIX-compatible formats (all but the `ts` emulations and `trad` formats)
 `.reginfo` has an entry size of 1, and in their ELF32 forms the symbol
 table's `sh_info` counts only the section symbols.
 
+**AArch64.** `ld` applies `R_AARCH64_ABS64`, `ABS32`, `ABS16`, `PREL64`,
+`PREL32`, `PREL16`, `ADR_PREL_LO21`, `ADR_PREL_PG_HI21` and its `_NC` form,
+`ADD_ABS_LO12_NC`, `LDST8_ABS_LO12_NC` to `LDST128_ABS_LO12_NC`, `CALL26`,
+`JUMP26`, `CONDBR19`, `TSTBR14`, `LD_PREL_LO19`, `MOVW_UABS_G0` to `G3` with
+their `_NC` forms, `MOVW_SABS_G0` to `G2` (which make the instruction `movz`
+or `movn` for the value's sign, as do the signed TLS moves), `ADR_GOT_PAGE`,
+`LD64_GOT_LO12_NC`, the local-exec relocations `R_AARCH64_TLSLE_*`, and the
+initial-exec relocations `TLSIE_ADR_GOTTPREL_PAGE21` and
+`TLSIE_LD64_GOTTPREL_LO12_NC`; other relocations, such as those of TLS
+descriptors, general and local dynamic TLS, `TLSIE_MOVW_GOTTPREL_*`, and
+`MOVW_PREL_*`, are diagnosed. Each relocation checks the range AAELF64
+gives it (`ABS16` and `ABS32` take signed and unsigned values, where GNU ld
+takes unsigned ones) and the alignment of a scaled load or store and of a
+branch or literal target; an error names the file, section, and offset, the
+relocation, and its symbol. A branch to an undefined weak symbol reaches the
+next instruction, as in ld.lld (GNU ld: address 0), and other PC-relative
+relocations of one resolve to their place. GOT relocations add a `.got`
+input section to the first object that has one, which
+`_GLOBAL_OFFSET_TABLE_`, a hidden symbol, starts: an entry holding the
+address for each symbol and addend, ordered as in ld.lld (global symbols in
+the order the inputs first name them, then each object's local symbols),
+without GNU ld's reserved entry and `.got.plt`. The thread pointer points at
+a 16-byte control block before the TLS block, which starts at the TLS
+segment's alignment (variant 1). Initial exec relaxes to local exec, as in
+GNU ld and ld.lld: the `adrp` becomes a `movz` of bits 16 to 31 of the
+offset and the load a `movk` of bits 0 to 15, each into its own destination
+register, so the GOT holds no TLS entries. A `B` or `BL` whose target is out
+of reach goes through a veneer, as in GNU ld: the code sections of an output
+section that lie within 127 MiB of a group's first one, and those that end
+within 127 MiB after the group, share a stub section that follows the
+group's last section, takes its name with `.stub` appended, and starts with
+a branch over its veneers and a `nop`. A veneer is eight-byte aligned, named
+`__SYMBOL_veneer` (`SYMBOL` being the section's name for a section
+symbol), and is `adrp x16, TARGET`, `add x16, x16, :lo12:TARGET`, `br x16`
+when the target lies within 4 GiB of pages, else a load of the target's
+offset into `x16`, `adr x17, .`, their sum, and `br x16`; neither needs a
+dynamic relocation. Veneers stay once added and follow the order of first
+use in their stub section, which has their size (GNU ld orders them by its
+hash table and sizes each one for the longer form). A branch within its
+input section to a symbol other than a function, a branch to an undefined
+weak symbol, `CONDBR19`, and `TSTBR14` take no veneer. Output header flags
+are 0, the page size is 64 KiB, and objects must be little-endian ELF64.
+
 **Other rules.** Relocation-free `SHF_MERGE` sections of one output section
 are merged as GNU ld merges them: one copy of each string or constant, and
 strings that end other strings share their tails. `--gc-sections` keeps the
@@ -727,7 +802,9 @@ and undefined weak symbols are left out. The map lists discarded input
 sections, then each output section (also those left out of the output) with
 its input sections, the files they come from, their symbols, and the
 script's assignments, in a format like GNU ld's, with addresses of the
-output's width. With `-r`, output sections follow
+output's width. Initializer tables (`SHT_INIT_ARRAY`, `SHT_FINI_ARRAY`,
+`SHT_PREINIT_ARRAY`) have the address size as their entry size, as in GNU
+ld. With `-r`, output sections follow
 GNU ld's relocatable layout for the target (`.text`, `.rodata`, `.data`,
 `.sdata`, `.sbss`, `.bss`, and the like collect input sections of exactly
 that name, in that order), then other input sections of one name share an
@@ -735,7 +812,8 @@ output section in the order they first appear, except that the members of a
 section group keep their own and the group stays; relocations remain,
 against output section symbols with their addends adjusted, and common
 symbols stay common unless `-d` makes them `.bss` (MIPS small commons
-`.scommon`) space; `-r` takes `--defsym` but no linker script.
+`.scommon`) space; an empty `.note.GNU-stack` stays when an input has one,
+executable when an input's is; `-r` takes `--defsym` but no linker script.
 
 ## Inspecting the compiler
 

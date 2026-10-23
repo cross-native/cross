@@ -744,7 +744,11 @@ bool Link::check_undefined() {
 
 SymbolValue Link::symbol_value(const InputFile& file, std::uint32_t index) const {
     SymbolValue result;
-    if (index == 0 || index >= file.symbols.size()) return result;
+    // No symbol: the addend alone, an absolute value.
+    if (index == 0 || index >= file.symbols.size()) {
+        result.absolute = true;
+        return result;
+    }
     const auto& entry = file.symbols[index];
     result.name = entry.name;
     if (entry.global) {
@@ -760,7 +764,9 @@ SymbolValue Link::symbol_value(const InputFile& file, std::uint32_t index) const
             }
             result.value = section_address(*target.section, target.value);
         } else {
+            // A script symbol of an output section moves with it.
             result.value = target.value;
+            result.absolute = !target.output;
         }
         return result;
     }
@@ -768,6 +774,7 @@ SymbolValue Link::symbol_value(const InputFile& file, std::uint32_t index) const
     result.section = entry.type == elf::stt_section;
     if (entry.shndx == shn_abs) {
         result.value = entry.value;
+        result.absolute = true;
         return result;
     }
     if (entry.shndx == 0) {
@@ -829,6 +836,30 @@ std::optional<std::uint64_t> Link::tls_base() const {
     return base;
 }
 
+std::uint64_t Link::tls_alignment() const {
+    std::uint64_t alignment = 1;
+    for (const auto& step : steps_) {
+        const auto* output = step.placement && step.placement->emitted ? step.placement->output : nullptr;
+        if (output && output->alloc() && (output->flags & elf::shf_tls) != 0) {
+            alignment = std::max(alignment, output->alignment);
+        }
+    }
+    return alignment;
+}
+
+void Link::insert_section(InputSection& after, std::unique_ptr<InputSection> section) {
+    for (auto& placement : placements_) {
+        for (auto& item : placement->items) {
+            const auto found = std::find(item.sections.begin(), item.sections.end(), &after);
+            if (found == item.sections.end()) continue;
+            item.sections.insert(std::next(found), section.get());
+            section->keep = true;
+            after.file->sections.push_back(std::move(section));
+            return;
+        }
+    }
+}
+
 bool Link::check_cross_references() {
     // NOCROSSREFS: no relocation in one of the listed output sections may
     // refer to a symbol in another (with NOCROSSREFS_TO, in the first).
@@ -869,6 +900,10 @@ bool Link::run() {
         diagnostics_.command_error("-r does not take a linker script");
         return false;
     }
+    if (options_.pie && options_.relocatable) {
+        diagnostics_.command_error("-r and -pie may not be used together");
+        return false;
+    }
     if (options_.script) {
         std::string message;
         const auto* source = sources_.load(*options_.script, message);
@@ -897,8 +932,14 @@ bool Link::run() {
     if (!read_inputs()) return false;
     // A script with INSERT augments the default script instead of
     // replacing it.
+    if (options_.pie && target_->relative_relocation() == 0) {
+        diagnostics_.command_error("position-independent executables are not supported for ELF machine " +
+                                   std::to_string(object_.machine));
+        return false;
+    }
     if (!options_.relocatable && (!options_.script || script_.has_insert)) {
-        const auto* source = sources_.add("<default script>", target_->default_script(false));
+        const auto kind = options_.pie ? OutputKind::PositionIndependent : OutputKind::Executable;
+        const auto* source = sources_.add("<default script>", target_->default_script(kind));
         if (!script::parse(*source, script_, {}, sources_, diagnostics_)) return false;
     }
     each_expression(script_, [&](const script::Expression& expression) {
@@ -908,6 +949,23 @@ bool Link::run() {
     target_->merge_sections(included_sections(), diagnostics_);
     if (diagnostics_.errors() != 0) return false;
     if (options_.relocatable) {
+        // GNU ld keeps the inputs' empty .note.GNU-stack, executable when
+        // one of them asks for an executable stack.
+        InputFile* noted = nullptr;
+        bool executable = false;
+        for (const auto& file : files_) {
+            if (!file->stack_note) continue;
+            if (!noted) noted = file.get();
+            executable = executable || file->executable_stack;
+        }
+        if (noted) {
+            auto note = std::make_unique<InputSection>();
+            note->file = noted;
+            note->name = ".note.GNU-stack";
+            note->flags = executable ? elf::shf_execinstr : 0;
+            note->keep = true;
+            noted->sections.push_back(std::move(note));
+        }
         // A relocatable link keeps common symbols common unless -d.
         if (options_.define_common) allocate_commons();
         parse_frames();
@@ -924,11 +982,14 @@ bool Link::run() {
     allocate_commons();
     parse_frames();
     if (options_.eh_frame_header) create_frame_header();
+    if (options_.pie) create_dynamic_sections();
     for (auto& created : target_->create_sections(included_sections())) {
         created->keep = true;
         created->file->sections.push_back(std::move(created));
     }
-    for (const auto& [name, section] : target_->created_symbols()) {
+    auto created_symbols = target_->created_symbols();
+    if (dynamic_) created_symbols.emplace_back("_DYNAMIC", dynamic_);
+    for (const auto& [name, section] : created_symbols) {
         auto& defined = symbol(name);
         if (defined.defined()) continue;
         defined.kind = Symbol::Kind::Defined;
@@ -946,7 +1007,8 @@ bool Link::run() {
             // GNU ld leaves out empty output sections before it edits
             // .eh_frame and .pdr, so editing does not remove a section.
             for (const auto* section : item.sections) {
-                if (section->size != 0) placement->keep = true;
+                // A dynamic section stays even when empty, for its tag.
+                if (section->size != 0 || section == dynamic_relocations_) placement->keep = true;
             }
         }
     }
@@ -957,11 +1019,40 @@ bool Link::run() {
     // their place without contents (GNU ld's SEC_EXCLUDE).
     edit_frames(false);
     merge_sections();
-    // SIZEOF_HEADERS counts the program headers, which the layout decides.
+    const ContextFactory factory = [this](const InputSection& section) { return context(section); };
+    if (options_.pie) size_dynamic_relocations(target_->relative_relocations(included_sections(), factory));
+    // Lay out again until the program headers that SIZEOF_HEADERS counts,
+    // the target's thunks, and the dynamic relocations settle.
+    const Insert insert = [this](InputSection& after, std::unique_ptr<InputSection> section) {
+        insert_section(after, std::move(section));
+    };
     for (int attempt = 0;; ++attempt) {
         if (!layout() || !build_segments()) return false;
-        if (!uses_headers_size_ || segments_.size() == segment_estimate_ || attempt == 4) break;
-        segment_estimate_ = segments_.size();
+        bool again = false;
+        if (uses_headers_size_ && segments_.size() != segment_estimate_ && attempt < 4) {
+            segment_estimate_ = segments_.size();
+            again = true;
+        }
+        std::vector<OutputSection*> emitted;
+        for (const auto& step : steps_) {
+            if (step.placement && step.placement->output && step.placement->emitted) {
+                emitted.push_back(step.placement->output);
+            }
+        }
+        if (target_->add_thunks(emitted, factory, insert)) again = true;
+        if (diagnostics_.errors() != 0) return false;
+        if (options_.pie) {
+            const auto count = target_->relative_relocations(included_sections(), factory);
+            if (count != relative_count_) {
+                size_dynamic_relocations(count);
+                again = true;
+            }
+        }
+        if (!again) break;
+        if (attempt == 32) {
+            diagnostics_.command_error("the layout does not settle: thunks or dynamic relocations keep changing");
+            return false;
+        }
     }
     if (!check_cross_references()) return false;
     target_->finish_sections(gp());

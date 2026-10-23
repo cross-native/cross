@@ -180,6 +180,9 @@ struct SymbolValue {
     bool section{};
     // A symbol in a removed section, referenced from a non-allocated one.
     bool removed{};
+    // A defined symbol whose value does not move with the image (SHN_ABS in
+    // the output).
+    bool absolute{};
     // A section symbol of a merged section, whose addend RelocationContext::
     // merged maps.
     const InputSection* merge{};
@@ -193,8 +196,17 @@ public:
     [[nodiscard]] virtual std::uint64_t place(std::uint64_t offset) const = 0;
     // _gp, or nullopt when nothing defines it.
     [[nodiscard]] virtual std::optional<std::uint64_t> gp() const = 0;
-    // The start of the TLS segment, or nullopt without one.
+    // The start of the TLS segment, or nullopt without one, and its
+    // alignment.
     [[nodiscard]] virtual std::optional<std::uint64_t> tls_base() const = 0;
+    [[nodiscard]] virtual std::uint64_t tls_alignment() const = 0;
+    // Whether the output is a position-independent executable, where an
+    // address that moves with the image needs a relative dynamic relocation.
+    [[nodiscard]] virtual bool position_independent() const = 0;
+    // Records the relative dynamic relocation of the address-sized field at
+    // an offset in the section, which holds `value` at the linked addresses;
+    // `what` names the relocation for a diagnostic.
+    virtual void relative(std::uint64_t offset, std::uint64_t value, std::string_view what) const = 0;
     // The address of an offset within a merged section.
     [[nodiscard]] virtual std::uint64_t merged(const InputSection& section,
                                                std::uint64_t offset) const = 0;
@@ -202,6 +214,15 @@ public:
     virtual void error(std::uint64_t offset, std::string_view message) const = 0;
     virtual void warning(std::uint64_t offset, std::string_view message) const = 0;
 };
+
+// The relocation view of an included section, with the current addresses.
+using ContextFactory = std::function<std::unique_ptr<RelocationContext>(const InputSection&)>;
+// Places a section that a target creates right after an included input
+// section, in the same output section.
+using Insert = std::function<void(InputSection& after, std::unique_ptr<InputSection> section)>;
+
+// What a link writes.
+enum class OutputKind : std::uint8_t { Executable, PositionIndependent, Relocatable };
 
 class Target {
 public:
@@ -249,11 +270,25 @@ public:
     }
     // Sizes the created sections for the sections that remain included.
     virtual void size_sections(std::span<InputSection* const> /*sections*/) {}
-    // Fills the created sections once addresses are final; `context` gives
-    // the relocation view of an included section.
-    virtual void fill_sections(
-        std::span<InputSection* const> /*sections*/,
-        const std::function<std::unique_ptr<RelocationContext>(const InputSection&)>& /*context*/) {}
+    // After each layout: adds range-extension thunks for the branches that
+    // do not reach their targets, as sections placed after included code
+    // sections, or resizes the ones it added; whether anything changed,
+    // which makes the link lay out again.
+    virtual bool add_thunks(std::span<OutputSection* const> /*outputs*/, const ContextFactory& /*context*/,
+                            const Insert& /*insert*/) {
+        return false;
+    }
+    // The type of relative dynamic relocations, which position-independent
+    // executables need; 0 when the target has none.
+    [[nodiscard]] virtual std::uint32_t relative_relocation() const { return 0; }
+    // How many relative dynamic relocations relocate() and fill_sections()
+    // report with the current addresses.
+    [[nodiscard]] virtual std::size_t relative_relocations(std::span<InputSection* const> /*sections*/,
+                                                           const ContextFactory& /*context*/) const {
+        return 0;
+    }
+    // Fills the created sections once addresses are final.
+    virtual void fill_sections(std::span<InputSection* const> /*sections*/, const ContextFactory& /*context*/) {}
     // A symbol the target defines for every link, such as MIPS _gp_disp,
     // which needs no definition and is left out of the symbol table.
     [[nodiscard]] virtual bool implicit_symbol(std::string_view /*name*/) const { return false; }
@@ -267,7 +302,10 @@ public:
     // The layout without a linker script, as script text; for a
     // relocatable link, the output sections that collect input sections
     // of given names, in order (the rest follow by name).
-    [[nodiscard]] virtual std::string default_script(bool relocatable) const = 0;
+    [[nodiscard]] virtual std::string default_script(OutputKind kind) const = 0;
+    // Whether an object without a .note.GNU-stack section needs an
+    // executable stack (GNU ld's default_execstack).
+    [[nodiscard]] virtual bool default_executable_stack() const { return true; }
     // Whether a local symbol's name marks an assembler label, which the
     // symbol table drops in mergeable sections, beyond `.L` and `..`.
     [[nodiscard]] virtual bool local_label(std::string_view name) const = 0;
@@ -314,6 +352,9 @@ struct Options {
     // visibility keep their sections.
     bool keep_exported{};
     bool relocatable{};
+    // `-pie`: a position-independent executable, which the program or its
+    // loader relocates by its relative dynamic relocations.
+    bool pie{};
     // `-d`: allocate common symbols in a relocatable link too.
     bool define_common{};
     // `--eh-frame-hdr`: a .eh_frame_hdr section and PT_GNU_EH_FRAME.

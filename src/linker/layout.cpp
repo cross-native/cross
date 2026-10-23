@@ -9,6 +9,7 @@ namespace cross::linker {
 namespace {
 
 constexpr std::uint32_t pt_load = 1;
+constexpr std::uint32_t pt_dynamic = 2;
 constexpr std::uint32_t pt_tls = 7;
 constexpr std::uint32_t pt_gnu_eh_frame = 0x6474e550;
 constexpr std::uint32_t pt_gnu_stack = 0x6474e551;
@@ -1538,6 +1539,15 @@ bool Link::build_segments() {
                 if ((section->flags & elf::shf_execinstr) != 0) segment.flags |= pf_x;
             }
         }
+        // PT_DYNAMIC for the output section holding .dynamic.
+        if (dynamic_ && dynamic_->included() && dynamic_->output &&
+            std::find(allocated.begin(), allocated.end(), dynamic_->output) != allocated.end()) {
+            Segment segment;
+            segment.type = pt_dynamic;
+            segment.flags = pf_r | pf_w;
+            segment.sections.push_back(dynamic_->output);
+            segments_.push_back(std::move(segment));
+        }
         // PT_TLS spans the TLS sections, which must be adjacent.
         std::vector<OutputSection*> tls;
         std::size_t first_tls = 0;
@@ -1559,13 +1569,14 @@ bool Link::build_segments() {
             segments_.push_back(std::move(segment));
         }
         // GNU ld's PT_GNU_STACK once an input has .note.GNU-stack: executable
-        // when an input asks for it or (the MIPS default) has no note.
+        // when an input asks for it or has no note and the target's default
+        // is an executable stack (MIPS).
         bool notes = false;
         bool executable = false;
         for (const auto& file : files_) {
             if (file->raw || file->just_symbols) continue;
             if (file->stack_note) notes = true;
-            if (!file->stack_note || file->executable_stack) executable = true;
+            if (file->stack_note ? file->executable_stack : target_->default_executable_stack()) executable = true;
         }
         // PT_GNU_EH_FRAME for the output section holding .eh_frame_hdr.
         if (frame_header_ && frame_header_->included() && frame_header_->size != 0 && frame_header_->output &&
