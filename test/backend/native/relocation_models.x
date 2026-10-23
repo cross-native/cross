@@ -9,6 +9,13 @@ i64 external_data_decl;
 
 static i64 local_data = 3;
 
+// Constant data holding addresses goes to .data.rel.ro in position-independent
+// output; constant data without addresses stays in .rodata.
+[[link_name("relocated_table")]]
+global const i64 *const relocated_table[2] = { &local_data, &external_data_decl };
+[[link_name("plain_table")]]
+global const i64 plain_table[2] = { 5, 7 };
+
 [[runtime_only, link_name("relocation_models_entry")]]
 global i64 relocation_models_entry() {
     return external_function_decl(external_data_decl + local_data);

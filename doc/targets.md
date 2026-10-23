@@ -69,6 +69,11 @@ function has a section of its own named after its link name `NAME`
 (`-ffunction-sections`, `[[hot]]`, `[[cold]]`, `[[retain]]`, or a `global`
 generic instance), in `.rodata.NAME` (COFF `.rdata$NAME`), which joins an
 instance's COMDAT group and holds the function's own copy of each constant.
+A `const` object whose value holds addresses goes, in position-independent
+ELF output (`-fpic`, `-fpie`), to the writable `.data.rel.ro`
+(`.data.rel.ro.NAME` with `-fdata-sections`) instead of `.rodata`, as GCC
+places it: the loader relocates it before the linker's RELRO segment makes it
+read-only.
 
 Mach-O output spells every link name with the leading underscore of C symbols
 on that format, so `[[link_name("write")]]` refers to the C function `write`

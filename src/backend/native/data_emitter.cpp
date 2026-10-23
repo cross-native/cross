@@ -282,6 +282,12 @@ private:
         const bool uninitialized =
             object.initializer == data::InitializerKind::Uninitialized;
         const bool split_section = options_.data_sections || object.retain;
+        // Position-independent ELF output relocates the addresses in
+        // constant data at load time, so they go where the loader may write
+        // before RELRO protects them, as GCC places them.
+        const bool relro = object.read_only && !object.relocations.empty() &&
+                           format_ == ObjectFormat::Elf &&
+                           options_.position_independent;
         const auto placed =
             data::data_base_section(entity, zero, split_section, options_);
         const auto section = entity.section ? *entity.section
@@ -295,6 +301,9 @@ private:
                               (split_section ? "." + entity.link_symbol : "")
             : uninitialized
                   ? std::string(".noinit") +
+                        (split_section ? "." + entity.link_symbol : "")
+            : relro
+                  ? std::string(".data.rel.ro") +
                         (split_section ? "." + entity.link_symbol : "")
             : split_section
                   ? std::string(
@@ -328,7 +337,7 @@ private:
             : zero ? AssemblySectionKind::ZeroFill
             // A table's entries share its section, writable as runtimes
             // expect, also when an entry object is constant.
-            : object.read_only && !entity.table_entry
+            : object.read_only && !entity.table_entry && !relro
                 ? AssemblySectionKind::ReadOnlyData
                 : AssemblySectionKind::WritableData;
         // A data base's sections take the kinds of what the entry admits,
