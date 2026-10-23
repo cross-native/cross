@@ -6,11 +6,11 @@
 // threaded: masks, shifts, remainders, conversions, signed and unsigned
 // views, additions that may wrap, relations between two unknown values,
 // phis whose incoming values decide a branch after their join, a loop whose
-// first test the path into it decides, and blocks with loads and stores
-// copied onto a path. test_entry returns zero when each checksum matches
-// the one an independent C version of the functions computes, or the
-// number of the first that differs. It runs with -fno-eval-calls, so that
-// the calls run.
+// first test the path into it decides, blocks with loads and stores copied
+// onto a path, and loop phis that exchange values. test_entry returns zero
+// when each checksum matches the one an independent C version of the
+// functions computes, or the number of the first that differs. It runs with
+// -fno-eval-calls, so that the calls run.
 
 global u32 data[16];
 
@@ -188,6 +188,24 @@ static u32 be32(in const u8 *p) {
     return sum + flags;
 }
 
+// The facts after a loop describe its last pass. Over the back edge, b
+// takes a of the pass before, which is zero after one pass from x = 0
+// while a is not.
+[[noinline]] global u32 swapped(in u32 n, in u32 x) {
+    u32 a = x;
+    u32 b = 0x7fffffffu32;
+    for (u32 k = 0u32; k < n; ++k) {
+        const u32 t = b;
+        b = a;
+        a = t;
+    }
+    if (a >= 0x10000u32) {
+        if (b != 0u32) return 1u32;
+        return 2u32;
+    }
+    return 3u32;
+}
+
 global u32 test_entry() {
     const u32 lives[8] = {0u32, 1u32, 5u32, 63u32, 64u32, 65u32, 100u32, 4294967295u32};
     const u32 seeds[5] = {0u32, 0x3f00u32, 0x12345678u32, 0xffffffffu32, 0x2a00u32};
@@ -294,5 +312,12 @@ global u32 test_entry() {
         }
     }
     if (sum != 799702280u32) return 13u32;
+    sum = 0u32;
+    for (u32 a = 0u32; a < opaque(4u32); ++a) {
+        for (u32 b = 0u32; b < opaque(9u32); ++b) {
+            sum = mix(sum, $::runtime(swapped(a, words[b])));
+        }
+    }
+    if (sum != 123637118u32) return 14u32;
     return 0u32;
 }

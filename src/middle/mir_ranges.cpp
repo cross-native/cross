@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
@@ -316,8 +317,9 @@ std::optional<bool> compare(BinaryOperation operation, const Bounds& left,
 // and the incoming values of phis on one path describe.
 class RangeContext {
 public:
-    RangeContext(const ManagedFunction& function, const hir::Module& module)
-        : function_(function), module_(module),
+    RangeContext(const ManagedFunction& function, const hir::Module& module,
+                 const DominatorTree& dominators)
+        : function_(function), module_(module), dominators_(dominators),
           bool_type_(module.builtin(BuiltinType::Bool)) {}
 
     std::optional<Bounds> bounds(ValueId id) { return evaluate(id, 0); }
@@ -417,6 +419,32 @@ private:
         if (auto result = evaluate(id, depth + 1)) return *result;
         const auto bits = integer_bits(function_.values[id.value].type);
         return full_bounds(bits == 0 ? 64U : bits);
+    }
+
+    // Whether PHI takes its value from PREDECESSOR over a back edge, from a
+    // block that PHI's block dominates. That value is one of an earlier
+    // pass through PHI's block than the one the facts describe.
+    bool back_edge(ValueId phi, BlockId predecessor) const {
+        for (const auto successor :
+             function_.blocks[predecessor.value].terminator.successors) {
+            const auto& values = function_.blocks[successor.value].values;
+            if (std::find(values.begin(), values.end(), phi) != values.end()) {
+                return dominators_.dominates(successor, predecessor);
+            }
+        }
+        return false;
+    }
+
+    // A context without this one's facts.
+    RangeContext& without_facts() {
+        if (known_.empty() && relations_.empty() && chosen_.empty()) {
+            return *this;
+        }
+        if (!plain_) {
+            plain_ = std::make_unique<RangeContext>(function_, module_,
+                                                    dominators_);
+        }
+        return *plain_;
     }
 
     Bounds compute(ValueId id, unsigned bits, unsigned depth) {
@@ -558,7 +586,10 @@ private:
             if (!active_.insert(id.value).second) return full;
             std::optional<Bounds> result;
             for (const auto& incoming : value.incoming) {
-                const auto next = operand_bounds(incoming.value, depth);
+                const auto next =
+                    back_edge(id, incoming.predecessor)
+                        ? without_facts().operand_bounds(incoming.value, depth)
+                        : operand_bounds(incoming.value, depth);
                 if (next.bits != bits) {
                     result = full;
                     break;
@@ -910,6 +941,7 @@ private:
 
     const ManagedFunction& function_;
     const hir::Module& module_;
+    const DominatorTree& dominators_;
     std::optional<hir::TypeId> bool_type_;
     std::unordered_map<std::uint32_t, Bounds> known_;
     std::unordered_map<std::uint32_t, ValueId> chosen_;
@@ -917,6 +949,7 @@ private:
     std::unordered_map<std::uint32_t, Bounds> memo_;
     std::unordered_set<std::uint32_t> active_;
     bool infeasible_{};
+    std::unique_ptr<RangeContext> plain_;
 };
 
 // The outcome of the conditional branch that ends PREDECESSOR on its edge to
@@ -1010,7 +1043,7 @@ private:
                     ValueKind::ConstantInteger) {
                 continue;
             }
-            RangeContext context(function_, module_);
+            RangeContext context(function_, module_, dominators);
             assume_dominating_edges(context, function_, dominators, block);
             const auto truth = context.decide(*terminator.value);
             if (!truth) continue;
@@ -1215,7 +1248,7 @@ private:
                                       const DominatorTree& dominators,
                                       const LoopForest& loops,
                                       const UseLists& uses) const {
-        RangeContext context(function_, module_);
+        RangeContext context(function_, module_, dominators);
         assume_dominating_edges(context, function_, dominators, source);
         const auto first = function_.blocks[source.value]
                                .terminator.successors[successor];
