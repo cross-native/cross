@@ -255,13 +255,11 @@ global i32 test_entry() {
     failures += pressure_float_8(4u32) != 9048.0f32;
     failures += pressure_float_8(5u32) != 18960.0f32;
     failures += pressure_float_8(7u32) != 84384.0f32;
-#ifdef PRESSURE_FLOAT_RUNTIME
     failures += pressure_float_14(0u32) != 1589.0f32;
     failures += pressure_float_14(1u32) != 3198.0f32;
     failures += pressure_float_14(3u32) != 13054.0f32;
     failures += pressure_float_14(4u32) != 26472.0f32;
     failures += pressure_float_14(5u32) != 53808.0f32;
     failures += pressure_float_14(7u32) != 223776.0f32;
-#endif
     return failures;
 }

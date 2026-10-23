@@ -6747,6 +6747,7 @@ private:
         }
         if (instruction.opcode == Opcode::Phi ||
             instruction.opcode == Opcode::Fphi ||
+            instruction.opcode == Opcode::Vphi ||
             has_property(instruction.opcode, OpcodeProperty::Floating) ||
             instruction.opcode == Opcode::Sdiv ||
             instruction.opcode == Opcode::Udiv ||
@@ -8383,54 +8384,44 @@ private:
                         interference[address.id].insert(target.id);
                     }
                 }
-                if (instruction.opcode == Opcode::Vcast &&
-                    !instruction.defs.empty() &&
+                // Operands an expansion reads after it first writes its
+                // result interfere with it, though they die here: a widening
+                // or narrowing cast's source, an ordered reduction's vector,
+                // another reduction's seed, and the element and variable lane
+                // of an insertion that copies its vector into the result.
+                std::vector<machine::Register> read_after_result;
+                if (instruction.defs.size() == 1 &&
                     !instruction.uses.empty()) {
+                    const auto& operands = instruction.uses;
+                    if (instruction.opcode == Opcode::Vcast) {
+                        if (instruction.defs.front().mode.bits !=
+                            operands.front().mode.bits) {
+                            read_after_result.push_back(operands.front());
+                        }
+                    } else if (instruction.opcode ==
+                               Opcode::VreduceAddOrdered) {
+                        read_after_result.push_back(operands.back());
+                    } else if ((instruction.opcode == Opcode::VreduceAdd ||
+                                instruction.opcode == Opcode::VreduceXor ||
+                                instruction.opcode == Opcode::VreduceAnd ||
+                                instruction.opcode == Opcode::VreduceOr) &&
+                               operands.size() == 2) {
+                        read_after_result.push_back(operands.front());
+                    } else if (instruction.opcode == Opcode::Vinsert) {
+                        read_after_result.assign(operands.begin() + 1,
+                                                 operands.end());
+                    }
+                }
+                for (const auto& operand : read_after_result) {
                     const auto target = instruction.defs.front();
-                    const auto source = instruction.uses.front();
                     if (target.kind == machine::RegisterKind::Virtual &&
-                        source.kind == machine::RegisterKind::Virtual &&
-                        target.mode.bits != source.mode.bits) {
-                        // Lane-wise widening/narrowing writes the result while
-                        // unread source lanes are still live. Their fallback
-                        // homes therefore cannot share a frame color even
-                        // though the SSA source dies at this instruction.
-                        interference[target.id].insert(source.id);
-                        interference[source.id].insert(target.id);
+                        operand.kind == machine::RegisterKind::Virtual &&
+                        target.id != operand.id) {
+                        interference[target.id].insert(operand.id);
+                        interference[operand.id].insert(target.id);
                     }
                 }
                 if (instruction.opcode == Opcode::VreduceAddOrdered &&
-                    instruction.defs.size() == 1 &&
-                    !instruction.uses.empty()) {
-                    const auto target = instruction.defs.front();
-                    const auto source = instruction.uses.back();
-                    if (target.kind == machine::RegisterKind::Virtual &&
-                        source.kind == machine::RegisterKind::Virtual &&
-                        target.id != source.id) {
-                        // The ordered form updates its scalar accumulator
-                        // while later vector lanes are still unread.
-                        interference[target.id].insert(source.id);
-                        interference[source.id].insert(target.id);
-                    }
-                    if (instruction.uses.size() == 2) {
-                        const auto initial = instruction.uses.front();
-                        if (target.kind ==
-                                machine::RegisterKind::Virtual &&
-                            initial.kind ==
-                                machine::RegisterKind::Virtual &&
-                            target.id != initial.id) {
-                            // Ordered reduction consumes the scalar seed
-                            // before updating it, so this is an ordinary
-                            // destructive accumulator affinity.
-                            affinity[target.id].insert(initial.id);
-                            affinity[initial.id].insert(target.id);
-                        }
-                    }
-                }
-                if ((instruction.opcode == Opcode::VreduceAdd ||
-                     instruction.opcode == Opcode::VreduceXor ||
-                     instruction.opcode == Opcode::VreduceAnd ||
-                     instruction.opcode == Opcode::VreduceOr) &&
                     instruction.defs.size() == 1 &&
                     instruction.uses.size() == 2) {
                     const auto target = instruction.defs.front();
@@ -8438,10 +8429,11 @@ private:
                     if (target.kind == machine::RegisterKind::Virtual &&
                         initial.kind == machine::RegisterKind::Virtual &&
                         target.id != initial.id) {
-                        // Associative horizontal work produces the target
-                        // before the scalar seed is consumed.
-                        interference[target.id].insert(initial.id);
-                        interference[initial.id].insert(target.id);
+                        // Ordered reduction consumes the scalar seed
+                        // before updating it, so this is an ordinary
+                        // destructive accumulator affinity.
+                        affinity[target.id].insert(initial.id);
+                        affinity[initial.id].insert(target.id);
                     }
                 }
                 if (instruction.opcode == Opcode::Select &&
@@ -9660,6 +9652,27 @@ private:
                             if (item->uses[index].kind ==
                                 machine::RegisterKind::Virtual) {
                                 forbid(item->uses[index].id);
+                            }
+                        }
+                        // A phi's copies run on each incoming edge, in any
+                        // order, with the block's other phis: no phi result
+                        // or source may occupy a scratch either.
+                        const auto forbid_virtual =
+                            [&](const machine::Register& reg) {
+                                if (reg.kind ==
+                                    machine::RegisterKind::Virtual) {
+                                    forbid(reg.id);
+                                }
+                            };
+                        if (is_phi(*item)) {
+                            for (const auto& other : block.instructions) {
+                                if (!is_phi(other)) continue;
+                                for (const auto& reg : other.defs) {
+                                    forbid_virtual(reg);
+                                }
+                                for (const auto& reg : other.uses) {
+                                    forbid_virtual(reg);
+                                }
                             }
                         }
                     }
@@ -15270,14 +15283,20 @@ private:
         const auto target = value.defs.front();
         const bool has_initial = value.uses.size() == 2;
         const auto width = memory_vector_width(vector);
-        load_vector(function, vector, 0, 0, width);
-        const auto source = vector_register(vector, 0, width);
+        const auto target_simd = assigned_simd_register(function, target);
+        const auto target_integer = assigned_integer_register(function, target);
+        // The ordered form writes its accumulator, XMM0 for a result in its
+        // home, before it reads every lane: stage the vector elsewhere.
+        const unsigned staging =
+            shape.floating && value.opcode == Opcode::VreduceAddOrdered &&
+                    (!target_simd || target_simd->name == "xmm0")
+                ? 1U : 0U;
+        load_vector(function, vector, staging, 0, width);
+        const auto source = vector_register(vector, staging, width);
         const auto number = source.find_first_of("0123456789");
         const auto low = std::string("xmm") +
             (number == std::string::npos ? std::string("0")
                                          : source.substr(number));
-        const auto target_simd = assigned_simd_register(function, target);
-        const auto target_integer = assigned_integer_register(function, target);
 
         if (shape.floating &&
             value.opcode == Opcode::VreduceAddOrdered) {
@@ -15308,8 +15327,8 @@ private:
                                     "$" + std::to_string(quarter) + ", %" +
                                         source + ", %xmm2");
                     } else {
-                        load_vector(function, vector, 0, quarter, 128);
-                        part = vector_register(vector, 0, 128);
+                        load_vector(function, vector, staging, quarter, 128);
+                        part = vector_register(vector, staging, 128);
                     }
                 }
                 const auto lanes_per_quarter = 128U / shape.element_bits;

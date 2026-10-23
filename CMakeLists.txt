@@ -5552,6 +5552,29 @@ if(BUILD_TESTING)
             set_tests_properties(cross_runtime_x86_loops_${loop_mode} PROPERTIES
                 LABELS "check.runtime;arch.x86_64;backend.native;feature.optimization;feature.control;opt.${loop_level}")
         endforeach()
+        # Floating and vector loop carries beyond the SIMD bank, against a
+        # C++ reference, also with the AVX2 colors.
+        foreach(ring_mode O1 O1-allocate O2 O3 Os O2-avx2 Os-avx2)
+            string(REGEX MATCH "^O[0-9s]" ring_level "${ring_mode}")
+            set(ring_flags "-${ring_level}")
+            set(ring_labels "")
+            if(ring_mode MATCHES "-allocate$")
+                list(APPEND ring_flags -fregister-allocation)
+            elseif(ring_mode MATCHES "-avx2$")
+                list(APPEND ring_flags -march=haswell)
+                set(ring_labels ";isa.avx")
+            endif()
+            add_test(NAME cross_runtime_x86_64_floating_rings_${ring_mode}
+                COMMAND "${CMAKE_COMMAND}" -DCC=$<TARGET_FILE:cross_cc>
+                    -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/machine/floating_rings.x
+                    -DRUNNER=${CMAKE_SOURCE_DIR}/test/backend/machine/floating_rings.cpp
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/floating-rings-${ring_mode}
+                    "-DCC_FLAGS=${ring_flags}"
+                    -P "${CMAKE_SOURCE_DIR}/test/backend/machine/x86_loops_runtime.cmake")
+            set_tests_properties(cross_runtime_x86_64_floating_rings_${ring_mode} PROPERTIES
+                LABELS "check.runtime;arch.x86_64;backend.native;feature.register_allocation;feature.floating;feature.vector;opt.${ring_level}${ring_labels}")
+        endforeach()
     endif()
     add_test(NAME cross_x86_64_shared_edge_copies
         COMMAND "${CMAKE_COMMAND}"
@@ -6212,7 +6235,7 @@ if(BUILD_TESTING)
                             -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/unroll_pressure.x
                             -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
                             -DOUTPUT=${pressure_output} -DEXPECTED=P
-                            "-DCC_FLAGS=${pressure_flags};-DPRESSURE_FLOAT_RUNTIME"
+                            "-DCC_FLAGS=${pressure_flags}"
                             -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
                     set_tests_properties(${pressure_name} PROPERTIES
                         LABELS "check.runtime;arch.mips;middle;feature.optimization;feature.register_allocation;isa.vr4300;isa.r3000;endian.big;endian.little;opt.${pressure_level}"
