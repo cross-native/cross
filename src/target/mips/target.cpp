@@ -87,6 +87,70 @@ std::vector<RegisterEntry> target_registers() {
     return result;
 }
 
+RegisterPressureModel register_pressure(
+    const Subtarget& subtarget, const CompilerOptions& options,
+    const RegisterPressureQuery& query) {
+    using mips::Feature;
+    const bool pairs = query.integer_bits > subtarget.integer_register_bits();
+    RegisterPressureModel result;
+    auto& integer = result.integer;
+    integer.register_class = "integer";
+    integer.register_bits = subtarget.integer_register_bits();
+    integer.registers = {"s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7"};
+    if (!pairs) {
+        const std::vector<std::string_view> ordinary{
+            "v0", "v1", "a0", "a1", "a2", "a3", "t4", "t5",
+            "t6", "t7", "t8", "t9"};
+        integer.registers.insert(integer.registers.end(),
+                                 ordinary.begin(), ordinary.end());
+        const auto carries = [&](std::string_view name) {
+            return std::any_of(query.interfaces.begin(), query.interfaces.end(),
+                [&](const AbiEntry* abi) {
+                    return !abi || abi_carries_register(
+                        subtarget.target(), *abi, name);
+                });
+        };
+        if (!query.constrained && !carries("t2") && !carries("t3")) {
+            integer.registers.insert(integer.registers.end(), {"t2", "t3"});
+            if (!options.position_independent &&
+                !subtarget.has_feature(Feature::AbiCalls) &&
+                !carries("t0") && !carries("t1")) {
+                integer.registers.insert(integer.registers.end(), {"t0", "t1"});
+            }
+        }
+    }
+    auto& floating = result.floating;
+    floating.register_class = "floating";
+    if (subtarget.has_feature(Feature::HardFloat)) {
+        const bool fp64 = subtarget.has_feature(Feature::Fp64);
+        const bool paired = !fp64 &&
+                           !subtarget.has_feature(Feature::SingleFloat);
+        const bool odd = fp64 ||
+            (subtarget.has_feature(Feature::OddSpreg) &&
+             !subtarget.has_feature(Feature::Fpxx) &&
+             (!paired || query.floating_bits <= 32));
+        floating.register_bits = paired || fp64 ? 64U : 32U;
+        for (unsigned i = 0; i < 32; ++i) {
+            if (i == 0 || i == 2 || i == 4 ||
+                (paired && (i == 1 || i == 3 || i == 5)) ||
+                (!odd && i % 2U != 0) ||
+                (i == 1 && (subtarget.has_feature(Feature::Mips32r6) ||
+                            subtarget.has_feature(Feature::Mips64r6)))) {
+                continue;
+            }
+            // Names and storage belong to the register registry.
+            for (const auto& reg : subtarget.target().registers) {
+                if (reg.register_class == floating.register_class &&
+                    reg.name == "f" + std::to_string(i)) {
+                    floating.registers.push_back(reg.name);
+                    break;
+                }
+            }
+        }
+    }
+    return result;
+}
+
 // Coprocessor 0 register numbers.
 constexpr unsigned cp0_entry_hi = 10;
 constexpr unsigned cp0_status = 12;
@@ -654,6 +718,7 @@ TargetInfo make_target(ByteOrder order, std::vector<TriplePrefix> prefixes) {
     };
     // The models give the instruction table.
     result.instruction_model = &instruction_model;
+    result.cost_model.register_pressure = register_pressure;
     // %gp_rel offsets are relative to _gp, which $gp holds.
     result.data_base_registers = {"gp"};
     // 64-bit integers are native from MIPS III and word pairs before it.

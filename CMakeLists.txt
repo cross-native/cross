@@ -6180,6 +6180,50 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/backend/machine/if_conversion.cmake")
     set_tests_properties(cross_x86_64_if_conversion PROPERTIES
         LABELS "check.compile;arch.x86_64;backend.native;feature.optimization")
+    foreach(pressure_arch x86_64 mips)
+        foreach(pressure_level O2 O3)
+            add_test(NAME cross_unroll_pressure_${pressure_arch}_${pressure_level}
+                COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/unroll_pressure.x
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/unroll-pressure-${pressure_arch}-${pressure_level}
+                    -DARCH=${pressure_arch} -DLEVEL=${pressure_level}
+                    -P "${CMAKE_SOURCE_DIR}/test/middle/unroll_pressure.cmake")
+            set_tests_properties(cross_unroll_pressure_${pressure_arch}_${pressure_level} PROPERTIES
+                LABELS "check.compile;arch.${pressure_arch};middle;feature.optimization;feature.register_allocation;feature.model;opt.${pressure_level}")
+            foreach(pressure_mode budget unlimited)
+                set(pressure_flags -${pressure_level} -fno-eval-calls)
+                if(pressure_mode STREQUAL "unlimited")
+                    list(APPEND pressure_flags -fno-unroll-register-pressure)
+                endif()
+                set(pressure_name cross_runtime_unroll_pressure_${pressure_arch}_${pressure_level}_${pressure_mode})
+                set(pressure_output ${CMAKE_CURRENT_BINARY_DIR}/runtime-unroll-pressure-${pressure_arch}-${pressure_level}-${pressure_mode})
+                if(pressure_arch STREQUAL "mips")
+                    add_test(NAME ${pressure_name}
+                        COMMAND "${CMAKE_COMMAND}" -DCC=$<TARGET_FILE:cross_cc>
+                            -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/unroll_pressure.x
+                            -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
+                            -DOUTPUT=${pressure_output} -DEXPECTED=P
+                            "-DCC_FLAGS=${pressure_flags};-DPRESSURE_FLOAT_RUNTIME"
+                            -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+                    set_tests_properties(${pressure_name} PROPERTIES
+                        LABELS "check.runtime;arch.mips;middle;feature.optimization;feature.register_allocation;isa.vr4300;isa.r3000;endian.big;endian.little;opt.${pressure_level}"
+                        SKIP_REGULAR_EXPRESSION "skipping MIPS")
+                else()
+                    add_test(NAME ${pressure_name}
+                        COMMAND "${CMAKE_COMMAND}" -DCC=$<TARGET_FILE:cross_cc>
+                            -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                            -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/unroll_pressure.x
+                            -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                            -DOUTPUT=${pressure_output} -DENTRY=test_entry -DEXPECTED=0
+                            "-DCC_FLAGS=-target;x86_64-unknown-linux-gnu;${pressure_flags}"
+                            -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+                    set_tests_properties(${pressure_name} PROPERTIES
+                        LABELS "check.runtime;arch.x86_64;middle;feature.optimization;feature.register_allocation;opt.${pressure_level}")
+                endif()
+            endforeach()
+        endforeach()
+    endforeach()
     add_test(NAME cross_x86_64_loop_unrolling
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

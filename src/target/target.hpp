@@ -763,6 +763,28 @@ struct VectorOperationCostQuery {
     bool uniform_shift{};
 };
 
+// Function facts that affect the target's allocation palette before selection.
+struct RegisterPressureQuery {
+    std::vector<const AbiEntry*> interfaces;
+    unsigned integer_bits{};
+    unsigned floating_bits{};
+    bool constrained{};
+    bool frame_pointer{};
+};
+
+struct RegisterPressureBank {
+    std::string_view register_class;
+    unsigned register_bits{};
+    unsigned vector_bits{};
+    std::vector<std::string_view> registers;
+    unsigned scratch_registers{};
+};
+
+struct RegisterPressureModel {
+    RegisterPressureBank integer;
+    RegisterPressureBank floating;
+};
+
 struct TargetCostModel {
     using IntegerConstantMaterializationCost =
         unsigned (*)(const Subtarget&, const IntegerConstantCostQuery&);
@@ -796,6 +818,10 @@ struct TargetCostModel {
     IntegerRegisterBits integer_register_bits{};
     SelectInstructions select{};
     VectorOperationInstructions vector_operation{};
+    // Allocation colors and emitter headroom for MIR loop profitability.
+    RegisterPressureModel (*register_pressure)(
+        const Subtarget&, const CompilerOptions&,
+        const RegisterPressureQuery&){};
 };
 
 // Direct typed instruction-memory addressing. These are encoding constraints,

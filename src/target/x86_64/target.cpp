@@ -65,6 +65,38 @@ std::vector<RegisterEntry> target_registers() {
     return result;
 }
 
+RegisterPressureModel register_pressure(
+    const Subtarget& subtarget, const CompilerOptions& options,
+    const RegisterPressureQuery& query) {
+    RegisterPressureModel result;
+    result.integer = {"integer", 64, 0,
+        {"rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11",
+         "rbx", "r12", "r13", "r14", "r15"}};
+    // RBP is a preserved-only color; frame state can reserve it.
+    const auto clobbers_frame = [&](const AbiEntry* abi) {
+        return !abi || std::any_of(abi->call_clobbers.begin(),
+            abi->call_clobbers.end(), [&](const std::string& name) {
+                const auto* reg = find_register(subtarget.target(), name);
+                return reg && reg->storage == "rbp";
+            });
+    };
+    if (!query.frame_pointer && subtarget.object_format() != ObjectFormat::Coff &&
+        !query.interfaces.empty() && !clobbers_frame(query.interfaces.front())) {
+        result.integer.registers.push_back("rbp");
+    }
+    unsigned vector_bits = subtarget.has_feature(x86_64::Feature::Avx512f)
+        ? 512U : subtarget.has_feature(x86_64::Feature::Avx2) ? 256U : 128U;
+    const auto preference = resolved_text(options, "m.prefer-vector-width", "none");
+    if (preference == "128") vector_bits = std::min(vector_bits, 128U);
+    if (preference == "256") vector_bits = std::min(vector_bits, 256U);
+    // XMM0-XMM2 stage emitter operands and parallel copies.
+    result.floating = {"simd", 64, vector_bits,
+        {"xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
+         "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15"},
+        3};
+    return result;
+}
+
 unsigned integer_constant_materialization_cost(
     const Subtarget&, const IntegerConstantCostQuery& query) {
     if (query.bits > 64 || query.high != 0) return 2;
@@ -975,6 +1007,7 @@ std::vector<InstructionCostEntry> declared_instructions() {
 TargetInfo with_instruction_costs(TargetInfo info) {
     set_instruction_costs(info, declared_instructions());
     info.integrated_assembler = &x86_64::assemble;
+    info.cost_model.register_pressure = register_pressure;
     return info;
 }
 

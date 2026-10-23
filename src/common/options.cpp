@@ -502,6 +502,10 @@ std::span<const OptionDefinition> common_option_definitions() {
         {"f.unroll-loops", {}, OptionValueKind::Boolean, false, {}, 0, 0,
          OptionCategory::Optimization, true, OptionImplementation::Partial,
          "unroll target-independent loops when legality and profitability are proven"},
+        {"f.unroll-register-pressure", {}, OptionValueKind::Boolean, false,
+         {}, 0, 0, OptionCategory::Optimization, true,
+         OptionImplementation::Implemented,
+         "limit loop unrolling to the target register banks"},
         {"f.loop-bounds-from-extents", {}, OptionValueKind::Boolean, false,
          {}, 0, 0, OptionCategory::Optimization, true,
          OptionImplementation::Implemented,
@@ -1023,6 +1027,8 @@ bool resolve_registered_options(
     options.move_loop_invariants =
         resolved_bool(options, "f.move-loop-invariants");
     options.unroll_loops = resolved_bool(options, "f.unroll-loops");
+    options.unroll_register_pressure =
+        resolved_bool(options, "f.unroll-register-pressure");
     options.peel_loops = resolved_bool(options, "f.peel-loops");
     options.loop_bounds_from_extents =
         resolved_bool(options, "f.loop-bounds-from-extents");

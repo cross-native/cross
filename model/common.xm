@@ -106,6 +106,7 @@ optimization "O2" {
     f.ccp-rounds = 2;
     f.if-conversion-memory-limit = 12;
     f.unroll-factor = 2;
+    f.unroll-register-pressure = true;
     f.peel-limit = 96;
     f.thread-jumps-limit = 6;
     f.vector-interleave = 2;

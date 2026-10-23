@@ -17425,9 +17425,179 @@ bool unroll_loop(ManagedFunction& function,
     return true;
 }
 
+RegisterPressureQuery unroll_register_query(
+    const ManagedFunction& function, const hir::Module& module,
+    const Subtarget& subtarget, const CompilerOptions& options) {
+    RegisterPressureQuery query;
+    const auto& entity = module.function(function.source);
+    query.interfaces.push_back(find_abi(subtarget.target(), entity.abi));
+    query.constrained = entity.naked;
+    query.frame_pointer = !options.omit_frame_pointer;
+    for (const auto& slot : function.slots) {
+        query.constrained |= slot.physical_location.has_value();
+        query.frame_pointer |= slot.minimum_alignment >
+                               subtarget.abi_info().stack_alignment;
+    }
+    for (const auto& value : function.values) {
+        const auto& type = module.type(value.type);
+        const auto scalar = type.kind == hir::Type::Kind::Vector && type.element
+            ? *type.element : value.type;
+        if (integer_type(module, scalar) ||
+            module.type(scalar).kind == hir::Type::Kind::Pointer) {
+            query.integer_bits = std::max(query.integer_bits,
+                                          type_bits(module, scalar));
+        } else if (floating_type(module, scalar)) {
+            query.floating_bits = std::max(query.floating_bits,
+                                           type_bits(module, scalar));
+        }
+        query.constrained |= value.kind == ValueKind::MachineInstruction;
+        query.frame_pointer |= value.kind == ValueKind::DynamicAlloca;
+        if (value.kind == ValueKind::Call) {
+            const auto signature = hir::call_signature(
+                module, value.callee, value.call_signature);
+            query.interfaces.push_back(signature
+                ? find_abi(subtarget.target(), signature->abi) : nullptr);
+        }
+    }
+    return query;
+}
+
+bool unroll_pressure_fits(const ManagedFunction& function,
+                          const hir::Module& module,
+                          const Subtarget& subtarget,
+                          const CompilerOptions& options,
+                          BlockId header_id, BlockId body_id) {
+    const auto describe = subtarget.target().cost_model.register_pressure;
+    if (!describe) return true;
+    const auto query = unroll_register_query(function, module, subtarget, options);
+    const auto model = describe(subtarget, options, query);
+    const std::array banks{model.integer, model.floating};
+    std::array<unsigned, 2> capacity{};
+    for (unsigned bank = 0; bank < banks.size(); ++bank) {
+        std::unordered_set<std::string_view> storage;
+        for (const auto name : banks[bank].registers) {
+            const auto* reg = find_register(subtarget.target(), name);
+            if (!reg || reg->register_class != banks[bank].register_class ||
+                !subtarget.supports_registry_feature(reg->feature)) continue;
+            const auto reserved = [&](std::string_view name) {
+                const auto* other = find_register(subtarget.target(), name);
+                return other && other->storage == reg->storage;
+            };
+            if (std::any_of(options.data_bases.begin(), options.data_bases.end(),
+                    [&](const DataBaseOptions& base) { return reserved(base.base); }) ||
+                std::any_of(function.slots.begin(), function.slots.end(),
+                    [&](const ManagedSlot& slot) {
+                        return slot.physical_location && reserved(*slot.physical_location);
+                    })) {
+                continue;
+            }
+            storage.insert(reg->storage);
+        }
+        capacity[bank] = storage.size() > banks[bank].scratch_registers
+            ? static_cast<unsigned>(storage.size()) - banks[bank].scratch_registers
+            : 0U;
+        // Toward CISC, spills fold into memory operands and cost less than
+        // the loop overhead unrolling removes; tolerate up to twice the colors.
+        capacity[bank] += capacity[bank] *
+                          std::min(options.risc_cisc_balance, 100U) / 100U;
+    }
+    const auto weight = [&](ValueId id) {
+        std::array<unsigned, 2> result{};
+        const auto& value = function.values[id.value];
+        // Integer literals fold into instructions or are rematerialized.
+        if (value.kind == ValueKind::ConstantInteger) return result;
+        const auto& type = module.type(value.type);
+        unsigned bank = floating_type(module, value.type) &&
+                        banks[1].register_bits != 0 ? 1U : 0U;
+        auto bits = type_bits(module, value.type);
+        unsigned width = banks[bank].register_bits;
+        if (type.kind == hir::Type::Kind::Vector && type.element) {
+            if (banks[1].vector_bits != 0 && bits <= banks[1].vector_bits) {
+                bank = 1;
+                width = banks[1].vector_bits;
+            } else {
+                bank = floating_type(module, *type.element) &&
+                       banks[1].register_bits != 0 ? 1U : 0U;
+                width = banks[bank].register_bits;
+                if (width != 0) {
+                    result[bank] = type.lanes *
+                        ((type_bits(module, *type.element) + width - 1U) / width);
+                }
+                return result;
+            }
+        }
+        if (width != 0) result[bank] = (bits + width - 1U) / width;
+        return result;
+    };
+    using LiveSet = std::unordered_set<std::uint32_t>;
+    std::vector<LiveSet> live_in(function.blocks.size());
+    std::vector<LiveSet> live_out(function.blocks.size());
+    // PHI operands are reads on their predecessor edges, not in the header.
+    bool changed;
+    do {
+        changed = false;
+        for (auto block = function.blocks.rbegin();
+             block != function.blocks.rend(); ++block) {
+            LiveSet live;
+            for (const auto next : block->terminator.successors) {
+                live.insert(live_in[next.value].begin(), live_in[next.value].end());
+                for (const auto id : function.blocks[next.value].values) {
+                    const auto& phi = function.values[id.value];
+                    if (phi.kind != ValueKind::Phi) continue;
+                    for (const auto& incoming : phi.incoming) {
+                        if (incoming.predecessor == block->id) {
+                            live.insert(incoming.value.value);
+                        }
+                    }
+                }
+            }
+            live_out[block->id.value] = live;
+            if (block->terminator.value) live.insert(block->terminator.value->value);
+            for (auto id = block->values.rbegin(); id != block->values.rend(); ++id) {
+                const auto& value = function.values[id->value];
+                live.erase(id->value);
+                if (value.kind == ValueKind::Phi) continue;
+                for (const auto operand : value.operands) live.insert(operand.value);
+                for (const auto& argument : value.call_arguments) {
+                    if (argument.value) live.insert(argument.value->value);
+                }
+            }
+            if (live != live_in[block->id.value]) {
+                live_in[block->id.value] = std::move(live);
+                changed = true;
+            }
+        }
+    } while (changed);
+    const auto fits = [&](const LiveSet& live) {
+        std::array<unsigned, 2> pressure{};
+        for (const auto id : live) {
+            const auto units = weight(ValueId{id});
+            for (unsigned bank = 0; bank < banks.size(); ++bank) {
+                pressure[bank] += units[bank];
+            }
+        }
+        return pressure[0] <= capacity[0] && pressure[1] <= capacity[1];
+    };
+    for (const auto block_id : {header_id, body_id}) {
+        const auto& block = function.blocks[block_id.value];
+        auto live = live_out[block_id.value];
+        if (block.terminator.value) live.insert(block.terminator.value->value);
+        if (!fits(live)) return false;
+        for (auto id = block.values.rbegin(); id != block.values.rend(); ++id) {
+            const auto& value = function.values[id->value];
+            if (value.kind == ValueKind::Phi) continue;
+            live.erase(id->value);
+            for (const auto operand : value.operands) live.insert(operand.value);
+            if (!fits(live)) return false;
+        }
+    }
+    return true;
+}
+
 void unroll_loops(ManagedFunction& function,
                   const hir::Module& hir_module,
                   const CompilerOptions& options,
+                  const Subtarget& subtarget,
                   std::span<const CanonicalLoop> loops) {
     if (options.unroll_factor < 2) return;
     for (const auto& loop : loops) {
@@ -17484,9 +17654,27 @@ void unroll_loops(ManagedFunction& function,
                   contains_floating_recurrence))
                 ? 4U
                 : 2U;
-        const unsigned factor = std::min(preferred, options.unroll_factor);
-        (void)unroll_loop(function, *pattern, hir_module, factor,
-                          options.ivopts);
+        unsigned factor = std::min(preferred, options.unroll_factor);
+        if (!options.unroll_register_pressure) {
+            (void)unroll_loop(function, *pattern, hir_module, factor,
+                              options.ivopts);
+            continue;
+        }
+        // Cost the actual clones, including hoisted invariants and the
+        // rounded bound, before accepting the larger live ranges.
+        for (; factor >= 2; factor /= 2) {
+            auto candidate = function;
+            const BlockId header{
+                static_cast<std::uint32_t>(function.blocks.size())};
+            const BlockId body{header.value + 1U};
+            if (!unroll_loop(candidate, *pattern, hir_module, factor,
+                             options.ivopts)) break;
+            if (unroll_pressure_fits(candidate, hir_module, subtarget,
+                                     options, header, body)) {
+                function = std::move(candidate);
+                break;
+            }
+        }
     }
 }
 
@@ -23274,7 +23462,7 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
             PassId::LoopUnrolling,
             [&](ManagedFunction& function,
                 FunctionAnalysisManager& analyses) {
-                unroll_loops(function, hir_module, options,
+                unroll_loops(function, hir_module, options, subtarget,
                              analyses.loops().canonical_loops());
                 return PassResult::changed_cfg();
             });

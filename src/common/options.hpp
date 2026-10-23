@@ -221,6 +221,7 @@ struct CompilerOptions {
     bool ivopts{};
     bool move_loop_invariants{};
     bool unroll_loops{};
+    bool unroll_register_pressure{};
     bool peel_loops{};
     bool loop_bounds_from_extents{};
     bool tree_reassoc{};
