@@ -1072,7 +1072,15 @@ Roles assign_roles(const enc::Form& form, const std::vector<const Operand*>& int
     const auto at = [&](unsigned index) { return index < intel.size() ? intel[index] : nullptr; };
     switch (form.layout) {
     case L::None: break;
-    case L::O: roles.opcode_reg = at(0); break;
+    // `xchg %acc, %reg` names the register that is not the accumulator.
+    case L::O:
+        roles.opcode_reg =
+            intel.size() == 2 && (form.operands[0] == enc::Kind::Ax ||
+                                  form.operands[0] == enc::Kind::Eax ||
+                                  form.operands[0] == enc::Kind::Rax)
+                ? at(1)
+                : at(0);
+        break;
     case L::M: roles.rm = at(0); break;
     case L::RM: roles.reg = at(0); roles.rm = at(1); break;
     case L::MR: roles.rm = at(0); roles.reg = at(1); break;

@@ -17,6 +17,11 @@ encodings:
 	shlq $5, %rbx
 	xchgl %eax, %ecx
 	xchgq %r8, %r10
+	xchgq %r11, %rax
+	xchgq %rax, %r11
+	xchgq %rbx, %rax
+	xchgl %r9d, %eax
+	xchgw %cx, %ax
 	movsbl %al, %eax
 	movzwq %bx, %rcx
 	incq (%rax)
