@@ -6,6 +6,7 @@
 #include "target/backend.hpp"
 #include "target/subtarget.hpp"
 #include "target/x86_64/dynamic_abi_plan.hpp"
+#include "target/x86_64/features.hpp"
 #include "target/x86_64/machine_description.hpp"
 #include "target/x86_64/manual_abi_plan.hpp"
 #include "target/x86_64/manual_endpoint.hpp"
@@ -102,7 +103,7 @@ public:
         if (diagnostics.errors() != 0) return false;
 
         auto dynamic_plans = build_dynamic_abi_plans(
-            managed_module, hir_module, manual_plans, options, diagnostics);
+            managed_module, hir_module, manual_plans, subtarget, options, diagnostics);
         if (diagnostics.errors() != 0) return false;
         if (mir::specialize_surviving_calls(
                 managed_module, hir_module, options)) {
@@ -118,7 +119,7 @@ public:
                 return false;
             }
             dynamic_plans = build_dynamic_abi_plans(
-                managed_module, hir_module, manual_plans, options,
+                managed_module, hir_module, manual_plans, subtarget, options,
                 diagnostics);
         }
         return diagnostics.errors() == 0;
@@ -135,7 +136,7 @@ public:
             &managed_module);
         if (diagnostics.errors() != 0) return {};
         const auto dynamic_plans = build_dynamic_abi_plans(
-            managed_module, hir_module, manual_plans, options, diagnostics);
+            managed_module, hir_module, manual_plans, subtarget, options, diagnostics);
         if (diagnostics.errors() != 0) return {};
 
         return x86_64::lower_managed_machine(
@@ -144,7 +145,7 @@ public:
     }
 
     bool verify_machine(
-        const machine::Module& module, const Subtarget&,
+        const machine::Module& module, const Subtarget& subtarget,
         const CompilerOptions&, Diagnostics& diagnostics) const override {
         bool valid = true;
         for (const auto& function : module.functions) {
@@ -226,10 +227,15 @@ public:
                                     [&](const machine::FrameTransfer& item) {
                                         const bool gpr = item.reg.id < 16 &&
                                                          item.reg.mode.bits == 64;
-                                        // This form emits legacy MOVDQU (XMM0..15).
+                                        const auto bits = item.reg.mode.bits;
                                         const bool simd = item.reg.id >= 16 &&
-                                                          item.reg.id < 32 &&
-                                                          item.reg.mode.bits == 128;
+                                            item.reg.id < 48 &&
+                                            (item.reg.id < 32 ||
+                                             (subtarget.has_feature(Feature::Avx512f) &&
+                                              (bits == 512 || subtarget.has_feature(Feature::Avx512vl)))) &&
+                                            (bits == 128 ||
+                                             (bits == 256 && subtarget.has_feature(Feature::Avx)) ||
+                                             (bits == 512 && subtarget.has_feature(Feature::Avx512f)));
                                         return (!gpr && !simd) ||
                                                ((push || pop) &&
                                                 (!gpr || item.offset != 0));
@@ -281,7 +287,7 @@ private:
             &managed_module);
         if (diagnostics.errors() != 0) return {};
         const auto dynamic_plans = build_dynamic_abi_plans(
-            managed_module, hir_module, manual_plans, options,
+            managed_module, hir_module, manual_plans, subtarget, options,
             diagnostics);
         if (diagnostics.errors() != 0) return {};
         return emit_managed_machine_assembly(

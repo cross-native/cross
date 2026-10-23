@@ -3,14 +3,46 @@
 #include "target/x86_64/dynamic_abi_plan.hpp"
 
 #include "model/model.hpp"
+#include "target/subtarget.hpp"
+#include "target/x86_64/features.hpp"
 
 #include <algorithm>
-#include <array>
 #include <limits>
 #include <numeric>
 
 namespace cross::x86_64 {
 namespace {
+
+PreservedRegisterRanges register_preservation(
+    const std::vector<std::string>& clobbers,
+    const std::vector<std::string>& views, unsigned integer_bits) {
+    PreservedRegisterRanges ranges{};
+    for (const auto& view : register_views()) {
+        auto& range = ranges[view.storage_id];
+        const bool frame = view.storage_name == "rsp" || view.storage_name == "rbp";
+        range.end = std::max(range.end,
+            view.register_class == RegisterClass::integer && !frame
+                ? integer_bits : unsigned(view.bits));
+    }
+    for (const auto& name : clobbers) {
+        if (const auto* view = find_register_view(name))
+            ranges[view->storage_id] = {};
+    }
+    for (const auto& name : views) {
+        const auto* view = find_register_view(name);
+        ranges[view->storage_id] = {
+            view->bit_offset, unsigned(view->bit_offset) + view->bits};
+    }
+    return ranges;
+}
+
+void clobber_ranges(PreservedRegisterRanges& ranges,
+                    const std::vector<std::string>& names) {
+    for (const auto& name : names) {
+        if (const auto* view = find_register_view(name))
+            ranges[view->storage_id] = {};
+    }
+}
 
 std::size_t align_up(std::size_t value, std::size_t alignment) {
     return (value + alignment - 1U) & ~(alignment - 1U);
@@ -267,10 +299,25 @@ bool build_plan(const hir::Module& module,
                 const mir::ManagedFunction& managed,
                 const hir::Function& function,
                 DynamicAbiPlan& plan) {
-    static constexpr std::array<std::string_view, 7> gprs{
+    std::vector<std::string_view> gprs{
         "rax", "r11", "r10", "r9", "r8", "rcx", "rdx"};
-    static constexpr std::array<std::string_view, 6> simd{
+    std::vector<std::string_view> simd{
         "xmm0", "xmm5", "xmm4", "xmm3", "xmm2", "xmm1"};
+    // Retained views cannot also carry a private result or be overwritten
+    // while the caller places arguments.
+    if (const auto* abi = model_registry().find_abi(function.abi)) {
+        const auto preserved = [&](std::string_view candidate_name) {
+            const auto* candidate = find_register_view(candidate_name);
+            return std::any_of(abi->call_preserved_views.begin(),
+                               abi->call_preserved_views.end(),
+                               [&](const std::string& name) {
+                const auto* view = find_register_view(name);
+                return view && shares_register_storage(*candidate, *view);
+            });
+        };
+        std::erase_if(gprs, preserved);
+        std::erase_if(simd, preserved);
+    }
 
     std::vector<std::optional<ScalarMode>> modes;
     modes.reserve(function.parameters.size());
@@ -376,6 +423,7 @@ bool build_plan(const hir::Module& module,
                                    ? 1U
                                    : static_cast<unsigned>(
                                          (result.mode.bits + 63U) / 64U);
+            if (count > (floating ? simd.size() : gprs.size())) return false;
             for (unsigned piece = 0; piece < count; ++piece) {
                 const auto bits = static_cast<std::uint16_t>(
                     std::min<unsigned>(
@@ -438,11 +486,43 @@ void DynamicAbiPlans::add(DynamicAbiPlan plan) {
     entries_.push_back(std::move(plan));
 }
 
+void DynamicAbiPlans::initialize_preservation() {
+    abi_preservation_.resize(model_registry().abis().size());
+    for (const auto& abi : model_registry().abis()) {
+        if (abi.architecture != "x86-64") continue;
+        abi_preservation_[abi.id.value] = register_preservation(
+            abi.call_clobbers, abi.call_preserved_views,
+            preserved_integer_bits(abi, 64U));
+    }
+}
+
+const PreservedRegisterRanges& DynamicAbiPlans::abi_preserved_ranges(AbiId abi) const {
+    return abi_preservation_[abi.value];
+}
+
+const PreservedRegisterRanges& DynamicAbiPlans::preserved_ranges(
+    const hir::Module& module, std::optional<hir::FunctionId> direct,
+    std::optional<hir::TypeId> signature) const {
+    static const PreservedRegisterRanges empty{};
+    if (!direct && !signature) return empty;
+    const auto key = direct ? std::uint64_t{direct->value}
+                           : (std::uint64_t{1} << 32U) | signature->value;
+    if (const auto found = boundary_preservation_.find(key);
+        found != boundary_preservation_.end()) return found->second;
+    const auto callee = hir::call_signature(module, direct, signature);
+    if (!callee) return empty;
+    const auto* plan = direct ? find(*direct) : nullptr;
+    auto ranges = plan ? plan->preserved_ranges : abi_preserved_ranges(callee->abi);
+    clobber_ranges(ranges, callee->clobbers);
+    return boundary_preservation_.emplace(key, ranges).first->second;
+}
+
 DynamicAbiPlans build_dynamic_abi_plans(
     const mir::ManagedModule& managed, const hir::Module& hir_module,
-    const ManualAbiPlans& manual_plans, const CompilerOptions& options,
-    Diagnostics&) {
+    const ManualAbiPlans& manual_plans, const Subtarget& subtarget,
+    const CompilerOptions& options, Diagnostics&) {
     DynamicAbiPlans result;
+    result.initialize_preservation();
     if (!options.private_abi) return result;
     for (const auto& function : hir_module.functions) {
         if (function.abi_contract != hir::AbiContract::Dynamic ||
@@ -454,11 +534,9 @@ DynamicAbiPlans build_dynamic_abi_plans(
         if (!body) continue;
         DynamicAbiPlan plan;
         if (build_plan(hir_module, *body, function, plan)) {
-            if (!options.ipa_ra) {
-                if (const auto* fallback =
-                        model_registry().find_abi(function.abi)) {
-                    plan.clobbers = fallback->call_clobbers;
-                }
+            if (const auto* fallback = model_registry().find_abi(function.abi)) {
+                plan.preserved_views = fallback->call_preserved_views;
+                if (!options.ipa_ra) plan.clobbers = fallback->call_clobbers;
             }
             result.add(std::move(plan));
         }
@@ -486,6 +564,54 @@ DynamicAbiPlans build_dynamic_abi_plans(
     for (auto& plan : result.mutable_entries()) {
         append_unique(plan.clobbers,
                       hir_module.function(plan.function).clobbers);
+        if (plan.result) {
+            for (const auto& piece : plan.result->pieces) {
+                if (piece.location.kind == LocationKind::Register)
+                    append_unique(plan.clobbers, {piece.location.reg});
+            }
+        }
+    }
+    for (auto& plan : result.mutable_entries()) {
+        // A private body exposes its own writes rather than saving the
+        // registered ABI's views around every inner call.
+        std::erase_if(plan.preserved_views, [&](const std::string& name) {
+            const auto* kept = find_register_view(name);
+            return std::any_of(plan.clobbers.begin(), plan.clobbers.end(),
+                [&](const std::string& clobber) {
+                    const auto* written = find_register_view(clobber);
+                    return written && shares_register_storage(*kept, *written);
+                });
+        });
+        plan.preserved_ranges = register_preservation(
+            plan.clobbers, plan.preserved_views, 64U);
+        if (!subtarget.has_feature(Feature::Avx)) {
+            // Legacy SSE writes only the low 128 bits. Even a private
+            // volatile scratch retains the upper lanes on this subtarget.
+            for (unsigned storage = 16; storage < 32; ++storage) {
+                if (plan.preserved_ranges[storage].end == 0)
+                    plan.preserved_ranges[storage] = {128, 512};
+            }
+            for (unsigned storage = 32; storage < 48; ++storage)
+                plan.preserved_ranges[storage] = {0, 512};
+            clobber_ranges(plan.preserved_ranges,
+                           hir_module.function(plan.function).clobbers);
+        }
+        const auto* body = managed.find(plan.function);
+        if (options.ipa_ra && subtarget.has_feature(Feature::Avx) &&
+            !has_precise_straight_line_scalar_clobbers(
+                hir_module, *body, hir_module.function(plan.function))) {
+            // Selection may introduce wide vectors, including from scalar
+            // loops. Account for VZEROUPPER before machine selection runs.
+            for (unsigned storage = 16; storage < 32; ++storage) {
+                auto& range = plan.preserved_ranges[storage];
+                const bool explicit_view = std::any_of(
+                    plan.preserved_views.begin(), plan.preserved_views.end(),
+                    [&](const std::string& name) {
+                        return find_register_view(name)->storage_id == storage;
+                    });
+                if (!explicit_view) range.end = std::min(range.end, 128U);
+            }
+        }
     }
     bool changed = true;
     while (changed) {
@@ -494,46 +620,76 @@ DynamicAbiPlans build_dynamic_abi_plans(
             const auto* body = managed.find(plan.function);
             if (!body) continue;
             for (const auto& value : body->values) {
-                if (value.kind != mir::ValueKind::Call) {
-                    continue;
-                }
-                if (!value.callee) {
-                    const auto signature = hir::call_signature(
-                        hir_module, std::nullopt, value.call_signature);
-                    if (const auto* abi = signature ? model_registry().find_abi(
-                                                          signature->abi)
-                                                    : nullptr) {
-                        changed |=
-                            append_unique(plan.clobbers, abi->call_clobbers);
-                    }
-                    if (signature) {
-                        changed |=
-                            append_unique(plan.clobbers, signature->clobbers);
-                    }
-                    continue;
-                }
-                const auto& callee = hir_module.function(*value.callee);
-                if (const auto* private_callee = result.find(callee.id)) {
-                    changed |= append_unique(
-                        plan.clobbers, private_callee->clobbers);
-                    for (const auto& argument :
-                         private_callee->call.arguments) {
+                if (value.kind != mir::ValueKind::Call) continue;
+                const auto signature = hir::call_signature(
+                    hir_module, value.callee, value.call_signature);
+                if (!signature) continue;
+                const auto* private_callee = value.callee
+                    ? result.find(*value.callee) : nullptr;
+                auto ranges = private_callee ? private_callee->preserved_ranges
+                    : result.abi_preserved_ranges(signature->abi);
+                clobber_ranges(ranges, signature->clobbers);
+                if (private_callee) {
+                    for (const auto& argument : private_callee->call.arguments) {
                         for (const auto& piece : argument.pieces) {
-                            if (piece.location.kind ==
-                                LocationKind::Register) {
-                                changed |= append_unique(
-                                    plan.clobbers,
-                                    std::vector<std::string>{
-                                        piece.location.reg});
+                            if (piece.location.kind != LocationKind::Register) continue;
+                            const auto* view = find_register_view(piece.location.reg);
+                            auto& range = ranges[view->storage_id];
+                            if (view->register_class == RegisterClass::simd &&
+                                !subtarget.has_feature(Feature::Avx)) {
+                                range.begin = std::max(range.begin, 128U);
+                                if (range.begin >= range.end) range = {};
+                            } else {
+                                range = {};
                             }
                         }
                     }
-                } else if (const auto* abi =
-                               model_registry().find_abi(callee.abi)) {
-                    changed |= append_unique(
-                        plan.clobbers, abi->call_clobbers);
                 }
-                changed |= append_unique(plan.clobbers, callee.clobbers);
+                for (unsigned storage = 0; storage < ranges.size(); ++storage) {
+                    const auto old = plan.preserved_ranges[storage];
+                    auto merged = PreservedRegisterRange{
+                        std::max(old.begin, ranges[storage].begin),
+                        std::min(old.end, ranges[storage].end)};
+                    if (merged.begin >= merged.end) merged = {};
+                    if (old != merged) {
+                        plan.preserved_ranges[storage] = merged;
+                        changed = true;
+                    }
+                }
+                // Retain non-register effects as well.
+                const auto* abi = model_registry().find_abi(signature->abi);
+                const auto& clobbers = private_callee ? private_callee->clobbers
+                                                     : abi->call_clobbers;
+                for (const auto* names : {&clobbers, &signature->clobbers}) {
+                    for (const auto& name : *names) {
+                        if (!find_register_view(name))
+                            changed |= append_unique(plan.clobbers, {name});
+                    }
+                }
+            }
+        }
+    }
+    for (auto& plan : result.mutable_entries()) {
+        plan.preserved_views.clear();
+        std::erase_if(plan.clobbers, [](const std::string& name) {
+            return find_register_view(name) != nullptr;
+        });
+        for (unsigned storage = 0; storage < plan.preserved_ranges.size(); ++storage) {
+            const auto range = plan.preserved_ranges[storage];
+            const RegisterView* full = nullptr;
+            const RegisterView* kept = nullptr;
+            for (const auto& view : register_views()) {
+                if (view.storage_id != storage) continue;
+                if (!full || view.bits > full->bits) full = &view;
+                if (view.bit_offset == range.begin &&
+                    unsigned(view.bit_offset) + view.bits == range.end) kept = &view;
+            }
+            if (range.begin == range.end) {
+                append_unique(plan.clobbers, {std::string(full->storage_name)});
+            } else if (kept && kept != full) {
+                plan.preserved_views.emplace_back(kept->name);
+            } else if (!kept && range.begin == 128 && range.end == 512) {
+                append_unique(plan.clobbers, {"xmm" + std::to_string(storage - 16U)});
             }
         }
     }

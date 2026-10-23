@@ -212,6 +212,10 @@ public:
         const auto* target = target_for_triple(triple_);
         out_ << abi_name << " preserves:";
         const auto clobbered = [&](const RegisterEntry& reg) {
+            for (const auto& name : abi->call_preserved_views) {
+                const auto* view = find_register(*target, name);
+                if (view && view->storage == reg.storage) return false;
+            }
             return std::any_of(abi->call_clobbers.begin(), abi->call_clobbers.end(),
                                [&](const std::string& name) {
                                    const auto* entry = find_register(*target, name);

@@ -241,3 +241,23 @@ if(NOT avx_only_object_status EQUAL 0)
         "(${avx_only_object_status})\n"
         "${avx_only_object_stdout}\n${avx_only_object_stderr}")
 endif()
+
+# The immediate-shift path also needs a legacy SSE encoding without AVX.
+execute_process(
+    COMMAND "${CC}" -S -O2 -mno-avx -mprefer-vector-width=128 "${SOURCE}"
+            -o "${OUTPUT}.sse.s"
+    RESULT_VARIABLE sse_status ERROR_VARIABLE sse_errors)
+if(NOT sse_status EQUAL 0)
+    message(FATAL_ERROR "SSE-only vector-loop compilation failed\n${sse_errors}")
+endif()
+file(READ "${OUTPUT}.sse.s" sse_assembly)
+if(sse_assembly MATCHES "(^|\n)[\t ]+v[a-z0-9]+[\t ]")
+    message(FATAL_ERROR "SSE-only vector loop contains a VEX instruction")
+endif()
+execute_process(
+    COMMAND "${CC}" -c -O2 -mno-avx -mprefer-vector-width=128 "${SOURCE}"
+            -o "${OUTPUT}.sse.o"
+    RESULT_VARIABLE sse_status ERROR_VARIABLE sse_errors)
+if(NOT sse_status EQUAL 0)
+    message(FATAL_ERROR "SSE-only vector-loop assembly failed\n${sse_errors}")
+endif()

@@ -1,3 +1,5 @@
+# These transport fixtures preserve the low SSE lanes. Wider SIMD, mask,
+# and x87 state is volatile at their host-ABI bridges.
 abi "test_sysv" {
     architecture = "x86-64";
     address_bits = 64;
@@ -10,6 +12,23 @@ abi "test_sysv" {
     stack_alignment = 16;
     stack_slot_bytes = 8;
     return_address_bytes = 8;
+    call_clobbers = [
+        "rax", "rdx", "zmm0", "zmm1",
+        "zmm16", "zmm17", "zmm18", "zmm19",
+        "zmm20", "zmm21", "zmm22", "zmm23",
+        "zmm24", "zmm25", "zmm26", "zmm27",
+        "zmm28", "zmm29", "zmm30", "zmm31",
+        "k0", "k1", "k2", "k3",
+        "k4", "k5", "k6", "k7",
+        "st0", "st1", "st2", "st3",
+        "st4", "st5", "st6", "st7"
+    ];
+    call_preserved_views = [
+        "xmm2", "xmm3",
+        "xmm4", "xmm5", "xmm6", "xmm7",
+        "xmm8", "xmm9", "xmm10", "xmm11",
+        "xmm12", "xmm13", "xmm14", "xmm15"
+    ];
     stack_order = ["arguments"];
 
     bank "integer" {
@@ -23,7 +42,7 @@ abi "test_sysv" {
         class = "simd";
         register_bits = 64;
         arguments = [
-            "xmm0", "xmm1", "xmm2", "xmm3",
+            "xmm2", "xmm3",
             "xmm4", "xmm5", "xmm6", "xmm7"
         ];
         results = ["xmm0", "xmm1"];
@@ -66,7 +85,23 @@ abi "odd_abi" {
     stack_alignment = 16;
     stack_slot_bytes = 8;
     return_address_bytes = 8;
-    call_clobbers = ["r8", "r9", "r10", "r11", "memory", "flags"];
+    call_clobbers = [
+        "r8", "r9", "r10", "r11", "memory", "flags",
+        "zmm16", "zmm17", "zmm18", "zmm19",
+        "zmm20", "zmm21", "zmm22", "zmm23",
+        "zmm24", "zmm25", "zmm26", "zmm27",
+        "zmm28", "zmm29", "zmm30", "zmm31",
+        "k0", "k1", "k2", "k3",
+        "k4", "k5", "k6", "k7",
+        "st0", "st1", "st2", "st3",
+        "st4", "st5", "st6", "st7"
+    ];
+    call_preserved_views = [
+        "xmm0", "xmm1", "xmm2", "xmm3",
+        "xmm4", "xmm5", "xmm6", "xmm7",
+        "xmm8", "xmm9", "xmm10", "xmm11",
+        "xmm12", "xmm13", "xmm14", "xmm15"
+    ];
 
     bank "integer" {
         class = "integer";
@@ -118,7 +153,23 @@ abi "stack_result_abi" {
     stack_alignment = 16;
     stack_slot_bytes = 8;
     return_address_bytes = 8;
-    call_clobbers = ["r8", "r9", "r10", "r11", "memory", "flags"];
+    call_clobbers = [
+        "r8", "r9", "r10", "r11", "memory", "flags",
+        "zmm16", "zmm17", "zmm18", "zmm19",
+        "zmm20", "zmm21", "zmm22", "zmm23",
+        "zmm24", "zmm25", "zmm26", "zmm27",
+        "zmm28", "zmm29", "zmm30", "zmm31",
+        "k0", "k1", "k2", "k3",
+        "k4", "k5", "k6", "k7",
+        "st0", "st1", "st2", "st3",
+        "st4", "st5", "st6", "st7"
+    ];
+    call_preserved_views = [
+        "xmm0", "xmm1", "xmm2", "xmm3",
+        "xmm4", "xmm5", "xmm6", "xmm7",
+        "xmm8", "xmm9", "xmm10", "xmm11",
+        "xmm12", "xmm13", "xmm14", "xmm15"
+    ];
 
     bank "integer" {
         class = "integer";
@@ -175,7 +226,23 @@ abi "partial_result_abi" {
     stack_alignment = 16;
     stack_slot_bytes = 8;
     return_address_bytes = 8;
-    call_clobbers = ["rax", "r10", "r11", "memory", "flags"];
+    call_clobbers = [
+        "rax", "r10", "r11", "memory", "flags",
+        "zmm16", "zmm17", "zmm18", "zmm19",
+        "zmm20", "zmm21", "zmm22", "zmm23",
+        "zmm24", "zmm25", "zmm26", "zmm27",
+        "zmm28", "zmm29", "zmm30", "zmm31",
+        "k0", "k1", "k2", "k3",
+        "k4", "k5", "k6", "k7",
+        "st0", "st1", "st2", "st3",
+        "st4", "st5", "st6", "st7"
+    ];
+    call_preserved_views = [
+        "xmm0", "xmm1", "xmm2", "xmm3",
+        "xmm4", "xmm5", "xmm6", "xmm7",
+        "xmm8", "xmm9", "xmm10", "xmm11",
+        "xmm12", "xmm13", "xmm14", "xmm15"
+    ];
 
     bank "integer" {
         class = "integer";
@@ -214,7 +281,21 @@ abi "memory_result_abi" {
     stack_slot_bytes = 8;
     return_address_bytes = 8;
     call_clobbers = [
-        "r9", "r10", "r11", "r12", "memory", "flags"
+        "r9", "r10", "r11", "r12", "memory", "flags",
+        "zmm16", "zmm17", "zmm18", "zmm19",
+        "zmm20", "zmm21", "zmm22", "zmm23",
+        "zmm24", "zmm25", "zmm26", "zmm27",
+        "zmm28", "zmm29", "zmm30", "zmm31",
+        "k0", "k1", "k2", "k3",
+        "k4", "k5", "k6", "k7",
+        "st0", "st1", "st2", "st3",
+        "st4", "st5", "st6", "st7"
+    ];
+    call_preserved_views = [
+        "xmm0", "xmm1", "xmm2", "xmm3",
+        "xmm4", "xmm5", "xmm6", "xmm7",
+        "xmm8", "xmm9", "xmm10", "xmm11",
+        "xmm12", "xmm13", "xmm14", "xmm15"
     ];
 
     bank "integer" {

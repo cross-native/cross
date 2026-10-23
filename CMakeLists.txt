@@ -3856,6 +3856,13 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/model/homogeneous_validation.cmake")
     set_tests_properties(cross_model_homogeneous_validation PROPERTIES
         LABELS "check.compile;diagnostics;arch.x86_64;arch.aarch64;feature.model;feature.abi")
+    add_test(NAME cross_model_preserved_views
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/model-preserved-views
+                -P "${CMAKE_SOURCE_DIR}/test/model/preserved_views.cmake")
+    set_tests_properties(cross_model_preserved_views PROPERTIES
+        LABELS "check.compile;arch.x86_64;arch.mips;arch.aarch64;feature.model;feature.abi")
     add_test(NAME cross_model_march_modifiers
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
@@ -7238,6 +7245,36 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
     set_tests_properties(cross_runtime_native_vectors PROPERTIES
         LABELS "check.runtime;arch.x86_64;backend.native;feature.vector;opt.O2")
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+       CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+        foreach(view_isa avx2 avx512)
+            add_test(NAME cross_x86_64_preserved_views_${view_isa}
+                COMMAND "${Python3_EXECUTABLE}"
+                        "${CMAKE_SOURCE_DIR}/test/backend/abi/preserved_views/check.py"
+                        --cc $<TARGET_FILE:cross_cc> --host "${CMAKE_CXX_COMPILER}"
+                        --output "${CMAKE_CURRENT_BINARY_DIR}/preserved-views-${view_isa}"
+                        --isa ${view_isa})
+            set_tests_properties(cross_x86_64_preserved_views_${view_isa} PROPERTIES
+                LABELS "check.runtime;check.compile;arch.x86_64;backend.native;feature.abi;feature.register_allocation;feature.unwind;feature.model;isa.${view_isa}"
+                SKIP_RETURN_CODE 77)
+        endforeach()
+        add_test(NAME cross_x86_64_preserved_views_tail
+            COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_SOURCE_DIR}/test/backend/abi/preserved_views/tail.py"
+                    --cc $<TARGET_FILE:cross_cc> --host "${CMAKE_CXX_COMPILER}"
+                    --output "${CMAKE_CURRENT_BINARY_DIR}/preserved-views-tail")
+        set_tests_properties(cross_x86_64_preserved_views_tail PROPERTIES
+            LABELS "check.runtime;check.compile;arch.x86_64;backend.native;feature.abi;feature.tail_calls;feature.register_allocation"
+            SKIP_RETURN_CODE 77)
+        add_test(NAME cross_x86_64_preserved_views_selection
+            COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_SOURCE_DIR}/test/backend/abi/preserved_views/check.py"
+                    --cc $<TARGET_FILE:cross_cc> --host "${CMAKE_CXX_COMPILER}"
+                    --output "${CMAKE_CURRENT_BINARY_DIR}/preserved-views-selection"
+                    --isa selection)
+        set_tests_properties(cross_x86_64_preserved_views_selection PROPERTIES
+            LABELS "check.compile;arch.x86_64;backend.native;feature.abi;feature.model;feature.subtarget")
+    endif()
     # Vectors of constant lanes, which load as one literal.
     foreach(constant_mode O0 O2 O2-avx2 O2-medium O3)
         string(REGEX MATCH "^O[0-9s]" constant_level "${constant_mode}")
@@ -7341,6 +7378,19 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
     set_tests_properties(cross_runtime_native_vector_loop_optimization PROPERTIES
         LABELS "check.runtime;arch.x86_64;backend.native;feature.vector;feature.optimization;opt.O2")
+    add_test(NAME cross_runtime_native_vector_loop_sse
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/vector/loop_optimization.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-vector-loop-sse
+                -DENTRY=vector_loop_entry
+                -DEXPECTED=16
+                "-DCC_FLAGS=-O2;-mno-avx;-mprefer-vector-width=128"
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+    set_tests_properties(cross_runtime_native_vector_loop_sse PROPERTIES
+        LABELS "check.runtime;arch.x86_64;backend.native;feature.vector;feature.optimization;isa.sse2;opt.O2")
     foreach(variant IN ITEMS "default;-O3" "sse41;-O2;-march=x86-64-v2")
         list(GET variant 0 variant_name)
         list(REMOVE_AT variant 0)

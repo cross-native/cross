@@ -126,6 +126,23 @@ The Cross ABI is not compatible with either C ABI. Across calls it preserves
 register and all SIMD, mask, and x87 state may change. Use `sysv_abi` or
 `ms_abi` at C boundaries.
 
+`ms_abi` preserves only the low 128 bits of `xmm6`-`xmm15`. The upper
+YMM/ZMM bits and all vector registers 16-31 and mask registers are volatile.
+User ABIs can specify other preserved slices with `call_preserved_views`
+([models.md](models.md#entry-properties)). Values wider than a preserved
+view are spilled around calls or allocated elsewhere. Definitions preserve
+the views they use in frame save slots; stronger callers also save the
+preservation difference when calling another ABI. SIMD save forms follow
+the encodings used and the contracts of called functions. Legacy SSE
+writes leave upper lanes intact; VEX and EVEX writes also clear upper
+lanes. An operation or call that destroys promised bits the selected
+features cannot save is diagnosed, for explicit views and whole-register
+promises alike. Sibling calls require the callee to preserve every bit
+the caller promises; an incompatible `musttail` call is diagnosed.
+Win64 unwind records describe XMM saves; saves of registers 16-31 and
+frame-register offsets above 240 bytes with Win64 unwind tables are
+diagnosed.
+
 The C ABIs name the C types ([models.md](models.md#entry-properties)), which
 the format checkers read; `char`, `short`, `int`, `long long`, `intmax_t`,
 `float`, and `double` are `i8`, `i16`, `i32`, `i64`, `i64`, `f32`, and `f64`

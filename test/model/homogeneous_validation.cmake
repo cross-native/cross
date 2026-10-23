@@ -115,11 +115,11 @@ abi "a" {
     }
 }
 ]=])
-foreach(case "clobbered;xmm0" "unknown;xmm32" "twice;xmm6\", \"ymm6")
+foreach(case "unknown;xmm32" "twice;xmm6\", \"ymm6")
     list(GET case 0 label)
     list(GET case 1 views)
     expect_rejected(views-${label} 7
-        "ABI model 'a' call_preserved_views names '[^']+', which is not a view of a register that call_clobbers omits, or a second view of one"
+        "ABI model 'a' call_preserved_views names '[^']+', which is not a register view, or a second view of one register"
         "abi \"a\" {
     architecture = \"x86-64\";
     address_bits = 64;

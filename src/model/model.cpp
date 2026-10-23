@@ -2415,6 +2415,16 @@ private:
                 !check_abi(*target_info, entry, properties, blocks, line)) {
                 return std::nullopt;
             }
+            // Keep the partial-preservation spelling equivalent to omitting
+            // that storage from the volatile set on every target.
+            std::erase_if(entry.call_clobbers, [&](const std::string& name) {
+                const auto* reg = find_register(*target_info, name);
+                return reg && std::ranges::any_of(
+                    entry.call_preserved_views, [&](const std::string& kept) {
+                        return find_register(*target_info, kept)->storage ==
+                               reg->storage;
+                    });
+            });
         }
         return entries;
     }
@@ -2590,16 +2600,12 @@ private:
         std::unordered_set<std::string_view> preserved_storage;
         for (const auto& name : abi.call_preserved_views) {
             const auto* view = find_register(target, name);
-            const auto clobbered = [&](std::string_view clobber) {
-                const auto* entry = find_register(target, clobber);
-                return entry && view && entry->storage == view->storage;
-            };
-            if (!view || std::ranges::any_of(abi.call_clobbers, clobbered) ||
+            if (!view ||
                 !preserved_storage.insert(view->storage).second) {
                 fail(property_line(properties, "call_preserved_views"),
                      model + " call_preserved_views names '" + name +
-                         "', which is not a view of a register that "
-                         "call_clobbers omits, or a second view of one");
+                         "', which is not a register view, or a second view "
+                         "of one register");
                 return false;
             }
         }

@@ -266,8 +266,8 @@ struct AbiEntry {
     // The storage that a call also changes in position-independent code
     // (MIPS -mabicalls), where the callee sets up its own GOT pointer.
     std::vector<std::string> pic_call_clobbers;
-    // Views of registers that call_clobbers omits: a call preserves only
-    // their bits, such as d8 of AArch64's v8.
+    // Preserved views, including exceptions to call_clobbers: a call keeps
+    // only their bits, such as d8 of AArch64's v8.
     std::vector<std::string> call_preserved_views;
     AbiRegisterFailure argument_register_failure{AbiRegisterFailure::Stack};
     AbiRegisterFailure result_register_failure{AbiRegisterFailure::Error};

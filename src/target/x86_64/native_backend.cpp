@@ -184,72 +184,105 @@ const AbiEntry* abi_model(AbiId abi) {
     return model && model->architecture == "x86-64" ? model : nullptr;
 }
 
-// The low bits of the general registers its call_clobbers omit that a
-// function preserves. A function with a dynamic plan is compiled here and
-// saves whole registers.
-unsigned preserved_integer_bits(const hir::Module& module,
-                                const DynamicAbiPlans& dynamic_plans,
-                                std::optional<hir::FunctionId> direct,
-                                std::optional<hir::TypeId> signature) {
-    if (direct && dynamic_plans.find(*direct)) return 64U;
-    const auto callee = hir::call_signature(module, direct, signature);
-    const auto* abi = callee ? abi_model(callee->abi) : nullptr;
-    return abi ? preserved_integer_bits(*abi, 64U) : 64U;
-}
-
-// The general registers whose upper bits a call under a narrow integer bank
-// may change: all but the stack and frame pointers.
-const std::unordered_set<std::uint32_t>& partially_preserved_registers() {
-    static const auto result = [] {
-        std::unordered_set<std::uint32_t> storage;
-        for (const auto* name :
-             {"rax", "rbx", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10",
-              "r11", "r12", "r13", "r14", "r15"}) {
-            if (const auto* view = find_register_view(name)) {
-                storage.insert(view->storage_id);
-            }
-        }
-        return storage;
-    }();
-    return result;
-}
-
 const RegisterView* canonical_storage_view(
     machine::PhysicalRegisterId physical) {
-    const auto& views = register_views();
-    const auto found = std::find_if(
-        views.begin(), views.end(), [&](const RegisterView& view) {
-            if (view.storage_id != physical.value) return false;
-            return (view.register_class == RegisterClass::integer &&
-                    view.bits == 64 && view.name == view.storage_name) ||
-                   (view.register_class == RegisterClass::simd &&
-                    view.bits == 128 && view.name.starts_with("xmm"));
-        });
-    return found == views.end() ? nullptr : &*found;
+    static const auto canonical = [] {
+        std::array<const RegisterView*, 64> result{};
+        for (const auto& view : register_views()) {
+            if ((view.register_class == RegisterClass::integer &&
+                 view.bits == 64 && view.name == view.storage_name) ||
+                (view.register_class == RegisterClass::simd &&
+                 view.bits == 128 && view.name.starts_with("xmm"))) {
+                result[view.storage_id] = &view;
+            }
+        }
+        return result;
+    }();
+    return physical.value < canonical.size() ? canonical[physical.value] : nullptr;
 }
 
-bool names_clobber_storage(const std::vector<std::string>& names,
-                           const RegisterView& candidate) {
-    return std::any_of(
-        names.begin(), names.end(), [&](const std::string& name) {
-            const auto* clobber = find_register_view(name);
-            return clobber && shares_register_storage(candidate, *clobber);
-        });
+const RegisterView* preserved_view(const std::vector<std::string>& names,
+                                   const RegisterView& candidate) {
+    for (const auto& name : names) {
+        const auto* view = find_register_view(name);
+        if (view && shares_register_storage(candidate, *view)) return view;
+    }
+    return nullptr;
 }
 
-// Whether the boundary of `function` lets it change `candidate`: the
-// clobbers of its dynamic plan or ABI, and its own clobber list.
+// Explicit function clobbers override the registered preservation contract.
+PreservedRegisterRange preserved_register_range(
+    const hir::Module& module, const DynamicAbiPlans& dynamic_plans,
+    std::optional<hir::FunctionId> direct,
+    std::optional<hir::TypeId> signature, const RegisterView& candidate) {
+    return dynamic_plans.preserved_ranges(module, direct, signature)[candidate.storage_id];
+}
+
 bool boundary_may_clobber(const hir::Module& module,
                           const DynamicAbiPlans& dynamic_plans,
                           hir::FunctionId function,
                           const RegisterView& candidate) {
-    const auto& entity = module.function(function);
-    const auto* dynamic = dynamic_plans.find(function);
-    const auto* abi = abi_model(entity.abi);
-    const bool base_clobber = dynamic
-        ? names_clobber_storage(dynamic->clobbers, candidate)
-        : abi && names_clobber_storage(abi->call_clobbers, candidate);
-    return base_clobber || names_clobber_storage(entity.clobbers, candidate);
+    const auto range = preserved_register_range(
+        module, dynamic_plans, function, std::nullopt, candidate);
+    return range.begin == range.end || range.begin >= candidate.bits;
+}
+
+const std::vector<const RegisterView*>& canonical_register_views() {
+    static const auto result = [] {
+        std::vector<const RegisterView*> views;
+        for (const auto& view : register_views()) {
+            if (canonical_storage_view({view.storage_id}) == &view)
+                views.push_back(&view);
+        }
+        return views;
+    }();
+    return result;
+}
+
+PreservedRegisterRanges call_preserved_ranges(
+    const hir::Module& module, const DynamicAbiPlans& dynamic_plans,
+    const machine::Instruction& call) {
+    auto ranges = dynamic_plans.preserved_ranges(
+        module, call.direct_callee, call.call_signature);
+    for (const auto& clobber : call.clobbers) {
+        if (clobber.kind != machine::RegisterKind::Physical || clobber.id >= ranges.size())
+            continue;
+        auto& range = ranges[clobber.id];
+        range.begin = std::max(range.begin, unsigned(clobber.mode.bits));
+        if (range.begin >= range.end) range = {};
+    }
+    return ranges;
+}
+
+bool register_feature_available(const RegisterView& view,
+                                 const Subtarget& subtarget) {
+    return view.required_feature == RegisterFeature::base ||
+           (view.required_feature == RegisterFeature::avx &&
+            subtarget.has_feature(Feature::Avx)) ||
+           (view.required_feature == RegisterFeature::avx512f &&
+            subtarget.has_feature(Feature::Avx512f));
+}
+
+const RegisterView* register_mode_view(machine::Register reg) {
+    for (const auto& view : register_views()) {
+        if (view.storage_id == reg.id && view.bit_offset == 0 &&
+            view.bits == reg.mode.bits) return &view;
+    }
+    return nullptr;
+}
+
+const RegisterView* callee_save_view(const machine::Function& function,
+                                    machine::PhysicalRegisterId physical) {
+    for (const auto& slot : function.stack_slots) {
+        if (slot.saved_register && slot.saved_register->id == physical.value)
+            return register_mode_view(*slot.saved_register);
+    }
+    return nullptr;
+}
+
+std::string_view simd_save_opcode(const RegisterView& view) {
+    return view.bits == 512 || view.storage_id >= 32 ? "vmovdqu64"
+         : view.bits == 256 ? "vmovdqu" : "movdqu";
 }
 
 const RegisterView* machine_register_view(
@@ -1146,25 +1179,56 @@ private:
         return source_ && !mir::has_reachable_return(*source_);
     }
 
-    void add_preserved_storage(std::uint32_t storage) {
+    unsigned available_vector_bits() const {
+        return subtarget_.has_feature(Feature::Avx512f) ? 512U
+             : subtarget_.has_feature(Feature::Avx) ? 256U : 128U;
+    }
+
+    void diagnose_preservation_width(const RegisterView& view, unsigned bits) {
+        diagnostics_.error(current_.location,
+            "preserving register storage '" + std::string(view.storage_name) +
+                "' across this call requires target feature '" +
+                (bits > 256 ? "avx512f" : "avx") + "'");
+    }
+
+    void add_preserved_storage(std::uint32_t storage, unsigned required_bits = 0) {
         if (current_.frame.elide_incoming_saves) return;
         const machine::PhysicalRegisterId physical{storage};
-        if (std::find(current_.callee_saved_registers.begin(),
-                      current_.callee_saved_registers.end(), physical) !=
-            current_.callee_saved_registers.end()) {
-            return;
-        }
         const auto* view = canonical_storage_view(physical);
         if (!view) return;
+        if (!register_feature_available(*view, subtarget_)) return;
+        const auto range = preserved_register_range(
+            hir_, dynamic_plans_, current_.source, std::nullopt, *view);
+        unsigned save_bits = 64;
+        if (view->register_class == RegisterClass::simd) {
+            const auto available = subtarget_.has_feature(Feature::Avx512f) ? 512U
+                                 : subtarget_.has_feature(Feature::Avx) ? 256U : 128U;
+            // Legacy SSE writes leave the upper lanes intact. If this
+            // subtarget cannot save the whole promise, the emitter checks
+            // that no VEX/EVEX write destroys those unsavable lanes.
+            save_bits = required_bits != 0 ? required_bits
+                      : range.end > available ? 128U : range.end;
+            save_bits = save_bits > 256 ? 512 : save_bits > 128 ? 256 : 128;
+            // Registers 16-31 need EVEX; short memory forms require AVX512VL.
+            if (view->storage_id >= 32 && !subtarget_.has_feature(Feature::Avx512vl))
+                save_bits = 512;
+        }
+        for (auto& save : current_.stack_slots) {
+            if (!save.saved_register || save.saved_register->id != storage) continue;
+            save.size = std::max(save.size, save_bits / 8U);
+            save.saved_register->mode.bits = static_cast<std::uint16_t>(save.size * 8U);
+            save.alignment = std::min(save.size, 16U);
+            return;
+        }
         current_.callee_saved_registers.push_back(physical);
         machine::StackSlot save;
         save.id = {static_cast<std::uint32_t>(
             current_.stack_slots.size())};
         save.kind = machine::StackSlotKind::CalleeSave;
-        save.size = view->register_class == RegisterClass::simd ? 16 : 8;
+        save.size = save_bits / 8U;
         save.saved_register = machine::Register::physical_register(
             physical, machine::IntegerMode{static_cast<std::uint16_t>(save.size * 8U)});
-        save.alignment = save.size;
+        save.alignment = std::min(save.size, 16U);
         save.location = current_.location;
         save.name = "$callee.save." + std::string(view->storage_name);
         current_.stack_slots.push_back(std::move(save));
@@ -1194,7 +1258,7 @@ private:
         for (const auto storage : bound) add_preserved_storage(storage);
         // The realigned dynamic prologue pushes its CFA anchor itself.
         const auto anchor = current_.frame.cfa_anchor_register;
-        std::unordered_set<std::uint32_t> required;
+        std::unordered_map<std::uint32_t, unsigned> required;
         for (const auto& block : current_.blocks) {
             for (const auto& instruction : block.instructions) {
                 for (const auto& clobber : instruction.clobbers) {
@@ -1205,12 +1269,7 @@ private:
                     const machine::PhysicalRegisterId physical{clobber.id};
                     const auto* view = canonical_storage_view(physical);
                     const bool feature_available = view &&
-                        (view->required_feature == RegisterFeature::base ||
-                         (view->required_feature == RegisterFeature::avx &&
-                          subtarget_.has_feature(Feature::Avx)) ||
-                         (view->required_feature ==
-                              RegisterFeature::avx512f &&
-                          subtarget_.has_feature(Feature::Avx512f)));
+                        register_feature_available(*view, subtarget_);
                     if (!feature_available ||
                         (view->register_class != RegisterClass::integer &&
                          view->register_class != RegisterClass::simd) ||
@@ -1218,42 +1277,43 @@ private:
                         current_function_may_clobber(*view)) {
                         continue;
                     }
-                    required.insert(view->storage_id);
+                    required.try_emplace(view->storage_id, 0U);
                 }
             }
         }
-        // A callee under a narrower integer bank may change the upper bits
-        // of registers this function's callers expect whole.
-        const auto own_bits = preserved_integer_bits(
-            hir_, dynamic_plans_, current_.source, std::nullopt);
-        const bool narrow_call = std::any_of(
-            current_.blocks.begin(), current_.blocks.end(),
-            [&](const machine::Block& block) {
-                return std::any_of(
-                    block.instructions.begin(), block.instructions.end(),
-                    [&](const machine::Instruction& instruction) {
-                        return instruction.kind ==
-                                   machine::InstructionKind::Call &&
-                               preserved_integer_bits(
-                                   hir_, dynamic_plans_,
-                                   instruction.direct_callee,
-                                   instruction.call_signature) < own_bits;
-                    });
-            });
-        if (narrow_call) {
-            for (const auto storage : partially_preserved_registers()) {
-                const auto* view = canonical_storage_view(
-                    machine::PhysicalRegisterId{storage});
-                if (view && !(anchor && anchor->value == storage) &&
-                    !current_function_may_clobber(*view)) {
-                    required.insert(storage);
+        // A call may preserve a narrower view than this function promises.
+        const auto& own_ranges = dynamic_plans_.preserved_ranges(hir_, current_.source);
+        for (const auto& block : current_.blocks) {
+            for (const auto& instruction : block.instructions) {
+                if (instruction.kind != machine::InstructionKind::Call) continue;
+                const auto callee_ranges = call_preserved_ranges(hir_, dynamic_plans_, instruction);
+                for (const auto* view : canonical_register_views()) {
+                    if (anchor && anchor->value == view->storage_id) continue;
+                    const auto own = own_ranges[view->storage_id];
+                    const auto callee = callee_ranges[view->storage_id];
+                    if (!callee.contains(own)) {
+                        // If a legacy callee retains the upper lanes, saving
+                        // only the changed prefix satisfies a wider promise.
+                        const auto bits = callee.end >= own.end
+                            ? std::min(own.end, callee.begin) : own.end;
+                        if (view->register_class == RegisterClass::simd &&
+                            (!register_feature_available(*view, subtarget_) ||
+                             bits > available_vector_bits())) {
+                            diagnose_preservation_width(*view,
+                                view->storage_id >= 32 ? 512U : bits);
+                        }
+                        auto& needed = required[view->storage_id];
+                        needed = std::max(needed, bits);
+                    }
                 }
             }
         }
-        std::vector<std::uint32_t> ordered(required.begin(), required.end());
+        std::vector<std::uint32_t> ordered;
+        for (const auto& [storage, bits] : required) ordered.push_back(storage);
         std::sort(ordered.begin(), ordered.end());
         if (!current_.frame.elide_incoming_saves) {
-            for (const auto storage : ordered) add_preserved_storage(storage);
+            for (const auto storage : ordered)
+                add_preserved_storage(storage, required.at(storage));
         }
     }
 
@@ -2042,8 +2102,10 @@ private:
                             machine::Register::physical_register(
                                 {view->storage_id},
                                 {static_cast<std::uint16_t>(
-                                    std::min<unsigned>(
-                                        view->bits, 128U))}));
+                                    view->register_class == RegisterClass::simd
+                                        ? (subtarget_.has_feature(Feature::Avx) ? 512U : 128U)
+                                        : view->zero_extends_storage_on_write ? 64U
+                                        : unsigned(view->bits) + view->bit_offset)}));
                     }
                 };
             if (const auto* dynamic = value.callee
@@ -8741,7 +8803,6 @@ private:
         // Colors a crossed call clobbers. A value may still take one and be
         // split through its home around that call.
         std::vector<std::unordered_set<std::uint32_t>> call_forbidden(count);
-        const auto& partially_preserved = partially_preserved_registers();
         for (const auto& block : current_.blocks) {
             auto live = live_out[block.id.value];
             for (auto item = block.instructions.rbegin();
@@ -8994,20 +9055,19 @@ private:
                     }
                 }
                 if (item->kind == machine::InstructionKind::Call) {
-                    // A value wider than the general-register bits the call
-                    // preserves is split around it like a clobbered one.
-                    const auto preserved_bits = preserved_integer_bits(
-                        hir_, dynamic_plans_, item->direct_callee,
-                        item->call_signature);
-                    for (const auto id : live) {
-                        if (id >= count ||
-                            current_.virtual_registers[id].bits <=
-                                preserved_bits) {
-                            continue;
+                    const auto ranges = call_preserved_ranges(hir_, dynamic_plans_, *item);
+                    for (const auto* view : canonical_register_views()) {
+                        const auto range = ranges[view->storage_id];
+                        const auto maximum = view->register_class == RegisterClass::simd ? 512U : 64U;
+                        // Whole-storage clobbers were handled above. Only
+                        // partial promises add width-dependent exclusions.
+                        if (range.begin == range.end || range.contains({0, maximum})) continue;
+                        for (const auto id : live) {
+                            if (id < count && !range.contains(
+                                    {0, current_.virtual_registers[id].bits})) {
+                                call_forbidden[id].insert(view->storage_id);
+                            }
                         }
-                        call_forbidden[id].insert(
-                            partially_preserved.begin(),
-                            partially_preserved.end());
                     }
                 }
                 if (!phi) {
@@ -9329,18 +9389,7 @@ private:
                 }
             }
         }
-        // Win64 preserves only the low 128 bits of XMM6-XMM15, and every
-        // ordinary x86-64 ABI permits a callee to clobber YMM/ZMM upper
-        // lanes. Keep a wide value crossing a call in its full-width home
-        // until call-boundary splitting understands vector-width spills.
-        for (std::size_t id = 0; id < count; ++id) {
-            if (crosses_call[id] &&
-                current_.virtual_register_classes[id] ==
-                    machine::VirtualRegisterClass::Vector) {
-                eligible[id] = false;
-            }
-        }
-        // A scalar crossing calls may take a volatile color that a crossed
+        // A value crossing calls may take a volatile color that a crossed
         // call clobbers; the emitter then stores and reloads it around that
         // call. Prefer this over a memory-resident value when its uses and
         // definition would cost at least as much home traffic.
@@ -9348,11 +9397,12 @@ private:
         for (std::size_t id = 0; id < count; ++id) {
             split_allowed[id] = crosses_call[id] && eligible[id] &&
                 !current_.rematerialized_immediates[id] &&
-                current_.virtual_registers[id].bits <= 64 &&
                 (current_.virtual_register_classes[id] ==
                      machine::VirtualRegisterClass::Integer ||
                  current_.virtual_register_classes[id] ==
-                     machine::VirtualRegisterClass::Floating) &&
+                     machine::VirtualRegisterClass::Floating ||
+                 current_.virtual_register_classes[id] ==
+                     machine::VirtualRegisterClass::Vector) &&
                 register_use_counts[id] + 1 >= 2 * crossed_calls[id];
         }
 
@@ -9931,18 +9981,22 @@ private:
                 colors.clear();
             } else if (crosses_call[id]) {
                 // Prefer a volatile register no crossed call clobbers, then a
-                // function-wide callee-save, then a clobbered volatile
-                // register split through the home around each crossed call.
+                // function-wide callee-save that survives the call, then
+                // volatile split colors, then preserved split colors.
                 std::vector<machine::PhysicalRegisterId> split;
                 std::erase_if(colors, [&](machine::PhysicalRegisterId color) {
                     if (!call_forbidden[id].contains(color.value)) return false;
                     split.push_back(color);
                     return true;
                 });
-                colors.insert(colors.end(), preserved_colors.begin(),
-                              preserved_colors.end());
+                for (const auto color : preserved_colors) {
+                    if (!call_forbidden[id].contains(color.value)) colors.push_back(color);
+                }
                 if (split_allowed[id]) {
                     colors.insert(colors.end(), split.begin(), split.end());
+                    for (const auto color : preserved_colors) {
+                        if (call_forbidden[id].contains(color.value)) colors.push_back(color);
+                    }
                 }
             } else if (!rematerializable) {
                 // A one-time callee-save is preferable to a spill inside a
@@ -10592,27 +10646,18 @@ private:
         }
 
         std::unordered_set<std::uint32_t> preserved_assignments;
-        const auto collect_preserved_assignment =
-            [&](const std::optional<machine::PhysicalRegisterId>& assignment,
-                const std::vector<machine::PhysicalRegisterId>& colors) {
-                if (assignment &&
-                    std::find(colors.begin(), colors.end(), *assignment) !=
-                        colors.end()) {
-                    preserved_assignments.insert(assignment->value);
-                }
-            };
-        for (std::size_t id = 0;
-             id < current_.virtual_register_assignments.size(); ++id) {
-            const bool simd_class =
-                current_.virtual_register_classes[id] ==
-                    machine::VirtualRegisterClass::Floating ||
-                current_.virtual_register_classes[id] ==
-                    machine::VirtualRegisterClass::Vector;
-            collect_preserved_assignment(
-                current_.virtual_register_assignments[id],
-                simd_class
-                    ? preserved_floating_colors
-                    : preserved_integer_colors);
+        const auto* own_dynamic = dynamic_plans_.find(current_.source);
+        const auto& own_views = own_dynamic ? own_dynamic->preserved_views
+                                           : function_abi->call_preserved_views;
+        for (const auto& assignment : current_.virtual_register_assignments) {
+            if (!assignment) continue;
+            const auto* view = canonical_storage_view(*assignment);
+            if (!view || current_function_may_clobber(*view)) continue;
+            const auto& colors = view->register_class == RegisterClass::simd
+                ? preserved_floating_colors : preserved_integer_colors;
+            if (preserved_view(own_views, *view) ||
+                std::find(colors.begin(), colors.end(), *assignment) != colors.end())
+                preserved_assignments.insert(assignment->value);
         }
         std::vector<std::uint32_t> ordered_preserved(
             preserved_assignments.begin(), preserved_assignments.end());
@@ -10635,9 +10680,7 @@ private:
                     }
                 }
                 if (item->kind == machine::InstructionKind::Call) {
-                    const auto preserved_bits = preserved_integer_bits(
-                        hir_, dynamic_plans_, item->direct_callee,
-                        item->call_signature);
+                    const auto ranges = call_preserved_ranges(hir_, dynamic_plans_, *item);
                     std::vector<std::uint32_t> ids(live.begin(), live.end());
                     std::sort(ids.begin(), ids.end());
                     for (const auto id : ids) {
@@ -10647,16 +10690,10 @@ private:
                         }
                         const auto assigned =
                             *current_.virtual_register_assignments[id];
-                        const bool call_clobbers_assignment = std::any_of(
-                            item->clobbers.begin(), item->clobbers.end(),
-                            [&](const machine::Register& clobber) {
-                                return clobber.kind ==
-                                           machine::RegisterKind::Physical &&
-                                       clobber.id == assigned.value;
-                            }) ||
-                            (current_.virtual_registers[id].bits >
-                                 preserved_bits &&
-                             partially_preserved.contains(assigned.value));
+                        const auto* view = canonical_storage_view(assigned);
+                        const bool call_clobbers_assignment = view &&
+                            !ranges[view->storage_id].contains(
+                                {0, current_.virtual_registers[id].bits});
                         if (call_clobbers_assignment) {
                             item->live_across_call.push_back(
                                 machine::Register::virtual_register(
@@ -12026,11 +12063,12 @@ private:
         case Opcode::FrameSave:
         case Opcode::FrameRestore:
             for (const auto& transfer : effect.transfers) {
-                const auto* view = canonical_storage_view({transfer.reg.id});
+                const auto* view = register_mode_view(transfer.reg);
                 const bool load = effect.operation == machine::FrameOperation::Restore;
                 const auto reg = "%" + std::string(view->name);
                 const auto address = std::to_string(transfer.offset) + "(" + base + ")";
-                instruction(view->register_class == RegisterClass::simd ? "movdqu" : "movq",
+                instruction(view->register_class == RegisterClass::simd
+                                ? simd_save_opcode(*view) : "movq",
                             load ? address + ", " + reg : reg + ", " + address);
             }
             break;
@@ -12062,8 +12100,8 @@ private:
             unsigned number{};
             const auto digits = storage.substr(3);
             const auto parsed = std::from_chars(digits.data(), digits.data() + digits.size(), number);
-            if (parsed.ec == std::errc{} && parsed.ptr == digits.data() + digits.size() && number < 16)
-                return 17 + number;
+            if (parsed.ec == std::errc{} && parsed.ptr == digits.data() + digits.size() && number < 32)
+                return number < 16 ? 17 + number : 67 + number - 16;
         }
         return std::nullopt;
     }
@@ -12080,7 +12118,8 @@ private:
                 [](unsigned reg) {
                     return "%" + (reg < std::size(dwarf_general_)
                                       ? std::string(dwarf_general_[reg])
-                                      : "xmm" + std::to_string(reg - 17));
+                                      : "xmm" + std::to_string(
+                                            reg >= 67 ? reg - 67 + 16 : reg - 17));
                 }};
     }
 
@@ -13350,7 +13389,7 @@ private:
         const machine::Function& function, bool seh) {
         if (compact_gpr_saves_) return;
         for (const auto physical : function.callee_saved_registers) {
-            const auto* view = canonical_storage_view(physical);
+            const auto* view = callee_save_view(function, physical);
             if (!view) continue;
             const auto slot = named_slot_offset(
                 function,
@@ -13366,10 +13405,17 @@ private:
                 ? fixed_cfa_memory(*slot)
                 : memory(*slot);
             if (view->register_class == RegisterClass::simd) {
-                instruction("movdqu", "%" + std::string(view->name) +
+                if (seh && view->storage_id >= 32) {
+                    diagnostics_.error(function.location,
+                        "Win64 unwind cannot describe callee-saved register '" +
+                            std::string(view->name) + "'");
+                    continue;
+                }
+                instruction(simd_save_opcode(*view), "%" + std::string(view->name) +
                                           ", " + address);
                 if (seh) {
-                    output_ << ".seh_savexmm %" << view->name << ", "
+                    output_ << ".seh_savexmm %"
+                            << canonical_storage_view(physical)->name << ", "
                             << (fixed_cfa
                                     ? static_cast<std::int64_t>(
                                           fixed_cfa_save_size(function)) +
@@ -13397,7 +13443,7 @@ private:
                     : static_cast<std::int64_t>(*slot) + red_zone_base_ -
                           frame_size_ -
                           (function.frame.has_frame_pointer ? 16 : 8);
-                output_ << ".cfi_offset %" << view->name << ", "
+                output_ << ".cfi_offset %" << canonical_storage_view(physical)->name << ", "
                         << cfa_offset << '\n';
             }
         }
@@ -13435,7 +13481,7 @@ private:
         }
         for (auto item = function.callee_saved_registers.rbegin();
              item != function.callee_saved_registers.rend(); ++item) {
-            const auto* view = canonical_storage_view(*item);
+            const auto* view = callee_save_view(function, *item);
             if (!view) continue;
             const auto slot = named_slot_offset(
                 function,
@@ -13445,7 +13491,7 @@ private:
                 ? fixed_cfa_memory(*slot)
                 : memory(*slot);
             if (view->register_class == RegisterClass::simd) {
-                instruction("movdqu", address + ", %" +
+                instruction(simd_save_opcode(*view), address + ", %" +
                                           std::string(view->name));
             } else {
                 instruction("movq", address + ", " +
@@ -13515,6 +13561,36 @@ private:
         return result;
     }
 
+    void verify_preserved_vector_encoding(std::string_view opcode,
+                                          std::string_view operands) {
+        if (!check_vector_encoding_ || !opcode.starts_with('v')) return;
+        const auto check = [&](unsigned storage) {
+            if (!unsavable_vector_views_[storage]) return;
+            unsavable_vector_views_[storage] = false;
+            const auto range = dynamic_plans_.preserved_ranges(
+                hir_, active_function_->source)[storage];
+            diagnostics_.error(pending_location_,
+                "preserving register storage 'zmm" + std::to_string(storage - 16U) +
+                    "' across this vector encoding requires target feature '" +
+                    (range.end > 256 ? "avx512f" : "avx") + "'");
+        };
+        if (opcode == "vzeroupper" || opcode == "vzeroall") {
+            for (unsigned storage = 16; storage < 32; ++storage) check(storage);
+            return;
+        }
+        // At the assembly boundary, VEX/EVEX SIMD destinations write the
+        // entire storage, including zeroed upper lanes. Flag-only tests have
+        // no SIMD destination, even though their last operand is a register.
+        if (opcode == "vptest" || opcode.starts_with("vtest") ||
+            opcode.starts_with("vcomis") || opcode.starts_with("vucomis")) return;
+        const auto comma = operands.rfind(", ");
+        if (comma == std::string_view::npos) return;
+        const auto destination = operands.substr(comma + 2);
+        if (!destination.starts_with('%')) return;
+        const auto* view = find_register_view(destination.substr(1));
+        if (view && view->register_class == RegisterClass::simd) check(view->storage_id);
+    }
+
     void instruction(std::string_view opcode,
                      std::string_view operands = {}) {
         if (unavailable_.contains(opcode) &&
@@ -13531,10 +13607,12 @@ private:
         // stalls), so such a function spells its SSE instructions with VEX.
         if (uses_wide_vectors_) {
             if (const auto vex = vex_spelling(opcode, operands)) {
+                verify_preserved_vector_encoding(vex->first, vex->second);
                 output_ << '\t' << vex->first << '\t' << vex->second << '\n';
                 return;
             }
         }
+        verify_preserved_vector_encoding(opcode, operands);
         output_ << '\t' << opcode;
         if (!operands.empty()) output_ << '\t' << operands;
         output_ << '\n';
@@ -16177,7 +16255,8 @@ private:
                 const auto root = value.opcode == Opcode::Vshl ? "psll" :
                                   value.opcode == Opcode::VshrS ? "psra"
                                                                 : "psrl";
-                const auto opcode = std::string("v") + root +
+                const bool vex = vex_packed_integer_form(subtarget_, width);
+                const auto opcode = std::string(vex ? "v" : "") + root +
                     packed_lane_suffix(shape.element_bits);
                 const auto source = vector_register(
                     value.uses.front(), 0, width);
@@ -16191,9 +16270,11 @@ private:
                      chunk < vector_chunks(value.defs.front(), width);
                      ++chunk) {
                     load_vector(function, value.uses.front(), 0, chunk, width);
+                    if (!vex && source != destination)
+                        instruction("movdqa", "%" + source + ", %" + destination);
                     instruction(opcode,
                                 "$" + std::to_string(immediate_shift->value) +
-                                    ", %" + source + ", %" + destination);
+                                    (vex ? ", %" + source : "") + ", %" + destination);
                     store_vector_from(function, value.defs.front(),
                                       destination, chunk, width);
                 }
@@ -16818,8 +16899,12 @@ private:
             }
             if (const auto* assigned =
                     assigned_simd_register(function, reg)) {
-                instruction("mov" + float_suffix(reg),
-                            "%" + std::string(assigned->name) + ", " +
+                const bool vector = function.virtual_register_classes[reg.id] ==
+                                    machine::VirtualRegisterClass::Vector;
+                const auto name = simd_register(*assigned, vector ? reg.mode.bits : 128);
+                instruction(vector ? simd_vector_move_opcode(reg.mode.bits)
+                                   : "mov" + float_suffix(reg),
+                            "%" + name + ", " +
                                 memory(offset));
                 continue;
             }
@@ -16844,9 +16929,13 @@ private:
             }
             if (const auto* assigned =
                     assigned_simd_register(function, reg)) {
-                instruction("mov" + float_suffix(reg),
+                const bool vector = function.virtual_register_classes[reg.id] ==
+                                    machine::VirtualRegisterClass::Vector;
+                const auto name = simd_register(*assigned, vector ? reg.mode.bits : 128);
+                instruction(vector ? simd_vector_move_opcode(reg.mode.bits)
+                                   : "mov" + float_suffix(reg),
                             memory(offset) + ", %" +
-                                std::string(assigned->name));
+                                name);
                 continue;
             }
             diagnostics_.error(
@@ -19993,8 +20082,9 @@ private:
 
     std::string simd_register(const RegisterView& view,
                               unsigned value_bits = 64) const {
-        if (value_bits > 128) return std::string(view.name);
-        return "xmm" +
+        const auto prefix = value_bits == 512 ? "zmm"
+                          : value_bits == 256 ? "ymm" : "xmm";
+        return prefix +
                std::to_string(static_cast<unsigned>(view.storage_id) - 16U);
     }
 
@@ -23728,6 +23818,20 @@ private:
         return true;
     }
 
+    bool preserves_upper_vector_bits(
+        std::optional<hir::FunctionId> direct,
+        std::optional<hir::TypeId> signature = std::nullopt) const {
+        const auto& ranges = dynamic_plans_.preserved_ranges(hir_, direct, signature);
+        for (const auto* view : canonical_register_views()) {
+            // VZEROUPPER affects only registers 0-15.
+            if (view->register_class != RegisterClass::simd ||
+                view->storage_id >= 32) continue;
+            const auto range = ranges[view->storage_id];
+            if (range.end > 128 && range.begin < range.end) return true;
+        }
+        return false;
+    }
+
     void emit_call_body(const machine::Function& function,
                         const machine::Instruction& value,
                         bool tail = false) {
@@ -23803,7 +23907,9 @@ private:
         // Clear upper vector lanes before any argument is placed: vector
         // arguments come from frame homes, and a wide argument register must
         // still hold its whole value at the transfer.
-        if (uses_wide_vectors_) instruction("vzeroupper");
+        if (uses_wide_vectors_ &&
+            !preserves_upper_vector_bits(value.direct_callee, value.call_signature))
+            instruction("vzeroupper");
         if (const auto* manual = manual_plans_.find(value.direct_callee,
                                                     value.call_signature);
             manual && emit_manual_call(function, value, entity, *manual,
@@ -24761,16 +24867,27 @@ private:
                 return "a tail argument endpoint conflicts with caller restoration";
             }
         }
-        for (const auto& clobber : call.clobbers) {
-            if (clobber.kind != machine::RegisterKind::Physical) continue;
-            const auto* view = canonical_storage_view({clobber.id});
-            if (view && !names_register(allowed, *view)) {
-                return "the callee clobber contract exceeds the caller contract";
-            }
-        }
+        if (const auto failure = tail_preservation_failure(function, call);
+            !failure.empty()) return failure;
         if (!call.direct_callee &&
             !manual_tail_jump_register(function, caller, callee)) {
             return "no register the caller may clobber can hold the tail target";
+        }
+        return {};
+    }
+
+    std::string_view tail_preservation_failure(
+        const machine::Function& function, const machine::Instruction& call) const {
+        const auto& own_ranges = dynamic_plans_.preserved_ranges(hir_, function.source);
+        const auto callee_ranges = call_preserved_ranges(hir_, dynamic_plans_, call);
+        for (unsigned storage = 0; storage < own_ranges.size(); ++storage) {
+            const auto own = own_ranges[storage];
+            const auto preserved = callee_ranges[storage];
+            if (!preserved.contains(own)) {
+                return preserved.begin == preserved.end
+                    ? "the callee clobber contract exceeds the caller contract"
+                    : "the callee preserves fewer register bits than the caller";
+            }
         }
         return {};
     }
@@ -24793,13 +24910,6 @@ private:
             call.operands.empty()) {
             return "the call is indirect or is not immediately returned";
         }
-        if (preserved_integer_bits(hir_, dynamic_plans_, call.direct_callee,
-                                   call.call_signature) <
-            preserved_integer_bits(hir_, dynamic_plans_, function.source,
-                                   std::nullopt)) {
-            return "the callee preserves fewer general-register bits than "
-                   "the caller";
-        }
         const auto* caller_manual = manual_plans_.find(function.source);
         const auto* callee_manual =
             manual_plans_.find(call.direct_callee, call.call_signature);
@@ -24810,6 +24920,8 @@ private:
         if (caller_manual || callee_manual) {
             return "only one of the caller and callee has manual ABI endpoints";
         }
+        if (const auto failure = tail_preservation_failure(function, call);
+            !failure.empty()) return failure;
         if (!call.direct_callee) {
             return "the call is indirect or is not immediately returned";
         }
@@ -24894,28 +25006,6 @@ private:
             caller_abi->stack_alignment % callee_abi->stack_alignment != 0) {
             return "caller and callee stack alignments are incompatible";
         }
-        for (const auto& clobber : call.clobbers) {
-            if (clobber.kind != machine::RegisterKind::Physical) continue;
-            const auto* view = canonical_storage_view({clobber.id});
-            if (!view) continue;
-            const auto names_clobber = [&](const std::vector<std::string>& names) {
-                return std::any_of(
-                    names.begin(), names.end(),
-                    [&](const std::string& name) {
-                        const auto* named = find_register_view(name);
-                        return named && shares_register_storage(*view, *named);
-                    });
-            };
-            const bool caller_allows =
-                (caller_plan
-                     ? names_clobber(caller_plan->clobbers)
-                     : caller_abi && names_clobber(caller_abi->call_clobbers)) ||
-                names_clobber(caller.clobbers);
-            if (!caller_allows) {
-                return "the callee clobber contract exceeds the caller contract";
-            }
-        }
-
         const bool caller_void = is_void(hir_, caller.result_type);
         const bool callee_void = is_void(hir_, callee.result_type);
         if (caller_void != callee_void) return "caller and callee results differ";
@@ -25418,14 +25508,14 @@ private:
             if (copy.vector) {
                 const auto temporary = require_wide_temporary();
                 if (!temporary) return;
+                const auto width = memory_vector_width(copy.target);
                 for (unsigned chunk = 0;
-                     chunk < vector_chunks(copy.target); ++chunk) {
-                    load_vector(function, copy.target, 0, chunk);
-                    instruction(
-                        "movdqu",
-                        "%xmm0, " +
-                            memory(*temporary +
-                                   static_cast<std::int32_t>(chunk * 16U)));
+                     chunk < vector_chunks(copy.target, width); ++chunk) {
+                    load_vector(function, copy.target, 0, chunk, width);
+                    instruction(vector_move_opcode(width),
+                        "%" + vector_register(copy.target, 0, width) + ", " +
+                            memory(*temporary + static_cast<std::int32_t>(
+                                chunk * (width / 8U))));
                 }
                 return;
             }
@@ -25478,14 +25568,14 @@ private:
                 }
                 const auto temporary = require_wide_temporary();
                 if (!temporary) return;
+                const auto width = memory_vector_width(copy.target);
                 for (unsigned chunk = 0;
-                     chunk < vector_chunks(copy.target); ++chunk) {
-                    instruction(
-                        "movdqu",
+                     chunk < vector_chunks(copy.target, width); ++chunk) {
+                    const auto target = vector_register(copy.target, 0, width);
+                    instruction(vector_move_opcode(width),
                         memory(*temporary + static_cast<std::int32_t>(
-                                            chunk * 16U)) +
-                            ", %xmm0");
-                    store_vector(function, copy.target, 0, chunk);
+                            chunk * (width / 8U))) + ", %" + target);
+                    store_vector(function, copy.target, 0, chunk, width);
                 }
                 return;
             }
@@ -25914,7 +26004,8 @@ private:
         if (!plan) return false;
         // Outputs come from frame homes; clear upper lanes before a wide
         // output register is written.
-        if (uses_wide_vectors_) instruction("vzeroupper");
+        if (uses_wide_vectors_ && !preserves_upper_vector_bits(function.source))
+            instruction("vzeroupper");
         const auto direct_register =
             [](const ManualBoundary& boundary) {
                 return (boundary.kind ==
@@ -26260,7 +26351,8 @@ private:
                 }
             }
         }
-        if (uses_wide_vectors_ && !wide_result) instruction("vzeroupper");
+        if (uses_wide_vectors_ && !wide_result &&
+            !preserves_upper_vector_bits(function.source)) instruction("vzeroupper");
         emit_frame_exit(function);
         instruction("retq");
         // The return block may precede other blocks in layout, whose rows
@@ -27139,6 +27231,20 @@ private:
 
     void emit_function(machine::Function& function) {
         active_function_ = &function;
+        check_vector_encoding_ = false;
+        unsavable_vector_views_.fill(false);
+        const auto available = subtarget_.has_feature(Feature::Avx512f) ? 512U
+                             : subtarget_.has_feature(Feature::Avx) ? 256U : 128U;
+        const auto& ranges = dynamic_plans_.preserved_ranges(hir_, function.source);
+        if (!function.frame.elide_incoming_saves) {
+            for (unsigned storage = 16; storage < 48; ++storage) {
+                if (ranges[storage].begin < ranges[storage].end &&
+                    ranges[storage].end > available) {
+                    unsavable_vector_views_[storage] = true;
+                    check_vector_encoding_ = true;
+                }
+            }
+        }
         std::uint32_t block_limit = 0;
         for (const auto& candidate : function.blocks) {
             block_limit = std::max(block_limit, candidate.id.value + 1);
@@ -27381,6 +27487,11 @@ private:
             use_red_zone(function, entity, storage);
         fixed_cfa_storage_ = fixed_cfa_save_size(function);
         const auto fixed_cfa_storage = fixed_cfa_storage_;
+        if (seh && fixed_cfa_storage > 240) {
+            diagnostics_.error(function.location,
+                "Win64 unwind cannot describe a frame-register offset greater than 240 bytes");
+            return;
+        }
         framed_ = machine::framed_blocks(function);
         if (function.frame.program) {
             frame_size_ = function.frame.program->stack_size - frame_pointer_save_size_;
@@ -27776,6 +27887,8 @@ private:
     bool compact_gpr_saves_{};
     bool compact_gpr_call_pad_{};
     bool uses_wide_vectors_{};
+    bool check_vector_encoding_{};
+    std::array<bool, 64> unsavable_vector_views_{};
     // Blocks of the active function that run with its frame, and whether the
     // code being emitted does.
     std::vector<bool> framed_;

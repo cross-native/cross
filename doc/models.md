@@ -379,10 +379,13 @@ and frame pointers, a call preserves only as many low bits as the
 of `s0`-`s7`. `pic_call_clobbers` lists, in the same form, the storage that
 a call may also change in position-independent code, such as MIPS
 `-mabicalls` code, where a callee computes its own GOT pointer: `o32` lists
-`gp`. `call_preserved_views` lists views of registers that `call_clobbers`
-omits, each register once: a call preserves only the bits of the named view
-and may change the rest of the register. AAPCS64 preserves only the low 64
-bits of `v8`–`v15`, so the shipped AArch64 ABIs list `d8`–`d15`.
+`gp`. `call_preserved_views` lists preserved register views, each register
+once: a call preserves only the bits of the named view and may change the
+rest of the register. A view is an exception to `call_clobbers` when both
+lists name the same storage. A function's explicit `clobber` overrides that
+exception. AAPCS64 preserves only the low 64 bits of `v8`–`v15`, so the
+shipped AArch64 ABIs list `d8`–`d15`. Win64 lists `xmm6`–`xmm15`, preserving
+their low 128 bits while the upper YMM/ZMM bits remain volatile.
 
 `elf_abi_tag` sets the ELF ABI tag of objects compiled with the entry as
 their ABI (`-mabi` or the profile's `abi`); without it, objects get the tag

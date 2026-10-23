@@ -1092,19 +1092,25 @@ private:
 
     bool abi_clobbers(const ManualAbiPlan& plan,
                       std::string_view storage) const {
-        if (plan.abi_info &&
-            std::find(plan.abi_info->call_clobbers.begin(),
-                      plan.abi_info->call_clobbers.end(),
-                      storage) != plan.abi_info->call_clobbers.end()) {
-            return true;
-        }
         const auto* sought = find_register(target_, storage);
-        return sought && std::any_of(
+        const bool explicit_clobber = sought && std::any_of(
             plan.clobbers.begin(), plan.clobbers.end(),
             [&](const std::string& name) {
                 const auto* declared = find_register(target_, name);
                 return declared && declared->storage == sought->storage;
             });
+        if (explicit_clobber) return true;
+        if (!sought || !plan.abi_info) return false;
+        for (const auto& name : plan.abi_info->call_preserved_views) {
+            const auto* view = find_register(target_, name);
+            if (view && view->storage == sought->storage) return false;
+        }
+        return std::any_of(plan.abi_info->call_clobbers.begin(),
+                           plan.abi_info->call_clobbers.end(),
+                           [&](const std::string& name) {
+            const auto* view = find_register(target_, name);
+            return view && view->storage == sought->storage;
+        });
     }
 
     bool validate_boundary(const PlanSource& function,
