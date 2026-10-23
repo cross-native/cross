@@ -95,7 +95,7 @@ token or one balanced group.
 | --- | --- |
 | `len(tokens)`, `at(tokens, i)`, `slice(tokens, i, n)`, `concat(a, b)` | Count, select, and join top-level tokens (a group counts as one). |
 | `is_kind(one, kind)` | Test the kind: `"identifier"`, `"builtin"`, `"integer"`, `"floating"`, `"character"`, `"string"`, `"punctuation"`, `"group"`, or `"splice"`. |
-| `spelling(one)` | The token's exact source text, as bytes. |
+| `spelling(one)` | The token's exact source text, as bytes; `==` and `!=` compare bytes by contents with bytes or a string, as in `spelling(one) == "yield"`. |
 | `children(one)`, `delimiter(one)` | A group's contents, and its delimiters: `"()"`, `"[]"`, `"{}"`, or `"[[]]"`. |
 | `token(kind, text)`, `group(delimiters, tokens)` | Construct a token or a group. |
 | `parse(string)` | Tokens from source text. |
@@ -298,15 +298,6 @@ so a call that returns normally leaves it null and the next call starts over.
 
 ```x
 namespace script {
-    // Whether `one` is the token spelled `text`.
-    static bool spelled($::meta::tokens one, const u8 *text) {
-        $::meta::bytes spelling = $::meta::spelling(one);
-        uptr i = 0;
-        for (; i < $::meta::len(spelling); ++i)
-            if (text[i] != $::meta::at(spelling, i)) return 0;
-        return text[i] == 0;
-    }
-
     // The name that a function header declares.
     static $::meta::syntax declared_name($::meta::syntax node) {
         for (uptr i = 0; i < $::meta::child_count(node); ++i) {
@@ -331,8 +322,9 @@ namespace script {
             if ($::meta::is_kind(one, "group")) {
                 one = $::meta::group($::meta::delimiter(one),
                                      rewrite($::meta::children(one), state, name));
-            } else if (spelled(one, "yield") && i + 1 < count &&
-                       spelled($::meta::at(body, i + 1), ";")) {
+            } else if ($::meta::spelling(one) == "yield" && i + 1 < count &&
+                       !$::meta::is_kind($::meta::at(body, i + 1), "group") &&
+                       $::meta::spelling($::meta::at(body, i + 1)) == ";") {
                 $::meta::tokens resume = $::meta::gensym("resume");
                 $::meta::tokens end = $::meta::at(body, ++i);
                 one = $::quote {

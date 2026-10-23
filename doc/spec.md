@@ -2350,7 +2350,10 @@ The `$::meta` sequence operations are:
 | `freeze(buffer, length)` | Consume its initialized prefix as `bytes`. |
 
 `len`, `at`, `slice`, and `concat` are exact-type overloads shared with
-`$::meta::tokens`; no mixed tokens/bytes operation is implicit. File length,
+`$::meta::tokens`; no mixed tokens/bytes operation is implicit. `==` and `!=`
+compare `$::meta::bytes` by contents with another `$::meta::bytes` or with a
+translation-time string, whose terminating zero is not part of its contents;
+they apply to no other meta value. File length,
 capacity, and materialized size must fit target `uptr`; length and capacity
 queries return target `uptr`, and a count that does not fit is an
 error, not a wrapped value. An index is a nonnegative integer within the

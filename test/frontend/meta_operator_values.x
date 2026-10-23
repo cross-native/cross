@@ -126,6 +126,23 @@ namespace SourceOperators {
         return 31u32;
     }
 }
+
+// Bytes compare by contents with bytes or a string, without its terminator.
+namespace BytesOperators {
+    [[macro]]
+    static $::meta::tokens kind($::meta::tokens input) {
+        $::meta::tokens one = $::meta::at(input, 0);
+        if ($::meta::spelling(one) == "yield") return $::quote { 1 };
+        if ("stop" == $::meta::spelling(one)) return $::quote { 2 };
+        if ($::meta::spelling(one) != $::meta::spelling($::meta::at(input, 1))) return $::quote { 3 };
+        return $::quote { 4 };
+    }
+    $::static_assert(kind!(yield x) == 1, "bytes equal a string");
+    $::static_assert(kind!(stop x) == 2, "a string equals bytes");
+    $::static_assert(kind!(a b) == 3, "different bytes");
+    $::static_assert(kind!(a a) == 4, "equal bytes");
+    $::static_assert(kind!(yiel x) == 3, "a prefix is not equal");
+}
 #ifdef CUSTOM_META_ABI
 [[abi(HOST_ABI)]]
 #endif

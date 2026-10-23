@@ -438,6 +438,10 @@ foreach(type tokens syntax syntax_match span context bytes buffer)
             "(u32)((${meta_type} *)0uptr)" "(u32)&value()"
             "(u32)(value() = value())" "(u32)(1u32 ? value() : 1u32)"
             "(u32)value()()" "(u32)value()[0uptr]" "(u32)value().field")
+        # Bytes compare by contents (meta_operator_values.x).
+        if(type STREQUAL "bytes" AND expression STREQUAL "value() == value()")
+            continue()
+        endif()
         string(MD5 key "${expression}")
         foreach(query sizeof "$::alignof")
             string(MAKE_C_IDENTIFIER "${query}" query_case)

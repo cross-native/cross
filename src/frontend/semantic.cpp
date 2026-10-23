@@ -5849,8 +5849,21 @@ const char* source_meta_expression_error(const Expr& node, const TypeOf& type_of
         return "opaque meta values do not support unary operators or addresses";
     } else if (node.kind == Expr::Kind::Binary) {
         const bool member = node.text == "member" || node.text == "pointer_member";
-        if ((node.left && is_meta_type(type_of(*node.left, true))) ||
-            (!member && node.right && is_meta_type(type_of(*node.right, true))))
+        const auto left = node.left ? type_of(*node.left, true) : nullptr;
+        const auto right = node.right ? type_of(*node.right, true) : nullptr;
+        // Bytes compare by contents with bytes or a string.
+        const auto bytes = [](const TypePtr& type) {
+            return type && type->kind == Type::Kind::Bytes;
+        };
+        const auto text = [&](const TypePtr& type) {
+            return bytes(type) || (type && type->kind == Type::Kind::Pointer && type->pointee &&
+                                   type->pointee->kind == Type::Kind::Builtin &&
+                                   type->pointee->builtin == BuiltinType::U8);
+        };
+        if ((node.text == "==" || node.text == "!=") && (bytes(left) || bytes(right)) &&
+            text(left) && text(right))
+            return nullptr;
+        if ((left && is_meta_type(left)) || (!member && right && is_meta_type(right)))
             return "opaque meta values do not support binary operators";
     } else if (node.kind == Expr::Kind::Conditional && node.left && node.right && node.third) {
         const auto selector = type_of(*node.left, true);
@@ -14610,6 +14623,29 @@ private:
             auto right = (co_await this->expression_async(*expression.right));
             if (!right) co_return std::nullopt;
             co_return co_await vector_binary_values_async(expression.text, *left, *right, expression.location);
+        }
+        if ((expression.text == "==" || expression.text == "!=") &&
+            (left->bytes || left->string)) {
+            const auto right_type = expression_type(*expression.right);
+            if (left->bytes || (right_type && right_type->kind == Type::Kind::Bytes)) {
+                auto right = (co_await this->expression_async(*expression.right));
+                if (!right) co_return std::nullopt;
+                const auto contents = [](const EvalValue& value) -> std::optional<std::string_view> {
+                    if (value.bytes)
+                        return std::string_view(*value.bytes).substr(value.byte_offset, value.byte_length);
+                    if (!value.string || value.offset > value.string->size()) return std::nullopt;
+                    const auto text = std::string_view(*value.string).substr(value.offset);
+                    return text.substr(0, text.find('\0'));
+                };
+                const auto a = contents(*left), b = contents(*right);
+                if (!a || !b) {
+                    fail(expression.location, "bytes compare only with bytes or a string");
+                    co_return std::nullopt;
+                }
+                const bool equal = *a == *b;
+                co_return EvalValue{UInt128{expression.text == "==" ? equal : !equal},
+                                    builtin_type(BuiltinType::Bool)};
+            }
         }
         if (left->tokens || left->bytes || left->buffer || left->object) {
             fail(expression.location, "meta values do not support scalar operators");
