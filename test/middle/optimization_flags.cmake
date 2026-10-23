@@ -102,6 +102,35 @@ if(NOT strict_assembly MATCHES
         "IPA purity removed the wrong call boundary\n${pure_assembly}")
 endif()
 
+# Without -ftree-dce as well, the conversion that alone reads an unused pure
+# call's result goes with the call.
+execute_process(
+    COMMAND "${CC}" -S -target x86_64-unknown-linux-gnu -O0 -fipa-pure-const
+            "${SOURCE}" -o "${OUTPUT}.pure-users.s"
+    RESULT_VARIABLE pure_users_status
+    ERROR_VARIABLE pure_users_error
+)
+if(NOT pure_users_status EQUAL 0)
+    message(FATAL_ERROR
+        "IPA purity compilation without DCE failed\n${pure_users_error}")
+endif()
+file(READ "${OUTPUT}.pure-users.s" pure_users_assembly)
+string(FIND "${pure_users_assembly}" "\noptimization_dead_pure_conversion:\n"
+       pure_users_start)
+string(FIND "${pure_users_assembly}" "\n.size optimization_dead_pure_conversion,"
+       pure_users_end)
+if(pure_users_start EQUAL -1 OR pure_users_end EQUAL -1)
+    message(FATAL_ERROR
+        "no optimization_dead_pure_conversion in\n${pure_users_assembly}")
+endif()
+math(EXPR pure_users_length "${pure_users_end} - ${pure_users_start}")
+string(SUBSTRING "${pure_users_assembly}" ${pure_users_start}
+       ${pure_users_length} pure_users_text)
+if(pure_users_text MATCHES "call|movs")
+    message(FATAL_ERROR
+        "IPA purity kept a reader of a removed call\n${pure_users_text}")
+endif()
+
 execute_process(
     COMMAND "${CC}" -S -O0 -ftree-fre -ftree-dce "${SOURCE}"
             -o "${OUTPUT}.fre.s"

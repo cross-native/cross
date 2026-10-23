@@ -41,6 +41,12 @@ global i32 optimization_unused_pure_call(in i32 value) {
     return value;
 }
 
+[[link_name("optimization_dead_pure_conversion")]]
+global i32 optimization_dead_pure_conversion(in i32 value) {
+    (i64)optimization_pure_leaf(value);
+    return value;
+}
+
 [[link_name("optimization_required_cell_call")]]
 global i32 optimization_required_cell_call(in i32 value) {
     i32 local = value;

@@ -10794,6 +10794,19 @@ void eliminate_dead_removable_calls(
         if (!live[value.id.value] && value.kind == ValueKind::Call &&
             value.callee && removable.contains(value.callee->value)) {
             removed.insert(value.id.value);
+            pending.push_back(value.id);
+        }
+    }
+    if (removed.empty()) return;
+    // What reads a removed call is dead as well, and goes with it.
+    const UseLists uses(function);
+    while (!pending.empty()) {
+        const auto id = pending.back();
+        pending.pop_back();
+        for (const auto& use : uses.uses(id)) {
+            if (use.user && removed.insert(use.user->value).second) {
+                pending.push_back(*use.user);
+            }
         }
     }
     remove_effectful_values(function, removed);
