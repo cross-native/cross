@@ -657,9 +657,12 @@ odd:
 }
 ```
 
-Computed jumps must stay within one function. `global label name:` exports a
-label for use as a symbol. `(uptr)function::name` is the label's address, also
-in a static initializer.
+Computed jumps must stay within one function, where they can reach only the
+labels whose address the program takes, as `function::name` in code or data,
+and its `global` labels. `global label name:` exports a label for use as a
+symbol. `(uptr)function::name` is the label's address, also in a static
+initializer. [metaprogramming.md](metaprogramming.md#example-resumable-functions)
+builds resumable functions on label values.
 
 ## ABIs and interoperability
 

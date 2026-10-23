@@ -10,7 +10,6 @@
 #include "frontend/intrinsic_constraints.hpp"
 #include "middle/data_ir.hpp"
 #include "middle/initializer.hpp"
-#include "middle/initialization.hpp"
 #include "middle/mir_analysis.hpp"
 #include "middle/mir_pass.hpp"
 #include "middle/patch_sink.hpp"
@@ -147,6 +146,12 @@ bool label_type(const hir::Module& module, hir::TypeId id) {
     const auto& type = module.type(id);
     return type.kind == hir::Type::Kind::Builtin &&
            type.builtin == BuiltinType::Label;
+}
+
+// A computed goto can reach a label whose address the group takes, and a
+// global label, whose address other groups can take.
+bool computed_goto_target(const hir::Label& label) {
+    return label.address_taken || label.is_global;
 }
 
 bool scalar_type(const hir::Module& module, hir::TypeId id) {
@@ -2116,6 +2121,7 @@ private:
             // The RHS may have changed other lanes. Reload the current cell
             // before inserting only the remembered destination lane.
             const auto vector = load_slot(*lane.local, location);
+            current_.values[vector.value].partial_update_read = true;
             const auto inserted = add_value(ValueKind::InsertElement,
                                              lane.local->type, location);
             current_.values[inserted.value].operands = {vector, lane.index, value};
@@ -2544,7 +2550,7 @@ private:
                 previous = load_pointer(designator.address, location,
                                         designator.alignment);
                 if (previous) {
-                    current_.values[previous->value].bit_field_update_read = true;
+                    current_.values[previous->value].partial_update_read = true;
                 }
             }
             if (!previous) return std::nullopt;
@@ -2627,49 +2633,41 @@ private:
             }
             return true;
         }
+        zero_fill(base, initialization_element, required, array.lanes,
+                  initializer.location);
+        return true;
+    }
 
-        const auto initial = constant(required, uptr, initializer.location);
+    // Zeroes the elements [first, limit) at `base`, at least one, in a loop
+    // that tests after its body, as the assignment proof can follow.
+    void zero_fill(ValueId base, hir::TypeId element, std::uint64_t first,
+                   std::uint64_t limit, SourceLocation location) {
+        const auto uptr = *hir_.builtin(BuiltinType::Uptr);
+        const auto initial = constant(first, uptr, location);
         const auto preheader = *current_block_;
-        const auto test = new_block(initializer.location);
-        const auto body = new_block(initializer.location);
-        const auto end = new_block(initializer.location);
-        terminate(TerminatorKind::Branch, initializer.location,
-                  std::nullopt, {test});
-
-        enter(test);
-        const auto index = add_value(ValueKind::Phi, uptr,
-                                     initializer.location);
-        const auto limit = constant(array.lanes, uptr,
-                                    initializer.location);
-        const auto condition = add_value(ValueKind::Binary,
-                                         *hir_.builtin(BuiltinType::Bool),
-                                         initializer.location);
-        current_.values[condition.value].binary =
-            BinaryOperation::UnsignedLess;
-        current_.values[condition.value].operands = {index, limit};
-        terminate(TerminatorKind::ConditionalBranch,
-                  initializer.location, condition, {body, end});
+        const auto body = new_block(location);
+        const auto test = new_block(location);
+        const auto end = new_block(location);
+        terminate(TerminatorKind::Branch, location, std::nullopt, {body});
 
         enter(body);
-        const auto address = indexed_address(
-            base, index, initialization_element, initializer.location);
-        const auto zero = constant(0, initialization_element,
-                                   initializer.location);
-        if (!store_pointer(address, zero, initializer.location, 1)) {
+        const auto index = add_value(ValueKind::Phi, uptr, location);
+        const auto address = indexed_address(base, index, element, location);
+        if (!store_pointer(address, constant(0, element, location), location, 1)) {
             failed_ = true;
         }
-        const auto one = constant(1, uptr, initializer.location);
-        const auto next = add_value(ValueKind::Binary, uptr,
-                                    initializer.location);
-        current_.values[next.value].binary = BinaryOperation::Add;
-        current_.values[next.value].operands = {index, one};
-        const auto backedge = *current_block_;
-        terminate(TerminatorKind::Branch, initializer.location,
-                  std::nullopt, {test});
-        current_.values[index.value].incoming = {
-            {preheader, initial}, {backedge, next}};
+        const auto next = integer_binary(BinaryOperation::Add, uptr, index,
+                                         constant(1, uptr, location), location);
+        terminate(TerminatorKind::Branch, location, std::nullopt, {test});
+
+        enter(test);
+        const auto condition = integer_binary(
+            BinaryOperation::UnsignedLess, *hir_.builtin(BuiltinType::Bool),
+            next, constant(limit, uptr, location), location);
+        terminate(TerminatorKind::ConditionalBranch, location, condition,
+                  {body, end});
+        current_.values[index.value].incoming = {{preheader, initial}, {test, next}};
         enter(end);
-        return true;
     }
 
     bool initialize_empty_dynamic_array(const LocalBinding& binding,
@@ -2994,40 +2992,7 @@ private:
                            source.location);
             }
         } else {
-            const auto initial = constant(0, uptr, source.location);
-            const auto preheader = *current_block_;
-            const auto test = new_block(source.location);
-            const auto body = new_block(source.location);
-            const auto end = new_block(source.location);
-            terminate(TerminatorKind::Branch, source.location,
-                      std::nullopt, {test});
-
-            enter(test);
-            const auto index = add_value(ValueKind::Phi, uptr,
-                                         source.location);
-            const auto limit = constant(*size, uptr, source.location);
-            const auto condition = add_value(
-                ValueKind::Binary, *hir_.builtin(BuiltinType::Bool),
-                source.location);
-            current_.values[condition.value].binary =
-                BinaryOperation::UnsignedLess;
-            current_.values[condition.value].operands = {index, limit};
-            terminate(TerminatorKind::ConditionalBranch, source.location,
-                      condition, {body, end});
-
-            enter(body);
-            store_byte(index, 0, source.location);
-            const auto one = constant(1, uptr, source.location);
-            const auto next = add_value(ValueKind::Binary, uptr,
-                                        source.location);
-            current_.values[next.value].binary = BinaryOperation::Add;
-            current_.values[next.value].operands = {index, one};
-            const auto backedge = *current_block_;
-            terminate(TerminatorKind::Branch, source.location,
-                      std::nullopt, {test});
-            current_.values[index.value].incoming = {
-                {preheader, initial}, {backedge, next}};
-            enter(end);
+            zero_fill(base, byte, 0, *size, source.location);
         }
 
         return initialize_aggregate_items(base, byte, object_volatile, plan);
@@ -4412,7 +4377,7 @@ private:
             const auto operand_type = current_.values[operand->value].type;
             const bool operand_vector = vector_type(hir_, operand_type);
             if (expression.text == "!" &&
-                pointer_type(hir_, operand_type)) {
+                (pointer_type(hir_, operand_type) || label_type(hir_, operand_type))) {
                 // Test against the selected null encoding before negating;
                 // neither an uptr cast nor a raw zero test defines pointer truth.
                 operand = booleanize(*operand, expression.location);
@@ -6943,6 +6908,7 @@ private:
                                       false, 1, std::nullopt});
             current_.slots.back().minimum_alignment =
                 declaration.explicit_alignment;
+            current_.slots.back().declared = true;
             const LocalBinding binding{slot, type, std::nullopt,
                                        std::nullopt,
                                        declaration.storage_register};
@@ -7170,12 +7136,13 @@ private:
                 failed_ = true;
                 return;
             }
+            // Every label for now; narrow_indirect_branches keeps those whose
+            // address the group takes once all of it is lowered.
             std::vector<BlockId> targets;
             targets.reserve(current_.labels.size());
             for (const auto& label : current_.labels) {
                 targets.push_back(label.block);
             }
-            if (targets.empty()) { failed_ = true; return; }
             terminate(TerminatorKind::IndirectBranch, statement.location,
                       *destination, std::move(targets));
             return;
@@ -7481,336 +7448,6 @@ private:
 
 bool comparison(BinaryOperation operation) {
     return operation >= BinaryOperation::Equal;
-}
-
-using OutBitInterval = InitializedBitRange;
-using OutBitIntervals = std::vector<OutBitInterval>;
-
-void add_out_interval(OutBitIntervals& intervals, OutBitInterval added) {
-    if (added.begin >= added.end) return;
-    intervals.push_back(added);
-    std::sort(intervals.begin(), intervals.end(),
-              [](const auto& left, const auto& right) {
-                  return left.begin < right.begin;
-              });
-    std::size_t kept = 0;
-    for (const auto& interval : intervals) {
-        if (kept && interval.begin <= intervals[kept - 1].end) {
-            intervals[kept - 1].end =
-                std::max(intervals[kept - 1].end, interval.end);
-        } else {
-            intervals[kept++] = interval;
-        }
-    }
-    intervals.resize(kept);
-}
-
-OutBitIntervals intersect_out_intervals(const OutBitIntervals& left,
-                                        const OutBitIntervals& right) {
-    OutBitIntervals result;
-    std::size_t a = 0;
-    std::size_t b = 0;
-    while (a < left.size() && b < right.size()) {
-        const auto begin = std::max(left[a].begin, right[b].begin);
-        const auto end = std::min(left[a].end, right[b].end);
-        if (begin < end) result.push_back({begin, end});
-        if (left[a].end < right[b].end) ++a;
-        else ++b;
-    }
-    return result;
-}
-
-bool out_intervals_cover(const OutBitIntervals& assigned,
-                         const OutBitIntervals& needed) {
-    return std::all_of(needed.begin(), needed.end(),
-        [&](const OutBitInterval& part) {
-            return std::any_of(assigned.begin(), assigned.end(),
-                [&](const OutBitInterval& available) {
-                    return available.begin <= part.begin &&
-                           available.end >= part.end;
-                });
-        });
-}
-
-bool out_type_complete(const hir::Module& module, const TargetInfo& target,
-                       hir::TypeId id, std::uint64_t base_bits,
-                       const OutBitIntervals& assigned) {
-    return initialized_type(module, id, base_bits, assigned,
-        [&](hir::TypeId type) { return storage_size(module, type, target); });
-}
-
-// The value whose truth decides `condition` having `truth`, through the
-// zero tests, logical negations and widenings that branch lowering adds.
-std::pair<ValueId, bool> truth_source(const ManagedFunction& function,
-                                      const hir::Module& module,
-                                      ValueId condition, bool truth) {
-    const auto zero = [&](ValueId id) {
-        const auto& value = function.values[id.value];
-        return value.kind == ValueKind::ConstantInteger && value.integer == 0 &&
-               value.integer_high == 0;
-    };
-    for (;;) {
-        const auto& value = function.values[condition.value];
-        if (value.kind == ValueKind::Unary && value.unary == UnaryOperation::IsZero &&
-            value.operands.size() == 1) {
-            truth = !truth;
-        } else if (value.kind == ValueKind::Binary && value.operands.size() == 2 &&
-                   (value.binary == BinaryOperation::NotEqual ||
-                    value.binary == BinaryOperation::Equal) && zero(value.operands[1])) {
-            if (value.binary == BinaryOperation::Equal) truth = !truth;
-        } else if (!(value.kind == ValueKind::Cast && value.operands.size() == 1 &&
-                     (value.cast == CastOperation::ZeroExtend ||
-                      value.cast == CastOperation::SignExtend ||
-                      value.cast == CastOperation::Reinterpret) &&
-                     integer_type(module, value.type) &&
-                     integer_type(module, function.values[value.operands[0].value].type))) {
-            return {condition, truth};
-        }
-        condition = value.operands[0];
-    }
-}
-
-// Run this on source MIR, before inlining or slot promotion can erase the
-// parameter-cell writes. A normal return consumes every `out` cell even when
-// the body contains no explicit load of it.
-void check_out_definite_assignment(const ManagedFunction& function,
-                                   const hir::Module& hir_module,
-                                   const TargetInfo& target,
-                                   Diagnostics& diagnostics) {
-    const auto& source = hir_module.function(function.source);
-    if (std::none_of(source.parameters.begin(), source.parameters.end(),
-                    [](const auto& parameter) { return parameter.mode == ParameterMode::Out; })) return;
-    const LocalPointerAnalysis pointers(function, hir_module, target);
-    std::vector<std::optional<BlockId>> defined_in(function.values.size());
-    for (const auto& block : function.blocks)
-        for (const auto id : block.values) defined_in[id.value] = block.id;
-    std::vector<bool> reachable(function.blocks.size());
-    std::vector<BlockId> pending{function.entry};
-    while (!pending.empty()) {
-        const auto id = pending.back();
-        pending.pop_back();
-        if (id.value >= function.blocks.size() || reachable[id.value]) continue;
-        reachable[id.value] = true;
-        for (const auto successor :
-             function.blocks[id.value].terminator.successors) {
-            pending.push_back(successor);
-        }
-    }
-
-    for (const auto& slot : function.slots) {
-        if (!slot.source_parameter ||
-            *slot.source_parameter >= source.parameters.size() ||
-            source.parameters[*slot.source_parameter].mode != ParameterMode::Out) {
-            continue;
-        }
-        const auto& parameter = source.parameters[*slot.source_parameter];
-        const auto slot_size = storage_size(hir_module, slot.type, target);
-        const OutBitIntervals top{{0, slot_size * 8}};
-        std::vector<OutBitIntervals> assigned_in(function.blocks.size(), top);
-        std::vector<OutBitIntervals> assigned_out(function.blocks.size(), top);
-        assigned_in[function.entry.value].clear();
-        const auto pointer_region = [&](const ManagedValue& value,
-                                        const LocalAddress& address, bool write)
-            -> std::optional<OutBitInterval> {
-            if (address.slot != slot.id || !address.bytes ||
-                *address.bytes > slot_size) return std::nullopt;
-            const auto start = *address.bytes * 8;
-            std::uint64_t begin = start;
-            std::uint64_t end{};
-            if (value.bit_field_region) {
-                begin += value.bit_field_region->offset;
-                end = begin + value.bit_field_region->width;
-            } else {
-                const auto type = write && value.operands.size() >= 2
-                    ? function.values[value.operands[1].value].type
-                    : value.type;
-                end = begin + storage_size(hir_module, type, target) * 8;
-            }
-            if (end > slot_size * 8 || begin >= end) return std::nullopt;
-            return OutBitInterval{begin, end};
-        };
-        const auto transfer_value = [&](const ManagedValue& value,
-                                        OutBitIntervals assigned) {
-            if (value.kind == ValueKind::LifetimeStart &&
-                value.slot == slot.id) {
-                assigned.clear();
-            } else if (value.kind == ValueKind::Store &&
-                       value.slot == slot.id) {
-                add_out_interval(assigned, {0, slot_size * 8});
-            } else if ((value.kind == ValueKind::PointerStore ||
-                        (value.kind == ValueKind::Atomic && value.atomic == AtomicOperation::Store)) &&
-                       !value.operands.empty()) {
-                if (const auto address = pointers.targets(value.operands.front()).definite())
-                    if (const auto region = pointer_region(value, *address, true))
-                        add_out_interval(assigned, *region);
-            }
-            return assigned;
-        };
-        const auto transfer = [&](const ManagedBlock& block,
-                                  OutBitIntervals assigned) {
-            for (const auto id : block.values)
-                assigned = transfer_value(function.values[id.value],
-                                          std::move(assigned));
-            return assigned;
-        };
-        // A branch on a short-circuit or conditional result tests a phi of
-        // its operands' values, so each successor is reached only through the
-        // incoming edges whose value has that truth: the cell is assigned
-        // "when true" and "when false" as in C# and Java. No state means the
-        // edge cannot be taken.
-        using EdgeState = std::optional<OutBitIntervals>;
-        std::map<std::tuple<std::uint32_t, std::uint32_t, bool>, EdgeState> known;
-        std::function<EdgeState(BlockId, ValueId, bool)> given;
-        const auto edge = [&](BlockId from, BlockId to) -> EdgeState {
-            const auto& terminator = function.blocks[from.value].terminator;
-            if (terminator.kind == TerminatorKind::ConditionalBranch && terminator.value &&
-                terminator.successors.size() == 2 &&
-                terminator.successors[0] != terminator.successors[1])
-                return given(from, *terminator.value, terminator.successors[0] == to);
-            return assigned_out[from.value];
-        };
-        given = [&](BlockId block, ValueId condition, bool truth) -> EdgeState {
-            const auto [phi, wanted] = truth_source(function, hir_module, condition, truth);
-            const auto& value = function.values[phi.value];
-            if (value.kind != ValueKind::Phi || defined_in[phi.value] != block)
-                return assigned_out[block.value];
-            const auto key = std::tuple{block.value, phi.value, wanted};
-            if (const auto found = known.find(key); found != known.end()) return found->second;
-            // A cycle through loop phis learns nothing.
-            known.emplace(key, assigned_out[block.value]);
-            EdgeState joined;
-            bool possible = false;
-            for (const auto& incoming : value.incoming) {
-                const auto from = incoming.predecessor;
-                if (from.value >= reachable.size() || !reachable[from.value]) continue;
-                const auto [root, root_truth] = truth_source(function, hir_module, incoming.value, wanted);
-                const auto& source = function.values[root.value];
-                EdgeState state;
-                if (source.kind == ValueKind::ConstantInteger) {
-                    if ((source.integer != 0 || source.integer_high != 0) != root_truth) continue;
-                    state = edge(from, block);
-                } else if (defined_in[incoming.value.value] == from &&
-                           function.blocks[from.value].terminator.kind == TerminatorKind::Branch) {
-                    state = given(from, incoming.value, wanted);
-                } else {
-                    state = edge(from, block);
-                }
-                if (!state) continue;
-                joined = possible ? intersect_out_intervals(*joined, *state) : *state;
-                possible = true;
-            }
-            const auto result = possible
-                ? EdgeState(transfer(function.blocks[block.value], *joined)) : std::nullopt;
-            known[key] = result;
-            return result;
-        };
-        bool changed = true;
-        while (changed) {
-            changed = false;
-            known.clear();
-            for (const auto& block : function.blocks) {
-                if (!reachable[block.id.value]) continue;
-                OutBitIntervals incoming;
-                if (block.id != function.entry &&
-                    !block.predecessors.empty()) {
-                    bool first = true;
-                    for (const auto predecessor : block.predecessors) {
-                        if (predecessor.value >= reachable.size() ||
-                            !reachable[predecessor.value]) continue;
-                        const auto state = edge(predecessor, block.id);
-                        if (!state) continue;
-                        if (first) {
-                            incoming = *state;
-                            first = false;
-                        } else {
-                            incoming = intersect_out_intervals(incoming, *state);
-                        }
-                    }
-                    if (first) incoming = top;
-                }
-                const auto outgoing = transfer(block, incoming);
-                if (assigned_in[block.id.value] != incoming ||
-                    assigned_out[block.id.value] != outgoing) {
-                    assigned_in[block.id.value] = incoming;
-                    assigned_out[block.id.value] = outgoing;
-                    changed = true;
-                }
-            }
-        }
-        // A tail call that forwards the parameter's transport pointer leaves
-        // the assignment to its callee.
-        const auto forwarded = [&](const ManagedBlock& block) {
-            const auto pointer = *slot.source_parameter <
-                                         function.parameters.size()
-                ? std::optional<ValueId>(
-                      function.parameters[*slot.source_parameter])
-                : std::nullopt;
-            return pointer && std::any_of(
-                block.values.begin(), block.values.end(), [&](ValueId id) {
-                    const auto& value = function.values[id.value];
-                    return value.kind == ValueKind::Call && value.must_tail &&
-                           std::any_of(
-                               value.call_arguments.begin(),
-                               value.call_arguments.end(),
-                               [&](const CallArgument& argument) {
-                                   return argument.value == pointer;
-                               });
-                });
-        };
-        bool read_reported = false;
-        bool return_reported = false;
-        for (const auto& block : function.blocks) {
-            if (!reachable[block.id.value]) continue;
-            auto assigned = assigned_in[block.id.value];
-            for (const auto id : block.values) {
-                const auto& value = function.values[id.value];
-                const bool direct_read = value.kind == ValueKind::Load &&
-                                         value.slot == slot.id &&
-                                         !value.copy_out_read;
-                const bool pointer_read = !value.bit_field_update_read &&
-                    !value.copy_out_read &&
-                    (value.kind == ValueKind::PointerLoad ||
-                     (value.kind == ValueKind::Atomic &&
-                      value.atomic != AtomicOperation::Store));
-                bool pointer_read_ready = true;
-                if (pointer_read && !value.operands.empty()) {
-                    for (const auto& address : pointers.targets(value.operands.front()).addresses) {
-                        if (address.slot != slot.id) continue;
-                        const auto region = pointer_region(value, address, false);
-                        if (!address.bytes) {
-                            pointer_read_ready &= out_type_complete(hir_module, target, slot.type, 0, assigned);
-                        } else if (region) {
-                            const auto kind = hir_module.type(value.type).kind;
-                            pointer_read_ready &= !value.bit_field_region &&
-                                (kind == hir::Type::Kind::Record || kind == hir::Type::Kind::Array)
-                                ? out_type_complete(hir_module, target, value.type, region->begin, assigned)
-                                : out_intervals_cover(assigned, {*region});
-                        }
-                    }
-                }
-                if (!read_reported &&
-                    ((direct_read &&
-                      !out_type_complete(hir_module, target, slot.type, 0,
-                                         assigned)) ||
-                     !pointer_read_ready)) {
-                    diagnostics.error(value.location,
-                        "read of 'out' parameter '" + parameter.name +
-                        "' before assignment");
-                    read_reported = true;
-                }
-                assigned = transfer_value(value, std::move(assigned));
-            }
-            if (!out_type_complete(hir_module, target, slot.type, 0,
-                                   assigned) && !return_reported &&
-                block.terminator.kind == TerminatorKind::Return &&
-                !forwarded(block)) {
-                diagnostics.error(block.terminator.location,
-                    "normal return leaves 'out' parameter '" +
-                    parameter.name + "' unassigned");
-                return_reported = true;
-            }
-        }
-    }
 }
 
 bool verify_function(const ManagedFunction& function, const hir::Module& hir_module,
@@ -9044,14 +8681,16 @@ bool verify_function(const ManagedFunction& function, const hir::Module& hir_mod
             std::vector<BlockId> label_targets;
             label_targets.reserve(function.labels.size());
             for (const auto& label : function.labels) {
-                label_targets.push_back(label.block);
+                if (label.label.value < hir_module.labels.size() &&
+                    computed_goto_target(hir_module.labels[label.label.value]))
+                    label_targets.push_back(label.block);
             }
             if (!terminator.value ||
                 terminator.value->value >= function.values.size() ||
                 !label_type(
                     hir_module,
                     function.values[terminator.value->value].type) ||
-                terminator.successors != label_targets) {
+                label_targets.empty() || terminator.successors != label_targets) {
                 fail(terminator.location, "invalid indirect branch");
             }
         } else if ((terminator.kind == TerminatorKind::Unreachable ||
@@ -9062,6 +8701,35 @@ bool verify_function(const ManagedFunction& function, const hir::Module& hir_mod
         }
     }
     return valid;
+}
+
+// Once the whole group is lowered, every label address is known: a computed
+// goto keeps its edges to the labels it can reach, and one that can reach
+// none cannot execute.
+void narrow_indirect_branches(ManagedFunction& function,
+                              const hir::Module& hir_module) {
+    std::vector<bool> reachable(function.blocks.size());
+    for (const auto& label : function.labels)
+        reachable[label.block.value] =
+            computed_goto_target(hir_module.labels[label.label.value]);
+    for (auto& block : function.blocks) {
+        auto& terminator = block.terminator;
+        if (terminator.kind != TerminatorKind::IndirectBranch) continue;
+        std::erase_if(terminator.successors, [&](BlockId successor) {
+            if (reachable[successor.value]) return false;
+            auto& target = function.blocks[successor.value];
+            std::erase(target.predecessors, block.id);
+            std::erase_if(function.effects[target.effect.value].incoming,
+                          [&](const EffectIncoming& incoming) {
+                              return incoming.predecessor == block.id;
+                          });
+            return true;
+        });
+        if (terminator.successors.empty()) {
+            terminator.kind = TerminatorKind::Unreachable;
+            terminator.value.reset();
+        }
+    }
 }
 
 } // namespace
@@ -9077,10 +8745,15 @@ ManagedModule lower_managed(hir::Module& hir_module,
                             Diagnostics& diagnostics) {
     auto module = ManagedLowerer(
         hir_module, subtarget, options, diagnostics).run();
+    for (auto& function : module.functions)
+        narrow_indirect_branches(function, hir_module);
     (void)verify(module, hir_module, diagnostics);
-    for (const auto& function : module.functions)
-        check_out_definite_assignment(function, hir_module,
-                                      subtarget.target(), diagnostics);
+    for (const auto& function : module.functions) {
+        check_out_assignment(function, hir_module, subtarget.target(),
+                             diagnostics);
+        check_automatic_assignment(function, hir_module, subtarget.target(),
+                                   diagnostics);
+    }
     return module;
 }
 

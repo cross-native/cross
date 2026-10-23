@@ -444,6 +444,52 @@ global i32 shifted(in i32 dx) {
 }
 ```
 
+### Assignment of objects
+
+The *assignment proof* determines which leaves of an object a function has
+assigned at each point of its control flow. A leaf is a member or element of
+a type other than a record or array, an array element counting separately
+when a translation-time index selects it; a bit-field is assigned per bit.
+The proof covers a function's `out` parameter cells, with the rules of
+“Parameter modes,” and its automatic objects; its other parameters are
+assigned when it starts.
+
+- Each execution of a declaration leaves its object unassigned, and an
+  initializer then assigns the whole object. The end of an object's lifetime
+  leaves it unassigned.
+- A leaf is assigned by an assignment to it or to an enclosing object, by
+  passing it or an enclosing object as an `out` argument, or by a store
+  through a pointer that the function derived from the object's address. A
+  union is assigned by any member.
+- Where control flow joins, a leaf is assigned if it is assigned on every path
+  into the join.
+
+The control flow is that of the statements, `goto` included: a computed
+`goto` can reach each label that “Direct and computed goto” admits as its
+target. It also follows the operators that select what they evaluate, as in
+C# and Java: a leaf is assigned after a condition *when true* or *when false*
+if every evaluation that gives the condition that value assigns it. After
+`a && b` when true, and before `b`, everything assigned after `a` when true is
+assigned; after `a && b` when false, what is assigned both after `a` when
+false and after `b` when false. `a || b` is the dual, `!a` exchanges the two
+states, and after `c ? x : y` with a given value what is assigned after `x`
+and after `y` with that value, where `x` starts from `c` when true and `y`
+from `c` when false. Statements branch on these states, so in
+`if (!s || parse(s, v) || v < 0) { ... }` the read `v < 0` and the code after
+the `if` see `v` assigned by `parse`. Another expression has one state for
+both values, except that no evaluation gives a translation-time constant its
+other value: after `while (1) { ... }`, only what each `break` leaves
+assigned counts. The truth of a stored value, such as `bool ok = get(v);`, is
+not tracked.
+
+For an automatic object, a store that may designate more than one object or
+position, as through a run-time index, counts as assigning each object it may
+designate, and an address that escapes to a call, into memory other than a
+pointer object of the function, or into an integer counts as assigning the
+object and each object whose address it holds. Copying a record or array as a
+whole reads none of its leaves. A read of a leaf that the proof shows
+unassigned on every path reads an indeterminate value.
+
 ### Values, conversions, and casts
 
 An **lvalue** designates an object or function. Except as the operand of `&`,
@@ -2905,30 +2951,13 @@ assignment, and must be assigned on every normal return. `out const T` and
 `inout const T` are invalid when `const` qualifies the parameter cell.
 Result-bearing mode is unrelated to `volatile`.
 
-Assignment of an `out` cell is proved on the function's control flow, per
-scalar leaf of the cell (a member, or an element selected by a
-translation-time index). A leaf is assigned by an assignment to it or to an
-enclosing object, by passing it or an enclosing object as an `out` argument,
-or by a store through a pointer the function derived from the cell's address
-without passing that pointer to a call or storing it in another object; a
-union is assigned by any member. Reading an unassigned leaf, including
-through such a pointer, and a normal return on a path where a leaf remains
-unassigned are errors. An address that escapes to a call or to storage
-neither assigns nor reads the cell.
-
-That control flow follows the operators that select what they evaluate, as
-in C# and Java: a leaf is assigned after a condition *when true* or *when
-false* if every evaluation that gives the condition that value assigns it.
-After `a && b` when true, and before `b`, everything assigned after `a` when
-true is assigned; after `a && b` when false, what is assigned both after `a`
-when false and after `b` when false. `a || b` is the dual, `!a` exchanges the
-two states, and after `c ? x : y` with a given value what is assigned after
-`x` and after `y` with that value, where `x` starts from `c` when true and `y`
-from `c` when false. Statements branch on these states, so in
-`if (!s || parse(s, v) || v < 0) { ... }` the read `v < 0` and the code after
-the `if` see `v` assigned by `parse`. Another expression has one state for
-both values; the truth of a stored value, such as `bool ok = get(v);`, is not
-tracked.
+The assignment proof (“Assignment of objects”) decides the assignment of an
+`out` cell. A store through a pointer assigns the cell only when the function
+derived the pointer from the cell's address without passing that pointer to
+a call or storing it in another object, and an address that escapes to a
+call or to storage neither assigns nor reads the cell. Reading a leaf that
+the proof does not show assigned, including through such a pointer, and a
+normal return on a path where a leaf remains unassigned are errors.
 
 Function declarations and their callers must agree on the normalized
 mode and ABI contract across separate compilations.
@@ -3133,9 +3162,12 @@ Null/invalid/unavailable targets are undefined. A bare identifier matching both
 a local label and object is direct; parentheses select the object expression.
 
 Without `naked`, source and target must share the canonical function,
-managed-frame state, raw-stack depth, and active VLA scopes. Computed goto does
-no copy-out or dynamic-stack cleanup; provable violations are diagnosed and
-runtime violations are undefined. Direct goto retains managed VLA cleanup.
+managed-frame state, raw-stack depth, and active VLA scopes: a computed `goto`
+can reach only the labels of its function whose address the compilation group
+takes, in code or in static data, and the function's `global` labels.
+Computed goto does no copy-out or dynamic-stack cleanup; provable violations
+are diagnosed and runtime violations are undefined. Direct goto retains
+managed VLA cleanup.
 
 Cross-function goto requires `naked` at both ends, a `global label`, and
 compatible complete manual ABI/stack/machine-state contracts. It is a raw

@@ -250,6 +250,9 @@ struct Label {
     bool is_global{};
     NameKey lookup_key;
     LabelBinding binding;
+    // Code or static data of the group takes the label's address, so a
+    // computed goto in its function can reach it.
+    bool address_taken{};
 };
 
 struct Object {
@@ -432,7 +435,8 @@ call_signature(const Module& module, std::optional<FunctionId> direct,
 // the function's registered ABI.
 void stabilize_function_address(Module& module, FunctionId function);
 // A label is a code address, not a callable entry or an ABI adapter request.
-// Preserve the owner's canonical body and its explicit endpoint contract.
+// Preserve the owner's canonical body and its explicit endpoint contract, and
+// mark the label as a computed-goto target.
 bool stabilize_label_address(Module& module, LabelId label,
                              SourceLocation location, Diagnostics& diagnostics);
 // The stem of a function's internal assembly labels. It names the function by

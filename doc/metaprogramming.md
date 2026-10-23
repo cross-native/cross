@@ -287,6 +287,125 @@ finishes.
 `$::has_feature($::feature::syntax_extensions)` reports the facility;
 `$::has_intrinsic` tests individual operations.
 
+### Example: resumable functions
+
+A syntax extension can rewrite a whole function. Here `resumable(state)`
+before a definition makes the function a script that runs one step per call,
+as a protothread does: `state` designates a `label` object, `yield;` stores in
+it the position after the `yield` and returns, and the next call resumes
+there. The entry dispatches on `state` with a computed `goto` and clears it,
+so a call that returns normally leaves it null and the next call starts over.
+
+```x
+namespace script {
+    // Whether `one` is the token spelled `text`.
+    static bool spelled($::meta::tokens one, const u8 *text) {
+        $::meta::bytes spelling = $::meta::spelling(one);
+        uptr i = 0;
+        for (; i < $::meta::len(spelling); ++i)
+            if (text[i] != $::meta::at(spelling, i)) return 0;
+        return text[i] == 0;
+    }
+
+    // The name that a function header declares.
+    static $::meta::syntax declared_name($::meta::syntax node) {
+        for (uptr i = 0; i < $::meta::child_count(node); ++i) {
+            $::meta::syntax child = $::meta::child(node, i);
+            if ($::meta::is_production(child, "qualified_name")) return child;
+            if ($::meta::is_production(child, "declarator") ||
+                $::meta::is_production(child, "direct_declarator"))
+                return declared_name(child);
+        }
+        return node;
+    }
+
+    // `body` with each `yield;` replaced by: store the label after it in
+    // `state`, return, and resume there. The label marks the `;` of the
+    // `yield`, so diagnostics about the resume point show the `yield`.
+    static $::meta::tokens rewrite($::meta::tokens body, $::meta::tokens state,
+                                   $::meta::tokens name) {
+        $::meta::tokens text = $::quote {};
+        uptr count = $::meta::len(body);
+        for (uptr i = 0; i < count; ++i) {
+            $::meta::tokens one = $::meta::at(body, i);
+            if ($::meta::is_kind(one, "group")) {
+                one = $::meta::group($::meta::delimiter(one),
+                                     rewrite($::meta::children(one), state, name));
+            } else if (spelled(one, "yield") && i + 1 < count &&
+                       spelled($::meta::at(body, i + 1), ";")) {
+                $::meta::tokens resume = $::meta::gensym("resume");
+                $::meta::tokens end = $::meta::at(body, ++i);
+                one = $::quote {
+                    {
+                        $::unquote(state) = $::unquote(name)::$::unquote(resume);
+                        return;
+                        $::unquote(resume): $::unquote(end)
+                    }
+                };
+            }
+            text = $::meta::concat(text, one);
+        }
+        return text;
+    }
+
+    [[syntax_expander]]
+    static $::meta::tokens expand_resumable($::meta::syntax_match input) {
+        $::meta::syntax header = $::syntax::node(input, "header");
+        $::meta::tokens state = $::meta::children($::syntax::capture(input, "state"));
+        $::meta::tokens body = rewrite($::meta::children($::syntax::capture(input, "body")),
+                                       state, $::meta::tokens(declared_name(header)));
+        $::meta::tokens resume = $::meta::gensym("resume");
+        // Resume where the last yield left off; start over on the next call
+        // unless another yield stores a label.
+        return $::quote {
+            $::unquote(header) {
+                label $::unquote(resume) = $::unquote(state);
+                $::unquote(state) = (label)0;
+                if ($::unquote(resume)) goto $::unquote(resume);
+                $::unquote(body)
+            }
+        };
+    }
+
+    syntax resumable : item {
+        prefix "resumable";
+        match state:paren header:function_header body:block;
+        expand expand_resumable;
+    }
+}
+
+struct walker {
+    i32 x;
+    label resume;   // null: start from the beginning
+    u32 steps;      // kept across each yield
+};
+
+syntax script::resumable;
+
+// One step per call: right three times, then back to the start.
+resumable(self->resume) void walk(struct walker *self) {
+    for (self->steps = 0; self->steps < 3; ++self->steps) {
+        self->x += 1;
+        yield;
+    }
+    self->x = 0;
+}
+```
+
+The pattern captures `state` raw, as a `paren` group: like the body, it is
+parsed where the output places it, so `self` binds to the parameter of the
+spliced header. The expander builds its output as one token sequence; a part
+parsed separately with `$::meta::parse` would be a fragment of its own.
+
+Locals do not survive a `yield`, since each call starts with fresh ones, so a
+script keeps what it needs across one in its state record, as `walk` keeps
+`steps` in `walker`. A local that is read after a resume before it is
+assigned again is reported by `-Wuninitialized` or `-Wmaybe-uninitialized`,
+which `-Wall` enables ([invoke.md](invoke.md#warnings)), with notes at the
+dispatch and at the `yield` that the read follows. Declaring `u32 steps` in
+the `for` statement instead reports `'steps' is used uninitialized` at
+`++steps`.
+
 ## Call checkers
 
 `[[check(name)]]` on a function declaration runs the call checker `name` at

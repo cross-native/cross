@@ -383,9 +383,8 @@ std::optional<OptionValue> checked_option_value(
     return result;
 }
 
-// The warning options: the groups first, so that resolution, which visits
-// definitions in order, sees a group's value before the warnings it enables.
-// Group membership follows GCC's C front end.
+// The warning options: the groups, then the warnings. Group membership
+// follows GCC's C front end.
 static std::vector<OptionDefinition> with_warning_options(std::vector<OptionDefinition> result) {
     const auto group = [&](std::string name, std::string description,
                            std::vector<std::vector<std::string>> enabled_by = {}) {
@@ -394,17 +393,19 @@ static std::vector<OptionDefinition> with_warning_options(std::vector<OptionDefi
                           OptionImplementation::Implemented, std::move(description),
                           std::move(enabled_by)});
     };
-    group("all", "enable -Wunused and -Wformat");
-    group("extra", "enable -Wimplicit-fallthrough, -Wsign-compare, and, with -Wunused, "
-                   "-Wunused-parameter");
+    group("all", "enable -Wunused, -Wformat, -Wuninitialized, and -Wmaybe-uninitialized");
+    group("extra", "enable -Wimplicit-fallthrough, -Wsign-compare, -Wuninitialized, and, "
+                   "with -Wunused, -Wunused-parameter");
     group("unused", "enable every -Wunused- warning", {{"w.all"}});
     group("error", "make every warning an error");
     const std::unordered_map<std::string_view, std::vector<std::vector<std::string>>> enabled_by{
         {"float-conversion", {{"w.conversion"}}},
         {"format", {{"w.all"}}},
         {"implicit-fallthrough", {{"w.extra"}}},
+        {"maybe-uninitialized", {{"w.uninitialized"}}},
         {"sign-compare", {{"w.extra"}}},
         {"sign-conversion", {{"w.conversion"}}},
+        {"uninitialized", {{"w.all"}, {"w.extra"}}},
         {"unused-function", {{"w.unused"}}},
         {"unused-parameter", {{"w.unused", "w.extra"}}},
         {"unused-variable", {{"w.unused"}}},
@@ -950,21 +951,27 @@ bool resolve_registered_options(
         }
     }
     if (diagnostics.errors() != 0) return false;
-    // A warning option that no layer set takes its value from the groups
-    // that enable it. Groups precede the warnings in the registry.
-    for (const auto& definition : common) {
-        if (definition.enabled_by.empty()) continue;
-        auto& resolved = options.resolved_options[definition.name];
-        if (resolved.origin != OptionOrigin::Default) continue;
-        for (const auto& condition : definition.enabled_by) {
-            if (!std::all_of(condition.begin(), condition.end(), [&](const std::string& name) {
-                    return resolved_bool(options, name);
-                })) {
-                continue;
+    // A warning option that no layer set takes its value from the options
+    // that enable it, groups or warnings such as -Wuninitialized, until no
+    // more are enabled.
+    for (bool enabled = true; enabled;) {
+        enabled = false;
+        for (const auto& definition : common) {
+            if (definition.enabled_by.empty()) continue;
+            auto& resolved = options.resolved_options[definition.name];
+            if (resolved.origin != OptionOrigin::Default ||
+                resolved_bool(options, definition.name)) continue;
+            for (const auto& condition : definition.enabled_by) {
+                if (!std::all_of(condition.begin(), condition.end(), [&](const std::string& name) {
+                        return resolved_bool(options, name);
+                    })) {
+                    continue;
+                }
+                const auto& source = options.resolved_options[condition.front()];
+                resolved = ResolvedOption{true, source.origin, source.source};
+                enabled = true;
+                break;
             }
-            const auto& source = options.resolved_options[condition.front()];
-            resolved = ResolvedOption{true, source.origin, source.source};
-            break;
         }
     }
 

@@ -3438,7 +3438,8 @@ void stabilize_function_address(Module& module, FunctionId id) {
 
 bool stabilize_label_address(Module& module, LabelId id,
                              SourceLocation location, Diagnostics& diagnostics) {
-    const auto& label = module.labels.at(id.value);
+    auto& label = module.labels.at(id.value);
+    label.address_taken = true;
     auto& function = module.function(label.owner);
     if (function.definition && function.definition->attribute("always_inline")) {
         diagnostics.error(location,

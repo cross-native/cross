@@ -27,8 +27,10 @@ enum class Warning : std::uint8_t {
     FloatConversion,
     Format,
     ImplicitFallthrough,
+    MaybeUninitialized,
     SignCompare,
     SignConversion,
+    Uninitialized,
     UnusedFunction,
     UnusedParameter,
     UnusedVariable,
@@ -40,7 +42,7 @@ struct WarningInfo {
     bool enabled_by_default{};
     std::string_view description;
 };
-inline constexpr std::size_t warning_count = 11;
+inline constexpr std::size_t warning_count = 13;
 std::span<const WarningInfo, warning_count> warning_table();
 inline std::string_view warning_name(Warning warning) {
     return warning_table()[static_cast<std::size_t>(warning)].name;

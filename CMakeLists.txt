@@ -216,6 +216,7 @@ add_library(cross_middle
     src/middle/frame_ir.cpp
     src/middle/mir.cpp
     src/middle/mir_analysis.cpp
+    src/middle/mir_assignment.cpp
     src/middle/mir_bits.cpp
     src/middle/mir_memory.cpp
     src/middle/mir_pass.cpp
@@ -9336,6 +9337,47 @@ if(BUILD_TESTING)
             -P "${CMAKE_SOURCE_DIR}/test/frontend/warnings.cmake")
     set_tests_properties(cross_warnings PROPERTIES
         LABELS "frontend;diagnostics;feature.warnings;arch.x86_64;check.compile")
+    # -Wuninitialized and -Wmaybe-uninitialized at every optimization level.
+    add_test(NAME cross_uninitialized_warnings
+        COMMAND "${CMAKE_COMMAND}" -DCC=$<TARGET_FILE:cross_cc>
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/uninitialized-warnings
+            -P "${CMAKE_SOURCE_DIR}/test/middle/uninitialized.cmake")
+    set_tests_properties(cross_uninitialized_warnings PROPERTIES
+        LABELS "middle;diagnostics;feature.warnings;feature.labels;arch.x86_64;check.compile;opt.O0;opt.O1;opt.O2;opt.O3;opt.Os;opt.Oz;opt.Og")
+    # The resumable-function extension of the manual: its warnings, and its
+    # scripts run on x86-64 and on the VR4300.
+    add_test(NAME cross_resumable_warnings
+        COMMAND "${CMAKE_COMMAND}" -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE_DIR=${CMAKE_SOURCE_DIR}
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/resumable-warnings
+            -P "${CMAKE_SOURCE_DIR}/test/frontend/resumable.cmake")
+    set_tests_properties(cross_resumable_warnings PROPERTIES
+        LABELS "frontend;diagnostics;feature.syntax;feature.warnings;feature.labels;arch.x86_64;check.compile")
+    foreach(level O0 O2)
+        add_test(NAME cross_runtime_resumable_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/resumable.x
+                -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/resumable-${level}
+                -DENTRY=resumable_check
+                -DEXPECTED=1
+                "-DCC_FLAGS=-${level};-Wall;-Werror"
+                -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_resumable_${level} PROPERTIES
+            LABELS "frontend;backend.native;arch.x86_64;check.runtime;feature.syntax;feature.labels;opt.${level}")
+        add_test(NAME cross_mips_resumable_${level} COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/resumable.x
+            -DSTARTUP=${CMAKE_SOURCE_DIR}/test/frontend/resumable_mips_start.s
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-resumable-${level}
+            -DMIPS_CPUS=vr4300 -DEXPECTED=1 "-DCC_FLAGS=-${level};-Wall;-Werror"
+            -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(cross_mips_resumable_${level} PROPERTIES
+            LABELS "frontend;check.runtime;arch.mips;backend.native;feature.syntax;feature.labels;isa.vr4300;endian.big;endian.little;opt.${level}"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS")
+    endforeach()
     add_test(NAME cross_call_checkers
         COMMAND "${CMAKE_COMMAND}" -DCC=$<TARGET_FILE:cross_cc>
             -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/call-checkers

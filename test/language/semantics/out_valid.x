@@ -56,3 +56,17 @@ union out_choice { u32 narrow; u64 wide; };
 global void out_union_member(out union out_choice value) {
     value.narrow = 12u32;
 }
+
+// No evaluation gives a constant condition its other value.
+bool out_ready();
+global void out_constant_loop(out i32 value) {
+    while (1) {
+        if (out_ready()) {
+            value = 5;
+            return;
+        }
+    }
+}
+global void out_constant_condition(out i32 value, in bool choose) {
+    if (1 || choose) value = 6;
+}

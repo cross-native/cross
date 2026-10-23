@@ -21,6 +21,8 @@ static u32 spare() { return 1; }
 static u32 relay<T>(in T value) { return (u32)value; }
 global u32 entry(in u32 x, in u32 unused, in i32 s) {
     u32 local = x;
+    u32 maybe;
+    if (s) maybe = x;
     u8 narrow = x;
     bool less = s < x;
     sink(x);
@@ -29,7 +31,7 @@ global u32 entry(in u32 x, in u32 unused, in i32 s) {
     case 0: x = 1;
     case 1: break;
     }
-    return x + narrow + less + relay(s);
+    return x + narrow + less + relay(s) + maybe;
 }
 ]=])
 foreach(level O0 O2)

@@ -113,9 +113,25 @@ public:
     LocalPointerAnalysis(const ManagedFunction& function,
                          const hir::Module& module, const TargetInfo& target);
     [[nodiscard]] const LocalPointerTargets& targets(ValueId value) const;
+    // The targets of pointer `base` advanced by `index` pointee elements, as
+    // an IndexedAddress or IndexedLoad forms its address.
+    [[nodiscard]] LocalPointerTargets indexed(ValueId base, ValueId index) const;
 private:
+    const ManagedFunction& function_;
+    const hir::Module& module_;
+    const TargetInfo& target_;
     std::vector<LocalPointerTargets> values_;
 };
+
+// The assignment proof on source MIR, before inlining or slot promotion: its
+// errors for `out` parameter cells, and -Wuninitialized and
+// -Wmaybe-uninitialized for the automatic objects that declarations define.
+void check_out_assignment(const ManagedFunction& function,
+                          const hir::Module& module, const TargetInfo& target,
+                          Diagnostics& diagnostics);
+void check_automatic_assignment(const ManagedFunction& function,
+                                const hir::Module& module, const TargetInfo& target,
+                                Diagnostics& diagnostics);
 
 enum class UseKind : std::uint8_t {
     Operand,

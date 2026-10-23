@@ -92,45 +92,57 @@ std::optional<UInt128> local_integer_constant(const ManagedFunction& function,
 
 } // namespace
 
+LocalPointerTargets LocalPointerAnalysis::indexed(ValueId base, ValueId index) const {
+    auto result = targets(base);
+    const auto& pointer = module_.type(function_.values[base.value].type);
+    const auto scale = pointer.pointee ? hir::layout_size(module_, *pointer.pointee, target_) : std::nullopt;
+    const auto integer = local_integer_constant(function_, module_, target_, index);
+    const auto type = local_integer_type(module_, target_, function_.values[index.value].type);
+    const bool negative = integer && type && integer_negative(*integer, *type);
+    const auto magnitude = integer && type ? (negative ? mask_to(negate(*integer), type->bits) : *integer) : UInt128{};
+    for (auto& address : result.addresses) {
+        if (!address.bytes || !integer || !type || !scale || *scale == 0 || magnitude.high ||
+            magnitude.low > std::numeric_limits<std::uint64_t>::max() / *scale) {
+            address.bytes.reset();
+            continue;
+        }
+        const auto delta = magnitude.low * *scale;
+        if (negative ? delta > *address.bytes : delta > std::numeric_limits<std::uint64_t>::max() - *address.bytes)
+            address.bytes.reset();
+        else if (negative) *address.bytes -= delta;
+        else *address.bytes += delta;
+    }
+    LocalPointerTargets normalized;
+    join_targets(normalized, result);
+    return normalized;
+}
+
 LocalPointerAnalysis::LocalPointerAnalysis(const ManagedFunction& function,
-    const hir::Module& module, const TargetInfo& target) : values_(function.values.size()) {
+    const hir::Module& module, const TargetInfo& target)
+    : function_(function), module_(module), target_(target), values_(function.values.size()) {
     const LocalPointerTargets unknown{true, {}};
-    using State = std::vector<LocalPointerTargets>;
-    std::vector<State> outgoing(function.blocks.size(), State(function.slots.size()));
-    std::vector<bool> reached(function.blocks.size());
     const auto pointer_type = [&](hir::TypeId type) {
         return module.type(type).kind == hir::Type::Kind::Pointer;
     };
-    const auto shifted = [&](LocalPointerTargets result, ValueId base, ValueId index) {
-        const auto& pointer = module.type(function.values[base.value].type);
-        const auto scale = pointer.pointee ? hir::layout_size(module, *pointer.pointee, target) : std::nullopt;
-        const auto integer = local_integer_constant(function, module, target, index);
-        const auto type = local_integer_type(module, target, function.values[index.value].type);
-        const bool negative = integer && type && integer_negative(*integer, *type);
-        const auto magnitude = integer && type ? (negative ? mask_to(negate(*integer), type->bits) : *integer) : UInt128{};
-        for (auto& address : result.addresses) {
-            if (!address.bytes || !integer || !type || !scale || *scale == 0 || magnitude.high ||
-                magnitude.low > std::numeric_limits<std::uint64_t>::max() / *scale) {
-                address.bytes.reset();
-                continue;
-            }
-            const auto delta = magnitude.low * *scale;
-            if (negative ? delta > *address.bytes : delta > std::numeric_limits<std::uint64_t>::max() - *address.bytes)
-                address.bytes.reset();
-            else if (negative) *address.bytes -= delta;
-            else *address.bytes += delta;
-        }
-        LocalPointerTargets normalized;
-        join_targets(normalized, result);
-        return normalized;
-    };
+    // The state holds the targets of each pointer cell; no other cell holds
+    // an address that the analysis follows.
+    std::vector<std::optional<std::size_t>> pointer_cell(function.slots.size());
+    std::vector<SlotId> pointer_cells;
+    for (const auto& slot : function.slots) {
+        if (!pointer_type(slot.type)) continue;
+        pointer_cell[slot.id.value] = pointer_cells.size();
+        pointer_cells.push_back(slot.id);
+    }
+    using State = std::vector<LocalPointerTargets>;
+    std::vector<State> outgoing(function.blocks.size(), State(pointer_cells.size()));
+    std::vector<bool> reached(function.blocks.size());
     bool changed = true;
     while (changed) {
         changed = false;
         for (const auto& block : function.blocks) {
             State state;
             bool live = block.id == function.entry;
-            if (live) state.assign(function.slots.size(), unknown);
+            if (live) state.assign(pointer_cells.size(), unknown);
             for (const auto predecessor : block.predecessors) {
                 if (!reached[predecessor.value]) continue;
                 if (!live) state = outgoing[predecessor.value];
@@ -143,8 +155,8 @@ LocalPointerAnalysis::LocalPointerAnalysis(const ManagedFunction& function,
                 LocalPointerTargets result;
                 result.unknown = address.unknown;
                 for (const auto& cell : address.addresses) {
-                    if (cell.bytes == 0 && pointer_type(function.slots[cell.slot.value].type))
-                        join_targets(result, state[cell.slot.value]);
+                    if (const auto index = pointer_cell[cell.slot.value]; index && cell.bytes == 0)
+                        join_targets(result, state[*index]);
                     else result.unknown = true;
                 }
                 return result;
@@ -155,7 +167,8 @@ LocalPointerAnalysis::LocalPointerAnalysis(const ManagedFunction& function,
                 if (value.kind == ValueKind::Call) {
                     for (const auto& argument : value.call_arguments) {
                         if (argument.value) join_targets(call_targets, targets(*argument.value));
-                        if (argument.cell) join_targets(call_targets, state[argument.cell->value]);
+                        if (argument.cell && pointer_cell[argument.cell->value])
+                            join_targets(call_targets, state[*pointer_cell[argument.cell->value]]);
                     }
                     // Unknown callees can copy any reachable address into a
                     // pointer cell or their pointer result. Retain those may
@@ -164,8 +177,8 @@ LocalPointerAnalysis::LocalPointerAnalysis(const ManagedFunction& function,
                     while (expanded) {
                         auto next = call_targets;
                         for (const auto& address : call_targets.addresses)
-                            if (pointer_type(function.slots[address.slot.value].type))
-                                join_targets(next, state[address.slot.value]);
+                            if (const auto index = pointer_cell[address.slot.value])
+                                join_targets(next, state[*index]);
                         expanded = next != call_targets;
                         call_targets = std::move(next);
                     }
@@ -175,15 +188,15 @@ LocalPointerAnalysis::LocalPointerAnalysis(const ManagedFunction& function,
                     LocalPointerTargets result = unknown;
                     if (value.kind == ValueKind::SlotAddress && value.slot)
                         result = {false, {{*value.slot, 0}}};
-                    else if (value.kind == ValueKind::Load && value.slot)
-                        result = state[value.slot->value];
+                    else if (value.kind == ValueKind::Load && value.slot && pointer_cell[value.slot->value])
+                        result = state[*pointer_cell[value.slot->value]];
                     else if (value.kind == ValueKind::PointerLoad && !value.operands.empty())
                         result = memory_load(targets(value.operands[0]));
                     else if (value.kind == ValueKind::Cast && value.cast == CastOperation::Reinterpret &&
                              value.operands.size() == 1 && pointer_type(function.values[value.operands[0].value].type))
                         result = targets(value.operands[0]);
                     else if (value.kind == ValueKind::IndexedAddress && value.operands.size() == 2)
-                        result = shifted(targets(value.operands[0]), value.operands[0], value.operands[1]);
+                        result = indexed(value.operands[0], value.operands[1]);
                     else if (value.kind == ValueKind::Select && value.operands.size() == 3) {
                         result = targets(value.operands[1]);
                         join_targets(result, targets(value.operands[2]));
@@ -203,38 +216,41 @@ LocalPointerAnalysis::LocalPointerAnalysis(const ManagedFunction& function,
                         changed = true;
                     }
                 }
-                if ((value.kind == ValueKind::LifetimeStart || value.kind == ValueKind::LifetimeEnd) && value.slot)
-                    state[value.slot->value] = unknown;
-                else if (value.kind == ValueKind::Store && value.slot && !value.operands.empty())
-                    state[value.slot->value] = targets(value.operands[0]);
+                const auto own = value.slot ? pointer_cell[value.slot->value] : std::nullopt;
+                if (value.kind == ValueKind::LifetimeStart || value.kind == ValueKind::LifetimeEnd) {
+                    if (own) state[*own] = unknown;
+                } else if (value.kind == ValueKind::Store && !value.operands.empty()) {
+                    if (own) state[*own] = targets(value.operands[0]);
+                }
                 else if ((value.kind == ValueKind::PointerStore ||
                           (value.kind == ValueKind::Atomic && value.atomic != AtomicOperation::Load &&
                            value.atomic != AtomicOperation::ThreadFence && value.atomic != AtomicOperation::SignalFence)) &&
                          !value.operands.empty()) {
                     const auto& address = targets(value.operands[0]);
                     const auto exact = address.definite();
-                    for (const auto& slot : function.slots) {
-                        if (!pointer_type(slot.type)) continue;
+                    for (std::size_t index = 0; index < pointer_cells.size(); ++index) {
+                        const auto& slot = function.slots[pointer_cells[index].value];
                         const bool possible = std::any_of(address.addresses.begin(), address.addresses.end(),
                             [&](const auto& part) { return part.slot == slot.id; });
                         if (!possible && !(address.unknown && slot.address_taken)) continue;
                         const bool full_pointer = value.kind == ValueKind::PointerStore && !value.bit_field_region &&
                             value.operands.size() == 2 && pointer_type(function.values[value.operands[1].value].type);
                         if (full_pointer && exact && exact->slot == slot.id && exact->bytes == 0)
-                            state[slot.id.value] = targets(value.operands[1]);
+                            state[index] = targets(value.operands[1]);
                         else {
                             // A partial or ambiguous overwrite may destroy the old
                             // value; never retain it as a must-alias fact.
-                            state[slot.id.value].unknown = true;
-                            if (full_pointer) join_targets(state[slot.id.value], targets(value.operands[1]));
+                            state[index].unknown = true;
+                            if (full_pointer) join_targets(state[index], targets(value.operands[1]));
                         }
                     }
                 } else if (value.kind == ValueKind::Call) {
-                    for (const auto& slot : function.slots)
-                        if (slot.address_taken && pointer_type(slot.type)) join_targets(state[slot.id.value], call_targets);
+                    for (std::size_t index = 0; index < pointer_cells.size(); ++index)
+                        if (function.slots[pointer_cells[index].value].address_taken)
+                            join_targets(state[index], call_targets);
                     for (const auto& argument : value.call_arguments)
-                        if (argument.cell && pointer_type(function.slots[argument.cell->value].type))
-                            join_targets(state[argument.cell->value], call_targets);
+                        if (argument.cell && pointer_cell[argument.cell->value])
+                            join_targets(state[*pointer_cell[argument.cell->value]], call_targets);
                 }
             }
             if (!reached[block.id.value] || outgoing[block.id.value] != state) {

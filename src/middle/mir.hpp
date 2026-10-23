@@ -209,10 +209,11 @@ struct ManagedValue {
     AbiStateId variadic_state;
     std::optional<SlotId> slot;
     // A bit-field access uses a carrier load/store, but its source-semantic
-    // access covers only the named field. The update's carrier load is not a
-    // source read of otherwise uninitialized neighboring fields.
+    // access covers only the named field.
     std::optional<BitFieldRegion> bit_field_region;
-    bool bit_field_update_read{};
+    // The load of a bit-field carrier or a vector that a store of one field
+    // or lane adds: not a source read of the otherwise unassigned rest.
+    bool partial_update_read{};
     // The load that copies an `out`/`inout` cell out at a normal return.
     // Definite assignment checks it as that return, not as a source read.
     bool copy_out_read{};
@@ -280,6 +281,9 @@ struct ManagedSlot {
     // Present only for a source parameter cell. Kept through lowering so
     // source definite-assignment checks do not infer identity from slot names.
     std::optional<std::uint32_t> source_parameter;
+    // An automatic object that a source declaration defines, whose reads the
+    // assignment proof checks.
+    bool declared{};
 };
 
 enum class EffectKind { Entry, Phi, Operation };

@@ -78,6 +78,22 @@ fourth:
     return 44u32;
 }
 
+// Only labels whose address is taken are computed-goto targets, so `join`,
+// a direct goto's target, merges no value from the computed goto.
+[[noinline]] static u32 narrowed(in u32 selector, in u32 seed) {
+    u32 kept = seed * 3u32;
+    label to = selector == 0u32 ? narrowed::first : narrowed::second;
+    goto to;
+join:
+    kept = kept + 100u32;
+    return kept;
+first:
+    kept = kept + 1u32;
+    goto join;
+second:
+    return kept + 2u32;
+}
+
 [[noinline]] static u32 collatz(in u32 start) {
     u32 steps = 0u32;
     u32 n = start;
@@ -128,5 +144,7 @@ global u32 test_main() {
     bool p = z == 0u64;
     bool q = z != 0u64;
     if (!both(p, p) || both(p, q)) return 12u32;
+    if (narrowed(0u32 + (u32)z, 5u32) != 116u32 ||
+        narrowed(1u32 + (u32)z, 5u32) != 17u32) return 13u32;
     return 0u32;
 }

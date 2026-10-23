@@ -196,6 +196,8 @@ keeps that setting whatever groups it also enables, wherever they appear, so
 | `-Waddress-of-packed-member` | default | Taking the address of a packed member that may be under-aligned. |
 | `-Wcpp` | default | `#warning` directives. |
 | `-Wformat` | `-Wall` | Calls whose arguments do not match their format string, as checked by `$::format::printf` and `$::format::scanf` ([language.md](language.md#abis-and-interoperability)) or by any call checker declared for this warning ([metaprogramming.md](metaprogramming.md#call-checkers)). |
+| `-Wuninitialized` | `-Wall`, `-Wextra` | A read of a scalar of a local object that no path to the read assigns. |
+| `-Wmaybe-uninitialized` | `-Wuninitialized` | A read of a scalar of a local object that some path to the read leaves unassigned. |
 | `-Wunused-variable` | `-Wunused`, which `-Wall` enables | A local variable that nothing uses, and a `static` object outside functions that nothing uses; a `const` one only in the input file itself, not in a file it includes. |
 | `-Wunused-function` | `-Wunused` | A `static` function definition that nothing outside its own definition uses. Inline, translation-only, and generic functions do not count. |
 | `-Wunused-parameter` | `-Wunused` with `-Wextra` | A parameter of a function definition that the body does not use. Unnamed parameters, the parameter of a macro, syntax expander, or call checker, and those of `[[naked]]` functions do not count. |
@@ -213,6 +215,23 @@ never matter. Conversions of constants are reported only when they change the
 value: `u8 x = 200;` is quiet and `u8 x = 300;` is not. Initializers and
 assertions outside functions are checked too. Compound assignments
 and the entries of brace initializers are not checked for conversions.
+
+`-Wuninitialized` and `-Wmaybe-uninitialized` check the automatic objects of
+each function with the assignment proof that also checks `out` parameters
+([spec.md](spec.md#assignment-of-objects)), before optimization, so `-O` does
+not change what they report. A read at a run-time index is reported only when
+no path assigns any part of the object. A store at a run-time index counts as
+assigning the whole object, as does passing its address to a call or storing
+the address in memory, and copying a whole record or array reads none of its
+scalars. Like C# and Java, the proof evaluates no condition other than a
+translation-time constant, so an object that only a loop assigns is reported
+by `-Wmaybe-uninitialized` even when the loop always runs. A register object
+bound to a named register is not checked. Each object is reported at its first
+such read, with a note at its declaration; when a path on which the read is
+unassigned passes through a computed `goto`, notes also show that `goto` and
+the label it reaches. A note about code that an expansion generated shows the
+source token that the code was copied from, if any, and otherwise the
+expansion.
 
 Each warning ends with the option that controls it, as in `warning: unused
 variable 'count' [-Wunused-variable]`. `-Werror` makes every warning an
