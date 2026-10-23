@@ -55,12 +55,24 @@ otherwise a relative name is looked up in the `--model-path` directories in
 command-line order, wherever those options appear. A `--model-path`
 directory is searched only for `--model` names; nothing else in it is
 loaded. Loading the same file twice has no further effect. Include paths
-(`-I`) play no part in model lookup. Once every file is loaded, all entries
-are checked, whether or not the compilation selects them, except for the
-properties that a base may omit ([Inheritance](#inheritance)); an error
-stops the compilation and is reported at the file and line of the entry or
-property, the same under `cc` and `cpp`. An entry may name entries of any
-loaded file.
+(`-I`) play no part in model lookup.
+
+Profiles are read first to resolve the target. Architecture-independent
+entries and the selected architecture's ABI, CPU, and instruction entries
+then load; other architectures' declarations are indexed by name. This
+applies to shipped and user files alike, including files that mix
+architectures. An entry may name entries of any loaded file.
+
+Queries that list models or entries across architectures (`--print-targets`,
+`--print-models`, `--print-profiles`, `--print-manglings`,
+`--print-optimizations`, `--print-data-bases`, `--print-init-tables`, and
+`--print-cpus` without an explicit target) load and validate every
+architecture. Other invocations defer errors in unselected architectures'
+entries and CPU feature modifiers until that architecture is loaded.
+Loaded entries are checked except for the properties that a base may omit
+([Inheritance](#inheritance)); an error stops the compilation and is
+reported at the file and line of the entry or property, the same under
+`cc` and `cpp`.
 
 A later file cannot replace an entry: reusing the name of a loaded entry, or
 an ABI alias, is an error. Mangling, optimization, and profile names are

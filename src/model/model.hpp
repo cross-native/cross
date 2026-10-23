@@ -19,6 +19,7 @@ namespace cross {
 
 class Diagnostics;
 struct CompilerOptions;
+struct ModelEntrySource;
 
 enum class ManglingExpressionKind {
     Literal,
@@ -365,7 +366,7 @@ std::span<const ShippedModelSource> shipped_model_sources();
 
 class ModelRegistry {
 public:
-    ModelRegistry();
+    explicit ModelRegistry(bool load_shipped = true);
 
     bool load_file(const std::filesystem::path& path, Diagnostics& diagnostics);
 
@@ -400,7 +401,8 @@ public:
     // Checks the instruction entries of every loaded file as a whole and
     // builds the instruction tables, then resolves the instructions that
     // cpu entries describe; returns false after a diagnostic.
-    bool complete_instructions(Diagnostics& diagnostics);
+    bool complete_instructions(Diagnostics& diagnostics,
+                               std::optional<std::string_view> architecture = {});
     // Gives each target the instruction table that the models built.
     void install_instruction_tables() const;
     // The f.* and m.* settings of a preset with its bases applied, by name.
@@ -438,8 +440,10 @@ public:
     }
 
 private:
+    friend bool configure_models(CompilerOptions&, Diagnostics&);
     bool load_text(std::string_view text, std::string origin,
-                   Diagnostics& diagnostics);
+                   Diagnostics& diagnostics,
+                   std::optional<std::span<const ModelEntrySource>> entries = {});
 
     std::vector<AbiEntry> abis_;
     std::vector<ManglingEntry> manglings_;
@@ -454,9 +458,11 @@ private:
     bool instructions_pending_{};
     std::vector<std::string> origins_;
     std::unordered_set<std::string> loaded_files_;
+    std::unordered_map<std::string, std::unordered_set<std::size_t>> loaded_entries_;
 };
 
-ModelRegistry& model_registry();
+// The first caller chooses whether to load all shipped entries immediately.
+ModelRegistry& model_registry(bool load_shipped = true);
 
 // Loads explicitly requested model sources and applies one profile. Command-line
 // selections always override profile defaults, independent of argument order.

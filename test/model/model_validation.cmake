@@ -1,8 +1,8 @@
 # Copyright (C) 2026 Cross contributors
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# Loading checks every model entry, selected or not, and reports each fault at
-# its file and line with the same text under cc and cpp.
+# Architecture-wide queries validate every model entry. Compilation checks
+# the selected architecture and reports the same file and line under cc and cpp.
 
 foreach(required CC CPP OUTPUT)
     if(NOT DEFINED ${required} OR "${${required}}" STREQUAL "")
@@ -31,7 +31,7 @@ endfunction()
 function(expect_rejected label line expected text)
     set(model "${OUTPUT}/${label}.xm")
     file(WRITE "${model}" "${text}")
-    compile(${label} "--model=${model}")
+    compile(${label} "--model=${model}" --print-targets)
     if(status EQUAL 0 OR
        NOT stderr MATCHES "${label}[.]xm:${line}: error: ${expected}")
         message(FATAL_ERROR

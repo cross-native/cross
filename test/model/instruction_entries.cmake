@@ -98,7 +98,7 @@ function(expect_rejected label line expected text)
     set(file "${OUTPUT}/${label}.xm")
     file(WRITE "${file}" "${text}")
     execute_process(COMMAND "${CC}" -target mips-unknown-elf "--model=${file}"
-                            --print-instructions
+                            --print-targets
                     RESULT_VARIABLE status OUTPUT_QUIET ERROR_VARIABLE stderr)
     if(status EQUAL 0 OR NOT stderr MATCHES "${label}[.]xm:${line}: error: ${expected}")
         message(FATAL_ERROR "${label} did not report '${expected}' at line ${line}\n${stderr}")

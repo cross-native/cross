@@ -362,7 +362,7 @@ function(expect_rejected label line expected text)
     set(rejected "${OUTPUT}/${label}.xm")
     file(WRITE "${rejected}" "${text}")
     execute_process(COMMAND "${CC}" "--model=${rejected}"
-            -target x86_64-unknown-linux-gnu -S "${source}"
+            -target x86_64-unknown-linux-gnu --print-targets -S "${source}"
             -o "${OUTPUT}/${label}.s"
         RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
     if(status EQUAL 0 OR

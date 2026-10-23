@@ -22,7 +22,7 @@ endif()
 function(expect_rejected label line expected text)
     set(model "${OUTPUT}/${label}.xm")
     file(WRITE "${model}" "${text}")
-    execute_process(COMMAND "${CC}" "--model=${model}" --print-abis
+    execute_process(COMMAND "${CC}" "--model=${model}" --print-targets
         RESULT_VARIABLE status OUTPUT_VARIABLE out ERROR_VARIABLE err)
     if(status EQUAL 0 OR NOT err MATCHES "${label}[.]xm:${line}: error: ${expected}")
         message(FATAL_ERROR "${label} did not report '${expected}' at line ${line}\n${out}\n${err}")

@@ -61,10 +61,37 @@ constexpr bool model_space(char ch) {
 
 class ModelLexer {
 public:
-    explicit ModelLexer(std::string_view input) : input_(input) {}
+    explicit ModelLexer(std::string_view input, unsigned line = 1)
+        : input_(input), line_(line) {}
+
+    [[nodiscard]] std::size_t offset() const { return offset_; }
+    [[nodiscard]] std::size_t token_offset() const { return token_offset_; }
+
+    // Skip the rest of a block without allocating tokens for its contents.
+    void skip_block() {
+        unsigned depth = 1;
+        while (offset_ < input_.size() && depth != 0) {
+            skip_trivia();
+            if (offset_ == input_.size()) break;
+            const char ch = input_[offset_++];
+            if (ch == '{') ++depth;
+            else if (ch == '}') --depth;
+            else if (ch == '"') {
+                while (offset_ < input_.size()) {
+                    const char item = input_[offset_++];
+                    if (item == '\n') ++line_;
+                    if (item == '"') break;
+                    if (item == '\\' && offset_ < input_.size()) {
+                        if (input_[offset_++] == '\n') ++line_;
+                    }
+                }
+            }
+        }
+    }
 
     ModelToken next() {
         skip_trivia();
+        token_offset_ = offset_;
         const unsigned line = line_;
         if (offset_ == input_.size()) return {ModelTokenKind::End, {}, line};
         const char ch = input_[offset_];
@@ -136,6 +163,15 @@ private:
     ModelToken string() {
         const unsigned line = line_;
         ++offset_;
+        const auto begin = offset_;
+        auto end = begin;
+        while (end < input_.size() && input_[end] != '"' &&
+               input_[end] != '\\' && input_[end] != '\n') ++end;
+        if (end < input_.size() && input_[end] == '"') {
+            offset_ = end + 1;
+            return {ModelTokenKind::String,
+                    std::string(input_.substr(begin, end - begin)), line};
+        }
         std::string value;
         while (offset_ < input_.size() && input_[offset_] != '"') {
             char ch = input_[offset_++];
@@ -173,8 +209,113 @@ private:
 
     std::string_view input_;
     std::size_t offset_{};
+    std::size_t token_offset_{};
     unsigned line_{1};
 };
+
+struct IndexedModel {
+    std::string text;
+    std::string origin;
+    std::vector<ModelEntrySource> entries;
+};
+
+// Read declaration boundaries and architecture/name metadata. Full parsing
+// diagnoses malformed headers and properties in the selected declarations.
+std::vector<ModelEntrySource> index_model(std::string_view text) {
+    ModelLexer lexer(text);
+    std::vector<ModelEntrySource> entries;
+    for (;;) {
+        const auto domain = lexer.next();
+        if (domain.kind == ModelTokenKind::End) break;
+        ModelEntrySource entry;
+        entry.offset = lexer.token_offset();
+        entry.line = domain.line;
+        entry.domain = domain.text;
+        const auto name = lexer.next();
+        entry.name = name.text;
+        if (domain.kind != ModelTokenKind::Identifier ||
+            name.kind != ModelTokenKind::String ||
+            lexer.next().kind != ModelTokenKind::LeftBrace) {
+            entry.size = text.size() - entry.offset;
+            entries.push_back(std::move(entry));
+            break;
+        }
+        const bool abi = entry.domain == "abi";
+        if (abi || entry.domain == "cpu" || entry.domain == "instruction") {
+            for (;;) {
+                const auto token = lexer.next();
+                if (token.kind == ModelTokenKind::End ||
+                    token.kind == ModelTokenKind::RightBrace) break;
+                if (token.kind == ModelTokenKind::LeftBrace) {
+                    lexer.skip_block();
+                    continue;
+                }
+                if (token.kind != ModelTokenKind::Identifier ||
+                    (token.text != "architecture" && token.text != "aliases" &&
+                     token.text != "function_selectable")) continue;
+                if (lexer.next().kind != ModelTokenKind::Equal) continue;
+                auto value = lexer.next();
+                if (token.text == "architecture" &&
+                    value.kind == ModelTokenKind::String) {
+                    entry.architecture = value.text;
+                    if (!abi) {
+                        lexer.skip_block();
+                        break;
+                    }
+                } else if (abi && token.text == "aliases") {
+                    if (value.kind == ModelTokenKind::String) {
+                        entry.aliases.push_back(value.text);
+                    } else if (value.kind == ModelTokenKind::LeftBracket) {
+                        while ((value = lexer.next()).kind == ModelTokenKind::String) {
+                            entry.aliases.push_back(value.text);
+                            if (lexer.next().kind != ModelTokenKind::Comma) break;
+                        }
+                    }
+                } else if (abi && token.text == "function_selectable") {
+                    entry.function_selectable = value.text == "true";
+                }
+            }
+        } else {
+            lexer.skip_block();
+        }
+        entry.size = lexer.offset() - entry.offset;
+        entries.push_back(std::move(entry));
+    }
+    return entries;
+}
+
+bool indexed_name(const ModelEntrySource& entry, std::string_view name) {
+    return entry.name == name ||
+           std::find(entry.aliases.begin(), entry.aliases.end(), name) != entry.aliases.end();
+}
+
+bool indexed_abi(std::span<const IndexedModel> sources, std::string_view architecture,
+                 std::string_view name, bool function_selectable = false) {
+    for (const auto& source : sources) {
+        for (const auto& entry : source.entries) {
+            if (entry.domain == "abi" &&
+                (architecture.empty() || entry.architecture == architecture) &&
+                (!function_selectable || entry.function_selectable) && indexed_name(entry, name)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// References to CPUs of other architectures only need their indexed names.
+// Their feature modifiers are checked when that architecture is loaded.
+bool indexed_cpu(std::span<const IndexedModel> sources, std::string_view architecture,
+                 std::string_view name, bool modifiers) {
+    for (const auto& source : sources) {
+        for (const auto& entry : source.entries) {
+            if (entry.domain != "cpu" || entry.architecture != architecture) continue;
+            if (entry.name == name ||
+                (modifiers && name.starts_with(entry.name + '+'))) return true;
+        }
+    }
+    return false;
+}
 
 // The address widths of the objects that the triples of `architecture`
 // produce, in increasing order.
@@ -295,12 +436,19 @@ constexpr unsigned max_cpu_cost = 65535;
 
 class ModelParser {
 public:
-    ModelParser(std::string_view text, std::string origin)
-        : lexer_(text), origin_(std::move(origin)), current_(lexer_.next()) {}
+    ModelParser(std::string_view text, std::string origin,
+                std::span<const ModelEntrySource> entries)
+        : text_(text), entries_(entries), lexer_(text), origin_(std::move(origin)) {}
 
     std::optional<ModelDocument> parse() {
         ModelDocument result;
-        while (current_.kind != ModelTokenKind::End && error_.empty()) {
+        result.instructions.reserve(static_cast<std::size_t>(std::count_if(
+            entries_.begin(), entries_.end(),
+            [](const ModelEntrySource& entry) { return entry.domain == "instruction"; })));
+        while (error_.empty() && next_entry_ < entries_.size()) {
+            const auto& source = entries_[next_entry_++];
+            lexer_ = ModelLexer(text_.substr(source.offset, source.size), source.line);
+            advance();
             if (current_.kind != ModelTokenKind::Identifier) {
                 fail(current_.line,
                      "expected model domain: abi, mangling, optimization, "
@@ -3242,6 +3390,9 @@ private:
         return error_.empty();
     }
 
+    std::string_view text_;
+    std::span<const ModelEntrySource> entries_;
+    std::size_t next_entry_{};
     ModelLexer lexer_;
     std::string origin_;
     ModelToken current_;
@@ -3380,7 +3531,8 @@ bool glob_matches(std::string_view pattern, std::string_view text) {
 
 } // namespace
 
-ModelRegistry::ModelRegistry() {
+ModelRegistry::ModelRegistry(bool load_shipped) {
+    if (!load_shipped) return;
     std::ostringstream errors;
     Diagnostics diagnostics(errors);
     for (const auto& source : shipped_model_sources()) {
@@ -3390,6 +3542,7 @@ ModelRegistry::ModelRegistry() {
             throw std::logic_error("invalid shipped Cross model: " +
                                    errors.str());
         }
+        loaded_files_.insert(std::string(source.name));
     }
     if (!complete_instructions(diagnostics)) {
         throw std::logic_error("invalid shipped Cross model: " + errors.str());
@@ -3404,8 +3557,16 @@ const TargetInfo* architecture_target(std::string_view architecture) {
 }
 
 bool ModelRegistry::load_text(std::string_view text, std::string origin,
-                              Diagnostics& diagnostics) {
-    ModelParser parser(text, origin);
+                              Diagnostics& diagnostics,
+                              std::optional<std::span<const ModelEntrySource>> entries) {
+    if (entries && loaded_files_.contains(origin)) return true;
+    const auto indexed = entries ? std::vector<ModelEntrySource>{} : index_model(text);
+    std::vector<ModelEntrySource> pending;
+    const auto& loaded = loaded_entries_[origin];
+    for (const auto& entry : entries.value_or(indexed)) {
+        if (!loaded.contains(entry.offset)) pending.push_back(entry);
+    }
+    ModelParser parser(text, origin, pending);
     auto document = parser.parse();
     if (!document) {
         diagnostics.file_error(parser.error_position(), parser.error());
@@ -3568,6 +3729,19 @@ bool ModelRegistry::load_text(std::string_view text, std::string origin,
     for (auto& entry : document->init_tables) {
         init_tables_.push_back(std::move(entry));
     }
+    std::unordered_map<std::string, std::size_t> instruction_counts;
+    for (const auto& entry : document->instructions) ++instruction_counts[entry.architecture];
+    for (const auto& [architecture, count] : instruction_counts) {
+        auto table = std::find_if(instruction_tables_.begin(), instruction_tables_.end(),
+            [&](const InstructionTable& item) { return item.architecture == architecture; });
+        if (table == instruction_tables_.end()) {
+            InstructionTable added;
+            added.architecture = architecture;
+            instruction_tables_.push_back(std::move(added));
+            table = std::prev(instruction_tables_.end());
+        }
+        table->entries.reserve(table->entries.size() + count);
+    }
     for (auto& entry : document->instructions) {
         auto table = std::find_if(instruction_tables_.begin(),
                                   instruction_tables_.end(),
@@ -3575,16 +3749,13 @@ bool ModelRegistry::load_text(std::string_view text, std::string origin,
                                       return item.architecture ==
                                              entry.architecture;
                                   });
-        if (table == instruction_tables_.end()) {
-            InstructionTable added;
-            added.architecture = entry.architecture;
-            instruction_tables_.push_back(std::move(added));
-            table = std::prev(instruction_tables_.end());
-        }
         table->entries.push_back(std::move(entry));
         instructions_pending_ = true;
     }
-    origins_.push_back(std::move(origin));
+    for (const auto& entry : pending) loaded_entries_[origin].insert(entry.offset);
+    if (std::find(origins_.begin(), origins_.end(), origin) == origins_.end()) {
+        origins_.push_back(std::move(origin));
+    }
     return true;
 }
 
@@ -3810,8 +3981,8 @@ std::vector<OptionAssignment> ModelRegistry::resolve_optimization(
     return result;
 }
 
-ModelRegistry& model_registry() {
-    static ModelRegistry registry;
+ModelRegistry& model_registry(bool load_shipped) {
+    static ModelRegistry registry(load_shipped);
     static const bool installed = (registry.install_instruction_tables(), true);
     (void)installed;
     return registry;
@@ -3888,7 +4059,9 @@ bool check_options(std::span<const OptionAssignment> options,
 bool check_cpu_options(const ModelRegistry& registry,
                        std::span<const OptionAssignment> options,
                        std::span<const TargetInfo* const> targets,
-                       Diagnostics& diagnostics) {
+                       Diagnostics& diagnostics,
+                       std::span<const IndexedModel> sources,
+                       std::optional<std::string_view> architecture) {
     for (const auto& option : options) {
         const auto* name = std::get_if<std::string>(&option.value);
         if ((option.name != "m.arch" && option.name != "m.tune") || !name) {
@@ -3896,6 +4069,10 @@ bool check_cpu_options(const ModelRegistry& registry,
         }
         std::string problem;
         const auto known = [&](const TargetInfo* target) {
+            if (architecture && target->architecture != *architecture) {
+                return indexed_cpu(sources, target->architecture, *name,
+                                   option.name == "m.arch");
+            }
             if (option.name == "m.tune") {
                 return registry.find_cpu(target->architecture, *name) != nullptr;
             }
@@ -3921,9 +4098,11 @@ bool check_cpu_options(const ModelRegistry& registry,
 
 // Checks the names that presets and profiles use, once every file is loaded:
 // parents, architectures, targets, ABIs, manglings, presets, and options.
-bool check_entries(const ModelRegistry& registry, Diagnostics& diagnostics) {
+bool check_entries(const ModelRegistry& registry, Diagnostics& diagnostics,
+                   std::span<const IndexedModel> sources,
+                   std::optional<std::string_view> architecture) {
     for (const auto& table : registry.init_tables()) {
-        if (table.abi &&
+        if (table.abi && !indexed_abi(sources, {}, *table.abi, true) &&
             std::none_of(registry.abis().begin(), registry.abis().end(),
                          [&](const AbiEntry& abi) {
                              return abi.function_selectable &&
@@ -3968,17 +4147,17 @@ bool check_entries(const ModelRegistry& registry, Diagnostics& diagnostics) {
             return false;
         }
         std::vector<const TargetInfo*> targets;
-        for (const auto& architecture : preset.targets) {
-            const auto* target = architecture_target(architecture);
+        for (const auto& name : preset.targets) {
+            const auto* target = architecture_target(name);
             if (!target) {
-                return fail("names unknown architecture '" + architecture +
+                return fail("names unknown architecture '" + name +
                             "'");
             }
             targets.push_back(target);
         }
         if (!check_options(preset.options, targets, true, diagnostics) ||
             !check_cpu_options(registry, preset.options, targets,
-                               diagnostics)) {
+                               diagnostics, sources, architecture)) {
             return false;
         }
     }
@@ -4011,6 +4190,8 @@ bool check_entries(const ModelRegistry& registry, Diagnostics& diagnostics) {
             }
         }
         if (profile.abi &&
+            !indexed_abi(sources, target ? target->architecture : std::string_view{},
+                         *profile.abi) &&
             std::none_of(registry.abis().begin(), registry.abis().end(),
                          [&](const AbiEntry& abi) {
                              return (!target || abi.architecture ==
@@ -4049,6 +4230,8 @@ bool check_entries(const ModelRegistry& registry, Diagnostics& diagnostics) {
                 return fail("names unknown init_table '" + **name + "'");
             }
             if (table->abi && target &&
+                !(architecture && target->architecture != *architecture &&
+                  indexed_abi(sources, target->architecture, *table->abi)) &&
                 !registry.find_abi(target->architecture, *table->abi,
                                    *profile.target)) {
                 return fail("names init_table '" + **name +
@@ -4062,7 +4245,7 @@ bool check_entries(const ModelRegistry& registry, Diagnostics& diagnostics) {
                    : std::span<const TargetInfo* const>{};
         if (!check_options(profile.options, targets, false, diagnostics) ||
             !check_cpu_options(registry, profile.options, targets,
-                               diagnostics)) {
+                               diagnostics, sources, architecture)) {
             return false;
         }
     }
@@ -4083,6 +4266,16 @@ bool check_entries(const ModelRegistry& registry, Diagnostics& diagnostics) {
                                                 "' of architecture " +
                                                 other.architecture + ", not " +
                                                 cpu.architecture);
+                }
+            }
+            for (const auto& source : sources) {
+                for (const auto& other : source.entries) {
+                    if (other.domain == "cpu" && other.name == name) {
+                        return cpu_failure(cpu, "inherits '" + name +
+                                                    "' of architecture " +
+                                                    other.architecture + ", not " +
+                                                    cpu.architecture);
+                    }
                 }
             }
             return cpu_failure(cpu, "inherits unknown cpu '" + name + "'");
@@ -4209,7 +4402,15 @@ bool select_data_bases(const ModelRegistry& registry, const TargetInfo& target,
 } // namespace
 
 bool configure_models(CompilerOptions& options, Diagnostics& diagnostics) {
-    auto& registry = model_registry();
+    auto& registry = model_registry(false);
+    std::vector<IndexedModel> sources;
+    for (const auto& shipped : shipped_model_sources()) {
+        IndexedModel source;
+        source.origin = shipped.name;
+        for (const auto piece : shipped.text) source.text += piece;
+        source.entries = index_model(source.text);
+        sources.push_back(std::move(source));
+    }
     for (const auto& path : options.model_paths) {
         std::error_code error;
         if (!std::filesystem::is_directory(path, error)) {
@@ -4219,6 +4420,7 @@ bool configure_models(CompilerOptions& options, Diagnostics& diagnostics) {
             return false;
         }
     }
+    std::unordered_set<std::string> files;
     for (const auto& file : options.model_files) {
         std::error_code error;
         std::optional<std::filesystem::path> resolved;
@@ -4239,13 +4441,54 @@ bool configure_models(CompilerOptions& options, Diagnostics& diagnostics) {
                 "cannot find Cross model file '" + file.string() + "'");
             return false;
         }
-        if (!registry.load_file(*resolved, diagnostics)) return false;
+        const auto identity = normalized(*resolved);
+        if (!files.insert(identity).second || registry.loaded_files_.contains(identity)) continue;
+        std::ifstream input(*resolved, std::ios::binary);
+        if (!input) {
+            diagnostics.command_error("cannot read Cross model file '" + resolved->string() + "'");
+            return false;
+        }
+        std::ostringstream contents;
+        contents << input.rdbuf();
+        IndexedModel source{contents.str(), identity, {}};
+        source.entries = index_model(source.text);
+        sources.push_back(std::move(source));
     }
-    if (!options.model_files.empty()) {
-        if (!registry.complete_instructions(diagnostics)) return false;
-        registry.install_instruction_tables();
+    for (const auto& source : sources) {
+        std::vector<ModelEntrySource> profiles;
+        for (const auto& entry : source.entries) {
+            if (entry.domain == "profile") profiles.push_back(entry);
+        }
+        if (!registry.load_text(source.text, source.origin, diagnostics, profiles)) return false;
     }
-    if (!check_entries(registry, diagnostics)) return false;
+    const auto* requested_profile =
+        options.profile_explicit && options.profile != "default"
+            ? registry.find_profile(options.profile) : nullptr;
+    const auto triple = !options.target_explicit && requested_profile && requested_profile->target
+                            ? std::string_view(*requested_profile->target)
+                            : std::string_view(options.target);
+    const auto* requested_target = target_for_triple(triple);
+    const bool all = options.print_targets || options.print_models || options.print_profiles ||
+                     options.print_manglings || options.print_optimizations ||
+                     options.print_data_bases || options.print_init_tables ||
+                     (options.print_cpus && !options.target_explicit);
+    const std::optional<std::string_view> architecture =
+        all ? std::nullopt : std::optional<std::string_view>(
+                                requested_target ? requested_target->architecture : std::string_view{});
+    for (const auto& source : sources) {
+        std::vector<ModelEntrySource> selected;
+        for (const auto& entry : source.entries) {
+            if (entry.domain == "profile") continue;
+            if (!architecture || entry.architecture.empty() ||
+                entry.architecture == *architecture || !architecture_target(entry.architecture)) {
+                selected.push_back(entry);
+            }
+        }
+        if (!registry.load_text(source.text, source.origin, diagnostics, selected)) return false;
+    }
+    if (!registry.complete_instructions(diagnostics, architecture)) return false;
+    registry.install_instruction_tables();
+    if (!check_entries(registry, diagnostics, sources, architecture)) return false;
 
     const ProfileEntry* profile{};
     if (options.profile_explicit && options.profile != "default") {

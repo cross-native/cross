@@ -1792,7 +1792,8 @@ std::span<const InstructionCostEntry> ModelRegistry::instruction_costs(
     return target.instruction_costs;
 }
 
-bool ModelRegistry::complete_instructions(Diagnostics& diagnostics) {
+bool ModelRegistry::complete_instructions(
+    Diagnostics& diagnostics, std::optional<std::string_view> architecture) {
     if (instructions_pending_) {
         for (auto& table : instruction_tables_) {
             if (!complete_table(*architecture_target(table.architecture), table, diagnostics)) {
@@ -1803,7 +1804,8 @@ bool ModelRegistry::complete_instructions(Diagnostics& diagnostics) {
     }
     // A target whose table comes from models needs one.
     for (const auto* target : all_targets()) {
-        if (target->instruction_model && !instruction_table(target->architecture)) {
+        if ((!architecture || target->architecture == *architecture) &&
+            target->instruction_model && !instruction_table(target->architecture)) {
             diagnostics.command_error("no model gives architecture '" +
                                       std::string(target->architecture) + "' instructions");
             return false;

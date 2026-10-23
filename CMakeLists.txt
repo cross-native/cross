@@ -3407,6 +3407,48 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/model/model_system.cmake")
     set_tests_properties(cross_model_system PROPERTIES
         LABELS "check.compile;arch.x86_64;feature.model;profile.custom")
+    add_executable(cross_model_loading_test test/model/loading.cpp)
+    target_link_libraries(cross_model_loading_test PRIVATE cross_targets)
+    cross_component(cross_model_loading_test)
+    foreach(architecture x86-64 mips aarch64)
+        set(loading_architecture "${architecture}")
+        if(architecture STREQUAL "x86-64")
+            set(loading_architecture x86_64)
+            set(loading_flags -target x86_64-unknown-linux-gnu)
+        elseif(architecture STREQUAL "mips")
+            set(loading_flags -mprofile=vr4300-o32)
+        else()
+            set(loading_flags -mprofile=switch)
+        endif()
+        add_test(NAME cross_model_loading_${architecture}
+            COMMAND $<TARGET_FILE:cross_model_loading_test> ${architecture} ${loading_flags})
+        set_tests_properties(cross_model_loading_${architecture} PROPERTIES
+            LABELS "check.unit;arch.${loading_architecture};feature.model;feature.driver")
+    endforeach()
+    foreach(query targets models profiles manglings optimizations data-bases init-tables cpus)
+        add_test(NAME cross_model_loading_print_${query}
+            COMMAND $<TARGET_FILE:cross_model_loading_test> all --print-${query})
+        set_tests_properties(cross_model_loading_print_${query} PROPERTIES
+            LABELS "check.unit;arch.x86_64;arch.mips;arch.aarch64;feature.model;feature.driver")
+    endforeach()
+    foreach(query abis costs options attributes registers keywords builtins instructions features)
+        add_test(NAME cross_model_loading_target_${query}
+            COMMAND $<TARGET_FILE:cross_model_loading_test> mips -target mips-unknown-elf --print-${query})
+        set_tests_properties(cross_model_loading_target_${query} PROPERTIES
+            LABELS "check.unit;arch.mips;feature.model;feature.driver")
+    endforeach()
+    add_test(NAME cross_model_shipped_validation COMMAND $<TARGET_FILE:cross_cc> --print-targets)
+    set_tests_properties(cross_model_shipped_validation PROPERTIES
+        LABELS "check.compile;arch.x86_64;arch.mips;arch.aarch64;feature.model;diagnostics")
+    add_test(NAME cross_model_loading_user
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DCPP=$<TARGET_FILE:cross_cpp>
+                -DAS=$<TARGET_FILE:cross_as>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/model-loading
+                -P "${CMAKE_SOURCE_DIR}/test/model/loading.cmake")
+    set_tests_properties(cross_model_loading_user PROPERTIES
+        LABELS "check.compile;arch.x86_64;arch.mips;arch.aarch64;feature.model;feature.driver;feature.assembler;diagnostics")
     add_test(NAME cross_model_validation
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

@@ -17,6 +17,18 @@
 // parts of the model loader.
 namespace cross {
 
+// A declaration's source range and the names needed before target selection.
+struct ModelEntrySource {
+    std::size_t offset{};
+    std::size_t size{};
+    unsigned line{};
+    std::string domain;
+    std::string name;
+    std::string architecture;
+    std::vector<std::string> aliases;
+    bool function_selectable{true};
+};
+
 struct ModelValue {
     enum class Kind { Text, Integer, Boolean, List } kind{Kind::Text};
     std::string text;
