@@ -21856,7 +21856,10 @@ void AssemblyEmitter::emit_phi_edge_copies(
                    copy.target.mode.bits / 8U);
     }
     // Pre-MIPS-III register-pair phis retain their established lowering until
-    // the paired-GPR class gains a dedicated allocator.
+    // the paired-GPR class gains a dedicated allocator: their stack homes
+    // take one parallel copy, which holds a cycle member in $t2/$t3, free
+    // wherever pairs are.
+    std::vector<Copy> pairs;
     for (const auto& copy : fallback_copies) {
         if (aggregate_vreg(function, copy.target)) {
             const auto* temporary = named_slot(
@@ -21865,8 +21868,24 @@ void AssemblyEmitter::emit_phi_edge_copies(
                        vreg_offset(function, copy.target, copy.location),
                        frame_base(), *temporary->frame_offset,
                        copy.target.mode.bits / 8U);
+        } else if (legalizes_to_pair(copy.target)) {
+            pairs.push_back(copy);
         } else {
             copy_vreg(function, copy.target, copy.source, copy.location);
+        }
+    }
+    if (!pairs.empty()) {
+        actions.clear();
+        resolve(pairs, false);
+        for (const auto& action : actions) {
+            const auto& copy = action.copy;
+            if (action.save) {
+                load_vreg_pair(function, copy.target, "t2", "t3", copy.location);
+            } else if (copy.source_temporary) {
+                store_vreg_pair(function, copy.target, "t2", "t3", copy.location);
+            } else {
+                copy_vreg(function, copy.target, copy.source, copy.location);
+            }
         }
     }
     finish();

@@ -5038,6 +5038,21 @@ if(BUILD_TESTING)
             LABELS "check.runtime;arch.mips;backend.native;middle;feature.optimization;isa.vr4300;isa.r3000;endian.big;endian.little;opt.${thread_level}"
             SKIP_REGULAR_EXPRESSION "skipping MIPS")
     endforeach()
+    # Loop phis that exchange and rotate 64-bit values, word pairs before
+    # MIPS III and single registers from it.
+    foreach(pair_level O1 O2 Os)
+        add_test(NAME cross_runtime_mips_pair_phi_copies_${pair_level}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/pair_phi_copies.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/runtime-mips-pair-phi-copies-${pair_level}
+                -DEXPECTED=P "-DCC_FLAGS=-${pair_level};-fno-eval-calls"
+                -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(cross_runtime_mips_pair_phi_copies_${pair_level} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;feature.codegen;isa.vr4300;isa.r3000;endian.big;endian.little;opt.${pair_level}"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS")
+    endforeach()
     # Values live across a call whose ABI preserves t0/t1 stay out of the
     # registers that compose its result.
     add_test(NAME cross_runtime_mips_low_scratch_calls
