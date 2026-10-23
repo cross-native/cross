@@ -3335,8 +3335,9 @@ private:
 
     // Whether the expansion of `value` may write t2 or t3 when every value
     // it reads or writes has a color: rotations without rotate
-    // instructions, atomics, dynamic stack operations, and, conservatively,
-    // aggregate and unaligned accesses and the entry and return boundaries.
+    // instructions, INS whose target holds the field, atomics, dynamic
+    // stack operations, and, conservatively, aggregate and unaligned
+    // accesses and the entry and return boundaries.
     static bool uses_scratch_colors(const machine::Instruction& value) {
         if (value.kind == machine::InstructionKind::Return) return true;
         if (value.kind != machine::InstructionKind::Target) return false;
@@ -3347,6 +3348,7 @@ private:
         case Opcode::UnalignedLoadSigned:
         case Opcode::UnalignedLoadUnsigned:
         case Opcode::UnalignedStore:
+        case Opcode::Insert:
         case Opcode::Rotl:
         case Opcode::Rotr:
         case Opcode::StackSave:

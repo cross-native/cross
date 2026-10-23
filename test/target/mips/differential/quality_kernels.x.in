@@ -1307,3 +1307,61 @@ global u32 k_q_low_scratches(in u32 a, in u32 b, in u32 c) {
     return s0 ^ s1 ^ s2 ^ s3 ^ s4 ^ s5 ^ s6 ^ s7 ^ s8 ^ s9 ^ s10 ^ s11 ^
         (u32)bits.bits ^ (u32)(bits.bits >> 32);
 }
+
+// INS writes its target in place: a target that holds the inserted field
+// works in a scratch, which no live value may hold.
+[[abi("@ABI@"), noinline]]
+global u32 k_q_insert_pressure(in u32 a, in u32 b, in u32 c) {
+    u32 w0 = a * 3u32 ^ (b + 0u32);
+    u32 w1 = a * 5u32 ^ (b + 1u32);
+    u32 w2 = a * 7u32 ^ (b + 2u32);
+    u32 w3 = a * 9u32 ^ (b + 3u32);
+    u32 w4 = a * 11u32 ^ (b + 4u32);
+    u32 w5 = a * 13u32 ^ (b + 5u32);
+    u32 w6 = a * 15u32 ^ (b + 6u32);
+    u32 w7 = a * 17u32 ^ (b + 7u32);
+    u32 w8 = a * 19u32 ^ (b + 8u32);
+    u32 w9 = a * 21u32 ^ (b + 9u32);
+    u32 w10 = a * 23u32 ^ (b + 10u32);
+    u32 w11 = a * 25u32 ^ (b + 11u32);
+    const u32 count = (c & 7u32) + 1u32;
+    for (u32 i = 0u32; i < count; ++i) {
+        const u32 f0 = (w3 >> 3u32) + i;
+        const u32 n0 = (w0 & 0xffff00ffu32) | ((f0 & 0xffu32) << 8u32);
+        w0 = n0 + (w0 >> 1u32);
+        const u32 f1 = (w4 >> 3u32) + i;
+        const u32 n1 = (w1 & 0xffff00ffu32) | ((f1 & 0xffu32) << 8u32);
+        w1 = n1 + (w1 >> 1u32);
+        const u32 f2 = (w5 >> 3u32) + i;
+        const u32 n2 = (w2 & 0xffff00ffu32) | ((f2 & 0xffu32) << 8u32);
+        w2 = n2 + (w2 >> 1u32);
+        const u32 f3 = (w6 >> 3u32) + i;
+        const u32 n3 = (w3 & 0xffff00ffu32) | ((f3 & 0xffu32) << 8u32);
+        w3 = n3 + (w3 >> 1u32);
+        const u32 f4 = (w7 >> 3u32) + i;
+        const u32 n4 = (w4 & 0xffff00ffu32) | ((f4 & 0xffu32) << 8u32);
+        w4 = n4 + (w4 >> 1u32);
+        const u32 f5 = (w8 >> 3u32) + i;
+        const u32 n5 = (w5 & 0xffff00ffu32) | ((f5 & 0xffu32) << 8u32);
+        w5 = n5 + (w5 >> 1u32);
+        const u32 f6 = (w9 >> 3u32) + i;
+        const u32 n6 = (w6 & 0xffff00ffu32) | ((f6 & 0xffu32) << 8u32);
+        w6 = n6 + (w6 >> 1u32);
+        const u32 f7 = (w10 >> 3u32) + i;
+        const u32 n7 = (w7 & 0xffff00ffu32) | ((f7 & 0xffu32) << 8u32);
+        w7 = n7 + (w7 >> 1u32);
+        const u32 f8 = (w11 >> 3u32) + i;
+        const u32 n8 = (w8 & 0xffff00ffu32) | ((f8 & 0xffu32) << 8u32);
+        w8 = n8 + (w8 >> 1u32);
+        const u32 f9 = (w0 >> 3u32) + i;
+        const u32 n9 = (w9 & 0xffff00ffu32) | ((f9 & 0xffu32) << 8u32);
+        w9 = n9 + (w9 >> 1u32);
+        const u32 f10 = (w1 >> 3u32) + i;
+        const u32 n10 = (w10 & 0xffff00ffu32) | ((f10 & 0xffu32) << 8u32);
+        w10 = n10 + (w10 >> 1u32);
+        const u32 f11 = (w2 >> 3u32) + i;
+        const u32 n11 = (w11 & 0xffff00ffu32) | ((f11 & 0xffu32) << 8u32);
+        w11 = n11 + (w11 >> 1u32);
+    }
+    return w0 ^ w1 ^ w2 ^ w3 ^ w4 ^ w5 ^ w6 ^ w7 ^ w8 ^ w9 ^ w10 ^ w11;
+}
