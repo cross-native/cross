@@ -35,7 +35,7 @@ an expected value; MIPS images are linked with `ld.lld`, or with the Cross
 
 | Label | Meaning |
 | --- | --- |
-| `arch.x86_64`, `arch.mips`, `arch.independent` | Target architecture, or none. |
+| `arch.x86_64`, `arch.mips`, `arch.aarch64`, `arch.independent` | Target architecture, or none. |
 | `feature.NAME` | Language or compiler feature, such as `feature.syntax` or `feature.abi`. |
 | `check.unit`, `check.compile`, `check.runtime`, `diagnostics` | Kind of check. |
 | `frontend`, `middle`, `backend.native`, `backend.llvm`, `backend.gcc` | Compiler layer or output path exercised. |

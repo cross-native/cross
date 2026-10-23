@@ -1,0 +1,383 @@
+// name, command/model spelling, description, prerequisites, implications,
+// explicit-on, explicit-off
+X(Rng, "rng",
+  "enable Random Number generation instructions",
+  (), (), (), ())
+X(Flagm, "flagm",
+  "enable Armv8.4-A Flag Manipulation instructions",
+  (), (), (), ())
+X(Flagm2, "flagm2",
+  "enable alternative NZCV format for floating point comparisons",
+  ("flagm"), (), (), ())
+X(Lse, "lse",
+  "enable Armv8.1-A Large System Extension (LSE) atomic instructions",
+  (), (), (), ())
+X(Fp, "fp",
+  "enable Armv8.0-A Floating Point Extensions",
+  (), (), (), ())
+X(Simd, "simd",
+  "enable Advanced SIMD instructions",
+  ("fp"), (), (), ())
+X(Dotprod, "dotprod",
+  "enable dot product support",
+  ("simd"), (), (), ())
+X(Sm4, "sm4",
+  "enable SM3 and SM4 support",
+  ("simd"), (), (), ())
+X(Rdma, "rdma",
+  "enable Armv8.1-A Rounding Double Multiply Add/Subtract instructions",
+  (), (), ("simd"), ())
+X(Crc, "crc",
+  "enable Armv8.0-A CRC-32 checksum instructions",
+  (), (), (), ())
+X(Sha2, "sha2",
+  "enable SHA1 and SHA256 support",
+  ("simd"), (), (), ())
+X(Aes, "aes",
+  "enable AES support",
+  ("simd"), (), (), ())
+X(Crypto, "crypto",
+  "enable aes and sha2; disabling it also disables sm4",
+  ("aes", "sha2"), (), (), ("aes", "sha2", "sm4"))
+X(Sha3, "sha3",
+  "enable SHA512 and SHA3 support",
+  ("sha2"), (), (), ())
+X(Fp16, "fp16",
+  "enable half-precision floating-point data processing",
+  ("fp"), (), (), ("fp16fml"))
+X(Fp16fml, "fp16fml",
+  "enable FP16 FML instructions",
+  (), (), ("fp16"), ())
+X(Jscvt, "jscvt",
+  "enable Armv8.3-A JavaScript FP conversion instructions",
+  ("fp"), (), (), ())
+X(Fcma, "fcma",
+  "enable Armv8.3-A Floating-point complex number support",
+  ("simd"), (), (), ())
+X(Rcpc, "rcpc",
+  "enable support for RCPC extension",
+  (), (), (), ())
+X(Rcpc2, "rcpc2",
+  "enable Armv8.4-A RCPC instructions with Immediate Offsets",
+  ("rcpc"), (), (), ())
+X(Rcpc3, "rcpc3",
+  "enable Armv8.9-A RCPC instructions for A64 and Advanced SIMD and floating-point instruction set",
+  ("rcpc2"), (), (), ())
+X(Frintts, "frintts",
+  "enable FRInt[32|64][Z|X] instructions that round a floating-point number to an integer (in FP format) forcing it to fit into a 32- or 64-bit int",
+  ("fp"), (), (), ())
+X(I8mm, "i8mm",
+  "enable Matrix Multiply Int8 Extension",
+  ("simd"), (), (), ())
+X(Bf16, "bf16",
+  "enable BFloat16 Extension",
+  ("fp"), (), ("simd"), ())
+X(Sve, "sve",
+  "enable Scalable Vector Extension (SVE) instructions",
+  ("simd", "fp16", "fcma"), (), (), ())
+X(SveB16b16, "sve-b16b16",
+  "enable SVE2 non-widening and SME2 Z-targeting non-widening BFloat16 instructions",
+  (), (), (), ())
+X(F32mm, "f32mm",
+  "enable Matrix Multiply FP32 Extension",
+  ("sve"), (), (), ())
+X(F64mm, "f64mm",
+  "enable Matrix Multiply FP64 Extension",
+  ("sve"), (), (), ())
+X(Sve2, "sve2",
+  "enable Scalable Vector Extension 2 (SVE2) instructions",
+  ("sve"), (), (), ())
+X(SveAes, "sve-aes",
+  "enable SVE AES and quadword SVE polynomial multiply instructions",
+  ("aes"), (), (), ())
+X(Sve2Aes, "sve2-aes",
+  "enable sve2 and sve-aes",
+  ("sve2", "sve-aes"), (), (), ("sve-aes"))
+X(SveBitperm, "sve-bitperm",
+  "enable bit permutation SVE2 instructions",
+  (), (), (), ())
+X(Sve2Bitperm, "sve2-bitperm",
+  "enable sve2 and sve-bitperm",
+  ("sve2", "sve-bitperm"), (), (), ("sve-bitperm"))
+X(SveSha3, "sve-sha3",
+  "enable SVE SHA3 instructions",
+  ("sha3"), (), (), ())
+X(Sve2Sha3, "sve2-sha3",
+  "enable sve2 and sve-sha3",
+  ("sve2", "sve-sha3"), (), (), ("sve-sha3"))
+X(SveSm4, "sve-sm4",
+  "enable SVE SM4 instructions",
+  ("sm4"), (), (), ())
+X(Sve2Sm4, "sve2-sm4",
+  "enable sve2 and sve-sm4",
+  ("sve2", "sve-sm4"), (), (), ("sve-sm4"))
+X(Sve2p1, "sve2p1",
+  "enable Scalable Vector Extension 2.1 instructions",
+  ("sve2"), (), (), ())
+X(Sme, "sme",
+  "enable Scalable Matrix Extension (SME)",
+  ("bf16", "fcma", "fp16", "fp16fml"), (), (), ())
+X(Memtag, "memtag",
+  "enable Memory Tagging Extension",
+  (), (), (), ())
+X(Sb, "sb",
+  "enable Armv8.5-A Speculation Barrier",
+  (), (), (), ())
+X(Predres, "predres",
+  "enable Armv8.5-A execution and data prediction invalidation instructions",
+  (), (), (), ())
+X(Ssbs, "ssbs",
+  "enable Speculative Store Bypass Safe bit",
+  (), (), (), ())
+X(Profile, "profile",
+  "enable Statistical Profiling extension",
+  (), (), (), ())
+X(Tme, "tme",
+  "enable the Transactional Memory Extension",
+  (), (), (), ())
+X(Pauth, "pauth",
+  "enable Armv8.3-A Pointer Authentication extension",
+  (), (), (), ())
+X(Ls64, "ls64",
+  "enable Armv8.7-A LD64B/ST64B Accelerator Extension",
+  (), (), (), ())
+X(Wfxt, "wfxt",
+  "enable Armv8.7-A WFET and WFIT instruction",
+  (), (), (), ())
+X(Xs, "xs",
+  "enable Armv8.7-A limited-TLB-maintenance instruction",
+  (), (), (), ())
+X(SmeF64f64, "sme-f64f64",
+  "enable Scalable Matrix Extension (SME) F64F64 instructions",
+  ("sme"), (), (), ())
+X(SmeI16i64, "sme-i16i64",
+  "enable Scalable Matrix Extension (SME) I16I64 instructions",
+  ("sme"), (), (), ())
+X(Sme2, "sme2",
+  "enable Scalable Matrix Extension 2 (SME2) instructions",
+  ("sme"), (), (), ())
+X(Sme2p1, "sme2p1",
+  "enable Scalable Matrix Extension 2.1 instructions",
+  ("sme2"), (), (), ())
+X(SmeB16b16, "sme-b16b16",
+  "enable SME2.1 ZA-targeting non-widening BFloat16 instructions",
+  ("sme2", "sve-b16b16"), (), (), ())
+X(SmeF16f16, "sme-f16f16",
+  "enable SME non-widening Float16 instructions",
+  ("sme2"), (), (), ())
+X(Mops, "mops",
+  "enable Armv8.8-A memcpy and memset acceleration instructions",
+  (), (), (), ())
+X(Cssc, "cssc",
+  "enable Common Short Sequence Compression (CSSC) instructions",
+  (), (), (), ())
+X(Cmpbr, "cmpbr",
+  "enable Armv9.6-A base compare and branch instructions",
+  (), (), (), ())
+X(Lse128, "lse128",
+  "enable Armv9.4-A 128-bit Atomic instructions",
+  ("lse"), (), (), ())
+X(D128, "d128",
+  "enable Armv9.4-A 128-bit Page Table Descriptors, System Registers and instructions",
+  ("lse128"), (), (), ())
+X(The, "the",
+  "enable Armv8.9-A Translation Hardening Extension",
+  (), (), (), ())
+X(Gcs, "gcs",
+  "enable Armv9.4-A Guarded Call Stack Extension",
+  (), (), (), ())
+X(Fp8, "fp8",
+  "enable FP8 instructions",
+  ("simd"), (), (), ())
+X(Fp8fma, "fp8fma",
+  "enable Armv9.5-A FP8 multiply-add instructions",
+  ("fp8"), (), (), ())
+X(SsveFp8fma, "ssve-fp8fma",
+  "enable SVE2 FP8 multiply-add instructions",
+  ("sme2", "fp8"), (), (), ())
+X(Faminmax, "faminmax",
+  "enable FAMIN and FAMAX instructions",
+  ("simd"), (), (), ())
+X(Fp8dot4, "fp8dot4",
+  "enable FP8 4-way dot instructions",
+  ("fp8"), (), (), ())
+X(SsveFp8dot4, "ssve-fp8dot4",
+  "enable SVE2 FP8 4-way dot product instructions",
+  ("sme2", "fp8"), (), (), ())
+X(Fp8dot2, "fp8dot2",
+  "enable FP8 2-way dot instructions",
+  ("fp8"), (), (), ())
+X(SsveFp8dot2, "ssve-fp8dot2",
+  "enable SVE2 FP8 2-way dot product instructions",
+  ("sme2", "fp8"), (), (), ())
+X(Lut, "lut",
+  "enable Lookup Table instructions",
+  ("simd"), (), (), ())
+X(SmeLutv2, "sme-lutv2",
+  "enable Scalable Matrix Extension (SME) LUTv2 instructions",
+  ("sme2"), (), (), ())
+X(SmeF8f16, "sme-f8f16",
+  "enable Scalable Matrix Extension (SME) F8F16 instructions",
+  ("sme2", "fp8"), (), (), ())
+X(SmeF8f32, "sme-f8f32",
+  "enable Scalable Matrix Extension (SME) F8F32 instructions",
+  ("sme2", "fp8"), (), (), ())
+X(Cpa, "cpa",
+  "enable Armv9.5-A Checked Pointer Arithmetic",
+  (), (), (), ())
+X(Fprcvt, "fprcvt",
+  "enable Armv9.6-A base convert instructions for SIMD&FP scalar register operands of different input and output sizes",
+  ("fp"), (), (), ())
+X(Lsfe, "lsfe",
+  "enable Armv9.6-A base Atomic floating-point in-memory instructions",
+  ("fp"), (), (), ())
+X(F8f32mm, "f8f32mm",
+  "enable Armv9.6-A FP8 to Single-Precision Matrix Multiplication",
+  ("simd", "fp8"), (), (), ())
+X(F8f16mm, "f8f16mm",
+  "enable Armv9.6-A FP8 to Half-Precision Matrix Multiplication",
+  ("simd", "fp8"), (), (), ())
+X(Sme2p2, "sme2p2",
+  "enable Armv9.6-A Scalable Matrix Extension 2.2 instructions",
+  ("sme2p1"), (), (), ())
+X(Sve2p2, "sve2p2",
+  "enable Armv9.6-A Scalable Vector Extension 2.2 instructions",
+  ("sve2p1"), (), (), ())
+X(SveAes2, "sve-aes2",
+  "enable Armv9.6-A SVE multi-vector AES and multi-vector quadword polynomial multiply instructions",
+  (), (), (), ())
+X(SveF16f32mm, "sve-f16f32mm",
+  "enable Armv9.6-A FP16 to FP32 Matrix Multiply instructions",
+  ("sve"), (), (), ())
+X(SveBfscale, "sve-bfscale",
+  "enable Armv9.6-A SVE BFloat16 scaling instructions",
+  (), (), (), ())
+X(SsveAes, "ssve-aes",
+  "enable Armv9.6-A SVE AES support in streaming SVE mode",
+  ("sme2", "sve-aes"), (), (), ())
+X(SsveBitperm, "ssve-bitperm",
+  "enable Armv9.6-A SVE BitPerm support in streaming SVE mode",
+  ("sme2", "sve-bitperm"), (), (), ())
+X(SsveFexpa, "ssve-fexpa",
+  "enable SVE FEXPA instruction in Streaming SVE mode",
+  ("sme2"), (), (), ())
+X(SmeMop4, "sme-mop4",
+  "enable SME Quarter-tile outer product instructions",
+  ("sme2"), (), (), ())
+X(SmeTmop, "sme-tmop",
+  "enable SME Structured sparsity outer product instructions.",
+  ("sme2"), (), (), ())
+X(Lsui, "lsui",
+  "enable Armv9.6-A unprivileged load/store instructions",
+  (), (), (), ())
+X(Occmo, "occmo",
+  "enable Armv9.6-A Outer cacheable cache maintenance operations",
+  (), (), (), ())
+X(Pcdphint, "pcdphint",
+  "enable the producer-consumer data placement hints (FEAT_PCDPHINT)",
+  (), (), (), ())
+X(Pops, "pops",
+  "enable Armv9.6-A Point Of Physical Storage (PoPS) DC instructions",
+  (), (), (), ())
+X(Poe2, "poe2",
+  "enable Stage 1 Permission Overlays Extension 2 instructions",
+  (), (), (), ())
+X(Tev, "tev",
+  "enable TIndex Exception-like Vector instructions",
+  (), (), (), ())
+X(Tlbid, "tlbid",
+  "enable Armv9.7-A TLBI Domains extension",
+  (), (), (), ())
+X(Gcie, "gcie",
+  "enable GICv5 (Generic Interrupt Controller) CPU Interface Extension",
+  (), (), (), ())
+X(Mpamv2, "mpamv2",
+  "enable MPAMv2 system registers",
+  (), (), (), ())
+X(Lscp, "lscp",
+  "enable Armv9.7-A Load-acquire and store-release pair extension",
+  (), (), (), ())
+X(MopsGo, "mops-go",
+  "enable memset acceleration granule only",
+  ("mops", "memtag"), (), (), ())
+X(Sve2p3, "sve2p3",
+  "enable Armv9.7-A Scalable Vector Extension 2.3 instructions",
+  ("sve2p2"), (), (), ())
+X(Sme2p3, "sme2p3",
+  "enable Armv9.7-A Scalable Matrix Extension 2.3 instructions",
+  ("sme2p2"), (), (), ())
+X(F16f32dot, "f16f32dot",
+  "enable Armv9.7-A Advanced SIMD half-precision dot product accumulate to single-precision",
+  ("simd", "fp16"), (), (), ())
+X(SveB16mm, "sve-b16mm",
+  "enable Armv9.7-A SVE non-widening BFloat16 matrix multiply-accumulate",
+  ("sve"), (), (), ())
+X(Mtetc, "mtetc",
+  "enable Virtual Memory Tagging Extension",
+  ("memtag"), (), (), ())
+X(F16f32mm, "f16f32mm",
+  "enable Armv9.7-A Advanced SIMD half-precision matrix multiply-accumulate to single-precision",
+  ("simd", "fp16"), (), (), ())
+X(F16mm, "f16mm",
+  "enable Armv9.7-A non-widening half-precision matrix multiply-accumulate",
+  ("simd", "fp16"), (), (), ())
+X(Armv8A, "armv8-a",
+  "enable the Armv8-A architecture and the extensions it implies",
+  (), ("fp", "simd"), (), ())
+X(Armv8_1A, "armv8.1-a",
+  "enable the Armv8.1-A architecture and the extensions it implies",
+  ("armv8-a"), ("lse", "rdma", "crc"), (), ())
+X(Armv8_2A, "armv8.2-a",
+  "enable the Armv8.2-A architecture and the extensions it implies",
+  ("armv8.1-a"), (), (), ())
+X(Armv8_3A, "armv8.3-a",
+  "enable the Armv8.3-A architecture and the extensions it implies",
+  ("armv8.2-a"), ("jscvt", "fcma", "rcpc", "pauth"), (), ())
+X(Armv8_4A, "armv8.4-a",
+  "enable the Armv8.4-A architecture and the extensions it implies",
+  ("armv8.3-a"), ("flagm", "dotprod", "fp16fml", "rcpc2"), (), ())
+X(Armv8_5A, "armv8.5-a",
+  "enable the Armv8.5-A architecture and the extensions it implies",
+  ("armv8.4-a"), ("flagm2", "frintts", "sb", "predres", "ssbs"), (), ())
+X(Armv8_6A, "armv8.6-a",
+  "enable the Armv8.6-A architecture and the extensions it implies",
+  ("armv8.5-a"), ("i8mm", "bf16"), (), ())
+X(Armv8_7A, "armv8.7-a",
+  "enable the Armv8.7-A architecture and the extensions it implies",
+  ("armv8.6-a"), ("wfxt", "xs"), (), ())
+X(Armv8_8A, "armv8.8-a",
+  "enable the Armv8.8-A architecture and the extensions it implies",
+  ("armv8.7-a"), ("mops"), (), ())
+X(Armv8_9A, "armv8.9-a",
+  "enable the Armv8.9-A architecture and the extensions it implies",
+  ("armv8.8-a"), ("cssc"), (), ())
+X(Armv8R, "armv8-r",
+  "enable the Armv8-R architecture and the extensions it implies",
+  ("armv8.4-a"), (), (), ())
+X(Armv9A, "armv9-a",
+  "enable the Armv9-A architecture and the extensions it implies",
+  ("armv8.5-a"), ("fp16", "sve", "sve2"), (), ())
+X(Armv9_1A, "armv9.1-a",
+  "enable the Armv9.1-A architecture and the extensions it implies",
+  ("armv8.6-a", "armv9-a"), (), (), ())
+X(Armv9_2A, "armv9.2-a",
+  "enable the Armv9.2-A architecture and the extensions it implies",
+  ("armv8.7-a", "armv9.1-a"), (), (), ())
+X(Armv9_3A, "armv9.3-a",
+  "enable the Armv9.3-A architecture and the extensions it implies",
+  ("armv8.8-a", "armv9.2-a"), (), (), ())
+X(Armv9_4A, "armv9.4-a",
+  "enable the Armv9.4-A architecture and the extensions it implies",
+  ("armv8.9-a", "armv9.3-a"), ("sve2p1"), (), ())
+X(Armv9_5A, "armv9.5-a",
+  "enable the Armv9.5-A architecture and the extensions it implies",
+  ("armv9.4-a"), ("faminmax", "lut", "cpa"), (), ())
+X(Armv9_6A, "armv9.6-a",
+  "enable the Armv9.6-A architecture and the extensions it implies",
+  ("armv9.5-a"), ("cmpbr", "lsui", "occmo"), (), ())
+X(Armv9_7A, "armv9.7-a",
+  "enable the Armv9.7-A architecture and the extensions it implies",
+  ("armv9.6-a"), ("fprcvt", "sve2p2", "sve2p3", "f16f32dot"), (), ())
+X(Armv9_8A, "armv9.8-a",
+  "enable the Armv9.8-A architecture and the extensions it implies",
+  ("armv9.7-a"), (), (), ())

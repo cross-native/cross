@@ -38,8 +38,9 @@ properties, options, and entry names are errors.
 
 The shipped models are built into `cc` and `cpp`, so no data files need to be
 installed. Their readable sources are `model/common.xm` (the optimization
-presets), `model/x86_64.xm`, `model/mips.xm`, and
-`model/mips_instructions.xm` (the MIPS instruction table). These options
+presets), `model/x86_64.xm`, `model/mips.xm`,
+`model/mips_instructions.xm` (the MIPS instruction table), and
+`model/aarch64.xm`. These options
 load more files:
 
 ```text
@@ -66,8 +67,8 @@ unique across all architectures. ABI names and aliases are unique per
 `architecture` and address width, so ABIs with different address widths may
 share a name. A shared name resolves to the entry with the address width of
 the target triple's objects: 32 bits for `mips`, `mipsel`, and
-`mipsallegrexel` triples, and 64 bits for `mips64`, `mips64el`, and x86-64
-triples. An entry without `address_bits` ([Entry
+`mipsallegrexel` triples, and 64 bits for `mips64`, `mips64el`, x86-64, and
+AArch64 triples. An entry without `address_bits` ([Entry
 properties](#entry-properties)) has every address width of its
 architecture's triples. One of its aliases may also name an entry of the
 same file that states `address_bits`; at that width, the alias denotes the
@@ -292,6 +293,7 @@ abi "example-regs" {
 | `result_register_failure` | text | `"error"` | no |
 | `call_clobbers` | list | `[]` | no |
 | `pic_call_clobbers` | list | `[]` | no |
+| `call_preserved_views` | list | `[]` | no |
 | `elf_abi_tag` | text | none | no |
 | `features` | list | `[]` | no |
 | `private_carrier_bits` | integer | none | no |
@@ -305,7 +307,7 @@ An entry also needs at least one `bank` and one `rule` block. It may have
 in [Variadic functions](#variadic-functions).
 
 - `architecture` is an architecture name that `cc --print-targets` prints:
-  `x86-64` or `mips`. Any other name is an error.
+  `x86-64`, `mips`, or `aarch64`. Any other name is an error.
 - `address_bits` is the nonzero width of addresses: of pointers, of the
   addresses passed for `out` and `inout` parameters, and of the addresses
   that `indirect` rules pass. Without it, the entry takes the address width
@@ -337,7 +339,7 @@ in [Variadic functions](#variadic-functions).
 - `return_address_bytes` is the size of the return address that a call
   pushes: 8 on x86-64 and 0 on MIPS.
 - `argument_register_failure` and `result_register_failure` are `"stack"`,
-  `"partial"`, or `"error"`; see [Rules](#rules).
+  `"partial"`, `"exhaust"`, or `"error"`; see [Rules](#rules).
 - `llvm_calling_convention` and `gcc_calling_attribute` name the convention
   that `-emit-llvm` and `-emit-gimple` output uses. They do not affect native
   code and may be empty.
@@ -363,15 +365,18 @@ and frame pointers, a call preserves only as many low bits as the
 of `s0`-`s7`. `pic_call_clobbers` lists, in the same form, the storage that
 a call may also change in position-independent code, such as MIPS
 `-mabicalls` code, where a callee computes its own GOT pointer: `o32` lists
-`gp`.
+`gp`. `call_preserved_views` lists views of registers that `call_clobbers`
+omits, each register once: a call preserves only the bits of the named view
+and may change the rest of the register. AAPCS64 preserves only the low 64
+bits of `v8`–`v15`, so the shipped AArch64 ABIs list `d8`–`d15`.
 
 `elf_abi_tag` sets the ELF ABI tag of objects compiled with the entry as
 their ABI (`-mabi` or the profile's `abi`); without it, objects get the tag
 implied by the triple and `address_bits`. Each architecture defines the tags
-it accepts, and any other tag is an error when the file loads. x86-64 defines
-none. MIPS defines `"eabi32"`, which requires `address_bits = 32` and writes
-`EF_MIPS_ABI_EABI32` and GNU's `.mdebug.eabi32` and `.gcc_compiled_long32`
-marker sections.
+it accepts, and any other tag is an error when the file loads. x86-64 and
+AArch64 define none. MIPS defines `"eabi32"`, which requires
+`address_bits = 32` and writes `EF_MIPS_ABI_EABI32` and GNU's
+`.mdebug.eabi32` and `.gcc_compiled_long32` marker sections.
 
 `features` lists target features, as `cc --print-features` names them,
 that compilations with the entry as their ABI select in place of the
@@ -398,8 +403,9 @@ x86-64 ignores the property.
 `natural_alignment_limit`, a power of two, is the largest alignment in bytes
 that a scalar type has by its size in compilations with the entry as their
 ABI; records, arrays, and alignment requests follow from it. Without it the
-target's applies: 8 on MIPS and 16 on x86-64. The shipped `n64` and `x64`
-set 16, so `i128` and `u128` have the 16-byte alignment of GCC's `__int128`.
+target's applies: 8 on MIPS and 16 on x86-64 and AArch64. The shipped
+`n64` and `x64` set 16, so `i128` and `u128` have the 16-byte alignment of
+GCC's `__int128`.
 
 On MIPS, every entry with 64-bit addresses, shipped or user-defined, produces
 ELF64 objects as described in [targets.md](targets.md#mips).
@@ -417,8 +423,9 @@ A `bank` block names registers of one class:
 | `results` | list | `[]` | no |
 
 `class` is the register class that `cc --print-registers` shows:
-`"integer"`, `"simd"`, `"x87"`, or `"mask"` on x86-64, and `"integer"`,
-`"floating"`, or `"special"` on MIPS. Every register in `arguments` and
+`"integer"`, `"simd"`, `"x87"`, or `"mask"` on x86-64, `"integer"`,
+`"floating"`, or `"special"` on MIPS, and `"integer"`, `"simd"`, or
+`"special"` on AArch64. Every register in `arguments` and
 `results` must have that class and at least `register_bits` bits, the width
 that the bank uses.
 
@@ -481,11 +488,14 @@ A `rule` block places values:
 | `cursor_advance` | integer | `0` | no |
 | `stack_alignment` | integer | `0` | no |
 | `stack_size` | integer | `0` | no |
+| `max_stack_alignment` | integer | `0` (no limit) | no |
 | `merge_banks` | list | `[]` | no |
 | `member_banks` | list | `[]` | no |
 | `members` | text | `"any"` | no |
 | `padding_bank` | text | none | no |
 | `require_natural_alignment` | boolean | `false` | no |
+| `uniform_members` | boolean | `false` | no |
+| `max_members` | integer | no limit | no |
 
 Rules are tried in order. The first rule whose filters all match and whose
 action can carry the value places it. An action that cannot carry a value,
@@ -566,8 +576,11 @@ defaults to the entry's `argument_register_failure` or
 stack and frees the registers already given to it, `"partial"` keeps the
 pieces that found registers and passes the rest on the stack (each such piece
 takes at least one slot and the bytes of its carrier, and in a `"packed"`
-area is aligned to that size, up to `stack_alignment`), and `"error"`
-rejects the function's signature. A `"flatten"` value counts as one value.
+area is aligned to that size, up to `stack_alignment`), `"exhaust"` passes
+the whole value on the stack as `"stack"` does and moves each cursor that
+the value would have used past the last register of its banks, so no later
+value takes a register of them, as AAPCS64 does, and `"error"` rejects the
+function's signature. A `"flatten"` value counts as one value.
 
 `cursor_alignment` aligns the position of every cursor that the rule uses
 before the value is placed: to a power of two of positions, or, with
@@ -585,13 +598,15 @@ odd single-precision registers.
 
 `stack_alignment`, a power of two, and `stack_size`, both in bytes,
 override the alignment and the minimum size of a value that the rule places
-on the stack. The outgoing argument area is aligned to the largest of the
+on the stack. `max_stack_alignment`, a power of two in bytes, caps that
+alignment, as AAPCS64 starts an argument aligned above 16 bytes at a
+16-byte boundary. The outgoing argument area is aligned to the largest of the
 entry's `stack_alignment` and the alignments of the values on the stack,
 and its size is rounded up to that alignment.
 
 A `"flatten"` rule may set `require_natural_alignment`, `member_banks`,
-`merge_banks`, and `padding_bank`. With `require_natural_alignment = true`, the rule does not
-apply unless
+`merge_banks`, `padding_bank`, `uniform_members`, and `max_members`. With
+`require_natural_alignment = true`, the rule does not apply unless
 every field offset and array stride meets the alignment of the nested
 value. `merge_banks`, which requires `unit_bits`, divides the value into
 `unit_bits` chunks and places each chunk in one register of the first bank
@@ -604,9 +619,17 @@ names the bank whose register carries it, as GCC's n64 ABI does with every
 64-bit word of a structure. A field that by itself fits one register of a
 listed bank, such as a 128-bit vector, stays in one register. `member_banks` lets the rule apply only when every field and
 element takes one of the listed banks, and keeps one piece for each, as when
-GCC's n64 ABI returns a structure of two `f32` members in `f0` and `f2`. A
-`"flatten"` value's cursors are those of the banks its pieces use; its
-`cursor_alignment` and `cursor_advance` apply to each of them.
+GCC's n64 ABI returns a structure of two `f32` members in `f0` and `f2`.
+With `uniform_members = true`, the rule applies only when the fields and
+elements that it places, counting those at one offset once, as the members
+of a union, have one value kind and width and fill the value without gaps,
+padding, or overlap; each takes a register of its own. `max_members` is the
+largest number of fields and elements that the rule places, so that, with
+`member_banks`, a rule can state AAPCS64's homogeneous floating-point and
+short-vector aggregates of up to four members. Such a rule cannot also have
+`merge_banks`. A `"flatten"` value's cursors are those of the banks its
+pieces use; its `cursor_alignment` and `cursor_advance` apply to each of
+them.
 
 Loading checks each ABI entry against its architecture, whatever the
 selected target: register names, classes, and widths; feature names; the
@@ -764,6 +787,7 @@ The shipped x86-64 model defines the default Cross ABI `x` and the C ABIs
 `sysv_abi` and `ms_abi`. The shipped MIPS model defines the Cross ABIs `x32`,
 with 32-bit registers and addresses, and `x64`, with 64-bit registers and the
 address width of the triple, and the C ABIs `o32`, `n64`, and `eabi32`.
+The shipped AArch64 model defines the Cross ABI `x` and the C ABI `aapcs64`.
 [targets.md](targets.md) describes them.
 
 ## Mangling entries
@@ -1465,10 +1489,12 @@ and the `-mtune` costs favor it; a machine instruction built-in (`$::_name`)
 that needs an unavailable instruction is an error, and so is an operation
 that the target implements only with one. The `m.arch` and `m.tune`
 properties of profiles and presets name `cpu` entries of their
-architectures.
+architectures. `m.arch`, like `-march`, may follow the name with `+FEATURE`
+and `+noFEATURE` modifiers ([invoke.md](invoke.md#targets-abis-and-profiles)),
+which change the entry's features in order.
 
-The shipped CPUs are `cpu` entries in `model/mips.xm` and
-`model/x86_64.xm`.
+The shipped CPUs are `cpu` entries in `model/mips.xm`, `model/x86_64.xm`,
+and `model/aarch64.xm`.
 
 ## Data-base entries
 
@@ -1506,8 +1532,8 @@ the entry's section followed by `.` and its link name, such as
 `.sdata.counter`; the first section is writable unless the entry admits only
 `readonly` and `literal` objects. A target accepts as `base` only the
 registers it can address data from (on MIPS `gp`); a target without
-base-relative data addressing, such as x86-64, rejects every entry, and two
-selected entries cannot name the same section. No ABI that the compilation
+base-relative data addressing, such as x86-64 or AArch64, rejects every
+entry, and two selected entries cannot name the same section. No ABI that the compilation
 uses may carry arguments or results in the base register, and no manual
 location or register binding may name it. A profile's `data_bases` sets
 `-mdata-bases` (`[]` selects none); a profile cannot also set

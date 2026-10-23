@@ -1,0 +1,36 @@
+homogeneous_test preserves: rbx rsp rbp r12 r13 r14 r15 xmm6 xmm7
+
+# uniform_members and max_members.
+homogeneous_test: ({f32, f32, f32}) -> {f32, f32, f32}
+  0: xmm0[0:32] xmm1[32:64] xmm2[64:96]
+  result: xmm0[0:32] xmm1[32:64] xmm2[64:96]
+homogeneous_test: (union {f32, f32[2]}) -> void
+  0: xmm0[0:32] xmm1[32:64]
+homogeneous_test: ({f32, f32, f32, f32, f32}) -> void
+  0: sp+0
+  stack: 32 bytes
+homogeneous_test: ({f32, f64}) -> void
+  0: rdi[0:64] rsi[64:128]
+
+# exhaust: no later value takes a register of the cursor.
+homogeneous_test: (f64, f64, f64, {f64, f64}, f64) -> void
+  0: xmm0
+  1: xmm1
+  2: xmm2
+  3: sp+0[0:64] sp+8[64:128]
+  4: sp+16
+  stack: 32 bytes
+homogeneous_test: (i64, {i64, i64}, i64) -> void
+  0: rdi
+  1: sp+0[0:64] sp+8[64:128]
+  2: sp+16
+  stack: 32 bytes
+
+# The same signature with stack instead of exhaust.
+homogeneous_stack: (f64, f64, f64, {f64, f64}, f64) -> void
+  0: xmm0
+  1: xmm1
+  2: xmm2
+  3: sp+0[0:64] sp+8[64:128]
+  4: xmm3
+  stack: 16 bytes

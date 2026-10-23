@@ -252,6 +252,8 @@ std::optional<std::string> feature_problem(
         enabled[index] = true;
         pending.insert(pending.end(), table[index].prerequisites.begin(),
                        table[index].prerequisites.end());
+        pending.insert(pending.end(), table[index].implies.begin(),
+                       table[index].implies.end());
     }
     for (std::size_t index = 0; index < table.size(); ++index) {
         if (!enabled[index]) continue;
@@ -1462,8 +1464,9 @@ private:
         if (spelling == "stack") return AbiRegisterFailure::Stack;
         if (spelling == "partial") return AbiRegisterFailure::Partial;
         if (spelling == "error") return AbiRegisterFailure::Error;
-        fail(line,
-             "ABI register failure must be 'stack', 'partial', or 'error'");
+        if (spelling == "exhaust") return AbiRegisterFailure::Exhaust;
+        fail(line, "ABI register failure must be 'stack', 'partial', "
+                   "'exhaust', or 'error'");
         return std::nullopt;
     }
 
@@ -1539,7 +1542,8 @@ private:
                  "compilation_selectable", "function_selectable",
                  "elf_abi_tag", "features", "private_carrier_bits",
                  "natural_alignment_limit",
-                 "call_clobbers", "pic_call_clobbers", "argument_register_failure",
+                 "call_clobbers", "pic_call_clobbers",
+                 "call_preserved_views", "argument_register_failure",
                  "result_register_failure", "stack_layout",
                  "argument_stack_base", "stack_alignment",
                  "stack_slot_bytes", "return_address_bytes",
@@ -1655,6 +1659,10 @@ private:
         }
         if (const auto value = list_property(properties, "pic_call_clobbers")) {
             result.pic_call_clobbers = *value;
+        }
+        if (const auto value =
+                list_property(properties, "call_preserved_views")) {
+            result.call_preserved_views = *value;
         }
         if (const auto value =
                 text_property(properties, "argument_register_failure")) {
@@ -1830,11 +1838,13 @@ private:
                      "max_elements",
                      "cursor_alignment", "cursor_advance",
                      "argument_limit", "requires_unused_banks",
-                     "stack_alignment", "stack_size", "applies_to",
+                     "stack_alignment", "stack_size",
+                     "max_stack_alignment", "applies_to",
                      "register_failure", "requires_features",
                      "forbids_features", "merge_banks", "member_banks",
                      "members", "padding_bank",
-                     "require_natural_alignment"})) {
+                     "require_natural_alignment", "uniform_members",
+                     "max_members"})) {
                 return std::nullopt;
             }
             AbiRule rule;
@@ -1928,6 +1938,10 @@ private:
                     unsigned_property(block.properties, "stack_size")) {
                 rule.stack_size = *value;
             }
+            if (const auto value = unsigned_property(
+                    block.properties, "max_stack_alignment")) {
+                rule.max_stack_alignment = *value;
+            }
             if (const auto value =
                     list_property(block.properties, "merge_banks")) {
                 rule.merge_banks = *value;
@@ -1954,6 +1968,14 @@ private:
                     block.properties, "require_natural_alignment")) {
                 rule.require_natural_alignment = *value;
             }
+            if (const auto value = bool_property(
+                    block.properties, "uniform_members")) {
+                rule.uniform_members = *value;
+            }
+            if (const auto value =
+                    unsigned_property(block.properties, "max_members")) {
+                rule.max_members = *value;
+            }
             if (const auto value =
                     list_property(block.properties,
                                   "requires_features")) {
@@ -1968,6 +1990,12 @@ private:
                 (rule.stack_alignment & (rule.stack_alignment - 1U)) != 0) {
                 fail(block.line,
                      "ABI rule stack_alignment must be a power of two");
+                return std::nullopt;
+            }
+            if (rule.max_stack_alignment != 0 &&
+                (rule.max_stack_alignment & (rule.max_stack_alignment - 1U)) != 0) {
+                fail(block.line,
+                     "ABI rule max_stack_alignment must be a power of two");
                 return std::nullopt;
             }
             if (rule.cursor_alignment == 0 ||
@@ -2410,6 +2438,23 @@ private:
                 }
             }
         }
+        // A preserved view is part of a register that a call keeps, once.
+        std::unordered_set<std::string_view> preserved_storage;
+        for (const auto& name : abi.call_preserved_views) {
+            const auto* view = find_register(target, name);
+            const auto clobbered = [&](std::string_view clobber) {
+                const auto* entry = find_register(target, clobber);
+                return entry && view && entry->storage == view->storage;
+            };
+            if (!view || std::ranges::any_of(abi.call_clobbers, clobbered) ||
+                !preserved_storage.insert(view->storage).second) {
+                fail(property_line(properties, "call_preserved_views"),
+                     model + " call_preserved_views names '" + name +
+                         "', which is not a view of a register that "
+                         "call_clobbers omits, or a second view of one");
+                return false;
+            }
+        }
         const auto has_stack_region = [&](AbiStackRegion sought) {
             return std::find(abi.stack_order.begin(), abi.stack_order.end(),
                              sought) != abi.stack_order.end();
@@ -2544,6 +2589,16 @@ private:
                 fail(rule_line,
                      rule_model +
                          " uses flatten-only merge/alignment properties");
+                return false;
+            }
+            if ((rule.uniform_members || rule.max_members != ~0U) &&
+                rule.action != AbiRuleAction::Flatten) {
+                fail(rule_line, rule_model + " uses uniform_members or "
+                                             "max_members without flatten");
+                return false;
+            }
+            if (rule.uniform_members && !rule.merge_banks.empty()) {
+                fail(rule_line, rule_model + " cannot merge uniform members");
                 return false;
             }
             std::unordered_set<std::string_view> member_names;
@@ -3828,7 +3883,8 @@ bool check_options(std::span<const OptionAssignment> options,
 }
 
 // An m.arch or m.tune property names a cpu entry of each of `targets`, or,
-// when `targets` is empty, of some compiled-in target.
+// when `targets` is empty, of some compiled-in target; m.arch may add
+// feature modifiers.
 bool check_cpu_options(const ModelRegistry& registry,
                        std::span<const OptionAssignment> options,
                        std::span<const TargetInfo* const> targets,
@@ -3838,8 +3894,12 @@ bool check_cpu_options(const ModelRegistry& registry,
         if ((option.name != "m.arch" && option.name != "m.tune") || !name) {
             continue;
         }
+        std::string problem;
         const auto known = [&](const TargetInfo* target) {
-            return registry.find_cpu(target->architecture, *name) != nullptr;
+            if (option.name == "m.tune") {
+                return registry.find_cpu(target->architecture, *name) != nullptr;
+            }
+            return parse_cpu_selection(*target, *name, problem).has_value();
         };
         const auto candidates =
             targets.empty() ? std::span<const TargetInfo* const>(all_targets())
@@ -3848,8 +3908,10 @@ bool check_cpu_options(const ModelRegistry& registry,
                                            candidates.end(), known)
                             : !std::all_of(candidates.begin(),
                                            candidates.end(), known)) {
-            diagnostics.file_error(option.source,
-                                   "unknown cpu '" + *name + "' for option '" +
+            diagnostics.file_error(
+                option.source,
+                !problem.empty() ? problem + " for option '" + option.name + "'"
+                                 : "unknown cpu '" + *name + "' for option '" +
                                        option.name + "'");
             return false;
         }

@@ -19,6 +19,8 @@ struct PieceRequest {
     std::uint16_t carrier_bits{};
     std::uint16_t indirect_value_bits{};
     AbiExtensionKind extension{AbiExtensionKind::None};
+    // The kind of the value that the piece carries part of.
+    ScalarKind kind{ScalarKind::Integer};
 };
 
 struct LoweredValue {
@@ -270,6 +272,9 @@ std::optional<LoweredValue> lower_value(const AbiEntry& abi,
                 value.transport == ValueTransport::ByReference
                     ? static_cast<std::uint16_t>(abi.address_bits)
                     : value.mode.bits;
+            const auto kind = value.transport == ValueTransport::ByReference
+                                  ? ScalarKind::Pointer
+                                  : value.mode.kind;
             const auto* bank = find_bank(abi, rule->bank);
             const auto unit_bits =
                 rule->unit_bits != 0
@@ -288,7 +293,7 @@ std::optional<LoweredValue> lower_value(const AbiEntry& abi,
         }
         result.pieces.push_back(
             {bank, 0, effective_bits, carrier(effective_bits), 0,
-             rule->extension});
+             rule->extension, kind});
         break;
     case AbiRuleAction::Split:
     case AbiRuleAction::Coerce: {
@@ -302,7 +307,7 @@ std::optional<LoweredValue> lower_value(const AbiEntry& abi,
                     unit_bits, effective_bits - offset));
             result.pieces.push_back(
                 {bank, offset, bits, carrier(bits), 0,
-                 rule->extension});
+                 rule->extension, kind});
         }
         break;
     }
@@ -343,6 +348,42 @@ std::optional<LoweredValue> lower_value(const AbiEntry& abi,
                 }
             }
         }
+        if (rule->uniform_members) {
+            // Members at one offset, as in a union, count once; the members
+            // share one kind and width and fill the value.
+            std::vector<PieceRequest> members;
+            for (const auto& piece : result.pieces) {
+                const auto same = std::find_if(
+                    members.begin(), members.end(),
+                    [&](const PieceRequest& member) {
+                        return member.value_bit_offset ==
+                               piece.value_bit_offset;
+                    });
+                if (same == members.end()) members.push_back(piece);
+            }
+            std::sort(members.begin(), members.end(),
+                      [](const PieceRequest& left, const PieceRequest& right) {
+                          return left.value_bit_offset < right.value_bit_offset;
+                      });
+            const auto uniform = [&](const PieceRequest& piece) {
+                return piece.kind == members.front().kind &&
+                       piece.value_bits == members.front().value_bits;
+            };
+            if (members.empty() ||
+                !std::all_of(result.pieces.begin(), result.pieces.end(),
+                             uniform) ||
+                members.size() * members.front().value_bits != effective_bits) {
+                return std::nullopt;
+            }
+            for (std::size_t index = 0; index < members.size(); ++index) {
+                if (members[index].value_bit_offset !=
+                    index * members.front().value_bits) {
+                    return std::nullopt;
+                }
+            }
+            result.pieces = std::move(members);
+        }
+        if (result.pieces.size() > rule->max_members) return std::nullopt;
         if (!rule->member_banks.empty() &&
             std::any_of(result.pieces.begin(), result.pieces.end(),
                         [&](const PieceRequest& piece) {
@@ -447,7 +488,8 @@ std::optional<LoweredValue> lower_value(const AbiEntry& abi,
             result.pieces.push_back(
                 {bank, offset,
                  static_cast<std::uint16_t>(abi.address_bits),
-                 static_cast<std::uint16_t>(bank->register_bits), chunk});
+                 static_cast<std::uint16_t>(bank->register_bits), chunk,
+                 AbiExtensionKind::None, ScalarKind::Pointer});
         }
         break;
     }
@@ -495,15 +537,26 @@ AbiRegisterFailure failure_policy(const AbiEntry& abi,
                      : abi.result_register_failure;
 }
 
+// The alignment of a whole value on the stack: its rule's stack_alignment
+// or the value's own, at most the rule's max_stack_alignment, at least one
+// slot.
+std::size_t stack_value_alignment(const AbiEntry& abi, const AbiValue& value,
+                                  const LoweredValue& lowered) {
+    std::size_t alignment = lowered.rule && lowered.rule->stack_alignment != 0
+                                ? lowered.rule->stack_alignment
+                                : value_alignment(value, abi);
+    if (lowered.rule && lowered.rule->max_stack_alignment != 0) {
+        alignment = std::min<std::size_t>(alignment,
+                                          lowered.rule->max_stack_alignment);
+    }
+    return std::max<std::size_t>(alignment, abi.stack_slot_bytes);
+}
+
 bool allocate_stack_value(const AbiEntry& abi, const AbiValue& value,
                           const LoweredValue& lowered,
                           AllocationState& state,
                           ArgumentAssignment& assignment) {
-    const auto alignment = std::max<std::size_t>(
-        lowered.rule && lowered.rule->stack_alignment != 0
-            ? lowered.rule->stack_alignment
-            : value_alignment(value, abi),
-        abi.stack_slot_bytes);
+    const auto alignment = stack_value_alignment(abi, value, lowered);
     std::size_t base{};
     if (!checked_align(state.stack_cursor, alignment, base)) return false;
     if (value_bytes(value, abi) == 0) {
@@ -584,11 +637,7 @@ bool allocate_result_stack_value(
     const AbiEntry& abi, const AbiValue& value,
     const LoweredValue& lowered, AllocationState& state,
     ReturnAssignment& assignment) {
-    const auto alignment = std::max<std::size_t>(
-        lowered.rule && lowered.rule->stack_alignment != 0
-            ? lowered.rule->stack_alignment
-            : value_alignment(value, abi),
-        abi.stack_slot_bytes);
+    const auto alignment = stack_value_alignment(abi, value, lowered);
     std::size_t base{};
     if (!checked_align(state.stack_cursor, alignment, base)) return false;
     if (value_bytes(value, abi) == 0) {
@@ -672,6 +721,23 @@ bool finish_rule_cursors(const LoweredValue& lowered, CursorMap& cursors,
         found->second = start + lowered.rule->cursor_advance;
     }
     return true;
+}
+
+// Moves each cursor that `lowered` uses past the last argument (or result)
+// register of the banks that share it.
+void exhaust_rule_cursors(const AbiEntry& abi, const LoweredValue& lowered,
+                          CursorMap& cursors, bool arguments) {
+    for (const auto& piece : lowered.pieces) {
+        if (!piece.bank) continue;
+        std::size_t end{};
+        for (const auto& bank : abi.banks) {
+            if (bank.cursor != piece.bank->cursor) continue;
+            end = std::max(end, arguments ? bank.arguments.size()
+                                          : bank.results.size());
+        }
+        auto& cursor = cursors[piece.bank->cursor];
+        cursor = std::max(cursor, end);
+    }
 }
 
 void record_rule_banks(const LoweredValue& lowered,
@@ -855,8 +921,13 @@ SignatureClassificationResult classify_signature_values(
                     std::move(layout),
                     ClassificationError::InvalidScalarMode, index, false);
             }
-            if (failure == AbiRegisterFailure::Stack) {
+            if (failure == AbiRegisterFailure::Stack ||
+                failure == AbiRegisterFailure::Exhaust) {
                 argument_registers.cursors = saved_cursors;
+                if (failure == AbiRegisterFailure::Exhaust) {
+                    exhaust_rule_cursors(abi, work.lowered,
+                                         argument_registers.cursors, true);
+                }
                 assignment.pieces.clear();
                 work.partial_stack.clear();
                 work.whole_stack = true;
@@ -919,8 +990,12 @@ SignatureClassificationResult classify_signature_values(
                 std::move(layout),
                 ClassificationError::InvalidScalarMode, index, true);
         }
-        if (failure == AbiRegisterFailure::Stack) {
+        if (failure == AbiRegisterFailure::Stack ||
+            failure == AbiRegisterFailure::Exhaust) {
             result_cursors = saved_cursors;
+            if (failure == AbiRegisterFailure::Exhaust) {
+                exhaust_rule_cursors(abi, work.lowered, result_cursors, false);
+            }
             assignment.pieces.clear();
             work.partial_stack.clear();
             work.whole_stack = true;

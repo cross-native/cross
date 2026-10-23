@@ -38,6 +38,7 @@ The shipped profiles name these initializer tables for `[[constructor]]` and
 | `x86_64-windows` (COFF) | `.CRT$XCU`, `.CRT$XCTNNNNN` | `.dtors`, `.dtors.NNNNN` of 65535 - `P` | `ms_abi` |
 | `x86_64-darwin` (Mach-O) | `__DATA,__mod_init_func` | `__DATA,__mod_term_func` | `sysv_abi` |
 | MIPS profiles (ELF) | `.init_array`, `.init_array.NNNNN` | `.fini_array`, `.fini_array.NNNNN` | the compilation's |
+| AArch64 profiles (ELF) | `.init_array`, `.init_array.NNNNN` | `.fini_array`, `.fini_array.NNNNN` | `aapcs64` |
 
 glibc and other ELF C runtimes call `.init_array` before `main` and
 `.fini_array` at exit. MinGW-w64's startup code calls the `.CRT$XC*`
@@ -749,6 +750,117 @@ linker gives `_gp` before such code runs, and its linker script keeps
         lui     $gp,%hi(_gp)
         addiu   $gp,$gp,%lo(_gp)        # daddiu with 64-bit addresses
 ```
+
+## AArch64
+
+| Triple | Format | Profile | Default ABI |
+| --- | --- | --- | --- |
+| `aarch64-unknown-linux-gnu` | ELF | `aarch64-linux` | `x` |
+| `aarch64-none-elf` | ELF | `aarch64-elf` | `x` |
+
+The AArch64 target describes A64 code with little-endian ELF64 objects and
+64-bit pointers. It has models, but no code generator: for `aarch64-*`
+triples, `cc` preprocesses (`-E`, `-M`) and answers the `--print-*` queries,
+and every output that needs code, such as `-S`, `-c`, or `-emit-llvm`, fails
+with one diagnostic. `as` and `ld` do not accept AArch64. A triple with
+`linux` selects the `aarch64-linux` profile and any other `aarch64-*` triple
+`aarch64-elf`; the models describe ELF systems, not Darwin's or Windows'
+variants of AAPCS64.
+
+| Profile | Triple | CPU | ABI |
+| --- | --- | --- | --- |
+| `aarch64-linux` | `aarch64-unknown-linux-gnu` | generic (Armv8-A) | `x` |
+| `aarch64-elf` | `aarch64-none-elf` | generic (Armv8-A) | `x` |
+| `switch` | `aarch64-none-elf` | `-march=armv8-a+crc+crypto -mtune=cortex-a57`, with `-fpie` | `x` |
+
+The `switch` profile follows devkitA64's options for Nintendo Switch
+homebrew. It reserves no register and describes no thread-local storage.
+
+ABIs:
+
+| ABI | Aliases | Use |
+| --- | --- | --- |
+| `x` | | The Cross ABI: default for global, unresolved, and indirect calls. |
+| `aapcs64` | `lp64` | The AAPCS64 C ABI of GNU/Linux and ELF systems. |
+
+Under both ABIs, calls preserve `x19`–`x28`, `x29`, `sp`, the low 64 bits of
+`v8`–`v15` (`d8`–`d15`), and FPCR; every other register, NZCV, and FPSR may
+change. `x` passes arguments in `x0`–`x15` and then `x19`–`x28`, and in
+`v0`–`v7` and then `v16`–`v31`, and returns results in `x0`–`x7` and
+`v0`–`v3`; `x16`, `x17`, and `x18` carry nothing. A record of up to four
+members of one floating or vector type takes one SIMD and floating-point
+register for each member; another record of up to 512 bits travels in
+64-bit pieces, a piece that holds only floating members in a SIMD and
+floating-point register, and returns in registers up to 256 bits and
+otherwise through a hidden pointer in `x0`. Without floating-point
+registers (`-mno-fp`), `x` passes floating values in general registers.
+
+`aapcs64` passes arguments in `x0`–`x7` and `v0`–`v7`, unnamed ones as named
+ones, and returns results in the registers that the same value would take as
+the first argument. A homogeneous floating-point or short-vector aggregate
+(HFA, HVA) has one to four members of one floating type or one vector width,
+counting nested records, arrays, and union members, and no padding; it takes
+one register per member. A 64- or 128-bit vector takes a SIMD and
+floating-point register. Any other record or vector of up to 16 bytes takes
+one or two general registers, starting at an even one when it is 16-byte
+aligned, as a 128-bit integer does; a larger one is passed by reference and
+returned to an address in `x8`, which takes no argument register. A value
+that finds too few registers left goes on the stack, and so do all later
+values of its register class; a stack value takes whole 8-byte slots from an
+8-byte boundary, or from a 16-byte boundary when it is aligned to 16 bytes
+or more. An integer argument narrower than 64 bits leaves the register bits
+above it unspecified. Without floating-point registers (`-mno-fp`),
+`aapcs64` has no location for a floating value, as GCC rejects such code.
+The `va_list` state of `aapcs64` is the address of a record of `__stack`,
+`__gr_top`, `__vr_top`, `__gr_offs`, and `__vr_offs`, the five states of
+AAPCS64's `va_list`, so a `variadic(void *arguments "va_list")` binding can
+be passed to a C function that takes a `va_list`. The Cross ABI `x` has no
+`va_list` state; its `gp_arg_area` and `fp_arg_area` point at the saved
+argument registers that follow the named arguments, and `overflow_arg_area`
+at the stack arguments that follow them.
+
+Target options:
+
+| Option | Values |
+| --- | --- |
+| `-march=`, `-mtune=` | A `cpu` model entry ([models.md](models.md#cpu-entries)), listed by `cc --print-cpus`; `-march` also takes `+FEATURE` and `+noFEATURE` modifiers, as in `-march=armv8-a+crc+crypto`. |
+| `-mFEATURE`, `-mno-FEATURE` | The extensions of GCC's AArch64 feature modifiers, such as `fp`, `simd`, `crc`, `crypto`, `aes`, `sha2`, `lse`, `fp16`, `dotprod`, `sve2`, and `sme2`, and the architecture levels `armv8-a` to `armv9.8-a` (see `--print-options=target`) |
+| `-mrisc-cisc-balance=` | `0` to `100`; the AArch64 profiles set `0`. |
+
+Each architecture level is a feature that requires the level before it and
+enables the extensions that GCC's `-march` of the level enables: `armv8-a`
+enables `fp` and `simd`, `armv8.1-a` also `lse`, `crc`, and `rdma`, and
+`armv9-a` also `sve2` and what it requires. `armv9.7-a` and `armv9.8-a` are
+Clang's levels. Disabling an extension keeps the level, as in GCC:
+`-march=armv8.1-a+nolse` keeps `armv8.1-a`, `crc`, and `rdma`, and
+`-march=armv8-a+nofp` keeps only `armv8-a`. An extension requires what GCC
+gives it, so disabling one disables the extensions that require it, as
+`-mno-simd` disables `dotprod` and `sve`. As in GCC, `crypto` requires `aes`
+and `sha2`, and disabling it also disables `sm4`; `sve2-aes`, `sve2-bitperm`,
+`sve2-sha3`, and `sve2-sm4` likewise name `sve2` with `sve-aes`,
+`sve-bitperm`, `sve-sha3`, and `sve-sm4`; selecting `fp16fml` also enables
+`fp16`, and disabling `fp16` also disables `fp16fml`, while `armv8.4-a`
+enables `fp16fml` without `fp16`.
+
+`model/aarch64.xm` ships an entry for each architecture level, for every
+CPU name that GCC or Clang accepts for AArch64, such as `cortex-a57`,
+`cortex-a76`, `neoverse-v2`, `apple-m1`, `thunderx2t99`, `a64fx`, and
+`oryon-1`, with their other names, such as `ares` for `neoverse-n1` and
+`cobalt-100` for `neoverse-n2`, and for GCC's big.LITTLE pairs, such as
+`cortex-a57.cortex-a53`, which take their big core's entry. `generic` is
+`armv8-a`. Where GCC and Clang give a CPU different extensions, its entry
+has those that both give it: Clang lists `aes` and `sha2` for Arm's
+Cortex-A cores, which have them only as an option, and GCC does not, so
+`-march=cortex-a57` enables `crc` and not `crypto`; GCC lists Apple's M
+series with their architecture levels only. A modifier adds a feature, as in
+`-march=cortex-a57+crypto`. A CPU that adds features to another of its line
+inherits that CPU and takes the features from an entry named `ext-` and its
+own name. The CPUs that LLVM schedules with one model inherit an entry
+named `pipeline-` and the model's name, which gives LLVM's issue width;
+the Cortex-A57 model's entry also sets a 16-byte function alignment, and
+the architecture levels and `generic` tune like LLVM's generic CPU, whose
+model is the Cortex-A510's. No AArch64 instruction has costs, so
+`cc --print-costs` lists none.
 
 ## Bit intrinsics
 

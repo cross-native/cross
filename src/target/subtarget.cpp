@@ -50,6 +50,18 @@ const std::vector<std::string_view>* missing_alternative(
     return nullptr;
 }
 
+// Whether `feature` is `other` or requires it, directly or through its
+// prerequisites.
+bool requires_feature(const SubtargetTable& table, std::string_view feature,
+                      std::string_view other) {
+    if (feature == other) return true;
+    const auto* entry = find_feature(table, feature);
+    return entry && std::ranges::any_of(entry->prerequisites,
+                                        [&](std::string_view required) {
+                                            return requires_feature(table, required, other);
+                                        });
+}
+
 // "'-mA' or '-mB'".
 std::string alternative_options(const std::vector<std::string_view>& names) {
     std::string result;
@@ -195,6 +207,47 @@ const SubtargetTable* subtarget_table_for(const TargetInfo& target) {
     return target.subtargets;
 }
 
+std::optional<CpuSelection> parse_cpu_selection(
+    const TargetInfo& target, std::string_view text, std::string& error) {
+    // The longest prefix, so that a name with a '+', such as octeon+, stays
+    // whole.
+    auto end = text.size();
+    while (!find_cpu(target, text.substr(0, end))) {
+        end = text.substr(0, end).rfind('+');
+        if (end == std::string_view::npos) return std::nullopt;
+    }
+    CpuSelection result{std::string(text.substr(0, end)), {}};
+    const auto* table = subtarget_table_for(target);
+    const auto architecture = std::string(target.architecture);
+    while (end < text.size()) {
+        const auto begin = end + 1;
+        end = std::min(text.find('+', begin), text.size());
+        const auto modifier = text.substr(begin, end - begin);
+        bool enable = true;
+        const auto* feature = table ? find_feature(*table, modifier) : nullptr;
+        if (!feature && modifier.starts_with("no") && table) {
+            feature = find_feature(*table, modifier.substr(2));
+            enable = false;
+        }
+        if (!feature) {
+            error = modifier.empty()
+                        ? "missing feature after '+' in '" + std::string(text) + "'"
+                        : "unknown " + architecture + " feature '" +
+                              std::string(modifier) + "' in '" +
+                              std::string(text) + "'";
+            return std::nullopt;
+        }
+        if (!feature->selectable) {
+            error = architecture + " feature '" + std::string(feature->name) +
+                    "' in '" + std::string(text) +
+                    "' is a CPU fact that a modifier cannot change";
+            return std::nullopt;
+        }
+        result.modifiers.push_back({std::string(feature->name), enable});
+    }
+    return result;
+}
+
 bool normalize_subtarget_options(const TargetInfo& target,
                                  CompilerOptions& options,
                                  Diagnostics& diagnostics) {
@@ -206,15 +259,22 @@ bool normalize_subtarget_options(const TargetInfo& target,
         return false;
     }
     const auto* arch_option = find_resolved_option(options, "m.arch");
-    const auto arch = std::string(
+    const auto arch_text = std::string(
         resolved_text(options, "m.arch", options.cpu));
-    const auto* cpu = find_cpu(target, arch);
-    if (!cpu) {
+    std::string selection_error;
+    const auto cpu_selection =
+        parse_cpu_selection(target, arch_text, selection_error);
+    if (!cpu_selection) {
         diagnostics.command_error(
-            "unknown " + std::string(target.architecture) +
-            " architecture CPU '" + arch + "'");
+            !selection_error.empty()
+                ? selection_error
+                : "unknown " + std::string(target.architecture) +
+                      " architecture CPU '" +
+                      arch_text.substr(0, arch_text.find('+')) + "'");
         return false;
     }
+    const auto arch = cpu_selection->cpu;
+    const auto* cpu = find_cpu(target, arch);
 
     auto* tune_option = [&]() -> ResolvedOption* {
         const auto found = options.resolved_options.find("m.tune");
@@ -244,6 +304,38 @@ bool normalize_subtarget_options(const TargetInfo& target,
     }
     const auto cpu_features = model_registry().resolve_cpu(target, *cpu).features;
     for (const auto& feature : cpu_features) states[feature] = true;
+    // The -march modifiers in order. +FEATURE selects the feature and what
+    // its explicit selection selects; +noFEATURE disables it, what its
+    // explicit disabling disables, and every feature that requires one of
+    // them. Implications do not enable again what a modifier disabled.
+    std::unordered_set<std::string> modifier_disabled;
+    for (const auto& modifier : cpu_selection->modifiers) {
+        const auto& feature = *find_feature(*table, modifier.feature);
+        std::unordered_set<std::string> changed{modifier.feature};
+        for (const auto other :
+             modifier.enable ? feature.explicit_on : feature.explicit_off) {
+            changed.emplace(other);
+        }
+        for (bool grew = !modifier.enable; grew;) {
+            grew = false;
+            for (const auto& other : table->features) {
+                if (!changed.contains(std::string(other.name)) &&
+                    std::ranges::any_of(other.prerequisites,
+                                        [&](std::string_view required) {
+                                            return changed.contains(
+                                                std::string(required));
+                                        })) {
+                    changed.emplace(other.name);
+                    grew = true;
+                }
+            }
+        }
+        for (const auto& name : changed) {
+            states[name] = modifier.enable;
+            if (modifier.enable) modifier_disabled.erase(name);
+            else modifier_disabled.insert(name);
+        }
+    }
     // A feature that options cannot select is a fact of the -march CPU,
     // which no option may take away, also not through a prerequisite or a
     // conflict.
@@ -274,8 +366,14 @@ bool normalize_subtarget_options(const TargetInfo& target,
             const auto name = std::string(pending.back());
             pending.pop_back();
             if (!result.insert(name).second) continue;
-            const auto& required = find_feature(*table, name)->prerequisites;
-            pending.insert(pending.end(), required.begin(), required.end());
+            const auto& feature = *find_feature(*table, name);
+            pending.insert(pending.end(), feature.prerequisites.begin(),
+                           feature.prerequisites.end());
+            for (const auto other : feature.implies) {
+                if (!modifier_disabled.contains(std::string(other))) {
+                    pending.push_back(other);
+                }
+            }
         }
         return result;
     };
@@ -334,7 +432,7 @@ bool normalize_subtarget_options(const TargetInfo& target,
             selection.value = states[std::string(feature.name)];
             selection.origin = arch_origin;
             selection.source = abi_features.contains(std::string(feature.name))
-                ? "abi=" + abi->canonical_name : "m.arch=" + arch;
+                ? "abi=" + abi->canonical_name : "m.arch=" + arch_text;
         }
     }
 
@@ -422,6 +520,26 @@ bool normalize_subtarget_options(const TargetInfo& target,
     for (const auto& [name, value] : explicit_values) {
         if (!value) unavailable_by.emplace(name, name);
     }
+    // What an explicit selection also selects or disables, unless that is
+    // explicit too.
+    for (const auto& feature : table->features) {
+        const auto name = std::string(feature.name);
+        const auto found = explicit_values.find(name);
+        if (found == explicit_values.end()) continue;
+        const bool value = found->second;
+        const auto* option = find_resolved_option(options, "m." + name);
+        for (const auto other_view :
+             value ? feature.explicit_on : feature.explicit_off) {
+            const auto other = std::string(other_view);
+            if (explicit_features.contains(other)) continue;
+            states[other] = value;
+            if (!value) unavailable_by.emplace(other, name);
+            update_implied_option(
+                other, value,
+                (value ? "selected with m." : "disabled with m.") + name,
+                option ? option->origin : arch_origin);
+        }
+    }
 
     bool changed = true;
     while (changed) {
@@ -436,7 +554,14 @@ bool normalize_subtarget_options(const TargetInfo& target,
                 if (unavailable != unavailable_by.end()) {
                     const auto& root = unavailable->second;
                     if (explicit_value(name, true)) {
-                        if (explicit_value(root, false)) {
+                        const bool disabled = explicit_value(root, false);
+                        if (!requires_feature(*table, required, root)) {
+                            // An explicit_off of `root` disabled `required`.
+                            diagnostics.command_error(
+                                "target option '-m" + name + "' requires '-m" +
+                                required + "', which explicit '-mno-" + root +
+                                "' disables");
+                        } else if (disabled) {
                             diagnostics.command_error(
                                 "target option '-m" + name +
                                 "' requires '-m" + root +
@@ -508,6 +633,21 @@ bool normalize_subtarget_options(const TargetInfo& target,
                         conflict, false, "conflicts with m." + name,
                         arch_origin);
                 }
+                changed = true;
+            }
+            if (!states[name]) continue;
+            // Implications enable only what nothing has disabled.
+            for (const auto implied_view : feature.implies) {
+                const auto other = std::string(implied_view);
+                if (states[other] || unavailable_by.contains(other) ||
+                    modifier_disabled.contains(other)) {
+                    continue;
+                }
+                states[other] = true;
+                const auto* implying = find_resolved_option(options, "m." + name);
+                update_implied_option(
+                    other, true, "implied by m." + name,
+                    implying ? implying->origin : arch_origin);
                 changed = true;
             }
         }

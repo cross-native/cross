@@ -6,6 +6,7 @@
 #include "common/integer_semantics.hpp"
 
 #include "model/model.hpp"
+#include "target/aarch64/target.hpp"
 #include "target/mips/target.hpp"
 #include "target/x86_64/target.hpp"
 
@@ -30,6 +31,7 @@ std::string_view TargetInfo::default_abi(std::string_view triple) const {
 
 const std::vector<const TargetInfo*>& all_targets() {
     static const std::vector<const TargetInfo*> targets{
+        &aarch64_target(),
         // Little-endian spellings begin with "mips" too, so keep the more
         // specific variant first.
         &mipsel_target(),

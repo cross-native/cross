@@ -74,13 +74,19 @@ give such files different spellings, for example with `-ffile-prefix-map`.
 | Option | Selects |
 | --- | --- |
 | `-target TRIPLE` | Target architecture, object format, and default ABI. |
-| `-march=CPU`, `-mtune=CPU` | A `cpu` model entry ([models.md](models.md#cpu-entries)): `-march` the instruction set, `-mtune` the instruction costs that guide instruction choice and scheduling (default: the `-march` CPU). |
+| `-march=CPU`, `-mtune=CPU` | A `cpu` model entry ([models.md](models.md#cpu-entries)): `-march` the instruction set, `-mtune` the instruction costs that guide instruction choice and scheduling (default: the `-march` CPU). `-march` also takes `+FEATURE` and `+noFEATURE` modifiers after the CPU, as in `-march=armv8-a+crc+nofp`. |
 | `-mFEATURE`, `-mno-FEATURE` | Target features, such as `-mavx2` or `-mno-red-zone`. |
 | `-mOPTION=VALUE` | Other target options, such as `-mcmodel=large`. |
 | `-mabi=NAME` | ABI for global, unresolved, and indirect calls (normally the Cross ABI, which `-mabi=x` names on every target). |
 | `-mmangling=NAME` | Link-name encoding: `cross` (default), `simple`, `itanium`, or `msvc`. `itanium` and `msvc` match C++ names only for scalar and pointer-to-scalar types. |
 | `-mprofile=NAME` | A profile: target, ABI, mangling, optimization preset, and options together. |
 | `-mdata-bases=NAME[,NAME...]` | `data_base` model entries ([models.md](models.md#data-base-entries)): small objects placed where one register reaches them, such as MIPS small data through `$gp`; `-mdata-bases=none`, the default, selects none. Targets without base-relative data addressing, such as x86-64, reject an entry. |
+
+A `-march` modifier enables a feature, as `-mFEATURE` would, or disables
+one together with the features that require it, as `-mno-FEATURE` would,
+in the order the modifiers appear: `-march=armv8-a+nofp+sve` enables `sve`
+and, again, the `fp` and `simd` that it requires. Explicit `-mFEATURE` and
+`-mno-FEATURE` options override the CPU's features and the modifiers alike.
 
 Without `-target` or `-mprofile`, `cc` uses the default target configured at
 build time; `cc --version` prints it. Explicit options override a profile's

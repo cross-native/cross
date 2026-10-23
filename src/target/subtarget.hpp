@@ -58,6 +58,13 @@ struct SubtargetFeature {
     // Each list needs one of its features. The resolver does not choose
     // one: without any, the feature is unavailable.
     std::vector<std::vector<std::string_view>> any_prerequisites{};
+    // Features that selecting this one enables, as an architecture level
+    // enables its extensions; disabling one of them later keeps this one.
+    std::vector<std::string_view> implies{};
+    // Features that an explicit selection of this one also enables or, when
+    // it disables it, also disables (GCC's EXPLICIT_ON and EXPLICIT_OFF).
+    std::vector<std::string_view> explicit_on{};
+    std::vector<std::string_view> explicit_off{};
 };
 
 struct SubtargetTable {
@@ -164,6 +171,23 @@ private:
 // separate from command-line parsing and may be replaced by a target module's
 // own table through the overload below.
 [[nodiscard]] const SubtargetTable* subtarget_table_for(const TargetInfo& target);
+
+// An m.arch value: a cpu entry name followed by `+FEATURE` and `+noFEATURE`
+// modifiers, as in GCC's -march=armv8-a+crc+nofp.
+struct CpuSelection {
+    std::string cpu;
+    struct Modifier {
+        std::string feature;
+        bool enable{};
+    };
+    std::vector<Modifier> modifiers;
+};
+
+// Splits `text` at the longest prefix that names a cpu entry of `target`;
+// none when no prefix does. A modifier names a selectable feature, or `no`
+// and one; `error` explains a modifier that does not.
+[[nodiscard]] std::optional<CpuSelection> parse_cpu_selection(
+    const TargetInfo& target, std::string_view text, std::string& error);
 
 // Validates typed target options, expands architecture feature baselines, and
 // writes the canonical CPU/tune/feature state consumed by preprocessing and

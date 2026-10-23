@@ -235,7 +235,10 @@ void install_early_evaluation_layout(Program& program, const CompilerOptions& op
 void print_targets() {
     for (const auto* target : all_targets()) {
         std::cout << target->architecture << "  triples:";
-        for (const auto& entry : target->triple_prefixes) std::cout << ' ' << entry.prefix << "-*";
+        for (const auto& entry : target->triple_prefixes) {
+            std::cout << ' ' << entry.prefix
+                      << (entry.prefix.ends_with('-') ? "*" : "-*");
+        }
         std::cout << '\n';
     }
 }
@@ -1129,6 +1132,16 @@ int run_cc(int argc, char** argv, Diagnostics& diagnostics, CompilerOptions& opt
         diagnostics.command_error("cc does not link; use -S, -c, or -E");
         return 1;
     }
+    if (const auto& architecture = target_for_triple(options.target)->architecture;
+        !target_backend_for(*target_for_triple(options.target)) &&
+        options.emit != EmitKind::Preprocess &&
+        options.dependency_mode != DependencyMode::Only) {
+        diagnostics.command_error(
+            "code generation for " + std::string(architecture) +
+            " is not implemented: for target '" + options.target +
+            "', cc supports only -E, -M, and the --print-* queries");
+        return 1;
+    }
     if (options.debug_info && (options.emit == EmitKind::LlvmTextDebug ||
                                options.emit == EmitKind::GimpleTextDebug ||
                                options.emit == EmitKind::GimpleRtlTextDebug)) {
@@ -1342,12 +1355,6 @@ int run_cc(int argc, char** argv, Diagnostics& diagnostics, CompilerOptions& opt
                           options.mangling, options.abi, pointer_resolver,
                           canonical_abi, install_layout)) return 1;
     const auto* backend = target_backend_for(*target);
-    if (!backend) {
-        diagnostics.command_error(
-            "target '" + std::string(target->architecture) +
-            "' has no registered production backend");
-        return 1;
-    }
     if (options.verbose) std::cerr << "cc: building HIR\n";
     auto hir_module = hir::build(program, options, *target, diagnostics);
     if (diagnostics.errors() != 0) return 1;

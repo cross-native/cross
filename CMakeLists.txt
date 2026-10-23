@@ -121,6 +121,7 @@ cross_component(cross_linker)
 
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
              "${CMAKE_CURRENT_SOURCE_DIR}/model/common.xm"
+             "${CMAKE_CURRENT_SOURCE_DIR}/model/aarch64.xm"
              "${CMAKE_CURRENT_SOURCE_DIR}/model/x86_64.xm"
              "${CMAKE_CURRENT_SOURCE_DIR}/model/mips.xm"
              "${CMAKE_CURRENT_SOURCE_DIR}/model/mips_instructions.xm"
@@ -140,6 +141,7 @@ function(cross_model_text variable path)
     set(${variable} "${pieces}" PARENT_SCOPE)
 endfunction()
 cross_model_text(CROSS_COMMON_MODEL "${CMAKE_CURRENT_SOURCE_DIR}/model/common.xm")
+cross_model_text(CROSS_AARCH64_MODEL "${CMAKE_CURRENT_SOURCE_DIR}/model/aarch64.xm")
 cross_model_text(CROSS_X86_64_MODEL "${CMAKE_CURRENT_SOURCE_DIR}/model/x86_64.xm")
 cross_model_text(CROSS_MIPS_MODEL "${CMAKE_CURRENT_SOURCE_DIR}/model/mips.xm")
 cross_model_text(CROSS_MIPS_INSTRUCTIONS_MODEL
@@ -165,6 +167,7 @@ add_library(cross_targets
     src/target/assembly_format.cpp
     src/target/registry.cpp
     src/target/subtarget.cpp
+    src/target/aarch64/target.cpp
     src/target/mips/assembler.cpp
     src/target/mips/linker.cpp
     src/target/mips/target.cpp
@@ -1688,6 +1691,10 @@ if(BUILD_TESTING)
     add_executable(cross_abi_rules_test test/model/abi_rules_test.cpp)
     target_link_libraries(cross_abi_rules_test PRIVATE cross_native_backend)
     cross_component(cross_abi_rules_test)
+
+    add_executable(cross_abi_layouts_test test/model/abi_layouts.cpp)
+    target_link_libraries(cross_abi_layouts_test PRIVATE cross_targets)
+    cross_component(cross_abi_layouts_test)
 
     add_executable(cross_manual_abi_plan_test test/backend/abi/manual_abi_plan_test.cpp)
     target_link_libraries(cross_manual_abi_plan_test PRIVATE cross_native_backend)
@@ -3454,6 +3461,42 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/model/model_inheritance.cmake")
     set_tests_properties(cross_model_inheritance PROPERTIES
         LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;feature.model;feature.optimization")
+    # The AArch64 architecture: registers, features and their implications,
+    # -march modifiers, the CPU catalog, ABIs, profiles, and the absence of
+    # code generation.
+    add_test(NAME cross_aarch64_models
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DCPP=$<TARGET_FILE:cross_cpp>
+                -DCATALOG=${CMAKE_SOURCE_DIR}/test/target/aarch64/catalog.txt
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aarch64-models
+                -P "${CMAKE_SOURCE_DIR}/test/target/aarch64/models.cmake")
+    set_tests_properties(cross_aarch64_models PROPERTIES
+        LABELS "check.compile;diagnostics;arch.aarch64;feature.model;feature.driver;feature.abi")
+    add_test(NAME cross_aarch64_codegen_unavailable
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aarch64-codegen-unavailable
+                -P "${CMAKE_SOURCE_DIR}/test/target/aarch64/codegen_unavailable.cmake")
+    set_tests_properties(cross_aarch64_codegen_unavailable PROPERTIES
+        LABELS "check.compile;diagnostics;arch.aarch64;feature.driver")
+    # Loading checks of uniform_members, max_members, exhaust, implications,
+    # and call_preserved_views.
+    add_test(NAME cross_model_homogeneous_validation
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DMODEL=${CMAKE_SOURCE_DIR}/test/model/homogeneous.xm
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/model-homogeneous-validation
+                -P "${CMAKE_SOURCE_DIR}/test/model/homogeneous_validation.cmake")
+    set_tests_properties(cross_model_homogeneous_validation PROPERTIES
+        LABELS "check.compile;diagnostics;arch.x86_64;arch.aarch64;feature.model;feature.abi")
+    add_test(NAME cross_model_march_modifiers
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/model-march-modifiers
+                -P "${CMAKE_SOURCE_DIR}/test/model/march_modifiers.cmake")
+    set_tests_properties(cross_model_march_modifiers PROPERTIES
+        LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;feature.model;feature.driver")
     add_test(NAME cross_model_data_base_entries
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
@@ -6575,6 +6618,20 @@ if(BUILD_TESTING)
                 "${CMAKE_SOURCE_DIR}/test/model/abi_dsl.y")
     set_tests_properties(cross_abi_rules PROPERTIES
         LABELS "check.unit;arch.independent;feature.abi")
+    # How aapcs64 and the AArch64 Cross ABI place example signatures.
+    add_test(NAME cross_aarch64_abi_layouts
+        COMMAND $<TARGET_FILE:cross_abi_layouts_test> aarch64
+                "${CMAKE_SOURCE_DIR}/test/target/aarch64/abi_layouts.txt")
+    set_tests_properties(cross_aarch64_abi_layouts PROPERTIES
+        LABELS "check.unit;arch.aarch64;feature.abi;feature.model")
+    # uniform_members, max_members, the exhaust failure, and preserved views
+    # in a user x86-64 model.
+    add_test(NAME cross_model_homogeneous_abi
+        COMMAND $<TARGET_FILE:cross_abi_layouts_test> custom
+                "${CMAKE_SOURCE_DIR}/test/model/homogeneous.xm"
+                "${CMAKE_SOURCE_DIR}/test/model/homogeneous.txt")
+    set_tests_properties(cross_model_homogeneous_abi PROPERTIES
+        LABELS "check.unit;arch.x86_64;feature.abi;feature.model")
     add_test(NAME cross_manual_abi_plan
         COMMAND $<TARGET_FILE:cross_manual_abi_plan_test>)
     set_tests_properties(cross_manual_abi_plan PROPERTIES

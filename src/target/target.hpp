@@ -101,6 +101,8 @@ enum class AbiRegisterFailure {
     Stack,
     Partial,
     Error,
+    // As Stack, and no later value takes a register of the value's cursors.
+    Exhaust,
 };
 
 enum class AbiStackLayout {
@@ -200,6 +202,9 @@ struct AbiRule {
     std::vector<std::string> requires_unused_banks;
     unsigned stack_alignment{};
     unsigned stack_size{};
+    // Nonzero: the largest alignment of a value the rule places on the
+    // stack.
+    unsigned max_stack_alignment{};
     // A flatten rule may merge recursively classified fields into fixed-size
     // chunks. Earlier banks dominate later banks when unlike field classes
     // overlap one chunk. This expresses policies such as the SysV INTEGER
@@ -213,6 +218,11 @@ struct AbiRule {
     std::vector<std::string> member_banks;
     AbiMemberScope members{AbiMemberScope::Any};
     bool require_natural_alignment{};
+    // A flatten rule applies only when its members, those at one offset
+    // counting once, share one kind and width and fill the value; it places
+    // at most max_members of them.
+    bool uniform_members{};
+    unsigned max_members{~0U};
     std::vector<std::string> required_features;
     std::vector<std::string> forbidden_features;
     bool arguments{true};
@@ -256,6 +266,9 @@ struct AbiEntry {
     // The storage that a call also changes in position-independent code
     // (MIPS -mabicalls), where the callee sets up its own GOT pointer.
     std::vector<std::string> pic_call_clobbers;
+    // Views of registers that call_clobbers omits: a call preserves only
+    // their bits, such as d8 of AArch64's v8.
+    std::vector<std::string> call_preserved_views;
     AbiRegisterFailure argument_register_failure{AbiRegisterFailure::Stack};
     AbiRegisterFailure result_register_failure{AbiRegisterFailure::Error};
     AbiStackLayout stack_layout{AbiStackLayout::Packed};
