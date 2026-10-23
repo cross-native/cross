@@ -11283,24 +11283,10 @@ private:
     // allocator can color are split.
     bool split_entry_parameters(machine::Function& function) const {
         const auto& entity = hir_.function(function.source);
-        if (!options_.shrink_wrap || !options_.register_allocation ||
-            options_.unwind_model != UnwindModel::None ||
-            options_.unwind_tables || options_.asynchronous_unwind_tables ||
-            function.frame.elide_incoming_saves ||
-            binds_variadic_state(entity) ||
-            std::any_of(entity.parameters.begin(), entity.parameters.end(),
-                        [](const hir::Parameter& parameter) {
-                            return parameter.mode != ParameterMode::In;
-                        })) {
-            return false;
-        }
-        // Incoming stack pieces keep the prologue at entry anyway.
+        if (!options_.register_allocation) return false;
         const auto* abi = managed_abi_model(hir_, entity, subtarget_, options_);
-        const auto layout =
-            abi ? classify_function_interface(entity, *abi) : std::nullopt;
-        if (!layout || !register_interface(*layout)) return false;
         // Without a preserved register of its class, a parameter crossing a
-        // call never makes the entry block need the frame; a copy only costs.
+        // call lives in its home around the call; a copy only costs.
         const auto preserves =
             [&](std::initializer_list<std::string_view> names) {
                 return std::any_of(
@@ -11318,28 +11304,43 @@ private:
             preserves({"s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7"});
         const bool floating_preserved =
             preserves({"f20", "f22", "f24", "f26", "f28", "f30"});
-        return machine::split_entry_parameters(
-            function,
-            [&](const machine::Instruction& instruction) {
-                const auto opcode = decode_opcode(instruction.opcode);
-                if ((opcode != Opcode::Parameter &&
-                     opcode != Opcode::Fparameter) ||
-                    instruction.defs.size() != 1 ||
-                    instruction.defs.front().kind !=
-                        machine::RegisterKind::Virtual) {
-                    return false;
-                }
-                const auto value = instruction.defs.front();
-                const auto kind = function.virtual_register_classes[value.id];
-                return (integer_preserved &&
-                        kind == machine::VirtualRegisterClass::Integer &&
-                        (value.mode.bits <= 32 ||
-                         subtarget_.has_feature(Feature::Mips3))) ||
-                       (floating_preserved &&
-                        kind == machine::VirtualRegisterClass::Floating &&
-                        colorable_floating(subtarget_, value.mode.bits));
-            },
-            phi_instruction);
+        const auto splittable = [&](const machine::Instruction& instruction) {
+            const auto opcode = decode_opcode(instruction.opcode);
+            if ((opcode != Opcode::Parameter && opcode != Opcode::Fparameter) ||
+                instruction.defs.size() != 1 ||
+                instruction.defs.front().kind != machine::RegisterKind::Virtual) {
+                return false;
+            }
+            const auto value = instruction.defs.front();
+            const auto kind = function.virtual_register_classes[value.id];
+            return (integer_preserved &&
+                    kind == machine::VirtualRegisterClass::Integer &&
+                    (value.mode.bits <= 32 ||
+                     subtarget_.has_feature(Feature::Mips3))) ||
+                   (floating_preserved &&
+                    kind == machine::VirtualRegisterClass::Floating &&
+                    colorable_floating(subtarget_, value.mode.bits));
+        };
+        // A parameter that the entry block's first call passes on keeps its
+        // argument register up to that call.
+        const bool changed = machine::split_call_arguments(function, splittable);
+        if (!options_.shrink_wrap ||
+            options_.unwind_model != UnwindModel::None ||
+            options_.unwind_tables || options_.asynchronous_unwind_tables ||
+            function.frame.elide_incoming_saves ||
+            binds_variadic_state(entity) ||
+            std::any_of(entity.parameters.begin(), entity.parameters.end(),
+                        [](const hir::Parameter& parameter) {
+                            return parameter.mode != ParameterMode::In;
+                        })) {
+            return changed;
+        }
+        // Incoming stack pieces keep the prologue at entry anyway.
+        const auto layout =
+            abi ? classify_function_interface(entity, *abi) : std::nullopt;
+        if (!layout || !register_interface(*layout)) return changed;
+        return machine::split_entry_parameters(function, splittable,
+                                               phi_instruction) || changed;
     }
 
     void record_private_clobbers(const machine::Function& function) {
@@ -16876,7 +16877,7 @@ private:
         auto steps = argument_copy_steps(function, std::move(moves));
         const bool delayed_argument =
             delays_argument(function, steps, signature->layout, tail);
-        if (spare && delayed_argument) emit_target(function, *spare);
+        if (spare && delayed_argument) emit_delay_slot(function, *spare);
         for (std::size_t index = 0;
              index + (delayed_argument ? 1U : 0U) < steps.size(); ++index) {
             emit_argument_step(function, steps[index], call.location);
@@ -16980,7 +16981,7 @@ private:
         if (delayed_argument) {
             emit_argument_step(function, steps.back(), call.location);
         } else if (spare) {
-            emit_target(function, *spare);
+            emit_delay_slot(function, *spare);
         } else {
             instruction("nop");
         }
@@ -17340,7 +17341,8 @@ private:
                          const machine::Instruction& candidate,
                          const machine::Instruction& call,
                          const SignatureLayout& layout) const {
-        if (candidate.kind != machine::InstructionKind::Target ||
+        if ((candidate.kind != machine::InstructionKind::Target &&
+             candidate.kind != machine::InstructionKind::Copy) ||
             candidate.has_side_effects ||
             !single_delay_slot_instruction(function, candidate) ||
             has_dynamic_stack(function)) {

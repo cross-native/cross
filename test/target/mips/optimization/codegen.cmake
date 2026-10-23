@@ -161,6 +161,16 @@ if(NOT ordinary_call MATCHES "[	 ]jal[	 ]+mips_tail_leaf")
         "-fno-optimize-sibling-calls did not preserve a call\n${ordinary_call}")
 endif()
 
+function_body("${OUTPUT}.enabled.s" mips_passed_on passed_on)
+string(FIND "${passed_on}" "jal\tmips_passed_on_leaf" call_position)
+string(SUBSTRING "${passed_on}" 0 ${call_position} before_call)
+if(call_position EQUAL -1 OR
+   before_call MATCHES "[	 ]move[	 ]+\\$a[01]," OR
+   NOT before_call MATCHES "[	 ]move[	 ]+\\$s[0-7],\\$a0")
+    message(FATAL_ERROR
+        "a passed-on parameter moved back into its argument register\n${passed_on}")
+endif()
+
 function_body("${OUTPUT}.enabled.s" mips_shared_epilogue shared_epilogue)
 if(shared_epilogue MATCHES
        "[	 ]b[	 ]+\\.Lcross[.]mips[.][0-9_]+[.]return" OR

@@ -61,4 +61,13 @@ bool split_entry_parameters(Function& function,
                             const InstructionPredicate& splittable,
                             const InstructionPredicate& is_phi);
 
+// Before allocation: a parameter that the entry block's first call reads as
+// an argument and that lives after the call is copied into a new virtual
+// register just before the call, and every later use reads the copy. The
+// original then ends at the call and can stay in its argument register,
+// with no move back into it for the call. Returns whether the function
+// changed.
+bool split_call_arguments(Function& function,
+                          const InstructionPredicate& splittable);
+
 } // namespace cross::machine

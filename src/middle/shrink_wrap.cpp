@@ -233,6 +233,39 @@ std::vector<bool> framed_blocks(const Function& function) {
     return result;
 }
 
+namespace {
+
+// A new virtual register of `original`'s mode and class, with a copy of its
+// spill home.
+Register copy_register(Function& function, Register original) {
+    const auto copy = Register::virtual_register(
+        {static_cast<std::uint32_t>(function.virtual_registers.size())},
+        original.mode);
+    function.virtual_registers.push_back(original.mode);
+    function.virtual_register_classes.push_back(
+        function.virtual_register_classes[original.id]);
+    function.virtual_register_assignments.push_back(std::nullopt);
+    function.rematerialized_immediates.push_back(std::nullopt);
+    const auto home = std::find_if(
+        function.stack_slots.begin(), function.stack_slots.end(),
+        [&](const StackSlot& slot) {
+            return slot.spill_for && slot.spill_for->value == original.id;
+        });
+    if (home != function.stack_slots.end()) {
+        StackSlot slot = *home;
+        slot.id = {static_cast<std::uint32_t>(function.stack_slots.size())};
+        slot.name = "$v" + std::to_string(copy.id);
+        slot.spill_for = VirtualRegisterId{copy.id};
+        slot.frame_offset.reset();
+        slot.frame_color.reset();
+        slot.elided = false;
+        function.stack_slots.push_back(std::move(slot));
+    }
+    return copy;
+}
+
+} // namespace
+
 bool split_entry_parameters(Function& function,
                             const InstructionPredicate& splittable,
                             const InstructionPredicate& is_phi) {
@@ -379,29 +412,7 @@ bool split_entry_parameters(Function& function,
         }
         if (!crosses) continue;
 
-        const auto copy = Register::virtual_register(
-            {static_cast<std::uint32_t>(function.virtual_registers.size())},
-            parameter.mode);
-        function.virtual_registers.push_back(parameter.mode);
-        function.virtual_register_classes.push_back(
-            function.virtual_register_classes[parameter.id]);
-        function.virtual_register_assignments.push_back(std::nullopt);
-        function.rematerialized_immediates.push_back(std::nullopt);
-        const auto home = std::find_if(
-            function.stack_slots.begin(), function.stack_slots.end(),
-            [&](const StackSlot& slot) {
-                return slot.spill_for && slot.spill_for->value == parameter.id;
-            });
-        if (home != function.stack_slots.end()) {
-            StackSlot slot = *home;
-            slot.id = {static_cast<std::uint32_t>(function.stack_slots.size())};
-            slot.name = "$v" + std::to_string(copy.id);
-            slot.spill_for = VirtualRegisterId{copy.id};
-            slot.frame_offset.reset();
-            slot.frame_color.reset();
-            slot.elided = false;
-            function.stack_slots.push_back(std::move(slot));
-        }
+        const auto copy = copy_register(function, parameter);
 
         const auto rename = [&](Register& reg) {
             if (names(reg, parameter.id)) reg = copy;
@@ -445,6 +456,80 @@ bool split_entry_parameters(Function& function,
         move.defs.push_back(copy);
         move.uses.push_back(parameter);
         top.insert(position, std::move(move));
+        changed = true;
+    }
+    return changed;
+}
+
+bool split_call_arguments(Function& function,
+                          const InstructionPredicate& splittable) {
+    if (function.entry.value >= function.blocks.size()) return false;
+    const auto entry = function.entry.value;
+    const auto& head = function.blocks[entry].instructions;
+    const auto first_call = std::find_if(
+        head.begin(), head.end(), [](const Instruction& instruction) {
+            return instruction.kind == InstructionKind::Call;
+        });
+    if (first_call == head.end()) return false;
+    auto call = static_cast<std::size_t>(first_call - head.begin());
+    std::vector<Register> parameters;
+    for (std::size_t index = 0; index < call; ++index) {
+        const auto& instruction = head[index];
+        if (splittable(instruction) && instruction.defs.size() == 1 &&
+            instruction.defs.front().kind == RegisterKind::Virtual) {
+            parameters.push_back(instruction.defs.front());
+        }
+    }
+    // PHI operands are register operands as well as uses.
+    const auto reads = [](const Instruction& instruction, std::uint32_t id) {
+        return std::any_of(instruction.uses.begin(), instruction.uses.end(),
+                           [&](const Register& use) { return names(use, id); });
+    };
+    bool changed = false;
+    for (const auto parameter : parameters) {
+        auto& instructions = function.blocks[entry].instructions;
+        if (!reads(instructions[call], parameter.id)) continue;
+        bool later = false;
+        for (const auto& block : function.blocks) {
+            const std::size_t from = block.id.value == entry ? call + 1 : 0;
+            for (std::size_t index = from;
+                 index < block.instructions.size() && !later; ++index) {
+                later = reads(block.instructions[index], parameter.id);
+            }
+        }
+        if (!later) continue;
+        // The entry dominates every block, so the copy reaches every use
+        // after the call; the call itself keeps reading the original.
+        const auto copy = copy_register(function, parameter);
+        const auto rename = [&](Register& reg) {
+            if (names(reg, parameter.id)) reg = copy;
+        };
+        for (auto& block : function.blocks) {
+            const std::size_t from = block.id.value == entry ? call : 0;
+            for (std::size_t index = from; index < block.instructions.size();
+                 ++index) {
+                auto& instruction = block.instructions[index];
+                for (auto& live : instruction.live_across_call) rename(live);
+                if (block.id.value == entry && index == call) continue;
+                for (auto& use : instruction.uses) rename(use);
+                for (auto& operand : instruction.operands) {
+                    if (auto* reg = std::get_if<RegisterOperand>(&operand)) {
+                        rename(reg->value);
+                    }
+                }
+            }
+        }
+        auto& entry_instructions = function.blocks[entry].instructions;
+        Instruction move;
+        move.kind = InstructionKind::Copy;
+        move.location = entry_instructions[call].location;
+        move.inline_site = entry_instructions[call].inline_site;
+        move.defs.push_back(copy);
+        move.uses.push_back(parameter);
+        entry_instructions.insert(
+            entry_instructions.begin() + static_cast<std::ptrdiff_t>(call),
+            std::move(move));
+        ++call;
         changed = true;
     }
     return changed;

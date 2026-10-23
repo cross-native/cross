@@ -22,6 +22,18 @@ global i32 mips_tail_wrapper(in i32 value) {
     return mips_tail_leaf(value);
 }
 
+// The first call's arguments stay in their argument registers; the copies
+// that outlive the call go to preserved registers.
+[[abi("o32"), noinline]]
+global u32 mips_passed_on_leaf(in u32 a, in u32 b) {
+    return a * 3u32 + b;
+}
+
+[[abi("o32"), noinline]]
+global u32 mips_passed_on(in u32 a, in u32 b) {
+    return mips_passed_on_leaf(a, b) + (a ^ b);
+}
+
 [[abi("o32"), noinline]]
 global i32 mips_shared_epilogue(in i32 value) {
     i32 left = mips_tail_leaf(value);
