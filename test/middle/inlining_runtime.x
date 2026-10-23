@@ -110,7 +110,7 @@ HELPER static u32 pick(in u32 selector, in u32 value) {
 // allocates it at the same address.
 HELPER static u32 squares(in u32 count, out uptr where) {
     u32 values[count];
-    where = values;
+    where = (uptr)values;
     for (u32 index = 0u32; index < count; index += 1u32) {
         values[index] = index * index;
     }

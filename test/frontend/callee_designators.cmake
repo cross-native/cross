@@ -201,7 +201,7 @@ foreach(context skipped sizeof)
             "((u32 (*)(in u32))0u32)()|invalid argument count"
             "((u32 (*)(in u32))0u32)(1u32, 2u32)|invalid argument count"
             "((u32 (*)(in u32 *))0u32)(1.0f64)|incompatible argument type|pointer.*floating"
-            "((u32 (*)(in u32 *))0u32)(3u32)|incompatible argument type"
+            "((u32 (*)(in u32 *))0u32)(3u32)|implicit conversion from integer 'u32' to pointer"
             "((u32 (*)(in u32))0u32)(missing)|unresolved name"
             "((u32 *)0u32)()|does not have a function type")
         string(FIND "${pair}" "|" split)

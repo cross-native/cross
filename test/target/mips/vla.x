@@ -26,7 +26,7 @@ static u32 nested(in u32 count) {
     for (u32 i = 0u32; i < 20u32; i += 1u32) {
         u8 temporary[count];
         if (sizeof(temporary) != (uptr)count) return 0u32;
-        uptr address = temporary;
+        uptr address = (uptr)temporary;
         if (i != 0u32 && address != previous) return 0u32;
         previous = address;
         temporary[count-1u32] = 3u8;
@@ -44,8 +44,8 @@ struct aligned_cell [[aligned(64)]] { u32 value; };
 static u32 aligned_array(in u32 count) {
     struct aligned_cell cells[count];
     [[aligned(64)]] stack u8 bytes[count];
-    uptr address = cells;
-    uptr byte_address = bytes;
+    uptr address = (uptr)cells;
+    uptr byte_address = (uptr)bytes;
     cells[0].value = 12u32;
     cells[count-1u32].value = 18u32;
     if ((address & 63) != 0) return 0u32;
@@ -60,7 +60,7 @@ static u32 goto_cleanup(in uptr count) {
     for (u32 index = 0u32; index < 4u32; index += 1u32) {
         {
             stack u8 temporary[count];
-            uptr address = temporary;
+            uptr address = (uptr)temporary;
             if (index != 0u32 && address != previous) return 100u32;
             previous = address;
             temporary[0] = (u8)(index + 1u32);

@@ -458,16 +458,17 @@ except under `&`.
 Assignment converts the source to the destination type. A cast `(T) value`
 requests the same conversion explicitly. Conversions are permitted between
 arithmetic types, between compatible pointer types, between `void *` and
-object pointers, between pointers to a record or union and to a type
-embedded in it, and between pointers and sufficiently wide integers as
-specified below. An explicit cast may also convert between any two object
-pointer types, including one that discards pointee qualifiers, and between any
-two function-pointer types. The result keeps the address; an access through it
+object pointers, and between pointers to a record or union and to a type
+embedded in it. An explicit cast may also convert between pointers and
+sufficiently wide integers as specified below, between any two object pointer
+types, including one that discards pointee qualifiers, and between any two
+function-pointer types. The result keeps the address; an access through it
 follows the alignment, effective-type, and qualifier rules of “Pointer and
 object-access model”, and calling through a pointer whose callable interface
 differs from the called function's own is undefined unless the target
-documents that the two interfaces are physically identical. Function and
-object pointers convert to each other only where the target defines it. A scalar converts to `bool` as false when it is numeric zero
+documents that the two interfaces are physically identical. Apart from a null
+pointer constant, function and object pointers convert to each other only where
+the target defines it. A scalar converts to `bool` as false when it is numeric zero
 or null and true otherwise. Converting to a narrower integer keeps the low
 bits; converting an unsigned integer wider zero-extends it; converting a signed
 integer wider sign-extends it. Floating/integer conversion truncates toward
@@ -480,20 +481,46 @@ effects without a value. A cast to `void`, `(void)expression`, evaluates its
 operand of any type for its effects and discards the value. These source
 constraints also apply in untaken branches and unevaluated operands.
 
-Initialization, assignment, arguments, return, and parameter copy-out all use
-assignment conversion and permit arithmetic narrowing. An implicit pointer
-conversion may add pointee qualifiers but cannot discard `const` or `volatile`,
-change atomic qualification, or convert unrelated pointee types except through
-`void *` or to an embedded member's type (see “Embedded members”). Adding
-nested pointee qualifiers requires `const` on every intervening
-destination pointer; for example, `T **` cannot become `const T **`.
+Initialization, including each entry of a brace initializer, assignment,
+arguments, return, and parameter copy-out all use assignment conversion and
+permit arithmetic narrowing. Assignment conversion converts a null pointer
+constant (see “Pointer and object-access model”) to any pointer type, a
+function-pointer type included, and a pointer to an integer only when the
+integer type is `bool`; every other conversion between a pointer and an
+integer requires a cast. A `label` converts implicitly only to `label` and
+`bool`. An implicit pointer conversion may add pointee qualifiers but
+cannot discard `const` or `volatile`, change atomic qualification, or convert
+unrelated pointee types except through `void *` or to an embedded member's
+type (see “Embedded members”). Adding nested pointee qualifiers requires
+`const` on every intervening destination pointer; for example, `T **` cannot
+become `const T **`.
+
+```x
+typedef void (*handler)();
+
+global u32 counter;
+global handler on_error = (void *)0;   // C's `NULL` is a null pointer constant
+
+global uptr address(in const u8 *text) {
+    const u8 *cursor = 0;              // a null pointer
+    if (text != 0) cursor = text;
+    bool present = cursor;             // a truth value
+    uptr bits = (uptr)cursor;          // not `uptr bits = cursor;`
+    u32 *device = (u32 *)0x1000uptr;   // not `u32 *device = 0x1000;`
+    if (on_error != (void *)0) on_error();
+    return present ? bits + (uptr)device + (uptr)&counter : 0;
+}
+```
 
 ### Conditional pointer result types
 
-After ordinary value conversions, `condition ? yes : no` with two pointer
-arms has the least qualification-preserving common pointer type described
-below. The result type does not depend on the condition's value or arm order;
-both arms must satisfy its source constraints even when one is not evaluated.
+After ordinary value conversions, if one arm of `condition ? yes : no` is a
+null pointer constant (see “Pointer and object-access model”) and the other has
+pointer type, the result is the pointer arm's unqualified value type, and the
+constant yields that type's null pointer. Otherwise two pointer arms have the
+least qualification-preserving common pointer type described below. The
+result type does not depend on the condition's value or arm order; both arms
+must satisfy its source constraints even when one is not evaluated.
 
 - Corresponding pointee types must have the same structure, nominal identity
   and array/vector bounds. A genuinely incomplete array is not a wildcard for
@@ -522,11 +549,9 @@ both arms must satisfy its source constraints even when one is not evaluated.
   require an explicit cast; representability and supported lowering remain
   target requirements.
 
-With one pointer arm and one integer arm, the integer arm must be a
-source-constant integer zero (see “Pointer and object-access model”). The result
-is the pointer arm's unqualified value type and uses that type's target-defined
-null representation. A nonzero or runtime integer does not establish a common
-pointer type.
+With one pointer arm and one integer arm, the integer arm must be a null
+pointer constant. A nonzero or runtime integer does not establish a common
+pointer type, nor does a cast of one to `void *` join a function-pointer arm.
 
 ### Expressions and sequencing
 
@@ -1023,16 +1048,24 @@ object element type because its offset scales by that type, even when the
 selection appears under `&`, `sizeof`, or `$::alignof`. These source constraints
 apply before execution, including untaken branches and unevaluated operands.
 
-Integer constant zero converted to a pointer is a null pointer. `==` and `!=`
-permit a pointer operand and an integer constant zero in either order; the zero
-is converted to the pointer operand's type before comparison. Other mixed
-pointer/integer comparisons are invalid. A null pointer
-compares unequal to every pointer to an object/function. Object pointers
-convert to/from `void *` without changing their address and recover their
-original value when converted back. Function and object pointers are distinct;
-conversion between them, and explicit conversion between a function pointer
-and `uptr`, exist only when the target defines them. The shipped x86-64 and
-MIPS targets define the `uptr` conversion as the code address, like `label`.
+A **null pointer constant** is a source-constant integer zero (see “Automatic
+and explicit evaluation”), or such an expression cast to `void *`, as in C. It
+converts implicitly to every pointer type, function-pointer types included,
+and the result is that type's null pointer; an integer constant zero cast
+explicitly to a pointer type is a null pointer too. A `void *` value that is
+not a null pointer constant, such as `(void *)x` for a variable `x` or a
+`void *` object holding null, does not convert to a function pointer. `==` and
+`!=` permit a pointer operand and a null pointer constant in either order; the
+constant is converted to the pointer operand's type before comparison. Other
+mixed pointer/integer comparisons are invalid, and two pointer operands
+require a common pointer type (see “Conditional pointer result types”). A null
+pointer compares unequal to every pointer to an object/function. Object
+pointers convert to/from `void *` without changing their address and recover
+their original value when converted back. Function and object pointers are
+distinct; apart from a null pointer constant, conversion between them, and
+explicit conversion between a function pointer and `uptr`, exist only when the
+target defines them. The shipped x86-64 and MIPS targets define the `uptr`
+conversion as the code address, like `label`.
 
 An object's lifetime begins after its storage and initialization are
 established and ends when its block exits, its dynamic stack region is
@@ -3034,7 +3067,8 @@ emission model and no `extern inline` form.
 `label` is a scalar code-address type; size, alignment, representation, null,
 relocation, signing, and tagging are target properties. It supports assignment,
 storage, aggregates, parameters/results, and `==`/`!=`, but not dereference,
-call, or arithmetic. Explicit `uptr` conversion is target-defined; where the
+call, or arithmetic. It converts implicitly only to `bool`, as a truth value.
+Explicit `uptr` conversion is target-defined; where the
 target defines it, `(uptr)function::label` is a relocatable address
 expression in static initialization. Passing a
 `label` through a registered ABI requires the ABI model to classify code

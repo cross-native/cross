@@ -25,7 +25,7 @@ reject(unknown "global i32 value = 0 && missing;" "unresolved name")
 reject(arity "static i32 helper(in i32 x) { return x; } global i32 value = 1 || helper();"
     "invalid argument count")
 reject(argument "static i32 helper(in i32 x) { return x; } global i32 value = 1 || helper(\"bad\");"
-    "incompatible argument type")
+    "implicit conversion from pointer 'const u8 [*]' to integer 'i32' requires an explicit cast in call argument")
 reject(pointer_argument "static i32 helper(in const u32 *x) { return 7; } global i32 value = 1 || helper(\"bad\");"
     "incompatible argument type")
 reject(dereference "global i32 value = 0 && *1;" "dereference requires a pointer operand")

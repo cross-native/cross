@@ -1674,14 +1674,33 @@ TypePtr conditional_meta_type(const TypePtr& left, const TypePtr& right) {
     return same_type(a, b) ? a : TypePtr{};
 }
 
+// The integer expression whose source-constant zero makes `source` a null
+// pointer constant for the pointer type `destination`: an integer source, or
+// the integer operand of a cast to `void *`.
+template<class TypeOf>
+const Expr* null_pointer_operand(const Expr& source, const TypePtr& source_type,
+                                 const TypePtr& destination, const TypeOf& type_of) {
+    if (!destination || destination->kind != Type::Kind::Pointer) return nullptr;
+    if (is_integer(source_type)) return &source;
+    const auto* operand = void_pointer_cast_operand(source);
+    return operand && is_integer(type_of(*operand)) ? operand : nullptr;
+}
+
 // Type selection does not execute a zero proof. The shared source-operator
-// checker validates a pointer/integer arm before evaluation or erasure.
-TypePtr conditional_pointer_type(const TypePtr& left, const TypePtr& right) {
+// checker validates a null pointer constant arm before evaluation or erasure
+// and retains the proof of a cast to `void *`. A null pointer constant arm
+// takes the other pointer arm's type.
+TypePtr conditional_pointer_type(const TypePtr& left, const TypePtr& right,
+                                 const Expr& yes, const Expr& no) {
     if (!left || !right) return {};
-    if (left->kind == Type::Kind::Pointer && right->kind == Type::Kind::Pointer)
-        return common_pointer_type(left, right).type.value_or(TypePtr{});
-    const auto pointer = left->kind == Type::Kind::Pointer && is_integer(right) ? left
-        : right->kind == Type::Kind::Pointer && is_integer(left) ? right : TypePtr{};
+    TypePtr pointer;
+    if (left->kind == Type::Kind::Pointer && is_integer(right)) pointer = left;
+    else if (right->kind == Type::Kind::Pointer && is_integer(left)) pointer = right;
+    else if (left->kind == Type::Kind::Pointer && right->kind == Type::Kind::Pointer) {
+        const bool yes_null = proven_null_pointer_cast(yes), no_null = proven_null_pointer_cast(no);
+        if (yes_null == no_null) return common_pointer_type(left, right).type.value_or(TypePtr{});
+        pointer = no_null ? left : right;
+    }
     if (!pointer) return {};
     auto result = std::make_shared<Type>(*pointer);
     result->is_const = result->is_volatile = result->is_atomic = result->is_restrict = false;
@@ -3670,8 +3689,8 @@ private:
                                                : TypePtr{};
             const auto right = expression.third ? type_of(*expression.third)
                                                : TypePtr{};
-            if ((left && left->kind == Type::Kind::Pointer) || (right && right->kind == Type::Kind::Pointer))
-                return conditional_pointer_type(left, right);
+            if (left && right && (left->kind == Type::Kind::Pointer || right->kind == Type::Kind::Pointer))
+                return conditional_pointer_type(left, right, *expression.right, *expression.third);
             return same_type(left, right) ? left : TypePtr{};
         }
         case Expr::Kind::AggregateInitializer:
@@ -4938,7 +4957,7 @@ TypePtr infer_generic_actual_step(const Expr& expression,
         const auto no = type_of(*expression.third);
         if (is_meta_type(yes) || is_meta_type(no)) return conditional_meta_type(yes, no);
         if ((yes && yes->kind == Type::Kind::Pointer) || (no && no->kind == Type::Kind::Pointer))
-            return conditional_pointer_type(yes, no);
+            return conditional_pointer_type(yes, no, *expression.right, *expression.third);
         if (same_type(yes, no)) return yes;
         return common_numeric(yes, no);
     }
@@ -5353,6 +5372,12 @@ const char* source_operator_error(const Expr& node, const Program& program,
         return is_vector(a) && is_vector(b) &&
             (a->scalable != b->scalable || (a->lanes && b->lanes && a->lanes != b->lanes));
     };
+    // The integer operand of a cast to `void *`, a null pointer constant when
+    // it is zero; its proof is requested and retained.
+    const auto null_cast = [&](const Expr& operand) -> Expr* {
+        auto* value = void_pointer_cast_operand(operand);
+        return value && is_integer(type_of(*value)) ? value : nullptr;
+    };
     if (node.kind == Expr::Kind::Conditional && node.left && node.right && node.third) {
         const auto selector = type_of(*node.left), yes = type_of(*node.right), no = type_of(*node.third);
         // Opaque and nominal values retain their dedicated compatibility checks.
@@ -5380,6 +5405,9 @@ const char* source_operator_error(const Expr& node, const Program& program,
             return "conditional operands cannot mix pointer and floating types";
         if (yes->kind == Type::Kind::Pointer || no->kind == Type::Kind::Pointer) {
             if (yes->kind == Type::Kind::Pointer && no->kind == Type::Kind::Pointer) {
+                auto* yes_zero = null_cast(*node.right);
+                auto* no_zero = null_cast(*node.third);
+                if (!yes_zero != !no_zero && null_integer(yes_zero ? *yes_zero : *no_zero)) return nullptr;
                 if (common_pointer_type(yes, no).type) return nullptr;
                 if (yes->pointee && no->pointee && yes->pointee->kind == Type::Kind::Function &&
                     no->pointee->kind == Type::Kind::Function)
@@ -5437,7 +5465,15 @@ const char* source_operator_error(const Expr& node, const Program& program,
                 return "pointer/integer equality requires an integer constant zero";
             return nullptr;
         }
-        // Common pointer type and address representation remain model-owned.
+        if (left_pointer && right_pointer) {
+            auto* left_zero = null_cast(*node.left);
+            auto* right_zero = null_cast(*node.right);
+            if ((operation == "==" || operation == "!=") && !left_zero != !right_zero &&
+                null_integer(left_zero ? *left_zero : *right_zero)) return nullptr;
+            // Address-space joins and address representation remain model-owned.
+            return left->address_space != right->address_space || common_pointer_type(left, right).type
+                ? nullptr : "pointer comparison requires compatible pointer types or a null pointer constant";
+        }
         return (left_pointer || is_integer(left)) && (right_pointer || is_integer(right))
             ? nullptr : "comparison requires numeric or pointer operands";
     }
@@ -5507,12 +5543,36 @@ const char* source_value_error(const TypePtr& type) {
 
 
 
+// C's rule, also C++'s, Go's, and Rust's: an implicit conversion between a
+// pointer and an integer requires a cast; the callers accept a null pointer
+// constant. A label converts implicitly only to a label or to bool.
+std::optional<std::string> implicit_address_conversion_error(const TypePtr& source,
+                                                             const TypePtr& destination) {
+    if (!source || !destination) return std::nullopt;
+    const auto pointer = [](const TypePtr& type) { return type->kind == Type::Kind::Pointer; };
+    const auto boolean = [](const TypePtr& type) {
+        return type->kind == Type::Kind::Builtin && type->builtin == BuiltinType::Bool;
+    };
+    const auto value = [](const TypePtr& type) { return is_scalar(type) || is_vector(type); };
+    const bool label = is_label_type(source) != is_label_type(destination) &&
+        value(source) && value(destination) && !(is_label_type(source) && boolean(destination));
+    const bool address = (pointer(source) && is_integer(destination) && !boolean(destination)) ||
+        (is_integer(source) && pointer(destination));
+    if (!label && !address) return std::nullopt;
+    const auto operand = [&](const TypePtr& type) {
+        if (is_label_type(type)) return std::string("label");
+        return (pointer(type) ? "pointer '" : is_integer(type) ? "integer '" : "'") + type_name(type) + "'";
+    };
+    return "implicit conversion from " + operand(source) + " to " + operand(destination) +
+        (is_integer(source) || is_integer(destination) ? " requires an explicit cast" : " is not allowed");
+}
+
 // Target-independent constraints only. Integer/address representation and
 // cross-address-space conversions remain owned by the resolved target. This
 // check must not execute a source value, including in an untaken helper branch.
-const char* source_conversion_error(const TypePtr& source, const TypePtr& destination,
-                                    SourceConversion conversion = SourceConversion::Implicit,
-                                    bool direct_function = false, const Program* program = nullptr) {
+const char* conversion_constraint_error(const TypePtr& source, const TypePtr& destination,
+                                        SourceConversion conversion, bool direct_function,
+                                        const Program* program) {
     if (!source || !destination || source->kind == Type::Kind::Generic ||
         destination->kind == Type::Kind::Generic) return nullptr;
     // A void expression may forward no result, but never becomes a scalar,
@@ -5580,6 +5640,18 @@ const char* source_conversion_error(const TypePtr& source, const TypePtr& destin
     return nullptr;
 }
 
+// A caller that may convert a null pointer constant proves it when this
+// reports an error (see null_pointer_operand).
+std::optional<std::string> source_conversion_error(const TypePtr& source, const TypePtr& destination,
+                                                   SourceConversion conversion = SourceConversion::Implicit,
+                                                   bool direct_function = false, const Program* program = nullptr) {
+    if (conversion == SourceConversion::Implicit)
+        if (auto reason = implicit_address_conversion_error(source, destination)) return reason;
+    if (const auto* reason = conversion_constraint_error(source, destination, conversion, direct_function, program))
+        return reason;
+    return std::nullopt;
+}
+
 template<class TypeOf>
 bool source_function_designator(const Expr& source, const TypeOf& type_of) {
     const auto* value = &source;
@@ -5636,18 +5708,6 @@ const char* source_meta_expression_error(const Expr& node, const TypeOf& type_of
     } else if (node.kind == Expr::Kind::CompoundLiteral && contains_meta_type(node.type)) {
         return "meta values cannot have compound literal storage";
     }
-    return nullptr;
-}
-
-template<class TypeOf>
-const char* source_expression_conversion_error(const Expr& node, const TypeOf& type_of,
-                                               const Program* program = nullptr) {
-    if (node.kind == Expr::Kind::Cast && node.left)
-        return source_conversion_error(type_of(*node.left, true), node.type, SourceConversion::Explicit,
-            source_function_designator(*node.left, type_of), program);
-    if (node.kind == Expr::Kind::Assign && node.text == "=" && node.left && node.right)
-        return source_conversion_error(type_of(*node.right, true), type_of(*node.left, false),
-            SourceConversion::Implicit, source_function_designator(*node.right, type_of), program);
     return nullptr;
 }
 
@@ -6519,20 +6579,18 @@ EvaluationTask<std::optional<SourceExpressionIssue>> source_atomic_intrinsic_err
         co_return SourceExpressionIssue{input.location, std::string(reason) + " in atomic value argument"};
     if (!is_scalar(incoming) || is_label_type(incoming))
         co_return SourceExpressionIssue{input.location, "atomic value argument requires a convertible scalar value"};
-    if (const auto* reason = source_conversion_error(incoming, value, SourceConversion::Implicit,
-            source_function_designator(input, type_of)))
-        co_return SourceExpressionIssue{input.location, std::string(reason) + " in atomic value argument"};
-    if (incoming->kind == Type::Kind::Pointer && value->kind != Type::Kind::Pointer &&
-        !(value->kind == Type::Kind::Builtin && value->builtin == BuiltinType::Bool))
-        co_return SourceExpressionIssue{input.location,
-            "implicit pointer-to-integer conversion requires an explicit cast in atomic value argument"};
-    if (value->kind == Type::Kind::Pointer && is_integer(incoming)) {
-        const auto probe = co_await constant(input);
-        if ((!probe.value || probe.value->value != UInt128{}) && !probe.needs_invocation_context)
-            co_return SourceExpressionIssue{input.location,
-                "implicit integer-to-pointer conversion requires a constant zero in atomic value argument"};
-        if (retain_constant && probe.value) input.evaluated_integer = probe.value;
+    auto reason = source_conversion_error(incoming, value, SourceConversion::Implicit,
+        source_function_designator(input, type_of));
+    // A null pointer constant converts to every pointer type.
+    if (const auto* zero = reason ? null_pointer_operand(input, incoming, value,
+            [&](const Expr& operand) { return type_of(operand, true); }) : nullptr) {
+        const auto probe = co_await constant(*zero);
+        if (probe.needs_invocation_context || (probe.value && probe.value->value == UInt128{})) {
+            if (retain_constant && probe.value && zero == &input) input.evaluated_integer = probe.value;
+            reason.reset();
+        }
     }
+    if (reason) co_return SourceExpressionIssue{input.location, *reason + " in atomic value argument"};
     co_return std::nullopt;
 }
 
@@ -6797,27 +6855,36 @@ private:
         return validator.intrinsic(call);
     }
 
-    void conversion(const Expr& value, const TypePtr& destination, std::string_view context,
-                    SourceConversion kind = SourceConversion::Implicit,
-                    bool compound = false) {
+    EvaluationTask<void> conversion(const Expr& value, const TypePtr& destination, std::string_view context,
+                                    SourceConversion kind = SourceConversion::Implicit,
+                                    bool compound = false) {
         // `(void)value` discards a value of any type.
-        if (kind == SourceConversion::Explicit && is_void_type(destination)) return;
+        if (kind == SourceConversion::Explicit && is_void_type(destination)) co_return;
         const auto source = type(value);
         if (is_meta_type(source) || is_meta_type(destination)) {
             if (value.kind == Expr::Kind::Quote && !is_meta_type(destination))
                 error(value.location, "quote cannot enter runtime expressions");
             else if (!conditional_meta_type(source, destination))
                 error(value.location, "incompatible meta value in " + std::string(context));
-            return;
+            co_return;
         }
         record_conversion(source, destination, value.location, context);
         // A compound assignment first computes its underlying operator; its
         // RHS is not independently assignment-converted to the destination.
-        if (valid_ && !compound)
-            if (const auto* reason = source_conversion_error(source, destination, kind,
-                    source_function_designator(value,
-                        [&](const Expr& operand, bool decay) { return type(operand, decay); }), &program_))
-                error(value.location, std::string(reason) + " in " + std::string(context));
+        if (!valid_ || compound) co_return;
+        auto reason = source_conversion_error(source, destination, kind,
+            source_function_designator(value, [&](const Expr& operand, bool decay) { return type(operand, decay); }),
+            &program_);
+        if (!reason) co_return;
+        // A null pointer constant converts to every pointer type, implicitly
+        // or by a cast. A proof that needs an invocation context is repeated
+        // there.
+        if (const auto* zero = null_pointer_operand(value, source, destination,
+                [&](const Expr& operand) { return type(operand); })) {
+            const auto probe = co_await probe_(*zero, types_.local_types);
+            if (probe.needs_invocation_context || (probe.value && probe.value->value == UInt128{})) co_return;
+        }
+        error(value.location, *reason + " in " + std::string(context));
     }
 
     void record_conversion(const TypePtr& source, const TypePtr& destination,
@@ -6863,7 +6930,7 @@ private:
                 error(source.location, "aggregate initializer requires a brace list");
                 co_return;
             }
-            conversion(source, destination, "local initializer");
+            co_await conversion(source, destination, "local initializer");
             if (valid_ && static_storage) {
                 const auto proof = co_await static_initializer_(source, types_.local_types, destination);
                 if (!proof.valid && !proof.needs_invocation_context)
@@ -6872,6 +6939,9 @@ private:
             co_return;
         }
         auto normalized = clone_expr(source);
+        // Memoized types of the clone's nodes must not outlive it: a later
+        // node can reuse a freed node's address.
+        struct Forget { SourceTypeValidator& validator; ~Forget() { validator.forget_types(); } } forget{*this};
         std::vector<const Expr*> deferred_indices;
         if (!(co_await normalize_initializer_indices_async(*normalized, deferred_indices, types_.local_types,
                 constant_, [&](SourceLocation at, std::string message) { error(at, std::move(message)); }))) co_return;
@@ -7099,13 +7169,13 @@ private:
         } else if (node.kind == Expr::Kind::Offsetof) {
             if (const auto issue = source_offsetof_error(node, program_)) error(issue->location, issue->message);
         } else if (node.kind == Expr::Kind::Cast && node.left) {
-            conversion(*node.left, node.type, "cast", SourceConversion::Explicit);
+            co_await conversion(*node.left, node.type, "cast", SourceConversion::Explicit);
         } else if (node.kind == Expr::Kind::CompoundLiteral && node.type && node.left) {
             object_type(node.type, node.location);
             co_await initializer(*node.left, node.type, nullptr, false, true);
         } else if (node.kind == Expr::Kind::Assign && node.left && node.right) {
             const auto destination = type(*node.left, false);
-            conversion(*node.right, destination, "assignment", SourceConversion::Implicit, node.text != "=");
+            co_await conversion(*node.right, destination, "assignment", SourceConversion::Implicit, node.text != "=");
         } else if (node.kind == Expr::Kind::Conditional && node.left && node.right && node.third) {
             const auto selector = type(*node.left), yes = type(*node.right), no = type(*node.third);
             if (selector && !is_scalar(selector))
@@ -7139,7 +7209,7 @@ private:
                         // Out arguments supply no input value, so even their
                         // record type need not match the parameter cell.
                         if (parameter.mode != ParameterMode::Out || is_meta_type(actual) || is_meta_type(parameter.type))
-                            conversion(argument, parameter.type, "call argument");
+                            co_await conversion(argument, parameter.type, "call argument");
                         if (parameter.mode != ParameterMode::In && actual &&
                             actual->kind != Type::Kind::Generic && !is_meta_type(actual)) {
                             if (actual->is_const || actual->kind == Type::Kind::Array ||
@@ -7148,9 +7218,9 @@ private:
                             } else {
                                 record_conversion(parameter.type, actual, argument.location, "parameter copy-out");
                                 if (valid_)
-                                    if (const auto* reason = source_conversion_error(parameter.type, actual,
+                                    if (const auto reason = source_conversion_error(parameter.type, actual,
                                             SourceConversion::Implicit, false, &program_))
-                                        error(argument.location, std::string(reason) + " in parameter copy-out");
+                                        error(argument.location, *reason + " in parameter copy-out");
                             }
                         }
                     } else {
@@ -7417,7 +7487,7 @@ private:
                     error(node.location, is_void_type(function_.return_type)
                         ? "void function cannot return a value"
                         : "non-void function cannot return a void expression");
-                if (valid_) conversion(*node.expression, function_.return_type, "return");
+                if (valid_) co_await conversion(*node.expression, function_.return_type, "return");
             }
             else if (is_meta_type(function_.return_type)) error(node.location, "meta helper must return a value");
             else if (function_.return_type && !(function_.return_type->kind == Type::Kind::Builtin &&
@@ -7844,11 +7914,10 @@ public:
                 fail(source.location, "generic pointer argument requires a compatible address constant");
                 co_return std::nullopt;
             }
-            if (const auto* reason = source_conversion_error(from, destination, SourceConversion::Implicit,
-                    source_function_designator(source, [&](const Expr& node, bool decay) {
-                        return expression_type(node, decay);
-                    }), &program_)) {
-                fail(source.location, reason);
+            const auto reason = co_await conversion_error_async(source, from, destination);
+            if (resource_exhausted_ || context_unavailable_) co_return std::nullopt;
+            if (reason) {
+                fail(source.location, *reason);
                 co_return std::nullopt;
             }
         } else {
@@ -8315,6 +8384,60 @@ public:
         if (integer && converted && converted->value && is_integer(converted->type))
             *integer = Expr::IntegerConstant{converted->value->integer, converted->type->builtin};
         co_return converted.has_value();
+    }
+
+    // Assignment conversion of each value of a static object's initializer,
+    // as in a block. Brace and array shape errors belong to the later
+    // initializer checks.
+    EvaluationTask<bool> static_initializer_conversions_async(const Expr& source, const TypePtr& destination,
+        std::span<const std::pair<NameKey, TypePtr>> local_types) {
+        push_source_types(local_types);
+        struct Pop { Evaluator& evaluator; ~Pop() { evaluator.pop_scope(); } } pop{*this};
+        co_return co_await static_conversions_async(source, destination);
+    }
+
+    EvaluationTask<bool> static_conversions_async(const Expr& source, const TypePtr& destination) {
+        if (!destination) co_return true;
+        const auto unbraced = unbrace_initializer(source, destination);
+        if (!unbraced.value) co_return true;
+        if (unbraced.value != &source)
+            co_return co_await static_conversions_async(*unbraced.value, destination);
+        if (source.kind == Expr::Kind::AggregateInitializer) {
+            if (!program_.evaluation_initializer_types) co_return true;
+            // Positions do not select types, so every index stays symbolic.
+            std::vector<const Expr*> indices;
+            std::vector<const Expr*> pending{&source};
+            while (!pending.empty()) {
+                const auto* node = pending.back();
+                pending.pop_back();
+                for (const auto& entry : node->initializer_entries) {
+                    for (const auto& designator : entry.designators)
+                        if (designator.index) indices.push_back(designator.index.get());
+                    if (entry.value && entry.value->kind == Expr::Kind::AggregateInitializer)
+                        pending.push_back(entry.value.get());
+                }
+            }
+            const auto plan = co_await program_.evaluation_initializer_types.async(source, destination, indices);
+            if (!plan.valid) co_return true;
+            for (const auto& [value, type] : plan.items)
+                if (!(co_await static_conversions_async(*value, type))) co_return false;
+            co_return true;
+        }
+        if (destination->kind == Type::Kind::Array) co_return true;
+        const auto reason = co_await conversion_error_async(source, expression_type(source), destination);
+        if (resource_exhausted_ || context_unavailable_) co_return false;
+        if (!reason) co_return true;
+        // Operand errors take precedence; the initializer's later checks
+        // report them.
+        const auto operands = co_await isolated_source_probe_async<bool>(nullptr, false,
+            [&](Evaluator& probe) -> EvaluationTask<std::optional<bool>> {
+                if (co_await probe.validate_unevaluated_constraints_async(source)) co_return true;
+                co_return std::nullopt;
+            });
+        if (resource_exhausted_ || context_unavailable_) co_return false;
+        if (!operands) co_return true;
+        fail(source.location, *reason + " in static initializer");
+        co_return false;
     }
 
     std::unique_ptr<Expr> required_pointer(const Expr& source, const TypePtr& destination) {
@@ -10339,6 +10462,31 @@ private:
         co_return source.evaluated_integer.has_value();
     }
 
+    // The conversion of `source`, of type `from`, to `destination`; a null
+    // pointer constant converts to every pointer type.
+    EvaluationTask<std::optional<std::string>> conversion_error_async(const Expr& source,
+        const TypePtr& from, const TypePtr& destination, SourceConversion kind = SourceConversion::Implicit) {
+        auto reason = source_conversion_error(from, destination, kind,
+            source_function_designator(source, [&](const Expr& node, bool decay) {
+                return expression_type(node, decay);
+            }), &program_);
+        if (const auto* zero = reason ? null_pointer_operand(source, from, destination,
+                [&](const Expr& operand) { return expression_type(operand); }) : nullptr)
+            if ((co_await null_integer_async(*zero)).has_value()) reason.reset();
+        co_return reason;
+    }
+
+    // Source conversion constraints of a cast or a plain assignment.
+    EvaluationTask<std::optional<std::string>> expression_conversion_error_async(const Expr& node) {
+        if (node.kind == Expr::Kind::Cast && node.left)
+            co_return co_await conversion_error_async(*node.left, expression_type(*node.left), node.type,
+                SourceConversion::Explicit);
+        if (node.kind == Expr::Kind::Assign && node.text == "=" && node.left && node.right)
+            co_return co_await conversion_error_async(*node.right, expression_type(*node.right),
+                expression_type(*node.left, false));
+        co_return std::nullopt;
+    }
+
     TypePtr call_signature(const Expr& node) {
         auto type = node.left ? expression_type(*node.left) : TypePtr{};
         if (type && type->kind == Type::Kind::Pointer) type = type->pointee;
@@ -10390,8 +10538,10 @@ private:
                  compare_source_types(callable_parameter_type(from, parameter.mode),
                            callable_parameter_type(to, parameter.mode)) != TypeComparison::Different);
             if (!compatible && from && to) compatible = co_await pointer_compatible();
-            if (!compatible && from && to && is_integer(from) && to->kind == Type::Kind::Pointer)
-                compatible = (co_await null_integer_async(argument)).has_value();
+            if (!compatible && from && to)
+                if (const auto* zero = null_pointer_operand(argument, from, to,
+                        [&](const Expr& operand) { return expression_type(operand); }))
+                    compatible = (co_await null_integer_async(*zero)).has_value();
             if (!compatible && from && to)
                 compatible = is_vector(to) && !to->scalable &&
                     ((is_vector(from) && !from->scalable && compatible_vector_shape(from, to) &&
@@ -10402,7 +10552,9 @@ private:
             // still has to be valid; a modifiable lvalue also receives copy-out.
             if (!compatible && (parameter.mode != ParameterMode::Out ||
                                 is_meta_type(from) || is_meta_type(to))) {
-                fail(argument.location, "unsupported or incompatible argument type in required expression");
+                const auto reason = implicit_address_conversion_error(from, to);
+                fail(argument.location, reason ? *reason + " in call argument"
+                    : "unsupported or incompatible argument type in required expression");
                 co_return false;
             }
             const auto object = expression_type(argument, false);
@@ -10421,9 +10573,9 @@ private:
                     fail(argument.location, "a record value requires the same nominal record type in parameter copy-out");
                     co_return false;
                 }
-                if (const auto* reason = source_conversion_error(to, object, SourceConversion::Implicit,
+                if (const auto reason = source_conversion_error(to, object, SourceConversion::Implicit,
                         false, &program_)) {
-                    fail(argument.location, std::string(reason) + " in parameter copy-out");
+                    fail(argument.location, *reason + " in parameter copy-out");
                     co_return false;
                 }
             }
@@ -10465,9 +10617,8 @@ private:
             co_return false;
         }
         if (!(co_await validate_constant_lane_index_async(node))) co_return false;
-        if (const auto* reason = source_expression_conversion_error(node,
-                [&](const Expr& operand, bool decay) { return expression_type(operand, decay); }, &program_)) {
-            fail(node.location, reason);
+        if (const auto reason = co_await expression_conversion_error_async(node)) {
+            fail(node.location, *reason);
             co_return false;
         }
         if (const auto* reason = co_await source_operator_error_async(node, program_,
@@ -10600,9 +10751,8 @@ private:
             co_return false;
         }
         if (!(co_await validate_constant_lane_index_async(node))) co_return false;
-        if (const auto* reason = source_expression_conversion_error(node,
-                [&](const Expr& operand, bool decay) { return expression_type(operand, decay); }, &program_)) {
-            fail(node.location, reason);
+        if (const auto reason = co_await expression_conversion_error_async(node)) {
+            fail(node.location, *reason);
             co_return false;
         }
         if (const auto* reason = co_await source_operator_error_async(node, program_,
@@ -11226,8 +11376,12 @@ private:
     EvaluationTask<bool> macro_convertible_expression_async(const Expr& source, const TypePtr& destination,
                                       bool explicit_cast = false) {
         const auto from = expression_type(source);
-        if (!explicit_cast && destination && destination->kind == Type::Kind::Pointer && is_integer(from))
-            co_return (co_await null_integer_async(source)).has_value();
+        if (!explicit_cast)
+            if (const auto* zero = null_pointer_operand(source, from, destination,
+                    [&](const Expr& operand) { return expression_type(operand); })) {
+                const bool null = (co_await null_integer_async(*zero)).has_value();
+                if (null || is_integer(from)) co_return null;
+            }
         co_return macro_convertible(from, destination, explicit_cast,
             source_function_designator(source,
                 [&](const Expr& operand, bool decay) { return expression_type(operand, decay); }));
@@ -11445,7 +11599,7 @@ private:
             if (conditional && (is_meta_type(left) || is_meta_type(right)))
                 return conditional_meta_type(left, right);
             if (conditional && (left->kind == Type::Kind::Pointer || right->kind == Type::Kind::Pointer))
-                return conditional_pointer_type(left, right);
+                return conditional_pointer_type(left, right, *expression.right, *expression.third);
             const auto object_pointer = [](const TypePtr& type) {
                 return type->kind == Type::Kind::Pointer && type->pointee &&
                     meta_object_type(type->pointee);
@@ -19009,6 +19163,16 @@ EvaluationTask<bool> expand_evaluation_impl_async(Program& program, Diagnostics&
                     object->initializer = std::move(replacement);
                 }
                 continue;
+            }
+            {
+                Evaluator evaluator(program, diagnostics, owner, source_namespace);
+                GenericExpansionState query_scope;
+                if (owner) collect_function_types(*owner, query_scope);
+                if (!(co_await evaluator.static_initializer_conversions_async(*object->initializer, object->type,
+                        query_scope.local_types))) {
+                    evaluator.diagnose(object->initializer->location);
+                    continue;
+                }
             }
             bool folded_pointer{};
             if (is_integer(object->type))

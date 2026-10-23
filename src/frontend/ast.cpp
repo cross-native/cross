@@ -1190,6 +1190,22 @@ UnbracedInitializer unbrace_initializer(const Expr& source, const TypePtr& desti
     return unbrace_initializer(source, is_scalar(destination), byte_array);
 }
 
+Expr* void_pointer_cast_operand(const Expr& expression) {
+    const auto* value = &expression;
+    while (value->kind == Expr::Kind::Parenthesized && value->left) value = value->left.get();
+    const auto& type = value->type;
+    if (value->kind != Expr::Kind::Cast || !value->left || !type || type->kind != Type::Kind::Pointer ||
+        type->address_space != 0 || !type->pointee) return nullptr;
+    const auto& pointee = *type->pointee;
+    return pointee.kind == Type::Kind::Builtin && pointee.builtin == BuiltinType::Void &&
+        !pointee.is_const && !pointee.is_volatile && !pointee.is_atomic ? value->left.get() : nullptr;
+}
+
+bool proven_null_pointer_cast(const Expr& expression) {
+    const auto* operand = void_pointer_cast_operand(expression);
+    return operand && operand->evaluated_integer && operand->evaluated_integer->value == UInt128{};
+}
+
 std::optional<std::string> decode_string_literal(std::string_view text) {
     if (text.size() < 2 || text.front() != '"' || text.back() != '"') return std::nullopt;
     std::string result;

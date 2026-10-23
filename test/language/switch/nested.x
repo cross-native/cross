@@ -127,7 +127,7 @@ inside:
         switch (selector) {
         case 1: {
             u8 bytes[count];
-            uptr address = bytes;
+            uptr address = (uptr)bytes;
             if (round != 0u32 && address != previous) return 0xdeadu32;
             previous = address;
             for (u32 i = 0u32; i < count; i++) bytes[i] = (u8)(i + round);
@@ -136,7 +136,7 @@ inside:
         }
         case 2: {
             u32 words[count];
-            uptr address = words;
+            uptr address = (uptr)words;
             if (round != 0u32 && address != previous) return 0xbeefu32;
             previous = address;
             words[count - 1u32] = round;

@@ -2,4 +2,4 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 global u64 scalar;
-global u64 *invalid = scalar;
+global u64 *invalid = (u64 *)scalar;

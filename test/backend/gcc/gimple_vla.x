@@ -13,7 +13,7 @@ global u32 gimple_vla_entry(in u32 count) {
     uptr previous = 0uptr;
     for (u32 round = 0u32; round < 64u32; round++) {
         u32 values[count];
-        uptr address = values;
+        uptr address = (uptr)values;
         if (round != 0u32 && address != previous) return 1u32;
         previous = address;
         for (u32 index = 0u32; index < count; index++) {

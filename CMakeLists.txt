@@ -7899,6 +7899,45 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/language/pointer_casts.cmake")
     set_tests_properties(cross_pointer_casts PROPERTIES
         LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;frontend;feature.pointer;feature.semantics;feature.evaluation")
+    add_test(NAME cross_pointer_integer_conversions
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/pointer-integer-conversions
+                -P "${CMAKE_SOURCE_DIR}/test/language/pointer_integer_conversions.cmake")
+    set_tests_properties(cross_pointer_integer_conversions PROPERTIES
+        LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;frontend;feature.pointer;feature.semantics;feature.evaluation;feature.initializer")
+    foreach(conversion_level O0 O2)
+        add_test(NAME cross_runtime_native_pointer_integer_conversions_${conversion_level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/pointer_integer_conversions.x
+                    -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/native-pointer-integer-conversions-${conversion_level}
+                    -DENTRY=pointer_integer_conversions_entry
+                    -DEXPECTED=1
+                    -DCC_FLAGS=-${conversion_level}
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_native_pointer_integer_conversions_${conversion_level} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;feature.pointer;feature.semantics;feature.initializer;opt.${conversion_level}")
+    endforeach()
+    foreach(conversion_case "vr4300;b;big;O2" "r3000;l;little;O0")
+        list(GET conversion_case 0 conversion_cpu)
+        list(GET conversion_case 1 conversion_endian)
+        list(GET conversion_case 2 conversion_order)
+        list(GET conversion_case 3 conversion_level)
+        set(name cross_runtime_mips_pointer_integer_conversions_${conversion_cpu}_${conversion_endian}_${conversion_level})
+        add_test(NAME ${name} COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/pointer_integer_conversions.x
+            -DSTARTUP=${CMAKE_SOURCE_DIR}/test/language/pointer_integer_conversions_start.s
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-pointer-integer-conversions-${conversion_cpu}-${conversion_endian}-${conversion_level}
+            -DMIPS_CPUS=${conversion_cpu} -DMIPS_ENDIANS=${conversion_endian} -DMIPS_SINGLE_CASE=ON
+            -DEXPECTED=P -DCC_FLAGS=-${conversion_level}
+            -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(${name} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;feature.pointer;feature.semantics;feature.initializer;profile.o32;isa.${conversion_cpu};endian.${conversion_order};opt.${conversion_level}")
+    endforeach()
     add_test(NAME cross_compound_literals
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

@@ -90,11 +90,11 @@ foreach(argument pair "$::quote {}")
 endforeach()
 reject_body(value_void "void expression cannot supply a value"
     "$::atomic_exchange(&object, empty(), $::memory::relaxed);")
-reject_body(value_pointer "implicit pointer-to-integer conversion requires an explicit cast"
+reject_body(value_pointer "implicit conversion from pointer 'u32 [*]' to integer 'u32' requires an explicit cast"
     "$::atomic_compare_exchange(&object, &plain, &plain, $::memory::seq_cst, $::memory::relaxed);")
-reject_body(pointer_nonzero "implicit integer-to-pointer conversion requires a constant zero"
+reject_body(pointer_nonzero "implicit conversion from integer 'u32' to pointer 'u32 [*]' requires an explicit cast"
     "$::atomic_store(&pointer, 1u32, $::memory::relaxed);")
-reject_body(pointer_runtime "implicit integer-to-pointer conversion requires a constant zero"
+reject_body(pointer_runtime "implicit conversion from integer 'u32' to pointer 'u32 [*]' requires an explicit cast"
     "$::atomic_store(&pointer, plain, $::memory::relaxed);")
 reject_body(pointer_float "conversion cannot convert between a pointer and a floating type"
     "$::atomic_store(&pointer, 1.0f32, $::memory::relaxed);")

@@ -26,7 +26,7 @@ static u32 goto_vla_cleanup(in uptr count) {
     for (u32 index = 0u32; index < 4u32; index += 1u32) {
         {
             stack u8 temporary[count];
-            uptr address = temporary;
+            uptr address = (uptr)temporary;
             if (index != 0u32 && address != previous) return 100u32;
             previous = address;
             temporary[0] = (u8)(index + 1u32);

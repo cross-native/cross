@@ -348,8 +348,18 @@ Statements are C99's. The differences in expressions:
   conversions through `void *`, casts, and `(void)expression` follow C: an
   explicit cast converts between any two object pointer types and may drop
   `const` or `volatile`, while an implicit conversion only adds qualifiers.
-  Function pointers and object pointers, including `void *`, do not convert;
-  see [Function pointers](#function-pointers) for their casts.
+  Function pointers and object pointers, including `void *`, do not convert,
+  apart from a null pointer constant such as `(void *)0`; see
+  [Function pointers](#function-pointers) for their casts.
+- A pointer and an integer convert into each other only by a cast, as
+  standard C and C++ require: `u32 n = p;`, `u8 *q = n;`, and
+  `u8 c = "abc";` are errors in initializers, assignments, arguments, and
+  returns alike. Two implicit conversions remain: a null pointer constant,
+  an integer constant zero or one cast to `void *` as C's `NULL` is, becomes
+  a null pointer of any pointer type, function pointers included (`p = 0`,
+  `f(NULL)`, `c ? p : NULL`), and a pointer becomes a `bool` truth value. A
+  `label` likewise converts implicitly only to `bool`; `(uptr)f::label`
+  gives its address.
 - A compound literal `(T){ ... }` is an unnamed object initialized like a
   declaration of `T`, as in C99; an omitted array bound comes from the
   initializer. In a function it lives until its enclosing block exits and is
@@ -765,7 +775,9 @@ global hash_fn hasher() {
 Parameter types, modes, and result must match exactly, and an existing
 function-pointer value is never implicitly converted to another interface. A
 conditional never selects a wrapper either: both of its function-pointer
-operands must already have the same interface.
+operands must already have the same interface. A null pointer constant, `0`
+or C's `(void *)0`, converts to every function-pointer type and may be the
+other operand of such a conditional.
 
 An explicit cast reinterprets a function pointer as any other function-pointer
 type, with no wrapper; calling through it with an interface that differs from

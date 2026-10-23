@@ -3321,7 +3321,7 @@ private:
         case Expr::Kind::Conditional: {
             const auto then_type = infer_type(*expression.right);
             const auto else_type = infer_type(*expression.third);
-            return then_type && else_type ? conditional_type(*then_type, *else_type)
+            return then_type && else_type ? conditional_type(expression, *then_type, *else_type)
                                           : std::nullopt;
         }
         case Expr::Kind::Assign: {
@@ -3424,6 +3424,17 @@ private:
         if (!integer_type(hir_, type)) return std::nullopt;
         return type_bits(hir_, type) < 32 ? hir_.builtin(BuiltinType::I32)
                                           : std::optional<hir::TypeId>(type);
+    }
+
+    // A null pointer constant arm takes the other pointer arm's type; source
+    // validation retained the zero proof of a cast to `void *`.
+    std::optional<hir::TypeId> conditional_type(const Expr& expression, hir::TypeId left, hir::TypeId right) {
+        if (pointer_type(hir_, left) && pointer_type(hir_, right)) {
+            const bool yes_null = proven_null_pointer_cast(*expression.right);
+            const bool no_null = proven_null_pointer_cast(*expression.third);
+            if (yes_null != no_null) return hir_.unqualified(no_null ? left : right);
+        }
+        return conditional_type(left, right);
     }
 
     std::optional<hir::TypeId> conditional_type(hir::TypeId left, hir::TypeId right) {
@@ -3732,6 +3743,10 @@ private:
             to.kind == hir::Type::Kind::Pointer && from.pointee && to.pointee &&
             (from.address_space != to.address_space ||
              !compatible_pointer_conversion(*from.pointee, *to.pointee))) {
+            // A null pointer constant, such as `(void *)0`, converts to every
+            // pointer type.
+            if (null_pointer_value(source))
+                if (const auto null = null_pointer_constant(destination, location)) return *null;
             diagnostics_.error(location,
                 "implicit pointer conversion changes address space, discards qualifiers, or uses incompatible pointee types");
             failed_ = true;
@@ -3754,6 +3769,17 @@ private:
         current_.values[value.value].integer = bits;
         current_.values[value.value].integer_high = bits_high;
         return value;
+    }
+
+    // Whether `value` is the constant null pointer of its type, as a null
+    // pointer constant lowers.
+    bool null_pointer_value(ValueId value) {
+        const auto& constant = current_.values[value.value];
+        const auto& type = hir_.type(constant.type);
+        const auto* space = type.kind == hir::Type::Kind::Pointer
+            ? find_address_space(target_, type.address_space) : nullptr;
+        return space && constant.kind == ValueKind::ConstantInteger &&
+            constant.integer == space->null_low && constant.integer_high == space->null_high;
     }
 
     std::optional<ValueId> null_pointer_constant(hir::TypeId type,
@@ -3983,6 +4009,12 @@ private:
                     !destination_pointer_type.pointee ||
                     function_pointer(source_pointer_type) !=
                         function_pointer(destination_pointer_type)) {
+                    // A null pointer constant converts to every pointer type.
+                    if (source_pointer_type.pointee && destination_pointer_type.pointee &&
+                        null_pointer_value(*source)) {
+                        result = null_pointer_constant(destination_type, expression.location);
+                        break;
+                    }
                     diagnostics_.error(
                         expression.location,
                         "explicit cast cannot convert between a function pointer and an object pointer");
@@ -4528,26 +4560,33 @@ private:
         if (!left_type || !right_type) co_return std::nullopt;
         const bool left_pointer = pointer_type(hir_, *left_type);
         const bool right_pointer = pointer_type(hir_, *right_type);
-        if ((expression.text == "==" || expression.text == "!=") && left_pointer != right_pointer) {
-            const auto& integer = left_pointer ? *expression.right : *expression.left;
-            const auto integer_type_id = left_pointer ? *right_type : *left_type;
-            if (!integer_type(hir_, integer_type_id) || !integer.evaluated_integer ||
-                integer.evaluated_integer->value != UInt128{}) {
-                diagnostics_.error(integer.location,
+        // A null pointer constant, an integer zero or a cast of one to `void *`
+        // whose proof source validation retained, compares as the other
+        // operand's null pointer.
+        const bool left_null = left_pointer && right_pointer && proven_null_pointer_cast(*expression.left);
+        const bool right_null = left_pointer && right_pointer && proven_null_pointer_cast(*expression.right);
+        if ((expression.text == "==" || expression.text == "!=") &&
+            (left_pointer != right_pointer || left_null != right_null)) {
+            const bool pointer_first = left_pointer != right_pointer ? left_pointer : right_null;
+            const auto& null = pointer_first ? *expression.right : *expression.left;
+            if (left_pointer != right_pointer &&
+                (!integer_type(hir_, pointer_first ? *right_type : *left_type) || !null.evaluated_integer ||
+                 null.evaluated_integer->value != UInt128{})) {
+                diagnostics_.error(null.location,
                     "pointer/integer equality requires an integer constant zero");
                 co_return std::nullopt;
             }
-            const auto pointer_type_id = left_pointer ? *left_type : *right_type;
-            const auto pointer = co_await lower_expression_async(left_pointer ? *expression.left : *expression.right,
+            const auto pointer_type_id = pointer_first ? *left_type : *right_type;
+            const auto pointer = co_await lower_expression_async(pointer_first ? *expression.left : *expression.right,
                                                    pointer_type_id);
             if (!pointer) co_return std::nullopt;
-            const auto zero = null_pointer_constant(pointer_type_id, integer.location);
+            const auto zero = null_pointer_constant(pointer_type_id, null.location);
             if (!zero) co_return std::nullopt;
             const auto result = add_value(ValueKind::Binary, *hir_.builtin(BuiltinType::Bool), expression.location);
             auto& value = current_.values[result.value];
             value.binary = expression.text == "==" ? BinaryOperation::Equal : BinaryOperation::NotEqual;
-            value.operands = left_pointer ? std::vector<ValueId>{*pointer, *zero}
-                                          : std::vector<ValueId>{*zero, *pointer};
+            value.operands = pointer_first ? std::vector<ValueId>{*pointer, *zero}
+                                           : std::vector<ValueId>{*zero, *pointer};
             co_return result;
         }
         const bool addition = expression.text == "+";
@@ -6580,7 +6619,7 @@ private:
         const auto else_type = infer_type(*expression.third);
         if (!then_type || !else_type) co_return std::nullopt;
         const auto common = void_type(hir_, *then_type) && void_type(hir_, *else_type)
-            ? then_type : conditional_type(*then_type, *else_type);
+            ? then_type : conditional_type(expression, *then_type, *else_type);
         if (!common) {
             diagnostics_.error(expression.location, "conditional operands have no compatible common type");
             co_return std::nullopt;

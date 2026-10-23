@@ -1596,12 +1596,22 @@ ContinuationTask<bool> normalize_generic_pointer_async(Program& program, std::un
         while (node->kind == Expr::Kind::Parenthesized && node->left) node = node->left.get();
         return node;
     };
+    // A null pointer converts to every pointer type: a null pointer constant
+    // such as `(void *)0`, or the address that one evaluated to.
+    const auto null_pointer = [&](const Expr& node) {
+        if (proven_null_pointer_cast(node)) return true;
+        const auto* value = unparen(&node);
+        if (value->kind != Expr::Kind::Address || !value->type || !value->evaluated_address ||
+            value->evaluated_address->kind != cross::AddressConstant::Kind::Absolute) return false;
+        const auto* space = find_address_space(subtarget.target(), value->type->address_space);
+        return space && value->evaluated_address->absolute == UInt128{space->null_low, space->null_high};
+    };
     const auto check_casts = [&](const Expr& root) -> bool {
         std::vector<const Expr*> pending{&root};
         while (!pending.empty()) {
             const auto& node = *pending.back();
             pending.pop_back();
-            if (node.kind == Expr::Kind::Cast && node.left &&
+            if (node.kind == Expr::Kind::Cast && node.left && !null_pointer(*node.left) &&
                 !check_conversion(unparen(node.left.get())->type, node.type, node.location, true))
                 return false;
             if (node.third) pending.push_back(node.third.get());
@@ -1610,8 +1620,8 @@ ContinuationTask<bool> normalize_generic_pointer_async(Program& program, std::un
         }
         return true;
     };
-    if (!check_casts(*expression) ||
-        !check_conversion(unparen(expression.get())->type, destination, expression->location))
+    if (!check_casts(*expression) || (!null_pointer(*expression) &&
+        !check_conversion(unparen(expression.get())->type, destination, expression->location)))
         co_return false;
 
     cross::AddressConstant normalized;

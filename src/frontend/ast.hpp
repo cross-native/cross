@@ -399,6 +399,13 @@ struct UnbracedInitializer {
 UnbracedInitializer unbrace_initializer(const Expr& source, bool scalar, bool byte_array);
 UnbracedInitializer unbrace_initializer(const Expr& source, const TypePtr& destination);
 
+// The operand of a cast to `void *`: the cast is a null pointer constant when
+// the operand is a source-constant integer zero.
+Expr* void_pointer_cast_operand(const Expr& expression);
+// Whether source validation retained the zero proof that makes `expression`
+// a null pointer constant cast to `void *`.
+bool proven_null_pointer_cast(const Expr& expression);
+
 struct VariableDecl {
     SourceLocation location;
     std::string name;
