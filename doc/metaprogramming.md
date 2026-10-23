@@ -3,9 +3,10 @@
 Cross code can run during compilation to generate code: procedural macros
 rewrite an explicit invocation, syntax extensions add new statement,
 expression, and item forms, and `$::embed` brings a file's bytes into the
-compilation. All three run ordinary Cross functions in a sandbox: they see
-only their inputs, use the target's type sizes, and cannot touch the host
-except through `$::embed`. Their output is ordinary Cross, checked like
+compilation. Call checkers inspect the calls of a function instead of
+generating code. All of them run ordinary Cross functions in a sandbox: they
+see only their inputs, use the target's type sizes, and cannot touch the host
+except through `$::embed`. Generated output is ordinary Cross, checked like
 written code.
 
 The `-feval-step-limit`, `-feval-depth-limit`, `-feval-memory-limit`, and
@@ -99,7 +100,7 @@ token or one balanced group.
 | `token(kind, text)`, `group(delimiters, tokens)` | Construct a token or a group. |
 | `parse(string)` | Tokens from source text. |
 | `span(one)` | The token's source position. |
-| `error(span, message)`, `warning(...)`, `note(...)` | Report a diagnostic at a position; an error stops the expansion. |
+| `error(span, message)`, `warning(...)`, `note(...)` | Report a diagnostic at a position; an error stops the expansion. The message is a string or bytes. |
 
 ### Type reflection
 
@@ -123,6 +124,7 @@ including a block-scope one, can inspect it.
 | `element(t)`, `count(t)` | Array element and length, vector lane and lane count, pointer pointee and 1, or enumeration underlying type and 0. |
 | `enumerator_count(t)`, `enumerator_name(t, i)` | The enumerators of an enumeration; a name is resolved at the invocation. |
 | `type_tokens(t)` | Tokens that denote the type wherever they are spliced, even where its name is hidden. |
+| `type_spelling(t)` | The type's spelling for messages, such as `const u8 *`, as bytes. |
 
 Counts and offsets are `uptr` and widths `u32`. A query on an incomplete type,
 an index out of range, or a type of the wrong kind is an error.
@@ -284,6 +286,50 @@ finishes.
 
 `$::has_feature($::feature::syntax_extensions)` reports the facility;
 `$::has_intrinsic` tests individual operations.
+
+## Call checkers
+
+`[[check(name)]]` on a function declaration runs the call checker `name` at
+every direct call of the function, during compilation. A checker is a
+`static` function marked `[[checker]]` that takes one `$::meta::call`; it
+reads the call's arguments and reports problems with `$::meta::warning`,
+`$::meta::note`, and `$::meta::error`. `[[checker("format")]]` ties the
+checker to a warning ([invoke.md](invoke.md#warnings)): it runs only while
+`-Wformat` is on, and its warnings are `-Wformat` warnings, which `-Werror`
+and `-Werror=format` turn into errors. A checker without a warning always
+runs.
+
+```x
+// The key of a lookup must be a literal without spaces.
+[[checker("format")]]
+static void key_checker(in $::meta::call call) {
+    $::meta::bytes key = $::meta::argument_string(call, 0);
+    if ($::meta::len(key) == 0) {
+        $::meta::warning($::meta::argument_span(call, 0), "the key is not a string literal");
+        return;
+    }
+    for (uptr i = 0; i < $::meta::len(key); ++i)
+        if ($::meta::at(key, i) == ' ')
+            $::meta::error($::meta::argument_span(call, 0), "a key cannot contain a space");
+}
+
+[[check(key_checker)]] u32 lookup(in const u8 *key);
+
+global u32 sword() { return lookup("sword"); }
+```
+
+| Operation | Result |
+| --- | --- |
+| `argument_count(call)`, `argument_type(call, i)`, `argument_span(call, i)` | The arguments, the type of each value (before parameter conversion or variadic promotion), and their positions. |
+| `argument_string(call, i)` | A string-literal argument's bytes with its terminating zero; empty for any other argument. |
+| `parameter_count(call)`, `parameter_type(call, i)`, `is_variadic(call)` | The called function's named parameters, and whether it takes more. |
+| `call_span(call)` | The call's position. |
+| `abi_type(call, name)` | The type that the called function's ABI model names `name`, such as `long` in a C ABI, or `void`. |
+
+The checkers `$::format::printf` and `$::format::scanf` are built into the
+compiler and written in Cross the same way; they check a call's format
+string against its arguments, as GCC's `-Wformat` does, using the C types of
+the called function's ABI ([language.md](language.md#abis-and-interoperability)).
 
 ## Embedded files
 

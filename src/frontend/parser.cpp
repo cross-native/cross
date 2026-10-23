@@ -3456,6 +3456,7 @@ EvaluationTask<bool> Parser::type_start_async(TypeProbe probe) {
            token.is("$::meta::span") ||
            token.is("$::meta::context") || token.is("$::meta::type") ||
            token.is("$::meta::bytes") || token.is("$::meta::buffer") ||
+           token.is("$::meta::call") ||
            token.is("restrict") || token.is("enum") ||
            token.is("struct") || token.is("union") ||
            builtin_kind(token.text).has_value() ||
@@ -3680,6 +3681,11 @@ EvaluationTask<TypePtr> Parser::parse_type_async(bool record_specifiers,
         } else if ((co_await current_async()).is("$::meta::type")) {
             ++index_;
             type = type_value_type();
+            type->is_const = is_const;
+            type->is_volatile = is_volatile;
+        } else if ((co_await current_async()).is("$::meta::call")) {
+            ++index_;
+            type = call_site_type();
             type->is_const = is_const;
             type->is_volatile = is_volatile;
         } else if ((co_await current_async()).is("$::meta::bytes") || (co_await current_async()).is("$::meta::buffer")) {
@@ -5529,7 +5535,7 @@ void Parser::apply_region_attributes(std::vector<Attribute>& attributes, const R
             if (among({"abi", "clobber", "stack_cleanup", "always_inline", "noinline", "hot",
                        "cold", "noreturn", "returns_twice", "interrupt", "naked", "raw_inline",
                        "runtime_only", "no_stack_protector", "no_sanitize", "section",
-                       "link_name"})) return true;
+                       "link_name", "check", "maybe_unused"})) return true;
             if (among({"aligned", "used", "retain", "constructor", "destructor"}))
                 return target.definition;
             if (name == "eval_only") return target.definition && !global;
@@ -5540,7 +5546,7 @@ void Parser::apply_region_attributes(std::vector<Attribute>& attributes, const R
         case RegionSubject::Object:
             if (among({"abi", "clobber", "stack_cleanup"})) return target.callable != nullptr;
             if (among({"aligned", "atomic", "section", "link_name", "thread_local",
-                       "tls_model"})) return true;
+                       "tls_model", "maybe_unused"})) return true;
             if (among({"used", "retain"})) return target.definition;
             if (among({"constructor", "destructor"}))
                 return target.definition && target.initializer && target.callable;
@@ -6022,6 +6028,7 @@ EvaluationTask<void> Parser::parse_external_impl_async(Program& program, std::st
                 linkage, inline_hint, std::move(function_attributes), std::move(signature),
                 std::move(angle_parameters));
             if (function) function->fresh = token_origin(name_location).fresh;
+            if (function) function->name_location = name_location;
             if (function) {
                 GenericSignature parameters;
                 for (const auto& parameter : function->generic_parameters)
@@ -6108,6 +6115,7 @@ EvaluationTask<void> Parser::parse_external_impl_async(Program& program, std::st
             auto object = co_await parse_object_async(location, std::move(*name), std::move(type),
                                        linkage, std::move(item_attributes), false);
             if (object) object->fresh = token_origin(name_location).fresh;
+            if (object) object->name_location = name_location;
             if (object) object->binding = binding;
             if (object) program.objects.push_back(std::move(object));
         }
@@ -6815,6 +6823,7 @@ EvaluationTask<ParameterDecl> Parser::parse_parameter_async(unsigned ordinal) {
                            "'out' and 'inout' parameter cells cannot be const");
     }
     parameter.name = name.value_or("_parameter" + std::to_string(ordinal));
+    parameter.unnamed = !name;
     if (name && !prototype_scopes_.empty()) {
         const auto lexical = name_key(parameter).binding;
         if (!preparing_header_) {
@@ -6830,9 +6839,15 @@ EvaluationTask<ParameterDecl> Parser::parse_parameter_async(unsigned ordinal) {
         for (const auto& attribute : entries)
             if (!is_known_attribute(attribute.name))
                 diagnostics_.error(attribute.location, "unknown attribute '" + attribute.name + "'");
-            else if (attribute.name == "aligned" || attribute.name == "packed" || attribute.name == "underlying")
+            else if (attribute.name == "aligned" || attribute.name == "packed" || attribute.name == "underlying" ||
+                     attribute.name == "fallthrough" || attribute.name == "check" || attribute.name == "checker")
                 diagnostics_.error(attribute.location,
                     "attribute '" + attribute.name + "' is not valid on a parameter");
+            else if (attribute.name == "maybe_unused") {
+                if (!attribute.arguments.empty())
+                    diagnostics_.error(attribute.location, "maybe_unused does not take arguments");
+                parameter.maybe_unused = true;
+            }
     };
     validate_parameter_attributes(attributes);
     apply_callable_attributes(parameter.type, attributes);
@@ -7242,9 +7257,13 @@ Parser::parse_local_declaration_async(std::vector<Attribute> attributes,
         declaration.attributes.insert(declaration.attributes.end(),
             std::make_move_iterator(trailing.begin()), std::make_move_iterator(trailing.end()));
         for (const auto& attribute : declaration.attributes) {
-            if (!parsing_public_fragment_ && attribute.name != "aligned") {
+            if (!parsing_public_fragment_ && attribute.name != "aligned" &&
+                attribute.name != "maybe_unused") {
                 diagnostics_.error(attribute.location,
                     "attribute '" + attribute.name + "' is not valid on a local object");
+            } else if (!parsing_public_fragment_ && attribute.name == "maybe_unused" &&
+                       !attribute.arguments.empty()) {
+                diagnostics_.error(attribute.location, "maybe_unused does not take arguments");
             }
             // Target-dependent constants are resolved after nominal HIR layout.
         }
@@ -7684,6 +7703,22 @@ Parser::StatementTask Parser::parse_unattributed_statement_async(
             // Public captures preserve balanced attribute grammar for
             // inspection/discard/repair. Surviving source gets the ordinary
             // placement, argument and duplicate-contract checks below.
+        } else if ((co_await current_async()).is(";")) {
+            // `[[fallthrough]];` is the only attributed empty statement.
+            std::vector<Attribute> valid;
+            for (auto& attribute : attributes) {
+                if (attribute.name != "fallthrough")
+                    diagnostics_.error(attribute.location, "attribute '" + attribute.name +
+                        "' is not valid on an empty statement");
+                else if (!attribute.arguments.empty())
+                    diagnostics_.error(attribute.location, "fallthrough does not take arguments");
+                else if (!valid.empty())
+                    diagnostics_.error(attribute.location,
+                        "an empty statement has at most one fallthrough attribute");
+                else
+                    valid.push_back(std::move(attribute));
+            }
+            attributes = std::move(valid);
         } else if ((co_await current_async()).is("return")) {
             bool musttail_seen = false;
             std::vector<Attribute> valid;
@@ -7708,8 +7743,9 @@ Parser::StatementTask Parser::parse_unattributed_statement_async(
             attributes = std::move(valid);
         } else {
             for (const auto& attribute : attributes)
-                diagnostics_.error(attribute.location, "attribute '" + attribute.name +
-                    "' is not valid on this statement");
+                diagnostics_.error(attribute.location, attribute.name == "fallthrough"
+                    ? std::string("fallthrough applies only to an empty statement: '[[fallthrough]];'")
+                    : "attribute '" + attribute.name + "' is not valid on this statement");
             attributes.clear();
         }
     }
@@ -7810,7 +7846,11 @@ Parser::StatementTask Parser::parse_unattributed_statement_async(
     const auto location = (co_await current_async()).location;
     auto statement = std::make_unique<Statement>();
     statement->location = location;
-    if ((co_await consume_async(";"))) { statement->kind = Statement::Kind::Empty; co_return statement; }
+    if ((co_await consume_async(";"))) {
+        statement->kind = Statement::Kind::Empty;
+        statement->attributes = std::move(attributes);
+        co_return statement;
+    }
     if ((co_await consume_async("return"))) {
         statement->kind = Statement::Kind::Return;
         statement->attributes = std::move(attributes);

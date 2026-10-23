@@ -62,7 +62,9 @@ struct Type {
         Bytes,
         Buffer,
         // `$::meta::type`: a type reflected by translation-time code.
-        TypeValue
+        TypeValue,
+        // `$::meta::call`: a call that a [[checker]] function inspects.
+        CallSite
     } kind{Kind::Builtin};
     BuiltinType builtin{BuiltinType::Void};
     TypePtr pointee;
@@ -150,6 +152,7 @@ bool is_reserved_identifier(std::string_view name);
 TypePtr bytes_type();
 TypePtr buffer_type();
 TypePtr type_value_type();
+TypePtr call_site_type();
 TypePtr pointer_type(TypePtr pointee, bool is_const = false,
                      bool is_volatile = false, bool is_atomic = false);
 TypePtr generic_type(std::string name, bool is_const = false,
@@ -472,6 +475,10 @@ struct ParameterDecl {
     // declarator. Keep their source type for required-bound validation.
     TypePtr declared_array_type;
     ValueBinding binding{};
+    // Written without a name, or with [[maybe_unused]]: exempt from
+    // -Wunused-parameter.
+    bool unnamed{};
+    bool maybe_unused{};
 };
 
 // Source-level callable identity. Names and source locations aid diagnostics;
@@ -520,6 +527,8 @@ struct FunctionDecl {
     using GenericParameter = cross::GenericParameter;
 
     SourceLocation location;
+    // The declared name, where diagnostics about the function point.
+    SourceLocation name_location;
     std::string name;
     ValueBinding binding;
     std::shared_ptr<const FreshIdentifier> fresh;
@@ -559,6 +568,8 @@ struct FunctionDecl {
 
 struct ObjectDecl {
     SourceLocation location;
+    // The declared name, where diagnostics about the object point.
+    SourceLocation name_location;
     std::string name;
     ValueBinding binding;
     std::shared_ptr<const FreshIdentifier> fresh;
@@ -922,6 +933,13 @@ struct Program {
     // Next ordinal of a lifted literal object in each source unit, so that
     // its internal name does not depend on other units.
     std::unordered_map<std::string, std::uint64_t> literal_ordinals;
+    // The scalar type that the named ABI's model names `name` (a `type.name`
+    // property), for $::meta::abi_type. Supplied by the selected target.
+    std::function<std::optional<BuiltinType>(std::string_view abi, std::string_view name)>
+        abi_named_type;
+    // The source unit of the call checkers shipped with the compiler, when a
+    // declaration names one; empty otherwise.
+    std::string checker_library_unit;
 };
 
 // A member of a record or union found directly or, failing that, through its

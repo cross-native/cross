@@ -40,7 +40,8 @@ bool supported_attribute(std::string_view name) {
            name == "constructor" || name == "destructor" ||
            name == "weak" || name == "visibility" ||
            name == "alias" || name == "weakref" ||
-           name == "thread_local" || name == "tls_model" || name == "address";
+           name == "thread_local" || name == "tls_model" || name == "address" ||
+           name == "maybe_unused";
 }
 
 bool marker_attribute(const ObjectDecl& object, std::string_view name,

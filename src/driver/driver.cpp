@@ -463,11 +463,16 @@ void print_options(const CompilerOptions& options) {
             continue;
         }
         if (category == "common" &&
-            definition->name.starts_with("m.")) {
+            (definition->name.starts_with("m.") ||
+             definition->category == OptionCategory::Warning)) {
             continue;
         }
         if (category == "target" &&
             !definition->name.starts_with("m.")) {
+            continue;
+        }
+        if (category == "warning" &&
+            definition->category != OptionCategory::Warning) {
             continue;
         }
         const auto* resolved =
@@ -489,6 +494,15 @@ void print_options(const CompilerOptions& options) {
                   << (definition->presettable ? "yes" : "no");
         if (resolved && resolved->source != "default") {
             std::cout << "  source: " << resolved->source;
+        }
+        if (!definition->enabled_by.empty()) {
+            std::cout << "  enabled_by: ";
+            for (std::size_t index = 0; index < definition->enabled_by.size(); ++index) {
+                if (index != 0) std::cout << " or ";
+                const auto& condition = definition->enabled_by[index];
+                for (std::size_t name = 0; name < condition.size(); ++name)
+                    std::cout << (name != 0 ? " and -W" : "-W") << condition[name].substr(2);
+            }
         }
         std::cout << '\n';
     }
@@ -1049,15 +1063,12 @@ bool emit_dependencies(
     return true;
 }
 
-} // namespace
-
-int cpp_main(int argc, char** argv) {
-    Diagnostics diagnostics(std::cerr, "cpp");
-    CompilerOptions options;
+int run_cpp(int argc, char** argv, Diagnostics& diagnostics, CompilerOptions& options) {
     if (!parse_cpp_options(argc, argv, options, diagnostics)) return 1;
     if (options.show_help) { print_cpp_help(); return 0; }
     if (options.show_version) { print_version(); return 0; }
     if (!configure_models(options, diagnostics)) return 1;
+    diagnostics.set_warning_policy(warning_policy(options));
     if (options.inputs.empty()) {
         diagnostics.command_error("no input files");
         return 1;
@@ -1080,13 +1091,12 @@ int cpp_main(int argc, char** argv) {
     return 0;
 }
 
-int cc_main(int argc, char** argv) {
-    Diagnostics diagnostics(std::cerr);
-    CompilerOptions options;
+int run_cc(int argc, char** argv, Diagnostics& diagnostics, CompilerOptions& options) {
     if (!parse_cc_options(argc, argv, options, diagnostics)) return 1;
     if (options.show_help) { print_cc_help(); return 0; }
     if (options.show_version) { print_version(); return 0; }
     if (!configure_models(options, diagnostics)) return 1;
+    diagnostics.set_warning_policy(warning_policy(options));
     if (options.print_targets) { print_targets(); return 0; }
     if (options.print_abis) { print_abis(options); return 0; }
     if (options.print_models) { print_models(); return 0; }
@@ -1166,6 +1176,14 @@ int cc_main(int argc, char** argv) {
     };
     Program program;
     program.canonical_callable_abi = canonical_abi;
+    program.abi_named_type = [&](std::string_view abi_name, std::string_view type_name)
+        -> std::optional<BuiltinType> {
+        const auto* abi = find_abi(*target, abi_name, options.target);
+        if (!abi) return std::nullopt;
+        for (const auto& [name, kind] : abi->named_types)
+            if (name == type_name) return kind;
+        return std::nullopt;
+    };
     program.address_bits = subtarget->abi_info().address_bits;
     if (options.constructor_table) program.constructor_abi = options.constructor_table->abi;
     if (options.destructor_table) program.destructor_abi = options.destructor_table->abi;
@@ -1249,6 +1267,35 @@ int cc_main(int argc, char** argv) {
         for (auto& object : unit.objects) program.objects.push_back(std::move(object));
     }
     if (diagnostics.errors() != 0) return 1;
+    // The checkers that $::format names are Cross source built into cc. While
+    // -Wformat, which controls them, is on, a declaration that names one adds
+    // that source as one more unit.
+    if (diagnostics.enabled(Warning::Format) &&
+        std::any_of(program.functions.begin(), program.functions.end(), [](const auto& function) {
+            return std::any_of(function->attributes.begin(), function->attributes.end(),
+                [](const Attribute& attribute) {
+                    return attribute.name == "check" && attribute.arguments.size() == 1 &&
+                        attribute.arguments.front().starts_with("$::format::");
+                });
+        })) {
+        const auto* library = sources.add("shipped:format.x", shipped_checker_source());
+        auto tokens = Lexer(*library, diagnostics).lex();
+        Parser parser(std::move(tokens), diagnostics,
+                      std::make_shared<SyntaxExecution>(sources, diagnostics,
+                          program.address_bits, macro_size, macro_align,
+                          program.evaluation_limits, program.evaluation_layout,
+                          install_expansion_evaluation, options.mangling, canonical_abi),
+                      program.address_bits);
+        program.checker_library_unit = library->source_unit_at(1);
+        parser.share_group_definitions(group_definitions, program.checker_library_unit);
+        auto unit = parser.parse();
+        for (auto& record : unit.records) program.records.push_back(std::move(record));
+        for (auto& enumeration : unit.enumerations) program.enumerations.push_back(std::move(enumeration));
+        for (auto& function : unit.functions) program.functions.push_back(std::move(function));
+        for (auto& object : unit.objects) program.objects.push_back(std::move(object));
+        program.source_units.push_back(program.checker_library_unit);
+        if (diagnostics.errors() != 0) return 1;
+    }
     if (!hir::validate_source_address_spaces(
             program, options, *target, diagnostics)) return 1;
     if (options.verbose) std::cerr << "cc: expanding generics and compile-time evaluation\n";
@@ -1472,6 +1519,24 @@ int cc_main(int argc, char** argv) {
         }
     }
     return diagnostics.errors() == 0 ? 0 : 1;
+}
+
+} // namespace
+
+int cpp_main(int argc, char** argv) {
+    Diagnostics diagnostics(std::cerr, "cpp");
+    CompilerOptions options;
+    const int status = run_cpp(argc, argv, diagnostics, options);
+    report_warning_summary(options, diagnostics);
+    return status;
+}
+
+int cc_main(int argc, char** argv) {
+    Diagnostics diagnostics(std::cerr);
+    CompilerOptions options;
+    const int status = run_cc(argc, argv, diagnostics, options);
+    report_warning_summary(options, diagnostics);
+    return status;
 }
 
 } // namespace cross

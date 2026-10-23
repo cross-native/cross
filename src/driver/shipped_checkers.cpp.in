@@ -1,0 +1,19 @@
+// Generated from lib/format.x by CMake.
+// SPDX-License-Identifier: GPL-3.0-or-later
+#include "driver/driver.hpp"
+
+namespace cross {
+namespace {
+
+constexpr std::string_view format_checkers[] = {
+@CROSS_FORMAT_CHECKERS@};
+
+} // namespace
+
+std::string shipped_checker_source() {
+    std::string text;
+    for (const auto piece : format_checkers) text += piece;
+    return text;
+}
+
+} // namespace cross

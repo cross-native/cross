@@ -688,6 +688,26 @@ written on a declaration takes precedence. Regions nest and create no scope:
 }
 ```
 
+The format checkers built into `cc` check calls of C's printf and scanf
+families: with `-Wformat`, which `-Wall` enables, each call with a literal
+format is checked against the C types of the function's ABI, so `%ld` takes
+an `i64` under `sysv_abi` and an `i32` under `ms_abi`:
+
+```x
+[[abi("sysv_abi"), check($::format::printf)]] {
+    i32 printf(in const u8 *format, ...);
+    i32 snprintf(in u8 *buffer, in uptr size, in const u8 *format, ...);
+}
+[[abi("sysv_abi"), check($::format::scanf)]]
+i32 sscanf(in const u8 *text, in const u8 *format, ...);
+
+global f64 parse(in const u8 *text) {
+    f64 value = 0.0;
+    sscanf(text, "%lf", &value);   // %f would expect an f32 pointer
+    return value;
+}
+```
+
 Parameters and results can also be pinned to registers, which is useful for
 assembly interfaces (x86-64):
 
@@ -802,6 +822,9 @@ creates a value that a loader can rewrite after linking.
 | `aligned(N)` | On a function definition, its entry alignment. |
 | `address(N)` | Place a declared object or function at the fixed address `N`; no storage or symbol is emitted. |
 | `constructor`, `destructor`, with an optional priority | Add a function, or an object holding function pointers, to the table that the C runtime calls before `main` or at exit, as GCC's attributes do. |
+| `maybe_unused` | On a function, object, variable, or parameter: no warning says that it is unused ([invoke.md](invoke.md#warnings)). |
+| `fallthrough` | `[[fallthrough]];` as the last statement before a `case` or `default` label: falling into the label is intended. |
+| `check(name)` | Check each call of the function with a call checker, such as `$::format::printf` ([metaprogramming.md](metaprogramming.md#call-checkers)). |
 
 A memory-mapped device is an object at a fixed address (the register layout
 here is illustrative):

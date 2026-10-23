@@ -1342,8 +1342,10 @@ private:
 
     bool known_properties(
         const ModelProperties& properties,
-        std::initializer_list<std::string_view> names) {
+        std::initializer_list<std::string_view> names,
+        std::string_view prefix = {}) {
         for (const auto& [name, property] : properties) {
+            if (!prefix.empty() && name.starts_with(prefix)) continue;
             if (std::find(names.begin(), names.end(), name) == names.end()) {
                 fail(property.line, "unknown model property '" + name + "'");
                 return false;
@@ -1547,10 +1549,27 @@ private:
                  "variadic_save_alignment", "variadic_home_bank",
                  "variadic_home_base", "variadic_home_stride",
                  "variadic_va_list_bytes",
-                 "variadic_va_list_alignment"})) {
+                 "variadic_va_list_alignment"}, "type.")) {
             return std::nullopt;
         }
         AbiEntry result;
+        // type.NAME = "T" names the scalar arithmetic type T, such as the C
+        // type NAME of a C ABI.
+        for (const auto& [property_name, property] : properties) {
+            if (!property_name.starts_with("type.")) continue;
+            const auto type_name = property_name.substr(5);
+            const auto spelling = text_property(properties, property_name);
+            if (!spelling) return std::nullopt;
+            const auto kind = builtin_kind(*spelling);
+            if (type_name.empty() || !kind || *kind == BuiltinType::Void ||
+                *kind == BuiltinType::Label) {
+                fail(property.line, type_name.empty()
+                    ? "ABI type property needs a name after 'type.'"
+                    : "ABI type '" + type_name + "' must be a scalar arithmetic type such as i32 or f64");
+                return std::nullopt;
+            }
+            result.named_types.emplace_back(type_name, *kind);
+        }
         result.canonical_name = std::move(name);
         const auto architecture =
             text_property(properties, "architecture", line);
@@ -2761,7 +2780,8 @@ private:
                 reserved.end()) {
                 continue;
             }
-            if (!name.starts_with("f.") && !name.starts_with("m.")) {
+            if (!name.starts_with("f.") && !name.starts_with("m.") &&
+                !name.starts_with("w.")) {
                 fail(property.line, "unknown model property '" + name + "'");
                 return false;
             }
@@ -3771,7 +3791,7 @@ std::optional<std::string> option_problem(
     return std::nullopt;
 }
 
-// Checks the f.* and m.* properties of a preset or profile. An m.* property
+// Checks the f.*, m.*, and w.* properties of a preset or profile. An m.* property
 // must suit each of `targets`, or, when `targets` is empty, some compiled-in
 // target that defines it.
 bool check_options(std::span<const OptionAssignment> options,
@@ -3779,7 +3799,7 @@ bool check_options(std::span<const OptionAssignment> options,
                    Diagnostics& diagnostics) {
     for (const auto& option : options) {
         std::optional<std::string> problem;
-        if (option.name.starts_with("f.") ||
+        if (option.name.starts_with("f.") || option.name.starts_with("w.") ||
             option_definition(common_option_definitions(), option.name)) {
             problem =
                 option_problem(option, common_option_definitions(), preset);

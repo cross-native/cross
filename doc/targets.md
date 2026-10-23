@@ -125,6 +125,18 @@ The Cross ABI is not compatible with either C ABI. Across calls it preserves
 register and all SIMD, mask, and x87 state may change. Use `sysv_abi` or
 `ms_abi` at C boundaries.
 
+The C ABIs name the C types ([models.md](models.md#entry-properties)), which
+the format checkers read; `char`, `short`, `int`, `long long`, `intmax_t`,
+`float`, and `double` are `i8`, `i16`, `i32`, `i64`, `i64`, `f32`, and `f64`
+in both:
+
+| C type | `sysv_abi` | `ms_abi` |
+| --- | --- | --- |
+| `long` | `i64` | `i32` |
+| `size_t`, `ptrdiff_t` | `u64`, `i64` | `u64`, `i64` |
+| `wchar_t`, `wint_t` | `i32`, `u32` | `u16`, `u16` |
+| `long double` | `f80` | `f64` |
+
 Target options:
 
 | Option | Values |
@@ -305,6 +317,17 @@ pointer. The Cross ABIs are not compatible with the C ABIs. Across calls,
 `n64` it preserves all 64 bits. Select `o32`, `n64`, or `eabi32` at C
 boundaries, per declaration with `[[abi("n64")]]` or for the whole
 compilation with `-mabi=n64`.
+
+The C ABIs name the C types ([models.md](models.md#entry-properties)), which
+the format checkers read; `char`, `short`, `int`, `long long`, `intmax_t`,
+`wchar_t`, `wint_t`, `float`, and `double` are `i8`, `i16`, `i32`, `i64`,
+`i64`, `i32`, `u32`, `f32`, and `f64` in all three:
+
+| C type | `o32`, `eabi32` | `n64` |
+| --- | --- | --- |
+| `long` | `i32` | `i64` |
+| `size_t`, `ptrdiff_t` | `u32`, `i32` | `u64`, `i64` |
+| `long double` | `f64` | `f128` |
 
 A 128-bit integer has 16-byte alignment under `n64` and `x64`, as GCC's
 `__int128` under n64, and 8-byte alignment under the other ABIs. It travels

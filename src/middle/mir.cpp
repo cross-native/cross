@@ -869,7 +869,9 @@ bool eligible_function(const hir::Module& module, const hir::Function& function,
             attribute.name != "variadic" &&
             attribute.name != "stack_cleanup" &&
             attribute.name != "clobber" &&
-            attribute.name != "naked") {
+            attribute.name != "naked" &&
+            attribute.name != "maybe_unused" &&
+            attribute.name != "check") {
             return false;
         }
     }
@@ -4162,7 +4164,7 @@ private:
                             hir_, designator->type, target_);
                         if (designator->alignment < natural) {
                             diagnostics_.warning(
-                                expression.location,
+                                Warning::AddressOfPackedMember, expression.location,
                                 "forming a pointer to a potentially under-aligned packed member");
                         }
                         result = designator->address;

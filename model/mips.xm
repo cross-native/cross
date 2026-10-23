@@ -349,6 +349,20 @@ abi "o32" {
     aliases = ["32", "abi32"];
     llvm_calling_convention = "";
     gcc_calling_attribute = "";
+    # The C types, for $::meta::abi_type and the format checkers.
+    type.char = "i8";
+    type.short = "i16";
+    type.int = "i32";
+    type.long = "i32";
+    type.long_long = "i64";
+    type.size_t = "u32";
+    type.ptrdiff_t = "i32";
+    type.intmax_t = "i64";
+    type.wchar_t = "i32";
+    type.wint_t = "u32";
+    type.float = "f32";
+    type.double = "f64";
+    type.long_double = "f64";
     compilation_selectable = true;
     function_selectable = true;
     # As GCC, FPRs as wide as the ABI's GPRs unless options select others.
@@ -584,6 +598,20 @@ abi "n64" {
     aliases = ["64", "abi64"];
     llvm_calling_convention = "";
     gcc_calling_attribute = "";
+    # The C types, for $::meta::abi_type and the format checkers.
+    type.char = "i8";
+    type.short = "i16";
+    type.int = "i32";
+    type.long = "i64";
+    type.long_long = "i64";
+    type.size_t = "u64";
+    type.ptrdiff_t = "i64";
+    type.intmax_t = "i64";
+    type.wchar_t = "i32";
+    type.wint_t = "u32";
+    type.float = "f32";
+    type.double = "f64";
+    type.long_double = "f128";
     compilation_selectable = true;
     function_selectable = true;
     # The n64 object class is defined on 64-bit FPRs. As in GCC, a 128-bit
@@ -841,6 +869,20 @@ abi "eabi32" {
     aliases = ["eabi", "eabi-32"];
     llvm_calling_convention = "";
     gcc_calling_attribute = "";
+    # The C types, for $::meta::abi_type and the format checkers.
+    type.char = "i8";
+    type.short = "i16";
+    type.int = "i32";
+    type.long = "i32";
+    type.long_long = "i64";
+    type.size_t = "u32";
+    type.ptrdiff_t = "i32";
+    type.intmax_t = "i64";
+    type.wchar_t = "i32";
+    type.wint_t = "u32";
+    type.float = "f32";
+    type.double = "f64";
+    type.long_double = "f64";
     compilation_selectable = true;
     function_selectable = true;
     features = ["fp32"];

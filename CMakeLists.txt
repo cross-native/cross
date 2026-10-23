@@ -123,7 +123,8 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
              "${CMAKE_CURRENT_SOURCE_DIR}/model/common.xm"
              "${CMAKE_CURRENT_SOURCE_DIR}/model/x86_64.xm"
              "${CMAKE_CURRENT_SOURCE_DIR}/model/mips.xm"
-             "${CMAKE_CURRENT_SOURCE_DIR}/model/mips_instructions.xm")
+             "${CMAKE_CURRENT_SOURCE_DIR}/model/mips_instructions.xm"
+             "${CMAKE_CURRENT_SOURCE_DIR}/lib/format.x")
 # A shipped model's text as raw string literals of at most 16000 bytes, the
 # length every C++ compiler accepts.
 function(cross_model_text variable path)
@@ -143,10 +144,16 @@ cross_model_text(CROSS_X86_64_MODEL "${CMAKE_CURRENT_SOURCE_DIR}/model/x86_64.xm
 cross_model_text(CROSS_MIPS_MODEL "${CMAKE_CURRENT_SOURCE_DIR}/model/mips.xm")
 cross_model_text(CROSS_MIPS_INSTRUCTIONS_MODEL
                  "${CMAKE_CURRENT_SOURCE_DIR}/model/mips_instructions.xm")
+cross_model_text(CROSS_FORMAT_CHECKERS "${CMAKE_CURRENT_SOURCE_DIR}/lib/format.x")
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/src/model/shipped_models.cpp.in"
     "${CMAKE_CURRENT_BINARY_DIR}/generated/shipped_models.cpp"
+    @ONLY
+)
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/driver/shipped_checkers.cpp.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/shipped_checkers.cpp"
     @ONLY
 )
 
@@ -266,6 +273,7 @@ endif()
 add_library(cross_driver
     src/driver/driver.cpp
     src/driver/stack.cpp
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/shipped_checkers.cpp"
 )
 target_link_libraries(cross_driver PUBLIC cross_native_backend)
 if(NOT WIN32)
@@ -8666,6 +8674,37 @@ if(BUILD_TESTING)
         COMMAND "${CMAKE_COMMAND}" -DCC=$<TARGET_FILE:cross_cc>
             -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/syntax-span-checks
             -P "${CMAKE_SOURCE_DIR}/test/frontend/syntax_spans.cmake")
+    add_test(NAME cross_warnings
+        COMMAND "${CMAKE_COMMAND}" -DCC=$<TARGET_FILE:cross_cc> -DCPP=$<TARGET_FILE:cross_cpp>
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/warnings
+            -P "${CMAKE_SOURCE_DIR}/test/frontend/warnings.cmake")
+    set_tests_properties(cross_warnings PROPERTIES
+        LABELS "frontend;diagnostics;feature.warnings;arch.x86_64;check.compile")
+    add_test(NAME cross_call_checkers
+        COMMAND "${CMAKE_COMMAND}" -DCC=$<TARGET_FILE:cross_cc>
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/call-checkers
+            -P "${CMAKE_SOURCE_DIR}/test/frontend/call_checkers.cmake")
+    set_tests_properties(cross_call_checkers PROPERTIES
+        LABELS "frontend;diagnostics;feature.warnings;feature.meta;arch.x86_64;check.compile")
+    foreach(arch x86_64 mips)
+        if(arch STREQUAL x86_64)
+            set(warning_target x86_64-unknown-linux-gnu)
+        else()
+            set(warning_target mips-unknown-elf)
+        endif()
+        add_test(NAME cross_format_checks_${arch}
+            COMMAND "${CMAKE_COMMAND}" -DCC=$<TARGET_FILE:cross_cc> -DARCH=${arch}
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/format-checks-${arch}
+                -P "${CMAKE_SOURCE_DIR}/test/frontend/format_checks.cmake")
+        set_tests_properties(cross_format_checks_${arch} PROPERTIES
+            LABELS "frontend;diagnostics;feature.warnings;feature.format;arch.${arch};check.compile")
+        add_test(NAME cross_warning_output_${arch}
+            COMMAND "${CMAKE_COMMAND}" -DCC=$<TARGET_FILE:cross_cc> -DTARGET=${warning_target}
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/warning-output-${arch}
+                -P "${CMAKE_SOURCE_DIR}/test/frontend/warning_output.cmake")
+        set_tests_properties(cross_warning_output_${arch} PROPERTIES
+            LABELS "frontend;feature.warnings;backend.native;arch.${arch};check.compile")
+    endforeach()
     add_test(NAME cross_syntax_origin_errors
         COMMAND "${CMAKE_COMMAND}" -DCC=$<TARGET_FILE:cross_cc>
             -DSOURCE=${CMAKE_SOURCE_DIR}/test/frontend/syntax_origin_errors.x

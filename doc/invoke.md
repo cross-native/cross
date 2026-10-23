@@ -167,6 +167,50 @@ output does not depend on the working directory. `-g` is an error with
 `-emit-llvm` and `-emit-gimple`. [targets.md](targets.md) states what each
 object format and target describes.
 
+## Warnings
+
+`-WNAME` enables a warning and `-Wno-NAME` disables it. Warnings never change
+the output. The groups `-Wall`, `-Wextra`, and `-Wunused` enable several
+warnings at once, as in GCC; a warning that the command line names itself
+keeps that setting whatever groups it also enables, wherever they appear, so
+`-Wno-unused-parameter -Wall -Wextra` leaves parameters unchecked.
+
+| Warning | Enabled by | Reports |
+| --- | --- | --- |
+| `-Waddress-of-packed-member` | default | Taking the address of a packed member that may be under-aligned. |
+| `-Wcpp` | default | `#warning` directives. |
+| `-Wformat` | `-Wall` | Calls whose arguments do not match their format string, as checked by `$::format::printf` and `$::format::scanf` ([language.md](language.md#abis-and-interoperability)) or by any call checker declared for this warning ([metaprogramming.md](metaprogramming.md#call-checkers)). |
+| `-Wunused-variable` | `-Wunused`, which `-Wall` enables | A local variable that nothing uses, and a `static` object outside functions that nothing uses; a `const` one only in the input file itself, not in a file it includes. |
+| `-Wunused-function` | `-Wunused` | A `static` function definition that nothing uses. Inline, translation-only, and generic functions do not count. |
+| `-Wunused-parameter` | `-Wunused` with `-Wextra` | A parameter of a function definition that the body does not use. Unnamed parameters, the parameter of a macro, syntax expander, or call checker, and those of `[[naked]]` functions do not count. |
+| `-Wimplicit-fallthrough` | `-Wextra` | A statement that can complete normally before a `case` or `default` label of the same `switch`. |
+| `-Wsign-compare` | `-Wextra` | A comparison that converts a signed operand to an unsigned type, unless the operand is known to be nonnegative. |
+| `-Wconversion` | none | An implicit integer conversion that may change a value: in an initializer, an assignment, an argument, or a `return`. |
+| `-Wsign-conversion` | `-Wconversion` | An implicit integer conversion that may change the sign of a value. |
+| `-Wfloat-conversion` | `-Wconversion` | An implicit conversion from a floating type to an integer or to a narrower floating type. |
+
+`[[maybe_unused]]` on a variable, parameter, or function and
+`[[fallthrough]];` before a label mark the intended cases
+([language.md](language.md#other-attributes)). `-Wimplicit-fallthrough`
+recognizes only the attribute, as GCC's `-Wimplicit-fallthrough=5`; comments
+never matter. Conversions of constants are reported only when they change the
+value: `u8 x = 200;` is quiet and `u8 x = 300;` is not. Compound assignments
+and the entries of brace initializers are not checked for conversions.
+
+Each warning ends with the option that controls it, as in `warning: unused
+variable 'count' [-Wunused-variable]`. `-Werror` makes every warning an
+error, `-Werror=NAME` makes one warning, or the warnings of a group, errors
+and enables them, and `-Wno-error=NAME` keeps a warning a warning under
+`-Werror`. `-w` reports no warnings. A profile may set warnings, such as
+`w.all = true` ([models.md](models.md#option-properties)), and
+`--print-options=warning` lists every warning option with its value and the
+groups that enable it.
+
+An unknown `-WNAME` is an error. As in GCC, an unknown `-Wno-NAME` is accepted
+and noted only when the compilation reports a diagnostic that it may have been
+meant to silence, so a build can pass the same `-Wno-` options to Cross and to
+C compilers.
+
 ## Preprocessing
 
 `-DNAME[=VALUE]`, `-UNAME`, `-I DIR`, `-isystem DIR`, `-include FILE`, and
@@ -654,7 +698,7 @@ with `-target`, `-march`, or `-mprofile` to inspect another configuration.
 | `--print-costs` | The latency, issue cost, and availability of each of the target's instructions for `-march` and `-mtune`: a `cpu: NAME  tune: NAME  issue_width: N` line, then one `INSTRUCTION  latency: N  issue: N  available: yes` (or `no`) line per instruction. |
 | `--print-data-bases` | The `data_base` entries: one `NAME  base: REGISTER  sections: LIST  max_size: N  kinds: LIST  source: FILE:LINE` line each. |
 | `--print-init-tables` | The `init_table` entries: one `NAME  section: SECTION  priority_section: PREFIX  abi: ABI  source: FILE:LINE` line each, without the parts an entry does not set and with ` (inverted)` after an inverted prefix. |
-| `--print-options[=all\|optimization\|common\|target]` | Options, values, and origins. |
+| `--print-options[=all\|optimization\|common\|target\|warning]` | Options, values, and origins. |
 | `--print-keywords`, `--print-builtins`, `--print-attributes` | The language surface. |
 | `--print-features`, `--print-registers` | Target feature queries and register names. |
 | `--print-instructions` | The machine-instruction built-ins with their feature gates and whether they are privileged or volatile, then, for a target whose instruction table models give, each instruction form: `MNEMONIC OPERANDS  [FEATURES]` (the features of which the form needs one, then `!NAME` for each it excludes), `alias of NAME` or `macro` where it is one, its built-in or `no built-in (REASON)`, and `source: FILE:LINE`. |

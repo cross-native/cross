@@ -43,7 +43,7 @@ enum class FpContractMode { Off, On, Fast };
 enum class UnwindModel { None, Platform };
 
 enum class OptionValueKind { Boolean, Unsigned, Enumeration, Text };
-enum class OptionCategory { Optimization, CodeGeneration, Semantic, Target };
+enum class OptionCategory { Optimization, CodeGeneration, Semantic, Target, Warning };
 enum class OptionImplementation { Implemented, Partial };
 enum class OptionOrigin { Default, Preset, Profile, CommandLine };
 
@@ -61,6 +61,9 @@ struct OptionDefinition {
     bool presettable{};
     OptionImplementation implementation{OptionImplementation::Implemented};
     std::string description;
+    // A warning option that nothing sets takes the value true when, for one
+    // of these lists, every listed option is true (GCC's EnabledBy).
+    std::vector<std::vector<std::string>> enabled_by{};
 };
 
 // Model assignments are already typed. Command-line value assignments retain
@@ -141,6 +144,17 @@ struct CompilerOptions {
     std::vector<std::filesystem::path> model_files;
     std::vector<std::string> macro_definitions;
     std::vector<std::string> macro_undefinitions;
+    // -Werror=NAME (true) and -Wno-error=NAME (false), in command-line order.
+    struct WarningSeverity {
+        std::string name;
+        bool error{};
+        std::string source;
+    };
+    std::vector<WarningSeverity> warning_severities;
+    // Unknown -Wno-NAME options, reported only when a diagnostic is.
+    std::vector<std::string> ignored_warning_options;
+    // -w: report no warning.
+    bool inhibit_warnings{};
 
     // Typed hot-path values populated from resolved_options. The registry and
     // its origin metadata remain authoritative; these fields keep lowering
@@ -306,6 +320,13 @@ bool parse_as_options(int argc, char** argv, CompilerOptions& options,
                       AssemblerCommand& command, Diagnostics& diagnostics);
 
 std::span<const OptionDefinition> common_option_definitions();
+// The warning settings of resolved options, for Diagnostics.
+WarningPolicy warning_policy(const CompilerOptions& options);
+// After a compilation, as GCC does: that -Werror made warnings errors, and,
+// when a diagnostic was reported, each unknown -Wno- option, which may have
+// been meant to silence it.
+void report_warning_summary(const CompilerOptions& options,
+                            Diagnostics& diagnostics);
 // The typed value of `value` for `definition`, or nothing with `reason` set.
 std::optional<OptionValue> checked_option_value(
     const OptionDefinition& definition, const OptionValue& value,

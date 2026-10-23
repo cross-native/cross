@@ -10,7 +10,7 @@ namespace cross {
 // Compiler-owned expression operations. Types, preprocessing macros/queries,
 // and target-owned instructions have separate registries. Keep source lookup,
 // capability queries and driver inspection on the same operation-name table.
-enum class CoreBuiltinKind { Intrinsic, Constant };
+enum class CoreBuiltinKind { Intrinsic, Constant, Checker };
 
 struct CoreBuiltinEntry {
     std::string_view name;
@@ -89,6 +89,16 @@ inline std::span<const CoreBuiltinEntry> core_expression_builtins() {
         {"$::meta::enumerator_count", K::Intrinsic, "type reflection"},
         {"$::meta::enumerator_name", K::Intrinsic, "type reflection"},
         {"$::meta::type_tokens", K::Intrinsic, "type reflection"},
+        {"$::meta::type_spelling", K::Intrinsic, "type reflection"},
+        {"$::meta::argument_count", K::Intrinsic, "call reflection"},
+        {"$::meta::argument_type", K::Intrinsic, "call reflection"},
+        {"$::meta::argument_span", K::Intrinsic, "call reflection"},
+        {"$::meta::argument_string", K::Intrinsic, "call reflection"},
+        {"$::meta::parameter_count", K::Intrinsic, "call reflection"},
+        {"$::meta::parameter_type", K::Intrinsic, "call reflection"},
+        {"$::meta::call_span", K::Intrinsic, "call reflection"},
+        {"$::meta::is_variadic", K::Intrinsic, "call reflection"},
+        {"$::meta::abi_type", K::Intrinsic, "call reflection"},
         {"$::meta::error", K::Intrinsic, "translation diagnostic"},
         {"$::meta::warning", K::Intrinsic, "translation diagnostic"},
         {"$::meta::note", K::Intrinsic, "translation diagnostic"},
@@ -121,6 +131,8 @@ inline std::span<const CoreBuiltinEntry> core_expression_builtins() {
         {"$::memory::release", K::Constant, "atomic-order constant"},
         {"$::memory::acq_rel", K::Constant, "atomic-order constant"},
         {"$::memory::seq_cst", K::Constant, "atomic-order constant"},
+        {"$::format::printf", K::Checker, "call checker"},
+        {"$::format::scanf", K::Checker, "call checker"},
     };
     return entries;
 }

@@ -264,9 +264,9 @@ Examples are `$::_movabs`, `$::_add`, `$::expect`, and
 `$::target::special_operation`. `$::` is a compiler-owned root namespace, not
 an ordinary namespace declaration. Every entry has a compiler-defined
 category: hardware instruction, runtime-free intrinsic, predefined macro,
-compile-time query, target-defined scalar type, compile-time meta type, or
-preprocessed-stream marker. A full name has exactly one category and shall not
-collide with an entry in another category.
+compile-time query, target-defined scalar type, compile-time meta type, call
+checker, or preprocessed-stream marker. A full name has exactly one category
+and shall not collide with an entry in another category.
 
 Every compiler-provided callable operation, macro, query, and
 compile-time/target type is named below `$::`. Attributes occupy only the
@@ -678,6 +678,14 @@ it proves the index valid or the excluded path undefined. Use
 `$::assume(op < 10u32)` for an externally established unsigned range, or
 `default: $::unreachable();` when every unmatched value violates the contract.
 Neither form inserts a runtime check; a false promise is undefined behavior.
+
+A *fallthrough statement*, `[[fallthrough]];`, is an empty statement that
+states that control is meant to continue into the next `case` or `default`
+label. It shall be the last statement before such a label of the innermost
+enclosing switch: the statement that precedes the label in the switch's
+compound body or, recursively, the last statement of a compound statement, a
+branch of an `if` statement, or a labeled statement in that position. It has
+no other effect.
 
 `goto` and label values have the additional rules in “Labels, code addresses,
 and computed goto.” Cross has no `asm`, exception, class, method-call, general
@@ -2037,7 +2045,7 @@ table is required; `concat` and `parse` are the minimum constructors, and
 | `$::meta::token(kind, text[, span])` | One lexical leaf, validated against `kind`. `text` is a translation-time string or immutable bytes value. Group delimiters and structured splices cannot be forged. |
 | `$::meta::group(delimiters, contents[, span])` | One balanced group around `$::meta::tokens` contents, using one of the four delimiter strings above. Contents retain their provenance and grouping. |
 | `$::meta::parse(text)` | Tokens lexed from a translation-time string or a complete immutable bytes value read as UTF-8 source. |
-| `$::meta::error(span, message)`, `warning(span, message)`, `note(span, message)` | Translation diagnostics returning `void`; `span` is a `$::meta::span` and `message` a translation-time string. An error stops the expansion, while warnings and notes do not. |
+| `$::meta::error(span, message)`, `warning(span, message)`, `note(span, message)` | Translation diagnostics returning `void`; `span` is a `$::meta::span` and `message` a translation-time string or `$::meta::bytes`. An error stops the expansion, while warnings and notes do not. |
 
 `kind` is one of `"identifier"`, `"builtin"`, `"integer"`, `"floating"`,
 `"character"`, `"string"`, `"punctuation"`, `"group"`, and `"splice"`; an
@@ -2097,6 +2105,7 @@ the type in a type position and the operation when followed by `(`.
 | `$::meta::element(t)`, `$::meta::count(t)` | The element type and length of an array, the lane type and lane count of a fixed vector, the pointee of a pointer with count 1, or the underlying type of an enumeration with count 0; `count` is a `uptr`. |
 | `$::meta::enumerator_count(t)`, `$::meta::enumerator_name(t, i)` | The enumerators of an enumeration in declaration order; the name is an identifier token. |
 | `$::meta::type_tokens(t)` | Tokens that denote `t` wherever they are spliced, with the hygiene of a name written in a quote. |
+| `$::meta::type_spelling(t)` | The spelling of `t` for messages, such as `const u8 *`, as `$::meta::bytes`. |
 
 A query sees a type as complete where the evaluation runs, so an item macro
 invoked after a record's definition can inspect it. An incomplete type where
@@ -4067,6 +4076,7 @@ The following object, type, and symbol attributes are normative:
 | `thread_local` | Gives a static-duration object thread-local storage. |
 | `tls_model("model")` | Selects a target TLS model for a thread-local entity. |
 | `link_name("name")` | Replaces the default link name of a global function, object, or label. |
+| `maybe_unused` | On a function, an object, a local variable, or a parameter: the entity may be unused, and no warning says that it is. |
 
 `section`, symbol binding, aliasing, visibility, retention, TLS, and `noinit`
 are valid only where the selected object format can represent them. An alias
@@ -4171,6 +4181,9 @@ The following function and statement attributes are normative:
 | `no_stack_protector` | Suppresses stack-protector instrumentation for this function. |
 | `no_sanitize("name")` | Suppresses the named optional instrumentation for this function. |
 | `musttail` | On a `return` statement, requires a tail transfer or a diagnostic. |
+| `fallthrough` | On an empty statement, `[[fallthrough]];`: control continues into the next label on purpose; see [Statements and control flow](#statements-and-control-flow). |
+| `check(name)` | Runs the call checker `name` at each direct call of the function; see [Call checkers](#call-checkers). |
+| `checker`, `checker("warning")` | Defines a call checker, controlled by the named warning when one is given; implies `eval_only`. |
 
 `[[noreturn]]` is the sole no-return declaration spelling. Its calls perform
 no copy-out; output-capable parameters are permitted but warned as unobservable.
@@ -4223,6 +4236,71 @@ to emitted functions; a translation-only function needs only the call shape.
 Target descriptions may add qualified contextual attributes and must document
 their contracts. Cross does not recognize `__attribute__`, `__declspec`, or
 vendor-qualified compatibility aliases.
+
+### Call checkers
+
+`[[check(name)]]` on a function declaration names a *call checker*, a
+translation-only function that checks the arguments of each direct call of
+the declared function. `name` is resolved as a function name where the
+declaration is, and must name a function defined with `[[checker]]`;
+`$::format::printf` and `$::format::scanf` name the checkers built into the
+compiler. A declaration may name several checkers, and every checker that a
+declaration of the function names checks each call.
+
+A checker is a `static`, nongeneric definition with one `in $::meta::call`
+parameter and a `void` result. At each direct call of a checked function,
+including calls in generated code, in generic instances, and in
+translation-only functions, the compiler evaluates the checker with that call
+after source validation and before translation-time evaluation folds the call
+or its arguments; an instance of a generic function reports a diagnostic at
+one source position once. A checker reports with `$::meta::warning`,
+`$::meta::note`, and `$::meta::error` at the spans the call provides. An
+error, or a failed evaluation, is an error at the call. `[[checker("warning")]]`
+names a warning that the implementation documents
+([invoke.md](invoke.md#warnings)); the checker then runs only while that
+warning is enabled, and its warnings are that warning. Without a name, the
+checker always runs and its warnings are not selectable.
+
+A `$::meta::call` value is an opaque translation-time value that describes one
+call:
+
+| Operation | Result |
+| --- | --- |
+| `$::meta::argument_count(call)` | The number of arguments, as `uptr`. |
+| `$::meta::argument_type(call, i)` | The type of argument `i`'s value: unqualified, with an array or function converted to a pointer, before conversion to a parameter type or variadic promotion. |
+| `$::meta::argument_span(call, i)` | The span of argument `i`. |
+| `$::meta::argument_string(call, i)` | The bytes of argument `i`, including the terminating zero, when it is a string literal, possibly parenthesized or cast; otherwise empty bytes. |
+| `$::meta::parameter_count(call)`, `$::meta::parameter_type(call, i)` | The number of the callee's named parameters, as `uptr`, and the adjusted type of parameter `i`. |
+| `$::meta::is_variadic(call)` | `bool`: whether the callee takes unnamed arguments. |
+| `$::meta::call_span(call)` | The span of the call. |
+| `$::meta::abi_type(call, name)` | The scalar type that the callee's ABI model names `name` with a `type.name` property ([models.md](models.md#entry-properties)), or `void` when the model names none. |
+
+Indices follow the index rules of “Embedded assets and translation-time
+bytes”; an index out of range is an error.
+
+`$::format::printf` and `$::format::scanf` check a call's format string
+against its arguments as the C printf and scanf functions read them, with the
+conversions, flags, length modifiers, `*` operands, and `N$` operand numbers
+of C and POSIX. The format is the callee's last named parameter that points to
+an 8-bit integer. A format that is not a string literal is not checked. When
+the callee is variadic, its unnamed arguments are the format's operands;
+otherwise only the format is checked. The C types that conversions and length
+modifiers name are the types that the callee's ABI names `char`, `short`,
+`int`, `long`, `long_long`, `size_t`, `ptrdiff_t`, `intmax_t`, `wchar_t`,
+`wint_t`, `float`, `double`, and `long_double`; an integer argument matches
+the width of its type after the default argument promotions, whatever its
+signedness. When the ABI names no `int`, only the format and the number of
+arguments are checked. Their diagnostics are warnings of the format warning
+(`-Wformat`).
+
+```x
+[[abi("sysv_abi"), check($::format::printf)]]
+i32 printf(in const u8 *format, ...);
+
+global void show(in i64 count, in const u8 *name) {
+    printf("%s: %ld\n", name, count);   // long is 64 bits in this ABI
+}
+```
 
 ## Compilation and separate compilation
 
@@ -4439,6 +4517,11 @@ The required core options are:
                 set a registered target-independent compiler option
 -moption/-mno-option/-moption=value
                 set a registered target option
+-Wname/-Wno-name
+                enable or disable a registered warning or warning group
+-Werror, -Werror=name, -Wno-error=name
+                make warnings errors
+-w              report no warnings
 --print-abis    list the selected target's ABI registry
 --print-models  list loaded model sources
 --print-profiles list loaded profiles
@@ -4542,7 +4625,11 @@ reject:
 - any lowering that would create an undeclared call or helper symbol.
 
 Forming a potentially misaligned pointer to a packed member requires at least a
-warning. Unsupported foreign syntax is rejected. Recovery is permitted after a
+warning. A warning never changes the output of a translation. An
+implementation that warns about unused entities does not warn about an entity
+declared `maybe_unused`, and one that warns about control that continues into
+a `case` or `default` label does not warn about a fallthrough statement.
+Unsupported foreign syntax is rejected. Recovery is permitted after a
 diagnostic, but the compiler shall not silently change a declared interface.
 For generated source, the primary diagnostic identifies the generated token
 and is followed by the complete procedural-expansion chain, including each

@@ -103,7 +103,7 @@ bool is_meta_type(const TypePtr& type) {
     switch (type->kind) {
     case Type::Kind::Tokens: case Type::Kind::SyntaxMatch: case Type::Kind::Syntax:
     case Type::Kind::Span: case Type::Kind::Context: case Type::Kind::Bytes:
-    case Type::Kind::Buffer: case Type::Kind::TypeValue: return true;
+    case Type::Kind::Buffer: case Type::Kind::TypeValue: case Type::Kind::CallSite: return true;
     default: return false;
     }
 }
@@ -259,6 +259,12 @@ TypePtr buffer_type() {
 TypePtr type_value_type() {
     auto type = std::make_shared<Type>();
     type->kind = Type::Kind::TypeValue;
+    return type;
+}
+
+TypePtr call_site_type() {
+    auto type = std::make_shared<Type>();
+    type->kind = Type::Kind::CallSite;
     return type;
 }
 
@@ -468,6 +474,7 @@ std::string type_name(const TypePtr& type) {
     if (type->kind == Type::Kind::Bytes) return "$::meta::bytes";
     if (type->kind == Type::Kind::Buffer) return "$::meta::buffer";
     if (type->kind == Type::Kind::TypeValue) return "$::meta::type";
+    if (type->kind == Type::Kind::CallSite) return "$::meta::call";
     std::string prefix;
     if (type->is_const) prefix += "const ";
     if (type->is_volatile) prefix += "volatile ";
@@ -555,6 +562,7 @@ std::string canonical_type_name(const TypePtr& type) {
     if (type->kind == Type::Kind::Bytes) return "$::meta::bytes";
     if (type->kind == Type::Kind::Buffer) return "$::meta::buffer";
     if (type->kind == Type::Kind::TypeValue) return "$::meta::type";
+    if (type->kind == Type::Kind::CallSite) return "$::meta::call";
     std::string result;
     if (type->is_const) result += 'K';
     if (type->is_volatile) result += 'V';
@@ -742,7 +750,8 @@ static bool same_type_impl(const TypePtr& left, const TypePtr& right,
     if (left->kind == Type::Kind::Tokens || left->kind == Type::Kind::SyntaxMatch ||
         left->kind == Type::Kind::Syntax || left->kind == Type::Kind::Span ||
         left->kind == Type::Kind::Context || left->kind == Type::Kind::Bytes ||
-        left->kind == Type::Kind::Buffer || left->kind == Type::Kind::TypeValue) return true;
+        left->kind == Type::Kind::Buffer || left->kind == Type::Kind::TypeValue ||
+        left->kind == Type::Kind::CallSite) return true;
     return left->builtin == right->builtin &&
            left->nominal_key() == right->nominal_key();
 }
@@ -1097,7 +1106,8 @@ unsigned type_bits(const TypePtr& type) {
         type->kind == Type::Kind::Tokens || type->kind == Type::Kind::SyntaxMatch ||
         type->kind == Type::Kind::Syntax || type->kind == Type::Kind::Span ||
         type->kind == Type::Kind::Context || type->kind == Type::Kind::Bytes ||
-        type->kind == Type::Kind::Buffer || type->kind == Type::Kind::TypeValue)
+        type->kind == Type::Kind::Buffer || type->kind == Type::Kind::TypeValue ||
+        type->kind == Type::Kind::CallSite)
         return 0;
     if (type->kind == Type::Kind::Vector) {
         return type->scalable ? 0 : type_bits(type->element) * type->lanes;

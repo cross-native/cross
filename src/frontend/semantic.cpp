@@ -25,9 +25,11 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -39,9 +41,9 @@ namespace cross {
 std::span<const std::string_view> core_attribute_names() {
     static constexpr std::string_view names[] = {
         "abi", "address", "address_space", "alias", "aligned", "always_inline",
-        "atomic", "clobber", "cold", "constructor", "destructor", "eval_only",
-        "exhaustive", "ext_vector_type",
-        "hot", "interrupt", "link_name", "macro", "may_alias",
+        "atomic", "check", "checker", "clobber", "cold", "constructor", "destructor", "eval_only",
+        "exhaustive", "ext_vector_type", "fallthrough",
+        "hot", "interrupt", "link_name", "macro", "may_alias", "maybe_unused",
         "musttail", "naked", "no_sanitize", "no_stack_protector", "noinit",
         "noinline", "noreturn", "operator", "packed", "raw_inline",
         "retain", "returns_twice", "runtime_only", "scalable_vector",
@@ -185,7 +187,8 @@ std::optional<std::string> attribute_argument_error(const Attribute& attribute) 
     // context, target or ABI. Validate before translation-only erasure as
     // well as at ordinary source entry; HIR cannot check an erased helper.
     static constexpr std::string_view argument_free[] = {
-        "always_inline", "atomic", "cold", "eval_only", "exhaustive", "hot", "macro", "may_alias", "musttail",
+        "always_inline", "atomic", "cold", "eval_only", "exhaustive", "fallthrough", "hot", "macro",
+        "may_alias", "maybe_unused", "musttail",
         "naked", "no_stack_protector", "noinit", "noinline", "noreturn", "packed",
         "raw_inline", "retain", "returns_twice", "runtime_only", "syntax_expander",
         "thread_local", "used", "weak",
@@ -208,9 +211,30 @@ std::optional<std::string> function_attribute_error(const Attribute& attribute) 
     if (attribute.name == "packed" || attribute.name == "underlying" ||
         attribute.name == "noinit" || attribute.name == "thread_local" ||
         attribute.name == "tls_model" || attribute.name == "musttail" ||
-        attribute.name == "exhaustive")
+        attribute.name == "exhaustive" || attribute.name == "fallthrough")
         return "attribute '" + attribute.name + "' is not valid on a function";
+    if (attribute.name == "check" && attribute.arguments.size() != 1)
+        return "check requires the name of one [[checker]] function";
+    if (attribute.name == "checker") {
+        if (attribute.arguments.size() > 1)
+            return "checker takes at most one warning-name string";
+        if (attribute.arguments.size() == 1) {
+            const auto name = decode_string_literal(attribute.arguments.front());
+            if (!name) return "checker takes a warning-name string, such as \"format\"";
+            if (!find_warning(*name))
+                return "checker names unknown warning '" + *name + "'";
+        }
+    }
     return {};
+}
+
+// Attributes that only a function, a statement, or a declared object or
+// parameter can carry.
+const char* misplaced_attribute_subject(std::string_view name) {
+    if (name == "check" || name == "checker") return "a function";
+    if (name == "fallthrough") return "an empty statement";
+    if (name == "maybe_unused") return "a function, object, or parameter";
+    return nullptr;
 }
 
 // These contracts need an emitted function, physical call boundary or machine
@@ -317,12 +341,18 @@ void validate_table_attributes(const std::vector<Attribute>& attributes,
 
 bool validate_attribute_names(const Program& program,
                               Diagnostics& diagnostics) {
-    enum class Subject { General, Function, Object };
+    enum class Subject { General, Function, Object, Statement };
     const auto validate = [&](const std::vector<Attribute>& attributes, Subject subject = Subject::General) {
         for (const auto& attribute : attributes) {
+            const auto* only = misplaced_attribute_subject(attribute.name);
             if (!is_known_attribute(attribute.name)) {
                 diagnostics.error(attribute.location,
                                   "unknown attribute '" + attribute.name + "'");
+            } else if (only && !(subject == Subject::Function && attribute.name != "fallthrough") &&
+                       !(subject == Subject::Object && attribute.name == "maybe_unused") &&
+                       !(subject == Subject::Statement && attribute.name == "fallthrough")) {
+                diagnostics.error(attribute.location, "attribute '" + attribute.name +
+                    "' is valid only on " + std::string(only));
             } else if (attribute.name == "syntax_expander") {
                 diagnostics.error(attribute.location,
                     "syntax_expander requires a dedicated static expansion-function declaration");
@@ -356,9 +386,20 @@ bool validate_attribute_names(const Program& program,
                 if (runtime_contract_attribute(attribute.name))
                     diagnostics.error(attribute.location,
                         runtime_contract_error(attribute, "a translation-only helper"));
+        if (function->attribute("checker")) {
+            if (function->linkage != Linkage::Static || !function->generic_parameters.empty() ||
+                !function->body || function->variadic || function->parameters.size() != 1 ||
+                function->parameters.front().mode != ParameterMode::In ||
+                !function->parameters.front().type ||
+                function->parameters.front().type->kind != Type::Kind::CallSite ||
+                !function->return_type || function->return_type->kind != Type::Kind::Builtin ||
+                function->return_type->builtin != BuiltinType::Void)
+                diagnostics.error(function->location, "a [[checker]] function is a static, nongeneric "
+                    "definition with one 'in $::meta::call' parameter and a void result");
+        }
         const auto visit_statement = [&](const auto& self,
                                          const Statement& statement) -> void {
-            validate(statement.attributes);
+            validate(statement.attributes, Subject::Statement);
             if (const auto* attribute = malformed_tail_return(statement))
                 diagnostics.error(attribute->location,
                     "musttail requires returning a call expression directly");
@@ -454,6 +495,8 @@ ContinuationTask<TypePtr> clone_type_async(const TypePtr& source,
         result = buffer_type();
     } else if (source->kind == Type::Kind::TypeValue) {
         result = type_value_type();
+    } else if (source->kind == Type::Kind::CallSite) {
+        result = call_site_type();
     } else {
         const auto found = substitutions.find(generic_type_key(*source));
         if (found == substitutions.end()) {
@@ -1477,6 +1520,19 @@ bool validate_generic_record_redeclarations(const Program& program, Diagnostics&
     return diagnostics.errors() == errors;
 }
 
+// The result types of the operations on a $::meta::call; null for other names.
+TypePtr call_reflection_result_type(std::string_view name) {
+    if (name == "$::meta::argument_count" || name == "$::meta::parameter_count")
+        return builtin_type(BuiltinType::Uptr);
+    if (name == "$::meta::argument_type" || name == "$::meta::parameter_type" ||
+        name == "$::meta::abi_type")
+        return type_value_type();
+    if (name == "$::meta::argument_span" || name == "$::meta::call_span") return span_type();
+    if (name == "$::meta::argument_string") return bytes_type();
+    if (name == "$::meta::is_variadic") return builtin_type(BuiltinType::Bool);
+    return {};
+}
+
 // The result types of the type-reflection operations; null for other names.
 TypePtr reflection_result_type(std::string_view name) {
     if (name == "$::meta::type" || name == "$::meta::member_type" || name == "$::meta::element")
@@ -1490,6 +1546,7 @@ TypePtr reflection_result_type(std::string_view name) {
         return builtin_type(BuiltinType::U32);
     if (name == "$::meta::member_name" || name == "$::meta::enumerator_name" || name == "$::meta::type_tokens")
         return tokens_type();
+    if (name == "$::meta::type_spelling") return bytes_type();
     return {};
 }
 
@@ -1558,6 +1615,7 @@ TypePtr translation_intrinsic_type(const Expr& expression, bool procedural, Type
         expression.left->text == "$::meta::is_production" ||
         expression.left->text == "$::meta::is_extension"))
         return builtin_type(BuiltinType::Bool);
+    if (auto call = call_reflection_result_type(expression.left->text)) return call;
     if (expression.left->text == "$::embed") return bytes_type();
     if (expression.left->text == "$::meta::len")
         return builtin_type(BuiltinType::Uptr);
@@ -4393,6 +4451,22 @@ std::unique_ptr<Expr> label_constant_expression(
     return result;
 }
 
+// The call a [[checker]] function inspects: what $::meta::call operations
+// report. Argument types are value types, before parameter conversion or
+// variadic promotion.
+struct CallSiteValue {
+    SourceLocation location;
+    std::vector<TypePtr> argument_types;
+    std::vector<SourceLocation> argument_locations;
+    // The bytes of a string-literal argument, with its terminating zero.
+    std::vector<std::optional<std::string>> argument_strings;
+    std::vector<TypePtr> parameter_types;
+    // Whether the callee takes unnamed arguments.
+    bool variadic{};
+    // The callee's canonical ABI.
+    std::string abi;
+};
+
 struct EvalValue {
     UInt128 integer{};
     TypePtr type;
@@ -4416,6 +4490,8 @@ struct EvalValue {
     std::shared_ptr<const SyntaxContext> syntax_context;
     // A `$::meta::type` value.
     TypePtr reflected;
+    // A `$::meta::call` value.
+    std::shared_ptr<const CallSiteValue> call_site;
     std::shared_ptr<const std::string> bytes;
     std::size_t byte_offset{};
     std::size_t byte_length{};
@@ -6488,7 +6564,13 @@ public:
         else if (name == "$::syntax::context") arguments(call, {A::MatchOrNode});
         else if (name == "$::syntax::error" || name == "$::syntax::warning" || name == "$::syntax::note" ||
                  name == "$::meta::error" || name == "$::meta::warning" || name == "$::meta::note")
-            arguments(call, {A::Span, A::String});
+            arguments(call, {A::Span, A::StringOrBytes});
+        else if (name == "$::meta::argument_count" || name == "$::meta::parameter_count" ||
+                 name == "$::meta::call_span" || name == "$::meta::is_variadic") arguments(call, {A::Call});
+        else if (name == "$::meta::argument_type" || name == "$::meta::parameter_type" ||
+                 name == "$::meta::argument_span" || name == "$::meta::argument_string")
+            arguments(call, {A::Call, A::Integer});
+        else if (name == "$::meta::abi_type") arguments(call, {A::Call, A::String});
         else if (name == "$::syntax::capture" || name == "$::syntax::node" || name == "$::syntax::count" ||
                  name == "$::syntax::is_variant" || name == "$::syntax::capture_span")
             arguments(call, {A::Match, A::String});
@@ -6538,7 +6620,7 @@ public:
 private:
     enum class Argument {
         Tokens, Node, Match, Span, Context, Buffer, Integer, String,
-        Sequence, BytesOrBuffer, MatchOrNode, TokensOrNode, StringOrBytes, Type,
+        Sequence, BytesOrBuffer, MatchOrNode, TokensOrNode, StringOrBytes, Type, Call,
     };
 
     TypePtr type(const Expr& expression) { return type_(expression); }
@@ -6565,6 +6647,7 @@ private:
         case Argument::MatchOrNode: return actual->kind == Type::Kind::SyntaxMatch || actual->kind == Type::Kind::Syntax;
         case Argument::TokensOrNode: return actual->kind == Type::Kind::Tokens || actual->kind == Type::Kind::Syntax;
         case Argument::Type: return actual->kind == Type::Kind::TypeValue;
+        case Argument::Call: return actual->kind == Type::Kind::CallSite;
         }
         return false;
     }
@@ -7407,6 +7490,12 @@ class Evaluator {
 public:
     enum class ResourceReporting { Required, Speculative };
     void resource_reporting(ResourceReporting reporting) { resource_reporting_ = reporting; }
+    // Makes this evaluator run a [[checker]] function, whose warnings are
+    // controlled by `warning`, or are uncategorized without one.
+    void check_call(std::optional<Warning> warning) {
+        checking_ = true;
+        checker_warning_ = warning;
+    }
 
     Evaluator(Program& program, Diagnostics& reporter,
               const FunctionDecl* current_function = nullptr,
@@ -7428,6 +7517,39 @@ public:
               (program.evaluation_pointer_resolver ? &program.evaluation_pointer_resolver : nullptr)),
           procedural_(macro_context != nullptr), macro_context_(std::move(macro_context)),
           syntax_parse_(std::move(syntax_parse)), call_context_(std::move(call_context)) {
+        install();
+    }
+
+    ~Evaluator() {
+        if (installed_) uninstall();
+    }
+
+    // A [[checker]] evaluator serves every call of its checker. Between calls
+    // it is suspended, so that other evaluators own the program's evaluation
+    // queries; each call resumes it with that call's context and budgets.
+    void suspend() { uninstall(); }
+    void resume(std::shared_ptr<const SyntaxContext> context) {
+        install();
+        macro_context_ = context;
+        call_context_ = std::move(context);
+        construction_contexts_.clear();
+        charged_contexts_.clear();
+        charged_environments_.clear();
+        counted_asset_backings_.clear();
+        token_bytes_ = 0;
+        meta_bytes_ = 0;
+        steps_ = 0;
+        budget_diagnosed_ = false;
+        context_unavailable_ = false;
+        failure_location_ = {};
+        failure_reason_.reset();
+        failure_trace_.clear();
+    }
+
+    // Installs this evaluator's queries into the program, keeping the ones
+    // they replace for uninstall to restore.
+    void install() {
+        installed_ = true;
         previous_record_query_ = std::move(program_.evaluation_record_definition);
         inherited_record_query_ = previous_record_query_;
         previous_layout_preparation_ = std::move(program_.evaluation_prepare_layout);
@@ -7501,7 +7623,8 @@ public:
         };
     }
 
-    ~Evaluator() {
+    void uninstall() {
+        installed_ = false;
         program_.evaluation_required_integer = std::move(previous_integer_query_);
         program_.evaluation_generic_value = std::move(previous_generic_query_);
         program_.evaluation_record_definition = std::move(previous_record_query_);
@@ -11822,6 +11945,14 @@ private:
             value.type = clone_type(type);
             co_return value;
         }
+        if (value.call_site || type->kind == Type::Kind::CallSite) {
+            if (!value.call_site || type->kind != Type::Kind::CallSite) {
+                fail(location, "$::meta::call values cannot be converted to or from other values");
+                co_return std::nullopt;
+            }
+            value.type = clone_type(type);
+            co_return value;
+        }
         if (value.bytes || value.buffer || type->kind == Type::Kind::Bytes ||
             type->kind == Type::Kind::Buffer) {
             if ((value.bytes && type->kind != Type::Kind::Bytes) ||
@@ -14467,6 +14598,7 @@ private:
             co_return std::nullopt;
         }
         if (reflection_result_type(name)) co_return (co_await reflection_call_async(expression));
+        if (call_reflection_result_type(name)) co_return (co_await call_reflection_async(expression));
         const bool token_kind = name == "$::meta::is_kind" &&
             !expression.arguments.empty() && expression_type(*expression.arguments[0]) &&
             expression_type(*expression.arguments[0])->kind == Type::Kind::Tokens;
@@ -14671,6 +14803,65 @@ private:
         co_return true;
     }
 
+    EvaluationTask<std::optional<EvalValue>> call_reflection_async(const Expr& expression) {
+        const auto& name = expression.left->text;
+        const auto location = expression.location;
+        auto subject = co_await this->expression_async(*expression.arguments[0]);
+        if (!subject) co_return std::nullopt;
+        if (!subject->call_site) {
+            fail(expression.arguments[0]->location, name + " requires a $::meta::call value");
+            co_return std::nullopt;
+        }
+        const auto call = subject->call_site;
+        const auto reflected = [&](TypePtr type) -> std::optional<EvalValue> {
+            if (!charge_meta_bytes(64, location)) return std::nullopt;
+            EvalValue result{UInt128{}, type_value_type()};
+            result.reflected = std::move(type);
+            return result;
+        };
+        if (name == "$::meta::argument_count")
+            co_return meta_count_value(call->argument_types.size(), location, name);
+        if (name == "$::meta::parameter_count")
+            co_return meta_count_value(call->parameter_types.size(), location, name);
+        if (name == "$::meta::call_span") co_return span_value({call->location, call->location}, location);
+        if (name == "$::meta::is_variadic")
+            co_return EvalValue{UInt128{call->variadic ? 1U : 0U}, builtin_type(BuiltinType::Bool)};
+        if (name == "$::meta::abi_type") {
+            auto selector = co_await this->expression_async(*expression.arguments[1]);
+            if (!selector || !selector->string || selector->offset >= selector->string->size()) {
+                fail(expression.arguments[1]->location, name + " requires a translation-time type-name string");
+                co_return std::nullopt;
+            }
+            const auto type_name = std::string_view(*selector->string).substr(selector->offset,
+                selector->string->size() - selector->offset - 1);
+            const auto kind = program_.abi_named_type
+                ? program_.abi_named_type(call->abi, type_name) : std::nullopt;
+            co_return reflected(builtin_type(kind.value_or(BuiltinType::Void)));
+        }
+        const bool parameter = name == "$::meta::parameter_type";
+        const auto count = parameter ? call->parameter_types.size() : call->argument_types.size();
+        const auto index = co_await this->expression_async(*expression.arguments[1]);
+        if (!index || !is_integer(index->type) ||
+            integer_negative(index->integer, integer_type(index->type)) ||
+            index->integer.high != 0 || index->integer.low >= count) {
+            fail(expression.arguments[1]->location, name + " index is out of range");
+            co_return std::nullopt;
+        }
+        const auto at = static_cast<std::size_t>(index->integer.low);
+        if (parameter) co_return reflected(call->parameter_types[at]);
+        if (name == "$::meta::argument_type") co_return reflected(call->argument_types[at]);
+        if (name == "$::meta::argument_span")
+            co_return span_value({call->argument_locations[at], call->argument_locations[at]}, location);
+        // $::meta::argument_string: empty unless the argument is a string literal.
+        const auto& text = call->argument_strings[at];
+        const auto size = text ? text->size() : 0;
+        if (!step(location, size) || !charge_meta_bytes(size, location)) co_return std::nullopt;
+        EvalValue result{UInt128{}, bytes_type()};
+        result.bytes = std::make_shared<const std::string>(text.value_or(std::string()));
+        result.byte_length = size;
+        co_return result;
+    }
+
     EvaluationTask<std::optional<EvalValue>> reflection_call_async(const Expr& expression) {
         const auto& name = expression.left->text;
         const auto location = expression.location;
@@ -14744,6 +14935,14 @@ private:
                 co_return std::nullopt;
             }
             co_return boolean(kind == written);
+        }
+        if (name == "$::meta::type_spelling") {
+            const auto spelling = type_name(type);
+            if (!charge_meta_bytes(spelling.size(), location)) co_return std::nullopt;
+            EvalValue result{UInt128{}, bytes_type()};
+            result.bytes = std::make_shared<const std::string>(spelling);
+            result.byte_length = spelling.size();
+            co_return result;
         }
         if (name == "$::meta::type_tokens") {
             // One identifier bound to the type itself, as a quoted alias is.
@@ -14893,17 +15092,30 @@ private:
             auto span = (co_await this->expression_async(*expression.arguments[0]));
             if (!span) co_return std::nullopt;
             auto message = (co_await this->expression_async(*expression.arguments[1]));
-            if (!span->syntax_span || !message || !message->string ||
-                message->offset >= message->string->size()) {
+            const bool bytes = message && message->bytes;
+            if (!span->syntax_span || !message || (!bytes && (!message->string ||
+                message->offset >= message->string->size()))) {
                 fail(expression.location, "syntax diagnostic requires a span and string message");
                 co_return std::nullopt;
             }
-            const auto text = std::string_view(*message->string).substr(message->offset,
-                message->string->size() - message->offset - 1);
+            const auto text = bytes
+                ? std::string_view(*message->bytes).substr(message->byte_offset, message->byte_length)
+                : std::string_view(*message->string).substr(message->offset,
+                      message->string->size() - message->offset - 1);
             if (!charge_meta_bytes(32 + text.size(), expression.location)) co_return std::nullopt;
             if (name == "$::syntax::error" || name == "$::meta::error") {
                 fail(span->syntax_span->first, std::string(text));
                 co_return std::nullopt;
+            }
+            if (checking_) {
+                // A call checker reports at the call, under its own warning.
+                if (name == "$::syntax::note" || name == "$::meta::note")
+                    diagnostics_.note(span->syntax_span->first, text);
+                else if (checker_warning_)
+                    diagnostics_.warning(*checker_warning_, span->syntax_span->first, text);
+                else
+                    diagnostics_.warning(span->syntax_span->first, text);
+                co_return EvalValue{UInt128{}, builtin_type(BuiltinType::Void)};
             }
             diagnostics_.report(name == "$::syntax::warning" || name == "$::meta::warning" ? DiagnosticLevel::Warning
                 : DiagnosticLevel::Note, span->syntax_span->first, text);
@@ -15827,6 +16039,11 @@ private:
     const LayoutQuery* align_of_{};
     const GenericPointerResolver* pointer_resolver_{};
     bool procedural_{};
+    // Whether this evaluator's queries are installed in the program.
+    bool installed_{};
+    // Running a [[checker]] function: its warnings report under its warning.
+    bool checking_{};
+    std::optional<Warning> checker_warning_;
     std::unordered_set<const FunctionDecl*> source_validated_;
     // Prepared aliases, expression type operands and retained proofs belong to
     // this evaluator's enclosing expansion, never the published declaration.
@@ -17447,10 +17664,1054 @@ EvaluationTask<void> rewrite_eval_statement_async(Statement& statement, Function
     }
 }
 
+// Each expression in a tree, parents first. Member names and the record of
+// $::offsetof are not value names; types in casts and layout queries carry
+// their bound expressions.
+template <typename Visitor>
+void visit_source_expressions(const Expr* root, Visitor&& visitor) {
+    std::vector<const Expr*> pending{root};
+    std::vector<const Type*> types;
+    const auto type_bounds = [&](const TypePtr& type) {
+        for (auto* current = type.get(); current; current = current->element ? current->element.get()
+                                                                              : current->pointee.get()) {
+            if (std::find(types.begin(), types.end(), current) != types.end()) break;
+            types.push_back(current);
+            if (current->array_bound) pending.push_back(current->array_bound.get());
+            if (current->vector_bound) pending.push_back(current->vector_bound.get());
+        }
+    };
+    while (!pending.empty()) {
+        const auto* expression = pending.back();
+        pending.pop_back();
+        if (!expression) continue;
+        visitor(*expression);
+        type_bounds(expression->type);
+        for (const auto& argument : expression->generic_arguments) {
+            type_bounds(argument.type);
+            pending.push_back(argument.value.get());
+        }
+        for (const auto& entry : expression->initializer_entries) {
+            pending.push_back(entry.value.get());
+            for (const auto& designator : entry.designators) pending.push_back(designator.index.get());
+        }
+        for (const auto& argument : expression->arguments) pending.push_back(argument.get());
+        pending.push_back(expression->third.get());
+        const bool member = expression->kind == Expr::Kind::Binary &&
+            (expression->text == "member" || expression->text == "pointer_member");
+        if (!member) pending.push_back(expression->right.get());
+        pending.push_back(expression->left.get());
+    }
+}
+
+bool has_attribute(const std::vector<Attribute>& attributes, std::string_view name) {
+    return std::any_of(attributes.begin(), attributes.end(),
+        [&](const Attribute& attribute) { return attribute.name == name; });
+}
+
+bool fallthrough_statement(const Statement& statement) {
+    return statement.kind == Statement::Kind::Empty && has_attribute(statement.attributes, "fallthrough");
+}
+
+// The role of a function whose signature its role fixes: a procedural
+// macro, a syntax expander, or a call checker.
+bool role_function(const FunctionDecl& function) {
+    return function.attribute("macro") || function.attribute("syntax_expander") ||
+        function.attribute("checker");
+}
+
+// A written literal that is not zero, such as the condition of `while (1)`.
+bool nonzero_literal(const Expr& expression) {
+    const auto* node = &expression;
+    while (node->kind == Expr::Kind::Parenthesized && node->left) node = node->left.get();
+    if (node->kind == Expr::Kind::Character) return decode_character_literal(node->text).value_or(0) != 0;
+    if (node->kind != Expr::Kind::Integer) return false;
+    const auto value = parse_integer_value(*node);
+    return value && value->integer != UInt128{};
+}
+
+// The source checks that read the written program before generic
+// instantiation: [[fallthrough]] placement, which is a constraint, and the
+// warnings about unused locals, parameters, and static functions and about
+// implicit fall-through.
+class SourceWarnings {
+public:
+    SourceWarnings(Program& program, Diagnostics& diagnostics)
+        : program_(program), diagnostics_(diagnostics) {}
+
+    void run() {
+        const bool unused_variables = diagnostics_.enabled(Warning::UnusedVariable);
+        const bool unused_functions = diagnostics_.enabled(Warning::UnusedFunction);
+        const bool names_needed = unused_variables || unused_functions ||
+            diagnostics_.enabled(Warning::UnusedParameter);
+        for (const auto& function : program_.functions) {
+            if (!function->body) continue;
+            function_ = function.get();
+            library_ = !program_.checker_library_unit.empty() &&
+                function->source_unit == program_.checker_library_unit;
+            switches(*function->body);
+            if (names_needed) names(*function);
+        }
+        if (unused_variables || unused_functions) file_scope_references();
+        if (unused_functions) static_functions();
+        if (unused_variables) static_objects();
+        report();
+    }
+
+private:
+    struct Report {
+        SourceLocation location;
+        Warning warning;
+        std::string message;
+        std::optional<std::pair<SourceLocation, std::string>> note;
+    };
+
+    void warn(SourceLocation location, Warning warning, std::string message,
+              std::optional<std::pair<SourceLocation, std::string>> note = {}) {
+        if (library_ || !diagnostics_.enabled(warning)) return;
+        reports_.push_back({location, warning, std::move(message), std::move(note)});
+    }
+
+    // In source order, so that the warnings of a unit read top to bottom.
+    void report() {
+        std::stable_sort(reports_.begin(), reports_.end(), [](const Report& left, const Report& right) {
+            const auto key = [](const SourceLocation& location) {
+                return std::tuple(location.file ? location.file->path.generic_string() : std::string(),
+                                  location.line, location.column);
+            };
+            return key(left.location) < key(right.location);
+        });
+        for (const auto& item : reports_) {
+            diagnostics_.warning(item.warning, item.location, item.message);
+            if (item.note) diagnostics_.note(item.note->first, item.note->second);
+        }
+    }
+
+    // --- Fall-through ---
+
+    enum class Exit { Falls, Jumps, Intentional };
+    struct Completion {
+        Exit exit{Exit::Falls};
+        // The statement that may complete normally.
+        const Statement* falls{};
+    };
+
+    // Whether a break in `statement` leaves the loop or switch that owns it.
+    static bool breaks(const Statement& statement) {
+        if (statement.kind == Statement::Kind::Break) return true;
+        if (statement.kind == Statement::Kind::While || statement.kind == Statement::Kind::DoWhile ||
+            statement.kind == Statement::Kind::For || statement.kind == Statement::Kind::Switch)
+            return false;
+        for (const auto& child : statement.statements)
+            if (breaks(*child)) return true;
+        return (statement.first && breaks(*statement.first)) ||
+            (statement.second && breaks(*statement.second));
+    }
+
+    bool noreturn_call(const Expr& expression) {
+        const auto* call = &expression;
+        while (call->kind == Expr::Kind::Parenthesized && call->left) call = call->left.get();
+        if (call->kind != Expr::Kind::Call || !call->left || call->left->kind != Expr::Kind::Name)
+            return false;
+        if (call->left->text == "$::unreachable" || call->left->text == "$::trap") return true;
+        const auto* callee = resolve_function(program_, function_, *call->left,
+            [](const FunctionDecl&) { return true; });
+        return callee && function_entity_attribute(program_, *callee, "noreturn");
+    }
+
+    // How control leaves the last statement before a case label. The
+    // fallthrough statements it ends in are valid.
+    Completion completion(const Statement& statement) {
+        switch (statement.kind) {
+        case Statement::Kind::Break: case Statement::Kind::Continue:
+        case Statement::Kind::Return: case Statement::Kind::Goto:
+            return {Exit::Jumps, &statement};
+        case Statement::Kind::Empty:
+            if (fallthrough_statement(statement)) {
+                valid_fallthroughs_.insert(&statement);
+                return {Exit::Intentional, &statement};
+            }
+            return {Exit::Falls, &statement};
+        case Statement::Kind::Expression:
+            if (statement.expression && noreturn_call(*statement.expression))
+                return {Exit::Jumps, &statement};
+            return {Exit::Falls, &statement};
+        case Statement::Kind::Compound:
+            if (statement.statements.empty()) return {Exit::Falls, &statement};
+            return completion(*statement.statements.back());
+        case Statement::Kind::Label: case Statement::Kind::Case: case Statement::Kind::Default:
+            if (!statement.first) return {Exit::Falls, &statement};
+            return completion(*statement.first);
+        case Statement::Kind::If: {
+            if (!statement.first) return {Exit::Falls, &statement};
+            if (!statement.second) {
+                completion(*statement.first);
+                return {Exit::Falls, &statement};
+            }
+            const auto yes = completion(*statement.first);
+            const auto no = completion(*statement.second);
+            if (yes.exit == Exit::Falls) return yes;
+            if (no.exit == Exit::Falls) return no;
+            return {yes.exit == Exit::Intentional || no.exit == Exit::Intentional
+                        ? Exit::Intentional : Exit::Jumps, &statement};
+        }
+        case Statement::Kind::While: case Statement::Kind::DoWhile:
+            if (statement.condition && nonzero_literal(*statement.condition) &&
+                !(statement.first && breaks(*statement.first)))
+                return {Exit::Jumps, &statement};
+            return {Exit::Falls, &statement};
+        case Statement::Kind::For:
+            if ((!statement.condition || nonzero_literal(*statement.condition)) &&
+                !(statement.second && breaks(*statement.second)))
+                return {Exit::Jumps, &statement};
+            return {Exit::Falls, &statement};
+        default:
+            return {Exit::Falls, &statement};
+        }
+    }
+
+    void switches(const Statement& statement) {
+        for (const auto& child : statement.statements) switches(*child);
+        if (statement.first) switches(*statement.first);
+        if (statement.second) switches(*statement.second);
+        if (fallthrough_statement(statement)) fallthroughs_.push_back(&statement);
+        if (statement.kind == Statement::Kind::Switch && statement.first &&
+            statement.first->kind == Statement::Kind::Compound) {
+            const auto& body = statement.first->statements;
+            bool labeled = false;
+            for (std::size_t index = 0; index < body.size(); ++index) {
+                const auto& entry = *body[index];
+                const bool label = entry.kind == Statement::Kind::Case ||
+                    entry.kind == Statement::Kind::Default;
+                if (!label) continue;
+                if (index > 0) {
+                    const auto previous = completion(*body[index - 1]);
+                    if (labeled && previous.exit == Exit::Falls)
+                        warn(previous.falls->location, Warning::ImplicitFallthrough,
+                             "this statement may fall through",
+                             std::pair(entry.location, std::string("here")));
+                }
+                labeled = true;
+            }
+        }
+        if (&statement == function_->body.get()) {
+            for (const auto* fallthrough : fallthroughs_) {
+                if (valid_fallthroughs_.contains(fallthrough)) continue;
+                const auto attribute = std::find_if(fallthrough->attributes.begin(),
+                    fallthrough->attributes.end(),
+                    [](const Attribute& entry) { return entry.name == "fallthrough"; });
+                diagnostics_.error(attribute->location,
+                    "a fallthrough statement must precede a case or default label of its switch");
+            }
+            fallthroughs_.clear();
+            valid_fallthroughs_.clear();
+        }
+    }
+
+    // --- Unused names ---
+
+    struct Local {
+        NameKey key;
+        SourceLocation location;
+        std::string name;
+        bool parameter{};
+        bool exempt{};
+        bool used{};
+    };
+
+    void declare(Local local) {
+        scopes_.back().push_back(locals_.size());
+        locals_.push_back(std::move(local));
+    }
+
+    // Marks the innermost local that `use` names, or else records the
+    // names it may give a function.
+    void use(const Expr& expression) {
+        if (expression.kind != Expr::Kind::Name || expression.text.starts_with("$::") ||
+            (expression.name_context && expression.name_context->label_address)) return;
+        const auto key = name_key(expression);
+        for (auto scope = scopes_.rbegin(); scope != scopes_.rend(); ++scope)
+            for (auto index = scope->rbegin(); index != scope->rend(); ++index)
+                if (locals_[*index].key == key) {
+                    locals_[*index].used = true;
+                    return;
+                }
+        reference(expression, function_->source_namespace, function_->imports, function_->source_unit);
+    }
+
+    void reference(const Expr& expression, std::string_view name_space,
+                   const std::vector<std::string>& imports, const std::string& unit) {
+        const NameUse name(expression);
+        const auto fresh = token_origin(expression.location).fresh;
+        for (auto& candidate : namespace_candidates(name, name_space, imports))
+            referenced_.insert({unit, std::move(candidate), fresh.get()});
+    }
+
+    void expressions(const Expr* root) {
+        visit_source_expressions(root, [&](const Expr& expression) { use(expression); });
+    }
+
+    // The bound expressions of an array or vector type, such as a VLA
+    // parameter's bound naming an earlier parameter.
+    void type_expressions(const TypePtr& type) {
+        unsigned depth = 0;
+        for (auto* current = type.get(); current && depth < 64; ++depth,
+             current = current->element ? current->element.get() : current->pointee.get()) {
+            expressions(current->array_bound.get());
+            expressions(current->vector_bound.get());
+        }
+    }
+
+    void close_scope() {
+        for (const auto index : scopes_.back()) {
+            const auto& local = locals_[index];
+            if (local.used || local.exempt) continue;
+            if (local.parameter)
+                warn(local.location, Warning::UnusedParameter, "unused parameter '" + local.name + "'");
+            else
+                warn(local.location, Warning::UnusedVariable, "unused variable '" + local.name + "'");
+        }
+        scopes_.pop_back();
+    }
+
+    void statement(const Statement& node) {
+        const bool scoped = node.kind == Statement::Kind::Compound || node.kind == Statement::Kind::For;
+        if (scoped) scopes_.emplace_back();
+        if (node.kind == Statement::Kind::For && node.first) statement(*node.first);
+        if (node.declaration) {
+            const auto& declaration = *node.declaration;
+            declare({name_key(declaration), declaration.location, declaration.name, false,
+                     declaration.name.starts_with('$') ||
+                         has_attribute(declaration.attributes, "maybe_unused")});
+            expressions(declaration.dynamic_array_bound.get());
+            expressions(declaration.initializer.get());
+            for (const auto& attribute : declaration.attributes)
+                expressions(attribute.expression_argument.get());
+            type_expressions(declaration.type);
+        }
+        expressions(node.expression.get());
+        expressions(node.condition.get());
+        for (const auto& increment : node.increments) expressions(increment.get());
+        for (const auto& child : node.statements) statement(*child);
+        if (node.first && node.kind != Statement::Kind::For) statement(*node.first);
+        if (node.second) statement(*node.second);
+        if (scoped) close_scope();
+    }
+
+    void names(const FunctionDecl& function) {
+        locals_.clear();
+        scopes_.assign(1, {});
+        // A role fixes its function's parameters, and a naked function
+        // reads its parameters' locations rather than their names.
+        const bool fixed = role_function(function) || function.attribute("naked");
+        for (const auto& parameter : function.parameters) {
+            declare({name_key(parameter), parameter.location, parameter.name, true,
+                     fixed || parameter.unnamed || parameter.maybe_unused ||
+                         parameter.name.starts_with('$')});
+            type_expressions(parameter.declared_array_type);
+        }
+        for (const auto& attribute : function.attributes) {
+            for (const auto& binding : attribute.variadic_bindings)
+                declare({name_key(binding), binding.location, binding.name, false, true});
+            expressions(attribute.expression_argument.get());
+        }
+        statement(*function.body);
+        close_scope();
+    }
+
+    // Every name outside function bodies that may refer to a function: in
+    // object, enumerator, and assertion initializers and in attributes.
+    void file_scope_references() {
+        for (const auto& object : program_.objects) {
+            const auto name_space = namespace_prefix(object->name);
+            visit_source_expressions(object->initializer.get(), [&](const Expr& expression) {
+                if (expression.kind == Expr::Kind::Name)
+                    reference(expression, name_space, {}, object->source_unit);
+            });
+        }
+        const auto anywhere = [&](const Expr* root) {
+            visit_source_expressions(root, [&](const Expr& expression) {
+                if (expression.kind != Expr::Kind::Name || !expression.location.file) return;
+                reference(expression, {}, {}, expression.location.file->source_unit_at(expression.location.line));
+            });
+        };
+        for (const auto& enumeration : program_.enumerations)
+            for (const auto& enumerator : enumeration.enumerators) anywhere(enumerator.initializer.get());
+        for (const auto& assertion : program_.static_assertions) anywhere(assertion.condition.get());
+        for (const auto& function : program_.functions) {
+            for (const auto& assertion : function->deferred_static_assertions)
+                anywhere(assertion.condition.get());
+            for (const auto& attribute : function->attributes) anywhere(attribute.expression_argument.get());
+        }
+        // An alias names the link name of the definition it aliases.
+        const auto aliases = [&](const std::vector<Attribute>& attributes) {
+            for (const auto& attribute : attributes)
+                if (attribute.name == "alias" && attribute.arguments.size() == 1)
+                    if (auto target = decode_string_literal(attribute.arguments.front()))
+                        alias_targets_.insert(std::move(*target));
+        };
+        for (const auto& function : program_.functions) aliases(function->attributes);
+        for (const auto& object : program_.objects) aliases(object->attributes);
+    }
+
+    // Whether an alias names the definition with `name` and `attributes`.
+    bool aliased(const std::string& name, const std::vector<Attribute>& attributes) const {
+        for (const auto& attribute : attributes)
+            if (attribute.name == "link_name" && attribute.arguments.size() == 1)
+                return alias_targets_.contains(decode_string_literal(attribute.arguments.front()).value_or(""));
+        return alias_targets_.contains(name);
+    }
+
+    void static_functions() {
+        for (const auto& function : program_.functions) {
+            if (function->linkage != Linkage::Static || !function->body || function->inline_hint ||
+                !function->generic_parameters.empty() || function->generic_instance ||
+                evaluation_only(*function) || role_function(*function) || function->name.starts_with('$') ||
+                function->source_unit == program_.checker_library_unit)
+                continue;
+            const auto exempt = [&](const FunctionDecl& declaration) {
+                for (const auto name : {"maybe_unused", "used", "retain", "constructor", "destructor",
+                                        "operator", "alias"})
+                    if (declaration.attribute(name)) return true;
+                return false;
+            };
+            if (std::any_of(program_.functions.begin(), program_.functions.end(), [&](const auto& other) {
+                    return same_function_entity(*function, *other) && exempt(*other);
+                })) continue;
+            if (referenced_.contains({function->source_unit, function->name, function->fresh.get()}) ||
+                aliased(function->name, function->attributes))
+                continue;
+            library_ = false;
+            warn(function->name_location.valid() ? function->name_location : function->location,
+                 Warning::UnusedFunction, "'" + function->name + "' defined but not used");
+        }
+    }
+
+    // Static objects at file or namespace scope. A const one counts only in
+    // the input file itself, not in a header it includes, as in GCC.
+    void static_objects() {
+        for (const auto& object : program_.objects) {
+            if (object->linkage != Linkage::Static || object->literal || object->compound_literal ||
+                object->name.starts_with('$') || object->lexical_function ||
+                object->source_unit == program_.checker_library_unit)
+                continue;
+            if (std::any_of(program_.objects.begin(), program_.objects.end(), [&](const auto& other) {
+                    if (other->name != object->name || other->source_unit != object->source_unit) return false;
+                    for (const auto name : {"maybe_unused", "used", "retain", "alias", "address"})
+                        if (has_attribute(other->attributes, name)) return true;
+                    return false;
+                })) continue;
+            if (referenced_.contains({object->source_unit, object->name, object->fresh.get()}) ||
+                aliased(object->name, object->attributes))
+                continue;
+            auto element = object->type;
+            while (element && element->kind == Type::Kind::Array) element = element->element;
+            if (element && element->is_const && object->location.file) {
+                const auto written = object->location.file->logical_location(object->location);
+                if (written.file && written.file->path != object->location.file->path) continue;
+            }
+            library_ = false;
+            warn(object->name_location.valid() ? object->name_location : object->location,
+                 Warning::UnusedVariable, "'" + object->name + "' defined but not used");
+        }
+    }
+
+    Program& program_;
+    Diagnostics& diagnostics_;
+    const FunctionDecl* function_{};
+    bool library_{};
+    std::vector<Report> reports_;
+    std::vector<const Statement*> fallthroughs_;
+    std::unordered_set<const Statement*> valid_fallthroughs_;
+    std::vector<Local> locals_;
+    std::vector<std::vector<std::size_t>> scopes_;
+    std::set<std::tuple<std::string, std::string, const FreshIdentifier*>> referenced_;
+    std::set<std::string> alias_targets_;
+};
+
+// The [[checker]] function that a check attribute of `function` names: a
+// function visible where `function` is declared, or a checker shipped with
+// the compiler, which $::format::NAME names.
+FunctionDecl* checker_function(Program& program, const FunctionDecl& function,
+                               const Attribute& attribute) {
+    if (attribute.arguments.size() != 1) return nullptr;
+    const auto& spelling = attribute.arguments.front();
+    if (spelling.starts_with("$::")) {
+        const auto* entry = find_core_expression_builtin(spelling);
+        if (!entry || entry->kind != CoreBuiltinKind::Checker || program.checker_library_unit.empty())
+            return nullptr;
+        const auto name = std::string_view(spelling).substr(3);
+        for (const auto& candidate : program.functions)
+            if (candidate->source_unit == program.checker_library_unit && candidate->name == name &&
+                candidate->attribute("checker")) return candidate.get();
+        return nullptr;
+    }
+    return resolve_function(program, &function, NameUse(spelling, attribute.location),
+        [](const FunctionDecl& candidate) { return candidate.attribute("checker") != nullptr; });
+}
+
+// Each check attribute must name a [[checker]] function. The driver loads
+// the shipped checkers only while -Wformat, which controls them, is on.
+bool validate_check_attributes(Program& program, Diagnostics& diagnostics) {
+    const auto errors = diagnostics.errors();
+    for (const auto& function : program.functions)
+        for (const auto& attribute : function->attributes) {
+            if (attribute.name != "check" || attribute.arguments.size() != 1 ||
+                checker_function(program, *function, attribute))
+                continue;
+            const auto* shipped = find_core_expression_builtin(attribute.arguments.front());
+            if (shipped && shipped->kind == CoreBuiltinKind::Checker && program.checker_library_unit.empty())
+                continue;
+            diagnostics.error(attribute.location, "check requires the name of a [[checker]] function; '" +
+                attribute.arguments.front() + "' is not one");
+        }
+    return diagnostics.errors() == errors;
+}
+
+// The warning that controls a checker's diagnostics, if it names one.
+std::optional<Warning> checker_warning(const FunctionDecl& checker) {
+    const auto* attribute = checker.attribute("checker");
+    if (!attribute || attribute->arguments.size() != 1) return std::nullopt;
+    const auto name = decode_string_literal(attribute->arguments.front());
+    return name ? find_warning(*name) : std::nullopt;
+}
+
+// One evaluator per [[checker]] function for a whole program, suspended
+// between the calls it checks, so that each function the checker calls is
+// prepared and validated once.
+using CheckerEvaluators = std::vector<std::pair<const FunctionDecl*, std::unique_ptr<Evaluator>>>;
+
+// The warnings that need the types of expressions: -Wsign-compare, the
+// -Wconversion family, and the checkers that check attributes name. A
+// function is read after source validation and before translation-time
+// calls are folded, so a constant is one the source writes and each call
+// keeps its arguments.
+class TypedWarnings {
+public:
+    TypedWarnings(Program& program, Diagnostics& diagnostics, const FunctionDecl& function,
+                  CheckerEvaluators& checkers)
+        : program_(program), diagnostics_(diagnostics), function_(function), checkers_(checkers) {}
+
+    // Whether a warning or a checker that may run needs the walk.
+    static bool wanted(Program& program, const Diagnostics& diagnostics) {
+        if (diagnostics.enabled(Warning::SignCompare) || conversions(diagnostics)) return true;
+        for (const auto& function : program.functions)
+            for (const auto& attribute : function->attributes) {
+                if (attribute.name != "check") continue;
+                const auto* checker = checker_function(program, *function, attribute);
+                const auto warning = checker ? checker_warning(*checker) : std::nullopt;
+                if (checker && (!warning || diagnostics.enabled(*warning))) return true;
+            }
+        return false;
+    }
+
+    EvaluationTask<void> run_async() {
+        if (!function_.body || !function_.generic_parameters.empty()) co_return;
+        library_ = !program_.checker_library_unit.empty() &&
+            function_.source_unit == program_.checker_library_unit;
+        for (const auto& parameter : function_.parameters)
+            types_.local_types.emplace_back(name_key(parameter), parameter.type);
+        for (const auto& attribute : function_.attributes)
+            for (const auto& binding : attribute.variadic_bindings)
+                types_.local_types.emplace_back(name_key(binding), binding.type);
+        co_await statement_async(*function_.body);
+    }
+
+private:
+    static bool conversions(const Diagnostics& diagnostics) {
+        return diagnostics.enabled(Warning::Conversion) || diagnostics.enabled(Warning::SignConversion) ||
+            diagnostics.enabled(Warning::FloatConversion);
+    }
+
+    TypePtr type(const Expr& expression, bool decay = true) {
+        return infer_generic_actual(expression, &function_, program_, types_, decay, &memo_);
+    }
+
+    void forget() { memo_ = {}; }
+
+    void warn(Warning warning, SourceLocation location, const std::string& message) {
+        if (!library_) diagnostics_.warning(warning, location, message);
+    }
+
+    bool local(const Expr& name) const {
+        const auto key = name_key(name);
+        return std::any_of(types_.local_types.begin(), types_.local_types.end(),
+            [&](const auto& entry) { return entry.first == key; });
+    }
+
+    // --- Constants ---
+
+    // A constant the source writes: literals, enumerators, and layout
+    // queries combined by operators and casts, never a call, an object, or
+    // a local.
+    bool written_constant(const Expr& expression) {
+        switch (expression.kind) {
+        case Expr::Kind::Integer: case Expr::Kind::Character: case Expr::Kind::Floating:
+        case Expr::Kind::Sizeof: case Expr::Kind::Alignof: case Expr::Kind::Offsetof:
+            return true;
+        case Expr::Kind::Parenthesized: case Expr::Kind::Cast:
+            return expression.left && written_constant(*expression.left);
+        case Expr::Kind::Unary:
+            return expression.left && (expression.text == "-" || expression.text == "+" ||
+                expression.text == "~" || expression.text == "!") && written_constant(*expression.left);
+        case Expr::Kind::Binary:
+            return expression.left && expression.right && expression.text != "index" &&
+                expression.text != "member" && expression.text != "pointer_member" &&
+                written_constant(*expression.left) && written_constant(*expression.right);
+        case Expr::Kind::Conditional:
+            return expression.left && expression.right && expression.third &&
+                written_constant(*expression.left) && written_constant(*expression.right) &&
+                written_constant(*expression.third);
+        case Expr::Kind::Name:
+            return !expression.text.starts_with("$::") && !local(expression) &&
+                !resolve_object(program_, &function_, expression) &&
+                !resolve_function(program_, &function_, expression,
+                    [](const FunctionDecl&) { return true; });
+        default:
+            return false;
+        }
+    }
+
+    EvaluationTask<std::optional<EvalValue>> constant_async(const Expr& expression) {
+        if (!written_constant(expression)) co_return std::nullopt;
+        std::ostringstream sink;
+        Diagnostics quiet(sink);
+        Evaluator evaluator(program_, quiet, &function_, function_.source_namespace);
+        evaluator.resource_reporting(Evaluator::ResourceReporting::Speculative);
+        co_return co_await evaluator.required_scalar_with_types_async(expression, types_.local_types);
+    }
+
+    // --- Arithmetic types ---
+
+    struct Arithmetic {
+        bool floating{};
+        IntegerType integer;
+        floating::Format format{};
+        unsigned rank{};
+        unsigned precision{};
+    };
+
+    std::optional<Arithmetic> arithmetic(const TypePtr& type) const {
+        if (!type || type->kind != Type::Kind::Builtin) return std::nullopt;
+        auto builtin = type->builtin;
+        if (builtin == BuiltinType::Fptr)
+            builtin = program_.address_bits == 32 ? BuiltinType::F32 : BuiltinType::F64;
+        switch (builtin) {
+        case BuiltinType::Void: case BuiltinType::Label: return std::nullopt;
+        case BuiltinType::F32: return Arithmetic{true, {}, floating::Format::Binary32, 1, 24};
+        case BuiltinType::F64: return Arithmetic{true, {}, floating::Format::Binary64, 2, 53};
+        case BuiltinType::F80: return Arithmetic{true, {}, floating::Format::Extended80, 3, 64};
+        case BuiltinType::F128: return Arithmetic{true, {}, floating::Format::Binary128, 4, 113};
+        default: return Arithmetic{false, evaluation_integer_type(type, program_.address_bits)};
+        }
+    }
+
+    // Whether every value of `source` is a value of `destination`.
+    static bool holds(IntegerType destination, IntegerType source) {
+        if (source.is_bool) return true;
+        if (destination.is_signed == source.is_signed) return destination.bits >= source.bits;
+        return destination.is_signed && destination.bits > source.bits;
+    }
+
+    // The warning, if any, for converting a value of type `source` to
+    // `target` when nothing is known about the value.
+    static std::optional<Warning> unsafe_type(const Arithmetic& source, const Arithmetic& target) {
+        if (!source.floating && source.integer.is_bool) return std::nullopt;
+        if (!source.floating && !target.floating) {
+            if (holds(target.integer, source.integer)) return std::nullopt;
+            return target.integer.bits < source.integer.bits ? Warning::Conversion : Warning::SignConversion;
+        }
+        if (!source.floating)
+            return source.integer.bits - (source.integer.is_signed ? 1U : 0U) <= target.precision
+                ? std::nullopt : std::optional(Warning::Conversion);
+        if (target.floating && target.rank >= source.rank) return std::nullopt;
+        return Warning::FloatConversion;
+    }
+
+    // Whether converting the constant `value` to `target` keeps it.
+    bool constant_fits(const EvalValue& value, const Arithmetic& target) {
+        const auto source = arithmetic(value.type);
+        if (!source) return false;
+        if (!source->floating && !target.floating) {
+            const auto bits = mask_to(value.integer, source->integer.bits);
+            const auto converted = convert_integer(bits, source->integer, target.integer);
+            return convert_integer(converted, target.integer, source->integer) == bits &&
+                integer_negative(converted, target.integer) == integer_negative(bits, source->integer);
+        }
+        floating::ExceptionSet raised{};
+        const auto inexact = floating::exception_set(floating::Exception::Inexact) |
+            floating::exception_set(floating::Exception::Overflow) |
+            floating::exception_set(floating::Exception::Underflow);
+        if (!source->floating) {
+            (void)floating::from_integer(mask_to(value.integer, source->integer.bits), source->integer.bits,
+                                         source->integer.is_signed, target.format, &raised);
+            return !(raised & inexact);
+        }
+        if (!value.floating) return false;
+        if (target.floating) {
+            (void)floating::convert(*value.floating, target.format, program_.evaluation_layout.nan_encoding, &raised);
+            return !(raised & inexact);
+        }
+        return floating::to_integer(*value.floating, target.integer.bits, target.integer.is_signed, &raised) &&
+            !(raised & inexact);
+    }
+
+    // The warning, if any, for converting `expression` to `target`, as GCC's
+    // conversion_warning decides: a comparison holds only 0 and 1; `a & k`
+    // with a constant `k` that fits holds no more than `k`; `|`, `^`, and
+    // `?:` are as safe as their operands; and arithmetic whose operands all
+    // fit, such as the sum of two u8 values stored in a u8, is not reported
+    // (GCC's -Warith-conversion, which Cross does not have).
+    EvaluationTask<std::optional<Warning>> unsafe_async(const Expr& expression, const Arithmetic& target) {
+        const auto* node = &expression;
+        while (node->kind == Expr::Kind::Parenthesized && node->left) node = node->left.get();
+        const auto& operation = node->text;
+        if ((node->kind == Expr::Kind::Unary && operation == "!") ||
+            (node->kind == Expr::Kind::Binary && (operation == "<" || operation == "<=" || operation == ">" ||
+             operation == ">=" || operation == "==" || operation == "!=" || operation == "&&" ||
+             operation == "||")))
+            co_return std::nullopt;
+        if (const auto constant = co_await constant_async(*node)) {
+            if (constant_fits(*constant, target)) co_return std::nullopt;
+            const auto source = arithmetic(constant->type);
+            co_return source ? unsafe_type(*source, target).value_or(Warning::Conversion) : Warning::Conversion;
+        }
+        if (node->kind == Expr::Kind::Binary && node->left && node->right &&
+            (operation == "&" || operation == "|" || operation == "^")) {
+            if (operation == "&")
+                for (const auto* operand : {node->left.get(), node->right.get()})
+                    if (const auto constant = co_await constant_async(*operand)) {
+                        const auto kind = arithmetic(constant->type);
+                        if (kind && !kind->floating && !integer_negative(constant->integer, kind->integer) &&
+                            constant_fits(*constant, target)) co_return std::nullopt;
+                    }
+            if (const auto left = co_await unsafe_async(*node->left, target)) co_return left;
+            co_return co_await unsafe_async(*node->right, target);
+        }
+        if (node->kind == Expr::Kind::Conditional && node->right && node->third) {
+            if (const auto yes = co_await unsafe_async(*node->right, target)) co_return yes;
+            co_return co_await unsafe_async(*node->third, target);
+        }
+        const auto source = arithmetic(type(*node));
+        if (!source) co_return std::nullopt;
+        const auto kind = unsafe_type(*source, target);
+        if (!kind) co_return std::nullopt;
+        std::vector<const Expr*> operands;
+        if (node->kind == Expr::Kind::Binary && node->left && node->right &&
+            (operation == "+" || operation == "-" || operation == "*" || operation == "/" || operation == "%"))
+            operands = {node->left.get(), node->right.get()};
+        else if (node->kind == Expr::Kind::Binary && node->left && (operation == "<<" || operation == ">>"))
+            operands = {node->left.get()};
+        else if (node->kind == Expr::Kind::Unary && node->left &&
+                 (operation == "-" || operation == "~" || operation == "++" || operation == "--" ||
+                  operation == "post++" || operation == "post--"))
+            operands = {node->left.get()};
+        if (operands.empty()) co_return kind;
+        for (const auto* operand : operands) {
+            if (const auto constant = co_await constant_async(*operand)) {
+                if (!constant_fits(*constant, target)) co_return kind;
+                continue;
+            }
+            const auto own = arithmetic(type(*operand));
+            if (!own || unsafe_type(*own, target)) co_return kind;
+        }
+        co_return std::nullopt;
+    }
+
+    // --- -Wconversion, -Wsign-conversion, -Wfloat-conversion ---
+
+    EvaluationTask<void> conversion_async(const Expr& value, const TypePtr& destination) {
+        if (!conversions(diagnostics_) || value.kind == Expr::Kind::AggregateInitializer) co_return;
+        const auto source_type = type(value);
+        const auto source = arithmetic(source_type);
+        const auto target = arithmetic(destination);
+        if (!source || !target || (!target->floating && target->integer.is_bool) ||
+            (!source->floating && source->integer.is_bool) || !unsafe_type(*source, *target)) co_return;
+        const auto from = type_name(callable_parameter_type(source_type, ParameterMode::In));
+        const auto to = type_name(callable_parameter_type(destination, ParameterMode::In));
+        if (const auto constant = co_await constant_async(value)) {
+            constant_conversion(*constant, *source, *target, value.location, from, to);
+            co_return;
+        }
+        const auto kind = co_await unsafe_async(value, *target);
+        if (!kind) co_return;
+        if (*kind == Warning::SignConversion)
+            warn(*kind, value.location, "conversion to '" + to + "' from '" + from +
+                 "' may change the sign of the result");
+        else
+            warn(*kind, value.location, "conversion from '" + from + "' to '" + to + "' may change value");
+    }
+
+    void constant_conversion(const EvalValue& constant, const Arithmetic& source, const Arithmetic& target,
+                             SourceLocation location, const std::string& from, const std::string& to) {
+        const auto changed = [&](Warning warning, const std::string& before, const std::string& after) {
+            warn(warning, location, "conversion from '" + from + "' to '" + to + "' changes value from '" +
+                before + "' to '" + after + "'");
+        };
+        const auto decimal = [](UInt128 value, IntegerType type) {
+            if (!integer_negative(value, type)) return to_decimal(mask_to(value, type.bits));
+            return "-" + to_decimal(mask_to(negate(value), type.bits));
+        };
+        if (!source.floating && !target.floating) {
+            const auto value = mask_to(constant.integer, source.integer.bits);
+            const auto converted = convert_integer(value, source.integer, target.integer);
+            if (convert_integer(converted, target.integer, source.integer) == value &&
+                integer_negative(converted, target.integer) == integer_negative(value, source.integer))
+                return;
+            // Only the sign changes when the magnitude fits the destination.
+            const bool sign = integer_negative(value, source.integer) && !target.integer.is_signed &&
+                convert_integer(convert_integer(value, source.integer, IntegerType{target.integer.bits, true}),
+                                IntegerType{target.integer.bits, true}, source.integer) == value;
+            changed(sign ? Warning::SignConversion : Warning::Conversion,
+                    decimal(value, source.integer), decimal(converted, target.integer));
+            return;
+        }
+        floating::ExceptionSet raised{};
+        if (!source.floating) {
+            (void)floating::from_integer(mask_to(constant.integer, source.integer.bits), source.integer.bits,
+                                         source.integer.is_signed, target.format, &raised);
+            if (raised & floating::exception_set(floating::Exception::Inexact))
+                warn(Warning::Conversion, location, "conversion from '" + from + "' to '" + to +
+                    "' changes the value of a constant");
+            return;
+        }
+        if (!constant.floating) return;
+        bool exact = true;
+        if (target.floating) {
+            (void)floating::convert(*constant.floating, target.format, program_.evaluation_layout.nan_encoding,
+                                    &raised);
+            exact = !(raised & (floating::exception_set(floating::Exception::Inexact) |
+                                floating::exception_set(floating::Exception::Overflow) |
+                                floating::exception_set(floating::Exception::Underflow)));
+        } else {
+            const auto integer = floating::to_integer(*constant.floating, target.integer.bits,
+                                                      target.integer.is_signed, &raised);
+            exact = integer && !(raised & floating::exception_set(floating::Exception::Inexact));
+        }
+        if (!exact)
+            warn(Warning::FloatConversion, location, "conversion from '" + from + "' to '" + to +
+                "' changes the value of a constant");
+    }
+
+    // --- -Wsign-compare ---
+
+    // Whether `expression` is never negative: a constant that is not, a
+    // narrower unsigned value, or a bitwise AND with one.
+    EvaluationTask<bool> nonnegative_async(const Expr& expression) {
+        const auto* node = &expression;
+        while (node->kind == Expr::Kind::Parenthesized && node->left) node = node->left.get();
+        if (const auto constant = co_await constant_async(*node)) {
+            const auto kind = arithmetic(constant->type);
+            co_return kind && !kind->floating && !integer_negative(constant->integer, kind->integer);
+        }
+        const auto own = arithmetic(type(*node));
+        if (own && !own->floating && !own->integer.is_signed) co_return true;
+        if (node->kind == Expr::Kind::Cast && node->left) {
+            const auto inner = arithmetic(type(*node->left));
+            if (own && inner && !inner->floating && holds(own->integer, inner->integer))
+                co_return co_await nonnegative_async(*node->left);
+            co_return false;
+        }
+        if (node->kind == Expr::Kind::Binary && node->left && node->right) {
+            if (node->text == "&")
+                co_return (co_await nonnegative_async(*node->left)) || (co_await nonnegative_async(*node->right));
+            if (node->text == ">>" || node->text == "%" || node->text == "/")
+                co_return (co_await nonnegative_async(*node->left)) &&
+                    (node->text == ">>" || co_await nonnegative_async(*node->right));
+        }
+        co_return false;
+    }
+
+    EvaluationTask<void> comparison_async(const Expr& node) {
+        if (!diagnostics_.enabled(Warning::SignCompare) || !node.left || !node.right) co_return;
+        const auto& operation = node.text;
+        if (operation != "<" && operation != "<=" && operation != ">" && operation != ">=" &&
+            operation != "==" && operation != "!=") co_return;
+        const auto left_type = type(*node.left);
+        const auto right_type = type(*node.right);
+        const auto left = arithmetic(left_type);
+        const auto right = arithmetic(right_type);
+        if (!left || !right || left->floating || right->floating) co_return;
+        const auto common = common_integer_type(left->integer, right->integer);
+        const bool left_signed = left->integer.is_signed && !left->integer.is_bool;
+        const bool right_signed = right->integer.is_signed && !right->integer.is_bool;
+        if (common.is_signed || left_signed == right_signed) co_return;
+        const auto& signed_operand = left_signed ? *node.left : *node.right;
+        const auto& unsigned_operand = left_signed ? *node.right : *node.left;
+        if (co_await nonnegative_async(signed_operand)) co_return;
+        // As in GCC, an equality with an unsigned constant that the signed
+        // version of the common type holds compares values.
+        if (operation == "==" || operation == "!=")
+            if (const auto constant = co_await constant_async(unsigned_operand)) {
+                const auto kind = arithmetic(constant->type);
+                if (kind && !kind->floating &&
+                    !bit(mask_to(constant->integer, kind->integer.bits), common.bits - 1)) co_return;
+            }
+        warn(Warning::SignCompare, node.location, "comparison of integer expressions of different "
+            "signedness: '" + type_name(callable_parameter_type(left_type, ParameterMode::In)) + "' and '" +
+            type_name(callable_parameter_type(right_type, ParameterMode::In)) + "'");
+    }
+
+    // --- Call checkers ---
+
+    EvaluationTask<void> call_async(const Expr& call) {
+        auto signature = call.left && conversions(diagnostics_) ? type(*call.left) : nullptr;
+        if (signature && signature->kind == Type::Kind::Pointer) signature = signature->pointee;
+        const auto* callable = signature && signature->kind == Type::Kind::Function
+            ? signature->function.get() : nullptr;
+        if (callable) {
+            for (std::size_t index = 0; index < call.arguments.size() && index < callable->parameters.size();
+                 ++index)
+                if (callable->parameters[index].mode == ParameterMode::In)
+                    co_await conversion_async(*call.arguments[index], callable->parameters[index].type);
+        }
+        if (!call.left || call.left->kind != Expr::Kind::Name || call.left->text.starts_with("$::") ||
+            local(*call.left)) co_return;
+        const auto* callee = resolve_function(program_, &function_, *call.left,
+            [](const FunctionDecl&) { return true; });
+        if (!callee) co_return;
+        std::vector<FunctionDecl*> checkers;
+        for (const auto& declaration : program_.functions) {
+            if (!same_function_entity(*callee, *declaration)) continue;
+            for (const auto& attribute : declaration->attributes) {
+                if (attribute.name != "check") continue;
+                auto* checker = checker_function(program_, *declaration, attribute);
+                if (checker && std::find(checkers.begin(), checkers.end(), checker) == checkers.end())
+                    checkers.push_back(checker);
+            }
+        }
+        std::shared_ptr<CallSiteValue> site;
+        for (auto* checker : checkers) {
+            const auto warning = checker_warning(*checker);
+            if (warning && !diagnostics_.enabled(*warning)) continue;
+            if (!site) site = call_site(call, *callee);
+            co_await run_checker_async(*checker, site, warning);
+            if (program_.evaluation_resource_errors != resources_) co_return;
+        }
+    }
+
+    std::shared_ptr<CallSiteValue> call_site(const Expr& call, const FunctionDecl& callee) {
+        auto site = std::make_shared<CallSiteValue>();
+        site->location = call.location;
+        for (const auto& argument : call.arguments) {
+            site->argument_types.push_back(callable_parameter_type(type(*argument), ParameterMode::In));
+            site->argument_locations.push_back(argument->location);
+            const auto* literal = argument.get();
+            while ((literal->kind == Expr::Kind::Parenthesized || literal->kind == Expr::Kind::Cast) &&
+                   literal->left)
+                literal = literal->left.get();
+            std::optional<std::string> text;
+            if (literal->kind == Expr::Kind::String)
+                text = literal->string_value.empty() ? decode_string_literal(literal->text)
+                                                     : std::optional<std::string>(literal->string_value);
+            if (text) text->push_back('\0');
+            site->argument_strings.push_back(std::move(text));
+        }
+        for (const auto& parameter : callee.parameters)
+            site->parameter_types.push_back(callable_parameter_type(parameter.type, parameter.mode));
+        site->variadic = callee.variadic;
+        std::string abi;
+        if (const auto* attribute = function_entity_attribute(program_, callee, "abi");
+            attribute && attribute->arguments.size() == 1)
+            abi = decode_string_literal(attribute->arguments.front()).value_or("");
+        site->abi = program_.canonical_callable_abi
+            ? program_.canonical_callable_abi(abi).value_or(abi) : abi;
+        return site;
+    }
+
+    EvaluationTask<void> run_checker_async(const FunctionDecl& checker, std::shared_ptr<const CallSiteValue> site,
+                                           std::optional<Warning> warning) {
+        auto definition = checker.translation_context ? std::make_shared<SyntaxContext>(*checker.translation_context)
+                                                      : std::make_shared<SyntaxContext>();
+        definition->kind = SyntaxContext::Kind::DefinitionSite;
+        definition->definition = checker.location;
+        definition->invocation = site->location;
+        definition->name_space = checker.source_namespace;
+        definition->imports = checker.imports;
+        const auto found = std::find_if(checkers_.begin(), checkers_.end(),
+            [&](const auto& entry) { return entry.first == &checker; });
+        Evaluator* evaluator{};
+        if (found == checkers_.end()) {
+            checkers_.emplace_back(&checker, std::make_unique<Evaluator>(program_, diagnostics_, &checker,
+                checker.source_namespace, nullptr, nullptr, nullptr, definition, SyntaxParseCallback{},
+                definition));
+            evaluator = checkers_.back().second.get();
+            evaluator->check_call(warning);
+        } else {
+            evaluator = found->second.get();
+            evaluator->resume(definition);
+        }
+        EvalValue argument{UInt128{}, call_site_type()};
+        argument.call_site = site;
+        const auto location = site->location;
+        const auto errors = diagnostics_.errors();
+        if (!(co_await evaluator->call_values_async(checker, {argument}, location))) {
+            if (diagnostics_.errors() == errors) evaluator->diagnose(diagnostics_, location);
+            diagnostics_.note(checker.location, "while checking this call with the checker '" + checker.name + "'");
+        }
+        evaluator->suspend();
+    }
+
+    // --- Traversal ---
+
+    EvaluationTask<void> expression_async(const Expr& node) {
+        if (node.kind == Expr::Kind::Quote) co_return;
+        if (node.left) co_await expression_async(*node.left);
+        const bool member = node.kind == Expr::Kind::Binary &&
+            (node.text == "member" || node.text == "pointer_member");
+        if (node.right && !member) co_await expression_async(*node.right);
+        if (node.third) co_await expression_async(*node.third);
+        for (const auto& argument : node.arguments) co_await expression_async(*argument);
+        for (const auto& entry : node.initializer_entries)
+            if (entry.value) co_await expression_async(*entry.value);
+        if (node.kind == Expr::Kind::Binary) co_await comparison_async(node);
+        else if (node.kind == Expr::Kind::Assign && node.text == "=" && node.left && node.right)
+            co_await conversion_async(*node.right, type(*node.left, false));
+        else if (node.kind == Expr::Kind::Call) co_await call_async(node);
+    }
+
+    EvaluationTask<void> statement_async(const Statement& node) {
+        if (program_.evaluation_resource_errors != resources_) co_return;
+        const auto saved = types_.local_types.size();
+        const bool scoped = node.kind == Statement::Kind::Compound || node.kind == Statement::Kind::For;
+        if (node.kind == Statement::Kind::For && node.first) co_await statement_async(*node.first);
+        if (node.declaration) {
+            const auto& declaration = *node.declaration;
+            types_.local_types.emplace_back(name_key(declaration), declaration.type);
+            forget();
+            if (declaration.dynamic_array_bound) co_await expression_async(*declaration.dynamic_array_bound);
+            if (declaration.initializer) {
+                co_await expression_async(*declaration.initializer);
+                co_await conversion_async(*declaration.initializer, declaration.type);
+            }
+        }
+        if (node.expression) co_await expression_async(*node.expression);
+        if (node.kind == Statement::Kind::Return && node.expression && function_.return_type)
+            co_await conversion_async(*node.expression, function_.return_type);
+        if (node.condition) co_await expression_async(*node.condition);
+        for (const auto& increment : node.increments) co_await expression_async(*increment);
+        for (const auto& child : node.statements) co_await statement_async(*child);
+        if (node.first && node.kind != Statement::Kind::For) co_await statement_async(*node.first);
+        if (node.second) co_await statement_async(*node.second);
+        if (scoped) types_.local_types.resize(saved);
+        forget();
+    }
+
+    Program& program_;
+    Diagnostics& diagnostics_;
+    const FunctionDecl& function_;
+    CheckerEvaluators& checkers_;
+    std::uint64_t resources_{program_.evaluation_resource_errors};
+    bool library_{};
+    GenericExpansionState types_;
+    SourceTypeMemo memo_;
+};
+
 EvaluationTask<bool> expand_evaluation_impl_async(Program& program, Diagnostics& diagnostics,
                        bool opportunistic) {
     const auto epoch = program.evaluation_resource_errors;
     const auto stopped = [&] { return program.evaluation_resource_errors != epoch; };
+    const bool typed_warnings = TypedWarnings::wanted(program, diagnostics);
+    CheckerEvaluators checkers;
     // These functions disappear before runtime HIR declaration merging. Check
     // their source interfaces here, without assigning a physical call ABI.
     for (std::size_t i = 0; i < program.functions.size(); ++i) {
@@ -17596,9 +18857,14 @@ EvaluationTask<bool> expand_evaluation_impl_async(Program& program, Diagnostics&
             pending.push_back({node, Visit::Expressions});
             if (statement.first) pending.push_back({statement.first.get(), Visit::Enter});
         }
+        const auto errors_before_validation = diagnostics.errors();
         Evaluator source_validator(program, diagnostics, function, function->source_namespace);
         if (!(co_await source_validator.validate_source_body_async(*function))) source_validator.diagnose(function->location);
         if (stopped()) co_return false;
+        if (typed_warnings && diagnostics.errors() == errors_before_validation) {
+            co_await TypedWarnings(program, diagnostics, *function, checkers).run_async();
+            if (stopped()) co_return false;
+        }
     }
     if (diagnostics.errors() != 0) co_return false;
     for (const auto& function : program.functions) {
@@ -18602,6 +19868,9 @@ bool expand_semantics(Program& program, Diagnostics& diagnostics,
         return enumeration.carried && !defined.insert(enumeration.nominal_key()).second;
     });
     if (!validate_attribute_names(program, diagnostics)) return false;
+    if (!validate_check_attributes(program, diagnostics)) return false;
+    SourceWarnings(program, diagnostics).run();
+    if (diagnostics.errors() != 0) return false;
     if (!expand_generics(program, diagnostics, mangling, pointer_resolver,
                          program.canonical_callable_abi)) {
         if (diagnostics.errors() == 0) {

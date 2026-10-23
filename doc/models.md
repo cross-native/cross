@@ -130,11 +130,12 @@ once in an entry or block.
 ### Option properties
 
 Properties of `optimization` and `profile` entries whose names begin with
-`f.` or `m.` set the `-f` and `-m` options that `cc --print-options=all`
-lists ([invoke.md](invoke.md), [targets.md](targets.md)): `f.tree-ccp = true`
-means `-ftree-ccp`, and `m.red-zone = false` means `-mno-red-zone`. Models
-use canonical option names, not aliases such as `f.inline` for
-`f.inline-functions`.
+`f.`, `m.`, or `w.` set the `-f`, `-m`, and `-W` options that
+`cc --print-options=all` lists ([invoke.md](invoke.md),
+[targets.md](targets.md)): `f.tree-ccp = true` means `-ftree-ccp`,
+`m.red-zone = false` means `-mno-red-zone`, and `w.all = true` means
+`-Wall`. Models use canonical option names, not aliases such as `f.inline`
+for `f.inline-functions`. Presets cannot set warnings.
 
 A value must suit its option: `true` or `false` for an on/off option, an
 integer in the option's range, or one of the option's text values. An
@@ -297,6 +298,7 @@ abi "example-regs" {
 | `natural_alignment_limit` | integer | the target's | no |
 | `llvm_calling_convention` | text | `""` | no |
 | `gcc_calling_attribute` | text | `""` | no |
+| `type.NAME` | text | none | no |
 
 An entry also needs at least one `bank` and one `rule` block. It may have
 `variadic_state` and `variadic_shadow` blocks and the properties described
@@ -339,6 +341,14 @@ in [Variadic functions](#variadic-functions).
 - `llvm_calling_convention` and `gcc_calling_attribute` name the convention
   that `-emit-llvm` and `-emit-gimple` output uses. They do not affect native
   code and may be empty.
+- `type.NAME` names a scalar arithmetic type of the ABI, such as `i64` or
+  `f80`, for translation-time code: `$::meta::abi_type` gives the type that
+  the ABI of a checked call names `NAME`
+  ([spec.md](spec.md#call-checkers)). `NAME` is any property-name text after
+  `type.`. The shipped C ABIs name the C types `char`, `short`, `int`, `long`,
+  `long_long`, `size_t`, `ptrdiff_t`, `intmax_t`, `wchar_t`, `wint_t`,
+  `float`, `double`, and `long_double` ([targets.md](targets.md)), which the
+  format checkers read; the Cross ABIs name none.
 
 `call_clobbers` lists the storage that a call under the ABI may change; the
 callee preserves everything else. An item is a register name, which stands
@@ -1609,7 +1619,7 @@ These options list what the loaded models define:
   whether it is an alias or a macro, and the file and line of its entry.
 - `--print-data-bases` lists the `data_base` entries, and
   `--print-init-tables` the `init_table` entries.
-- `--print-options[=all|optimization|common|target]` lists each option
+- `--print-options[=all|optimization|common|target|warning]` lists each option
   with its value for the compilation, its origin (`default`, `preset`,
   `profile`, or `command-line`), whether presets may set it, and the model
   file and line that set it.

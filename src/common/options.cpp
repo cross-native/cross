@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <string_view>
@@ -32,6 +33,7 @@ bool take_value(int argc, char** argv, int& index, std::string_view option,
 std::string command_spelling(std::string_view name) {
     if (name.starts_with("f.")) return "-f" + std::string(name.substr(2));
     if (name.starts_with("m.")) return "-m" + std::string(name.substr(2));
+    if (name.starts_with("w.")) return "-W" + std::string(name.substr(2));
     return std::string(name);
 }
 
@@ -88,6 +90,52 @@ bool parse_registered_spelling(std::string_view argument,
                            std::string(body.substr(equals + 1)),
                            std::string(argument));
     }
+    return true;
+}
+
+// -WNAME and -Wno-NAME set the registered warning option w.NAME, -Werror=NAME
+// and -Wno-error=NAME its severity, and -w suppresses every warning. -Wl,
+// -Wa, and -Wp, pass options to other programs and are not warnings.
+bool parse_warning_spelling(std::string_view argument, CompilerOptions& options,
+                            Diagnostics& diagnostics) {
+    if (argument == "-w") {
+        options.inhibit_warnings = true;
+        return true;
+    }
+    if (argument.size() <= 2 || !argument.starts_with("-W") ||
+        argument.find(',') != std::string_view::npos) {
+        return false;
+    }
+    std::string_view body = argument.substr(2);
+    bool value = true;
+    if (body.starts_with("no-")) {
+        value = false;
+        body.remove_prefix(3);
+    }
+    if (body.starts_with("error=")) {
+        const auto name = body.substr(6);
+        if (name.empty()) {
+            diagnostics.command_error("missing warning name after '" +
+                                      std::string(argument) + "'");
+            return true;
+        }
+        options.warning_severities.push_back(
+            {std::string(name), value, std::string(argument)});
+        // As in GCC, -Werror=NAME also enables the warning.
+        if (value) {
+            add_command_option(options, "w." + std::string(name), true,
+                               std::string(argument));
+        }
+        return true;
+    }
+    if (body.empty()) return false;
+    if (body.find('=') != std::string_view::npos) {
+        diagnostics.command_error("warning option '" + std::string(argument) +
+                                  "' takes no value; use -WNAME or -Wno-NAME");
+        return true;
+    }
+    add_command_option(options, "w." + std::string(body), value,
+                       std::string(argument));
     return true;
 }
 
@@ -219,6 +267,7 @@ bool common_option(int argc, char** argv, int& index, CompilerOptions& options,
         options.model_files.emplace_back(value);
         return true;
     }
+    if (parse_warning_spelling(argument, options, diagnostics)) return true;
     if (parse_registered_spelling(argument, options)) return true;
     if (argument == "-I" || argument.starts_with("-I")) {
         if (!take_value(argc, argv, index, "-I", value, diagnostics)) return true;
@@ -255,7 +304,9 @@ std::optional<OptionValue> coerce_value(const OptionDefinition& definition,
     switch (definition.kind) {
     case OptionValueKind::Boolean:
         if (const auto* value = std::get_if<bool>(&input)) return *value;
-        reason = "expects a boolean -f/-fno or -m/-mno spelling";
+        reason = definition.name.starts_with("w.")
+            ? "expects a -W/-Wno spelling"
+            : "expects a boolean -f/-fno or -m/-mno spelling";
         return std::nullopt;
     case OptionValueKind::Unsigned: {
         std::uint64_t value{};
@@ -332,8 +383,46 @@ std::optional<OptionValue> checked_option_value(
     return result;
 }
 
+// The warning options: the groups first, so that resolution, which visits
+// definitions in order, sees a group's value before the warnings it enables.
+// Group membership follows GCC's C front end.
+static std::vector<OptionDefinition> with_warning_options(std::vector<OptionDefinition> result) {
+    const auto group = [&](std::string name, std::string description,
+                           std::vector<std::vector<std::string>> enabled_by = {}) {
+        result.push_back({"w." + std::move(name), {}, OptionValueKind::Boolean, false, {},
+                          0, 0, OptionCategory::Warning, false,
+                          OptionImplementation::Implemented, std::move(description),
+                          std::move(enabled_by)});
+    };
+    group("all", "enable -Wunused and -Wformat");
+    group("extra", "enable -Wimplicit-fallthrough, -Wsign-compare, and, with -Wunused, "
+                   "-Wunused-parameter");
+    group("unused", "enable every -Wunused- warning", {{"w.all"}});
+    group("error", "make every warning an error");
+    const std::unordered_map<std::string_view, std::vector<std::vector<std::string>>> enabled_by{
+        {"float-conversion", {{"w.conversion"}}},
+        {"format", {{"w.all"}}},
+        {"implicit-fallthrough", {{"w.extra"}}},
+        {"sign-compare", {{"w.extra"}}},
+        {"sign-conversion", {{"w.conversion"}}},
+        {"unused-function", {{"w.unused"}}},
+        {"unused-parameter", {{"w.unused", "w.extra"}}},
+        {"unused-variable", {{"w.unused"}}},
+    };
+    for (const auto& warning : warning_table()) {
+        const auto found = enabled_by.find(warning.name);
+        result.push_back({"w." + std::string(warning.name), {}, OptionValueKind::Boolean,
+                          warning.enabled_by_default, {}, 0, 0, OptionCategory::Warning,
+                          false, OptionImplementation::Implemented,
+                          std::string(warning.description),
+                          found == enabled_by.end() ? std::vector<std::vector<std::string>>{}
+                                                    : found->second});
+    }
+    return result;
+}
+
 std::span<const OptionDefinition> common_option_definitions() {
-    static const std::vector<OptionDefinition> definitions{
+    static const std::vector<OptionDefinition> definitions = with_warning_options({
         {"f.optimize-for", {}, OptionValueKind::Enumeration,
          std::string("debug"), {"debug", "speed", "size", "minimum-size"},
          0, 0, OptionCategory::Optimization, true,
@@ -671,7 +760,7 @@ std::span<const OptionDefinition> common_option_definitions() {
          0, 0, OptionCategory::CodeGeneration, false,
          OptionImplementation::Implemented,
          "data_base model entries in use, comma-separated, or none"},
-    };
+    });
     return definitions;
 }
 
@@ -725,6 +814,14 @@ bool resolve_registered_options(
             }
         }
         if (!definition) {
+            // As in GCC, an unknown -Wno- option is accepted: it asks for
+            // silence that no warning breaks. It is reported once the
+            // compilation reports a diagnostic it may have been meant for.
+            if (assignment.name.starts_with("w.") && origin == OptionOrigin::CommandLine &&
+                assignment.source.starts_with("-Wno-")) {
+                options.ignored_warning_options.push_back(assignment.source);
+                return;
+            }
             if (assignment.name == "f.ipa-sra") {
                 diagnostics.command_error(
                     "option '-fipa-sra' is reserved for scalar replacement; "
@@ -753,7 +850,8 @@ bool resolve_registered_options(
                     }
                 }
                 std::string message =
-                    "unknown compiler option '" +
+                    std::string(assignment.name.starts_with("w.") ? "unknown warning option '"
+                                                                 : "unknown compiler option '") +
                     command_spelling(assignment.name) + "' from " +
                     assignment.source;
                 if (suggestion && best <= 3) {
@@ -824,7 +922,33 @@ bool resolve_registered_options(
     for (const auto& setting : options.command_options) {
         apply_compound(setting, OptionOrigin::CommandLine, true);
     }
+    for (const auto& severity : options.warning_severities) {
+        const bool known = canonical.contains("w." + severity.name);
+        // -Werror=NAME also set w.NAME, whose application reported an
+        // unknown NAME already.
+        if ((!known && !severity.error) || severity.name == "error") {
+            diagnostics.command_error("unknown warning option '-W" + severity.name +
+                                      "' in '" + severity.source + "'");
+        }
+    }
     if (diagnostics.errors() != 0) return false;
+    // A warning option that no layer set takes its value from the groups
+    // that enable it. Groups precede the warnings in the registry.
+    for (const auto& definition : common) {
+        if (definition.enabled_by.empty()) continue;
+        auto& resolved = options.resolved_options[definition.name];
+        if (resolved.origin != OptionOrigin::Default) continue;
+        for (const auto& condition : definition.enabled_by) {
+            if (!std::all_of(condition.begin(), condition.end(), [&](const std::string& name) {
+                    return resolved_bool(options, name);
+                })) {
+                continue;
+            }
+            const auto& source = options.resolved_options[condition.front()];
+            resolved = ResolvedOption{true, source.origin, source.source};
+            break;
+        }
+    }
 
     const auto optimize_for =
         resolved_text(options, "f.optimize-for", "debug");
@@ -1049,6 +1173,48 @@ std::string_view resolved_text(const CompilerOptions& options,
     return value ? std::string_view(*value) : fallback;
 }
 
+WarningPolicy warning_policy(const CompilerOptions& options) {
+    WarningPolicy policy;
+    const auto table = warning_table();
+    for (std::size_t index = 0; index < table.size(); ++index) {
+        policy.enabled[index] = resolved_bool(options, "w." + std::string(table[index].name),
+                                              table[index].enabled_by_default);
+    }
+    policy.all_errors = resolved_bool(options, "w.error");
+    policy.inhibit = options.inhibit_warnings;
+    // A group in -Werror=NAME or -Wno-error=NAME names the warnings it
+    // enables, directly or through other groups.
+    const auto definitions = common_option_definitions();
+    const std::function<bool(std::string_view, std::string_view)> enables =
+        [&](std::string_view group, std::string_view option) {
+            if (group == option) return true;
+            const auto found = std::find_if(definitions.begin(), definitions.end(),
+                [&](const OptionDefinition& definition) { return definition.name == option; });
+            if (found == definitions.end()) return false;
+            for (const auto& condition : found->enabled_by)
+                for (const auto& name : condition)
+                    if (enables(group, name)) return true;
+            return false;
+        };
+    for (const auto& severity : options.warning_severities) {
+        for (std::size_t index = 0; index < table.size(); ++index) {
+            if (enables("w." + severity.name, "w." + std::string(table[index].name)))
+                policy.error[index] = severity.error;
+        }
+    }
+    return policy;
+}
+
+void report_warning_summary(const CompilerOptions& options, Diagnostics& diagnostics) {
+    if (diagnostics.promoted_warnings())
+        diagnostics.command_note("all warnings being treated as errors");
+    if (diagnostics.errors() == 0 && diagnostics.warnings() == 0) return;
+    for (const auto& option : options.ignored_warning_options) {
+        diagnostics.command_note("unrecognized command-line option '" + option +
+                                 "' may have been intended to silence earlier diagnostics");
+    }
+}
+
 bool floating_reassociation(const CompilerOptions& options) {
     return options.fast_math &&
            floating::permits_new_intermediates(options.floating_environment);
@@ -1152,11 +1318,12 @@ bool parse_cc_options(int argc, char** argv, CompilerOptions& options,
                 } else if (options.print_options_category != "all" &&
                            options.print_options_category != "optimization" &&
                            options.print_options_category != "common" &&
-                           options.print_options_category != "target") {
+                           options.print_options_category != "target" &&
+                           options.print_options_category != "warning") {
                     diagnostics.command_error(
                         "unknown --print-options category '" +
                         options.print_options_category +
-                        "'; expected all, optimization, common, or target");
+                        "'; expected all, optimization, common, target, or warning");
                 }
             }
             continue;
@@ -1358,6 +1525,11 @@ void print_cc_help() {
   -g0                   emit no debugging information
   -fOPTION/-fno-OPTION  set a registered common boolean option
   -fOPTION=VALUE        set a registered common valued option
+  -WNAME/-Wno-NAME      enable or disable a warning or warning group, such as
+                        -Wall, -Wextra, or -Wunused-variable
+  -Werror, -Werror=NAME make every warning, or one, an error
+  -Wno-error=NAME       keep a warning a warning under -Werror
+  -w                    report no warnings
   -target TRIPLE        select a compiled-in target
   -march=CPU            select target instruction compatibility
   -mtune=CPU            select target scheduling and cost preferences
@@ -1382,7 +1554,8 @@ void print_cc_help() {
   --print-data-bases    list data_base model entries
   --print-init-tables   list init_table model entries
   --print-options[=CATEGORY]
-                        list typed effective options and origins
+                        list typed effective options and origins; CATEGORY
+                        is all, optimization, common, target, or warning
   --print-attributes    list contextual [[attribute]] names
   --print-registers     list target register names, storage, and widths
   --print-keywords      list every reserved Cross keyword
@@ -1433,6 +1606,9 @@ void print_cpp_help() {
   -MP                   add a phony target for each included or embedded file
   -ffile-prefix-map=OLD=NEW
                         spell source paths starting with OLD as NEW
+  -WNAME/-Wno-NAME      enable or disable a warning, such as -Wno-cpp
+  -Werror, -Werror=NAME make every warning, or one, an error
+  -w                    report no warnings
   -target TRIPLE        select target macros
   -march=CPU            select target instruction compatibility
   -mtune=CPU            select target tuning

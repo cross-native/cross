@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "common/builtin_type.hpp"
 #include "common/options.hpp"
 #include "common/code_address.hpp"
 #include "common/patch_address.hpp"
@@ -278,6 +279,9 @@ struct AbiEntry {
     unsigned variadic_home_stride{};
     unsigned variadic_va_list_bytes{};
     unsigned variadic_va_list_alignment{1};
+    // The `type.NAME` properties: scalar types the model names, such as the
+    // C types of a C ABI, for $::meta::abi_type.
+    std::vector<std::pair<std::string, BuiltinType>> named_types;
 };
 
 struct RegisterEntry {

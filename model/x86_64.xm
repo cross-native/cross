@@ -531,6 +531,20 @@ abi "sysv_abi" {
     aliases = ["linux"];
     llvm_calling_convention = "x86_64_sysvcc";
     gcc_calling_attribute = "sysv_abi";
+    # The C types, for $::meta::abi_type and the format checkers.
+    type.char = "i8";
+    type.short = "i16";
+    type.int = "i32";
+    type.long = "i64";
+    type.long_long = "i64";
+    type.size_t = "u64";
+    type.ptrdiff_t = "i64";
+    type.intmax_t = "i64";
+    type.wchar_t = "i32";
+    type.wint_t = "u32";
+    type.float = "f32";
+    type.double = "f64";
+    type.long_double = "f80";
     compilation_selectable = true;
     function_selectable = true;
     argument_register_failure = "stack";
@@ -857,6 +871,20 @@ abi "ms_abi" {
     aliases = ["ms", "win64", "windows"];
     llvm_calling_convention = "win64cc";
     gcc_calling_attribute = "ms_abi";
+    # The C types, for $::meta::abi_type and the format checkers.
+    type.char = "i8";
+    type.short = "i16";
+    type.int = "i32";
+    type.long = "i32";
+    type.long_long = "i64";
+    type.size_t = "u64";
+    type.ptrdiff_t = "i64";
+    type.intmax_t = "i64";
+    type.wchar_t = "u16";
+    type.wint_t = "u16";
+    type.float = "f32";
+    type.double = "f64";
+    type.long_double = "f64";
     compilation_selectable = true;
     function_selectable = true;
     argument_register_failure = "partial";

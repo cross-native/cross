@@ -2,7 +2,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include <string>
+
 namespace cross {
+
+// The Cross source of the call checkers that $::format names (lib/format.x).
+std::string shipped_checker_source();
 
 int cc_main(int argc, char** argv);
 int cpp_main(int argc, char** argv);

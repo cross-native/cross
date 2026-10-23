@@ -921,7 +921,7 @@ std::string Preprocessor::expand_macros(std::string_view source, const SourceFil
             continue;
         }
         if (command.name == "warning") {
-            diagnostics_.warning(location, "#warning " + command.operand);
+            diagnostics_.warning(Warning::Cpp, location, "#warning " + command.operand);
             continue;
         }
         if (command.name == "require") {
