@@ -368,6 +368,10 @@ unsigned word_instructions(std::uint32_t word) {
 // The cycles a preserved register costs a call: its save and its restore.
 constexpr std::uint64_t preserved_register_cycles = 2;
 
+// The cycles a frame access of a value without a color costs: the access
+// and, for a reload, its reader's load delay.
+constexpr std::uint64_t frame_access_cycles = 2;
+
 // A load or store of one scalar.
 bool scalar_memory_access(const machine::Instruction& value) {
     if (value.kind != machine::InstructionKind::Target) return false;
@@ -1029,6 +1033,40 @@ machine::TargetOpcodeId atomic_opcode(mir::AtomicOperation operation) {
     case AtomicOperation::SignalFence: return Opcode::AtomicSignalFence;
     }
     return Opcode::Invalid;
+}
+
+// The values a call splits that the block's next call splits again and
+// that nothing reads in between, the next call included.
+std::unordered_set<std::uint32_t> kept_in_home(
+    const machine::Block& block, std::size_t call_index) {
+    std::unordered_set<std::uint32_t> kept;
+    const auto& call = block.instructions[call_index];
+    std::size_t next = call_index + 1;
+    while (next < block.instructions.size() &&
+           block.instructions[next].kind !=
+               machine::InstructionKind::Call) {
+        ++next;
+    }
+    if (next == block.instructions.size()) return kept;
+    const auto& following = block.instructions[next];
+    for (const auto value : call.live_across_call) {
+        if (std::find(following.live_across_call.begin(),
+                      following.live_across_call.end(),
+                      value) != following.live_across_call.end()) {
+            kept.insert(value.id);
+        }
+    }
+    for (std::size_t index = call_index + 1; index <= next; ++index) {
+        const auto& between = block.instructions[index];
+        for (const auto use : between.uses) kept.erase(use.id);
+        for (const auto& operand : between.operands) {
+            if (const auto* reg =
+                    std::get_if<machine::RegisterOperand>(&operand)) {
+                kept.erase(reg->value.id);
+            }
+        }
+    }
+    return kept;
 }
 
 // An ordered comparison of a register with a constant right operand as
@@ -3810,6 +3848,13 @@ private:
         const auto function_layout = function_abi
             ? classify_function_interface(entity, *function_abi)
             : std::optional<SignatureLayout>{};
+        const auto function_clobbers = [&](std::string_view name) {
+            return (function_abi &&
+                    abi_clobbers(*function_abi, name,
+                                 pic_ != PicModel::None)) ||
+                   std::find(entity.clobbers.begin(), entity.clobbers.end(),
+                             name) != entity.clobbers.end();
+        };
         LiveSet incoming_endpoint_colors;
         std::unordered_map<std::uint32_t, unsigned>
             incoming_endpoint_uses;
@@ -4811,10 +4856,22 @@ private:
         });
 
         bool changed = false;
-        for (const auto id : order) {
+        // Each value's spill weight, filled in before coloring with
+        // eviction (below).
+        std::vector<std::uint64_t> spill_weight;
+        std::size_t evictions = 0;
+        // Colors `id` with the first free color of its candidates. With
+        // `evict`, a value that finds none takes the candidate whose holders
+        // among its neighbors weigh least together, when they weigh less
+        // than the value itself; the holders lose the color and join
+        // `evicted`, to be colored again at once. A holder weighs less than
+        // the value that takes its color, so chains of evictions end; a
+        // budget bounds them.
+        const auto color_value = [&](std::uint32_t id, bool evict,
+                                     std::vector<std::uint32_t>& evicted) {
             if (!eligible[id] ||
                 function.virtual_register_assignments[id]) {
-                continue;
+                return;
             }
             const auto& colors =
                 function.virtual_register_classes[id] ==
@@ -4915,7 +4972,7 @@ private:
                     preferred[index] = ranked[index].second;
                 }
             }
-            const auto selected = std::find_if(
+            auto selected = std::find_if(
                 preferred.begin(), preferred.end(),
                 [&](machine::PhysicalRegisterId color) {
                     if (hard_forbidden_colors[id].contains(color.value)) {
@@ -4930,7 +4987,41 @@ private:
                                     neighbor] == color;
                         });
                 });
-            if (selected == preferred.end()) continue;
+            if (selected == preferred.end() && evict &&
+                evictions < 4 * count + 64) {
+                std::unordered_map<std::uint32_t, std::uint64_t> held;
+                for (const auto neighbor : interference[id]) {
+                    if (neighbor >= count) continue;
+                    if (const auto color =
+                            function.virtual_register_assignments[neighbor]) {
+                        held[color->value] += spill_weight[neighbor];
+                    }
+                }
+                auto lightest = spill_weight[id];
+                for (auto candidate = preferred.begin();
+                     candidate != preferred.end(); ++candidate) {
+                    const auto weight = held.find(candidate->value);
+                    if (weight != held.end() && weight->second < lightest &&
+                        !hard_forbidden_colors[id].contains(
+                            candidate->value)) {
+                        lightest = weight->second;
+                        selected = candidate;
+                    }
+                }
+                if (selected != preferred.end()) {
+                    ++evictions;
+                    for (const auto neighbor : interference[id]) {
+                        if (neighbor < count &&
+                            function.virtual_register_assignments[neighbor] ==
+                                *selected) {
+                            function.virtual_register_assignments[neighbor]
+                                .reset();
+                            evicted.push_back(neighbor);
+                        }
+                    }
+                }
+            }
+            if (selected == preferred.end()) return;
             function.virtual_register_assignments[id] = *selected;
             changed = true;
             // A loop-carried partner takes the color too, unless a call
@@ -4954,6 +5045,201 @@ private:
                     continue;
                 }
                 function.virtual_register_assignments[neighbor] = *selected;
+            }
+        };
+        const auto color_values = [&](bool evict) {
+            evictions = 0;
+            std::vector<std::uint32_t> pending;
+            for (const auto id : order) {
+                pending.push_back(id);
+                while (!pending.empty()) {
+                    const auto next = pending.back();
+                    pending.pop_back();
+                    color_value(next, evict, pending);
+                }
+            }
+        };
+        const auto fully_colored = [&] {
+            for (std::uint32_t id = 0; id < count; ++id) {
+                if (eligible[id] &&
+                    !function.virtual_register_assignments[id]) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        const auto initial_assignments = function.virtual_register_assignments;
+        color_values(false);
+        // The order colors long ranges first, so the values it leaves
+        // without a color are mostly short ones, although a long range
+        // that went home instead would free its register for many of them.
+        // So coloring runs again with eviction by spill weight, as LLVM's
+        // greedy allocator weighs: the frame accesses a value costs without
+        // a color, weighted by how often their blocks run, over the
+        // instructions it is live in plus twenty-five, so that short ranges
+        // weigh by their accesses and long ones by their density. That
+        // coloring stays when its frame accesses, moves, and preserved
+        // registers cost less.
+        if (!naked_ && !fully_colored()) {
+            const auto weights = allocation_weights(function);
+            // `splits` counts what splitting a value around the calls it
+            // crosses costs, as the emitter splits: one store in each block,
+            // and a load after each call unless the block's next call splits
+            // it again before anything reads it.
+            std::vector<std::uint64_t> accesses(count), splits(count),
+                length(count);
+            // When an argument arrives in t0 or t1, which captures use as
+            // scratches, one parameter capture without a color sends every
+            // incoming register through its home: a store and a load each.
+            std::vector<bool> capture(count);
+            std::uint64_t capture_homes = 0;
+            if (function_layout) {
+                bool scratch_argument = false;
+                std::uint64_t register_pieces = 0;
+                for (const auto& assignment :
+                     function_layout->call.arguments) {
+                    for (const auto& piece : assignment.pieces) {
+                        if (piece.location.kind != LocationKind::Register) {
+                            continue;
+                        }
+                        ++register_pieces;
+                        scratch_argument = scratch_argument ||
+                            piece.location.reg == "t0" ||
+                            piece.location.reg == "t1";
+                    }
+                }
+                if (scratch_argument) capture_homes = 2 * register_pieces;
+            }
+            for (const auto& block : function.blocks) {
+                if (block.id.value >= block_count) continue;
+                const auto weight = weights[block.id.value];
+                auto live = live_out[block.id.value];
+                LiveSet read, crossed;
+                bool later_call = false;
+                for (auto item = block.instructions.rbegin();
+                     item != block.instructions.rend(); ++item) {
+                    for (const auto id : live) ++length[id];
+                    for (const auto& definition : item->defs) {
+                        if (const auto id = virtual_id(definition)) {
+                            if (live.erase(*id) == 0) ++length[*id];
+                        }
+                    }
+                    if (item->kind == machine::InstructionKind::Call) {
+                        for (const auto id : live) {
+                            if (!later_call || read.contains(id)) {
+                                splits[id] += weight;
+                            }
+                            crossed.insert(id);
+                        }
+                        read.clear();
+                        later_call = true;
+                    }
+                    if (item->opcode == Opcode::Phi) {
+                        // The result is stored and an incoming value loaded
+                        // on each edge.
+                        for (std::size_t index = 0;
+                             index + 1 < item->operands.size(); index += 2) {
+                            const auto* predecessor =
+                                std::get_if<machine::BlockOperand>(
+                                    &item->operands[index]);
+                            const auto* incoming =
+                                std::get_if<machine::RegisterOperand>(
+                                    &item->operands[index + 1]);
+                            if (!predecessor ||
+                                predecessor->target.value >= block_count) {
+                                continue;
+                            }
+                            const auto edge =
+                                weights[predecessor->target.value];
+                            for (const auto& definition : item->defs) {
+                                if (const auto id = virtual_id(definition)) {
+                                    accesses[*id] += edge;
+                                }
+                            }
+                            if (incoming) {
+                                if (const auto id =
+                                        virtual_id(incoming->value)) {
+                                    accesses[*id] += edge;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    const bool captures =
+                        item->opcode == Opcode::Parameter ||
+                        item->opcode == Opcode::Fparameter;
+                    for (const auto& definition : item->defs) {
+                        if (const auto id = virtual_id(definition)) {
+                            accesses[*id] += weight;
+                            capture[*id] = capture[*id] || captures;
+                        }
+                    }
+                    for (const auto& use : item->uses) {
+                        if (const auto id = virtual_id(use)) {
+                            accesses[*id] += weight;
+                            live.insert(*id);
+                            read.insert(*id);
+                        }
+                    }
+                    for (const auto& [value, reads] :
+                         piece_reads(*item, function_layout)) {
+                        if (const auto id = virtual_id(value)) {
+                            accesses[*id] += weight * reads;
+                        }
+                    }
+                }
+                for (const auto id : crossed) splits[id] += weight;
+            }
+            spill_weight.resize(count);
+            for (std::uint32_t id = 0; id < count; ++id) {
+                spill_weight[id] =
+                    ((accesses[id] + (capture[id] ? capture_homes : 0U))
+                     << 10U) /
+                    (length[id] + 25U);
+            }
+            const auto preserved = [&](machine::PhysicalRegisterId color) {
+                const auto name = color.value >= fpr_physical_base
+                    ? fpr_name(color) : gpr_name(color);
+                return !name.empty() && !function_clobbers(name);
+            };
+            const bool size =
+                options_.optimize_for == OptimizationGoal::Size ||
+                options_.optimize_for == OptimizationGoal::MinimumSize;
+            // The frame accesses of values without a color and of those
+            // that calls which clobber their color split, the incoming
+            // registers' homes, the weighted moves, and the saves of
+            // preserved colors.
+            const auto coloring_cost = [&] {
+                std::uint64_t frame{};
+                std::unordered_set<std::uint32_t> saved;
+                bool homed = false;
+                for (std::uint32_t id = 0; id < count; ++id) {
+                    if (!eligible[id]) continue;
+                    const auto color =
+                        function.virtual_register_assignments[id];
+                    if (!color) {
+                        frame += accesses[id];
+                        homed = homed || capture[id];
+                        continue;
+                    }
+                    if (forbidden_colors[id].contains(color->value)) {
+                        frame += splits[id];
+                    }
+                    if (preserved(*color)) saved.insert(color->value);
+                }
+                if (homed) frame += capture_homes;
+                return (size ? 1U : frame_access_cycles) * frame +
+                       weighted_moves(function, weights) +
+                       preserved_register_cycles * saved.size();
+            };
+            const auto first = function.virtual_register_assignments;
+            const auto first_cost = coloring_cost();
+            function.virtual_register_assignments = initial_assignments;
+            color_values(true);
+            // A trial of the scratch colors survives only a full coloring.
+            if (!(scratch_colors_ && fully_colored()) &&
+                coloring_cost() >= first_cost) {
+                function.virtual_register_assignments = first;
             }
         }
 
@@ -5101,12 +5387,6 @@ private:
             }
         }
 
-        const auto* abi = managed_abi_model(hir_, entity, subtarget_, options_);
-        const auto function_clobbers = [&](std::string_view name) {
-            return (abi && abi_clobbers(*abi, name, pic_ != PicModel::None)) ||
-                   std::find(entity.clobbers.begin(), entity.clobbers.end(), name) !=
-                       entity.clobbers.end();
-        };
         std::unordered_set<std::uint32_t> saved;
         const auto preserve_storage = [&](machine::PhysicalRegisterId physical) {
             // A naked function's contract is the programmer's: it saves
@@ -9291,6 +9571,19 @@ private:
         return weights;
     }
 
+    // The block weights that allocations are compared by: one everywhere
+    // under a size goal, where a frame access or a move costs its bytes
+    // wherever it runs.
+    std::vector<std::uint64_t> allocation_weights(
+        const machine::Function& function) const {
+        auto weights = block_weights(function);
+        if (options_.optimize_for == OptimizationGoal::Size ||
+            options_.optimize_for == OptimizationGoal::MinimumSize) {
+            std::fill(weights.begin(), weights.end(), 1U);
+        }
+        return weights;
+    }
+
     bool schedule_region(std::vector<machine::Instruction>& instructions,
                          std::size_t begin, std::size_t end,
                          machine::BlockId owner,
@@ -10359,8 +10652,8 @@ private:
     // past them. The allocator may still not fit the live values of those
     // schedules in the colors the first pass needs, so register allocation
     // colors the function both ways and keeps the latency schedules unless
-    // they save more preserved registers, leave more values without a
-    // color, or need more moves.
+    // they save more preserved registers, need more frame accesses, or need
+    // more moves.
     bool schedule_instructions(machine::Function& function) {
         if (!options_.schedule_insns) return false;
         bool changed = split_hilo_operations(function);
@@ -10412,32 +10705,130 @@ private:
         return changed || latency || split;
     }
 
-    // Values that allocation left without a color.
-    static std::size_t uncolored_values(const machine::Function& function) {
-        std::unordered_set<std::uint32_t> uncolored;
+    // The reads from their homes, beyond one per use, of the uses of
+    // `instruction` that have no color: a call argument or a returned value
+    // that the emitter places piece by piece is read for each piece.
+    std::vector<std::pair<machine::Register, std::uint64_t>> piece_reads(
+        const machine::Instruction& instruction,
+        const std::optional<SignatureLayout>& function_layout) const {
+        std::vector<std::pair<machine::Register, std::uint64_t>> reads;
+        const auto add = [&](const machine::Register& value,
+                             std::size_t pieces) {
+            if (value.kind == machine::RegisterKind::Virtual && pieces > 1) {
+                reads.emplace_back(value, pieces - 1U);
+            }
+        };
+        if (instruction.kind == machine::InstructionKind::Return) {
+            if (instruction.result_composition ==
+                    machine::ResultComposition::None &&
+                function_layout && function_layout->results.size() == 1 &&
+                instruction.uses.size() == 1) {
+                add(instruction.uses.front(),
+                    function_layout->results.front().pieces.size());
+            }
+            return reads;
+        }
+        if (instruction.kind != machine::InstructionKind::Call) return reads;
+        const auto site =
+            classify_call_site(hir_, subtarget_, options_, instruction);
+        if (!site) return reads;
+        const auto& arguments = site->second.call.arguments;
+        for (std::size_t index = 0; index < arguments.size() &&
+             index < instruction.call_argument_types.size();
+             ++index) {
+            const auto operands =
+                machine::call_argument_operands(instruction, index);
+            const auto* operand = operands.count == 1
+                ? std::get_if<machine::RegisterOperand>(
+                      &instruction.operands[operands.first])
+                : nullptr;
+            const auto type = instruction.call_argument_types[index];
+            if (!operand || is_aggregate(hir_, type) ||
+                single_register_argument(arguments[index],
+                                         is_floating(hir_, type),
+                                         type_bits(hir_, type),
+                                         operand->value.mode.bits,
+                                         subtarget_)) {
+                continue;
+            }
+            add(operand->value, arguments[index].pieces.size() +
+                                    arguments[index].shadows.size());
+        }
+        return reads;
+    }
+
+    // The frame accesses that an allocation leaves, each weighted by
+    // `weights` of the block where it runs: a load for each read (see
+    // piece_reads) and a store for each definition of a value without a
+    // color (for a PHI, the store of its result and the load of its
+    // incoming value on each edge), and for each value that calls split, a
+    // store in each block and a load after each call that does not keep it
+    // in its home.
+    std::uint64_t frame_accesses(
+        const machine::Function& function,
+        const std::vector<std::uint64_t>& weights) const {
+        const auto layout = own_interface_layout(function);
+        const auto uncolored = [&](const machine::Register& value) {
+            return value.kind == machine::RegisterKind::Virtual &&
+                value.id < function.virtual_register_assignments.size() &&
+                function.virtual_register_classes[value.id] !=
+                    machine::VirtualRegisterClass::Memory &&
+                !function.virtual_register_assignments[value.id];
+        };
+        std::uint64_t accesses{};
         for (const auto& block : function.blocks) {
-            for (const auto& instruction : block.instructions) {
-                for (const auto* list : {&instruction.defs, &instruction.uses}) {
-                    for (const auto& value : *list) {
-                        if (value.kind == machine::RegisterKind::Virtual &&
-                            value.id < function.virtual_register_assignments.size() &&
-                            function.virtual_register_classes[value.id] !=
-                                machine::VirtualRegisterClass::Memory &&
-                            !function.virtual_register_assignments[value.id]) {
-                            uncolored.insert(value.id);
+            if (block.id.value >= weights.size()) continue;
+            const auto weight = weights[block.id.value];
+            std::unordered_set<std::uint32_t> split;
+            for (std::size_t index = 0; index < block.instructions.size();
+                 ++index) {
+                const auto& instruction = block.instructions[index];
+                if (decode_opcode(instruction.opcode) != Opcode::Phi) {
+                    for (const auto* list :
+                         {&instruction.defs, &instruction.uses}) {
+                        accesses += weight * static_cast<std::uint64_t>(
+                            std::count_if(list->begin(), list->end(),
+                                          uncolored));
+                    }
+                    for (const auto& [value, reads] :
+                         piece_reads(instruction, layout)) {
+                        if (uncolored(value)) accesses += weight * reads;
+                    }
+                    if (!instruction.live_across_call.empty()) {
+                        const auto kept = kept_in_home(block, index);
+                        for (const auto value : instruction.live_across_call) {
+                            accesses += weight *
+                                ((split.insert(value.id).second ? 1U : 0U) +
+                                 (kept.contains(value.id) ? 0U : 1U));
                         }
                     }
+                    continue;
+                }
+                for (std::size_t operand = 0;
+                     operand + 1 < instruction.operands.size(); operand += 2) {
+                    const auto* from = std::get_if<machine::BlockOperand>(
+                        &instruction.operands[operand]);
+                    const auto* value = std::get_if<machine::RegisterOperand>(
+                        &instruction.operands[operand + 1]);
+                    if (!from || from->target.value >= weights.size()) continue;
+                    const auto edge = weights[from->target.value];
+                    accesses += edge * static_cast<std::uint64_t>(
+                        std::count_if(instruction.defs.begin(),
+                                      instruction.defs.end(), uncolored));
+                    if (value && uncolored(value->value)) accesses += edge;
                 }
             }
         }
-        return uncolored.size();
+        return accesses;
     }
 
-    // The moves that an allocation's register copies and PHIs whose
-    // incoming values have other colors cost, each weighted by how often
-    // its block runs.
-    static std::uint64_t weighted_moves(const machine::Function& function) {
-        const auto weights = block_weights(function);
+    // The moves between registers that an allocation's register copies and
+    // PHIs whose incoming values have other colors cost, each weighted by
+    // `weights` of the block where it runs, by default how often it runs.
+    // A value without a color moves through its home (frame_accesses).
+    static std::uint64_t weighted_moves(
+        const machine::Function& function,
+        const std::vector<std::uint64_t>& weights) {
         const auto color = [&](const machine::Register& value)
             -> std::optional<machine::PhysicalRegisterId> {
             if (value.kind == machine::RegisterKind::Physical) {
@@ -10448,19 +10839,26 @@ private:
             }
             return function.virtual_register_assignments[value.id];
         };
+        const auto moves_between = [&](const machine::Register& from,
+                                       const machine::Register& to) {
+            const auto source = color(from);
+            const auto target = color(to);
+            return source && target && *source != *target;
+        };
         std::uint64_t moves{};
         for (const auto& block : function.blocks) {
             for (const auto& instruction : block.instructions) {
                 if (decode_opcode(instruction.opcode) == Opcode::Phi &&
                     instruction.defs.size() == 1) {
-                    const auto target = color(instruction.defs.front());
                     for (std::size_t index = 0;
                          index + 1 < instruction.operands.size(); index += 2) {
                         const auto* from = std::get_if<machine::BlockOperand>(
                             &instruction.operands[index]);
                         const auto* value = std::get_if<machine::RegisterOperand>(
                             &instruction.operands[index + 1]);
-                        if (from && value && color(value->value) != target &&
+                        if (from && value &&
+                            moves_between(value->value,
+                                          instruction.defs.front()) &&
                             from->target.value < weights.size()) {
                             moves += weights[from->target.value];
                         }
@@ -10468,8 +10866,8 @@ private:
                 } else if (instruction.kind == machine::InstructionKind::Copy &&
                            instruction.defs.size() == 1 &&
                            instruction.uses.size() == 1 &&
-                           color(instruction.defs.front()) !=
-                               color(instruction.uses.front()) &&
+                           moves_between(instruction.uses.front(),
+                                         instruction.defs.front()) &&
                            block.id.value < weights.size()) {
                     moves += weights[block.id.value];
                 }
@@ -10478,12 +10876,15 @@ private:
         return moves;
     }
 
+    static std::uint64_t weighted_moves(const machine::Function& function) {
+        return weighted_moves(function, block_weights(function));
+    }
+
     // Allocates the scheduled function, and when loop constants were also
     // hoisted into the headroom, the function hoisted below it, scheduled
-    // the same way, keeping the headroom when it leaves no further value
-    // without a color and needs no further moves or preserved registers
-    // than the cycles of the constants it takes out of loops repay; under a
-    // size goal it may need no further preserved register at all.
+    // the same way, keeping the headroom when the frame accesses, moves,
+    // and preserved registers it adds cost fewer cycles than the constants
+    // it takes out of loops repay; under a size goal it may add none.
     bool allocate_scheduled_registers(machine::Function& function) {
         const bool changed = allocate_schedule(function);
         if (!headroom_fallback_) return changed;
@@ -10499,17 +10900,21 @@ private:
         const bool size =
             options_.optimize_for == OptimizationGoal::Size ||
             options_.optimize_for == OptimizationGoal::MinimumSize;
+        const auto accesses = [&](const machine::Function& value) {
+            return frame_accesses(value, allocation_weights(value));
+        };
         const auto cost = [&](const machine::Function& value) {
             return preserved_register_cycles *
                        value.callee_saved_registers.size() +
-                   weighted_moves(value);
+                   weighted_moves(value) +
+                   frame_access_cycles * accesses(value);
         };
-        const bool keep =
-            uncolored_values(hoisted) <= uncolored_values(function) &&
-            (size ? hoisted.callee_saved_registers.size() <=
-                            function.callee_saved_registers.size() &&
-                        weighted_moves(hoisted) <= weighted_moves(function)
-                  : cost(hoisted) < cost(function) + headroom_gain_);
+        const bool keep = size
+            ? accesses(hoisted) <= accesses(function) &&
+                  hoisted.callee_saved_registers.size() <=
+                      function.callee_saved_registers.size() &&
+                  weighted_moves(hoisted) <= weighted_moves(function)
+            : cost(hoisted) < cost(function) + headroom_gain_;
         if (keep) function = std::move(hoisted);
         return true;
     }
@@ -10521,17 +10926,18 @@ private:
         (void)split_entry_parameters(fallback);
         const bool changed = allocate_with_scratch_colors(function);
         (void)allocate_with_scratch_colors(fallback);
-        // The latency schedules stay when they need no further uncolored
-        // value or move, and no further preserved register beyond what the
-        // cycles saved by orders that load before a store repay, weighted
-        // by how often their blocks run.
+        // The latency schedules stay when they need no further frame access
+        // or move, and no further preserved register beyond what the cycles
+        // saved by orders that load before a store repay, weighted by how
+        // often their blocks run.
         const auto moves = weighted_moves(function);
         const auto fallback_moves = weighted_moves(fallback);
         const auto saves = [](const machine::Function& value) {
             return preserved_register_cycles *
                 value.callee_saved_registers.size();
         };
-        if (uncolored_values(function) > uncolored_values(fallback) ||
+        if (frame_accesses(function, allocation_weights(function)) >
+                frame_accesses(fallback, allocation_weights(fallback)) ||
             moves > fallback_moves ||
             saves(function) > saves(fallback) + latency_gain_) {
             function = std::move(fallback);
@@ -17445,40 +17851,6 @@ private:
             }
         }
         return true;
-    }
-
-    // The values a call splits that the block's next call splits again and
-    // that nothing reads in between, the next call included.
-    static std::unordered_set<std::uint32_t> kept_in_home(
-        const machine::Block& block, std::size_t call_index) {
-        std::unordered_set<std::uint32_t> kept;
-        const auto& call = block.instructions[call_index];
-        std::size_t next = call_index + 1;
-        while (next < block.instructions.size() &&
-               block.instructions[next].kind !=
-                   machine::InstructionKind::Call) {
-            ++next;
-        }
-        if (next == block.instructions.size()) return kept;
-        const auto& following = block.instructions[next];
-        for (const auto value : call.live_across_call) {
-            if (std::find(following.live_across_call.begin(),
-                          following.live_across_call.end(),
-                          value) != following.live_across_call.end()) {
-                kept.insert(value.id);
-            }
-        }
-        for (std::size_t index = call_index + 1; index <= next; ++index) {
-            const auto& between = block.instructions[index];
-            for (const auto use : between.uses) kept.erase(use.id);
-            for (const auto& operand : between.operands) {
-                if (const auto* reg =
-                        std::get_if<machine::RegisterOperand>(&operand)) {
-                    kept.erase(reg->value.id);
-                }
-            }
-        }
-        return kept;
     }
 
     // The instruction of a block that a non-tail call's delay slot takes

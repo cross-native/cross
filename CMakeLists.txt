@@ -2676,6 +2676,32 @@ if(BUILD_TESTING)
                 LABELS "check.runtime;arch.mips;backend.native;feature.array;endian.${vla_endian}")
         endforeach()
     endforeach()
+    # Loops that keep more values live than there are registers: their
+    # results against the recurrences evaluated independently, at each
+    # level on both CPU classes and byte orders, and the spill shape at -O2
+    # and -Oz.
+    foreach(pressure_level O0 O2 O3 Oz)
+        add_test(NAME cross_mips_pressure_spills_runtime_${pressure_level}
+            COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/pressure_spills.x
+                -DSTARTUP=${CMAKE_SOURCE_DIR}/test/support/mips_entry_start.s
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-pressure-spills-${pressure_level}
+                -DEXPECTED=P "-DCC_FLAGS=-${pressure_level};-fno-eval-calls"
+                "-DMIPS_CPUS=vr4300;r3000"
+                -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(cross_mips_pressure_spills_runtime_${pressure_level} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;feature.register_allocation;isa.vr4300;isa.r3000;endian.big;endian.little;opt.${pressure_level}"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS")
+    endforeach()
+    add_test(NAME cross_mips_pressure_spills_codegen
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/target/mips/pressure_spills.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/mips-pressure-spills
+                -P "${CMAKE_SOURCE_DIR}/test/target/mips/pressure_spills.cmake")
+    set_tests_properties(cross_mips_pressure_spills_codegen PROPERTIES
+        LABELS "check.compile;arch.mips;backend.native;feature.register_allocation;isa.vr4300;endian.big;opt.O2;opt.Oz")
     # Floating values in FPRs on every hard-float CPU, and floating
     # comparisons that branch into phis.
     add_test(NAME cross_mips_fpr_allocation
