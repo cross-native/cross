@@ -18,7 +18,7 @@ constexpr OpcodeProperty properties(std::string_view name) {
         result = result | OpcodeProperty::Test;
     }
     if (name.starts_with("x86.f") && !name.starts_with("x86.fixed.") &&
-        !name.starts_with("x86.frame.")) {
+        !name.starts_with("x86.frame.") && !name.starts_with("x86.flags.")) {
         result = result | OpcodeProperty::Floating;
     }
     if (name.starts_with("x86.v")) result = result | OpcodeProperty::Vector;

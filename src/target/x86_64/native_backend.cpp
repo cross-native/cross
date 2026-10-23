@@ -3,6 +3,7 @@
 
 #include "target/x86_64/native_backend.hpp"
 #include "middle/mir_analysis.hpp"
+#include "middle/mir_transform.hpp"
 #include "middle/shrink_wrap.hpp"
 #include "backend/native/debug_info.hpp"
 #include "backend/native/frame_cfi.hpp"
@@ -69,6 +70,32 @@ AssemblySymbolVisibility assembly_visibility(
     return AssemblySymbolVisibility::Default;
 }
 
+std::string_view flags_condition(machine::TargetOpcodeId opcode) {
+    switch (decode_opcode(opcode)) {
+    case Opcode::FlagsEq: return "e";
+    case Opcode::FlagsNe: return "ne";
+    case Opcode::FlagsSlt: return "l";
+    case Opcode::FlagsSle: return "le";
+    case Opcode::FlagsSgt: return "g";
+    case Opcode::FlagsSge: return "ge";
+    case Opcode::FlagsUlt: return "b";
+    case Opcode::FlagsUle: return "be";
+    case Opcode::FlagsUgt: return "a";
+    case Opcode::FlagsUge: return "ae";
+    case Opcode::FlagsSign: return "s";
+    case Opcode::FlagsNotSign: return "ns";
+    default: return {};
+    }
+}
+
+bool defines_arithmetic_flags(const machine::Instruction& value) {
+    return std::any_of(value.clobbers.begin(), value.clobbers.end(),
+        [](machine::Register reg) {
+            return reg.kind == machine::RegisterKind::Physical &&
+                   reg.id == flags_storage.value;
+        });
+}
+
 enum class LoweringPass : std::uint16_t {
     HoistParameterCaptures,
     PropagateCopiesInitial,
@@ -107,10 +134,12 @@ enum class LoweringPass : std::uint16_t {
     ScheduleAcrossBlocks,
     ScheduleBlocks,
     ClusterSharedCompareSelects,
+    ReuseArithmeticFlags,
     SplitEntryParameters,
     SelectRematerialization,
     SelectCfaAnchor,
     AllocateRegisters,
+    FoldPhiFlagBranches,
     PreserveBoundaryContract,
     CreateWidePhiTemporary,
     FinalizeFrame,
@@ -2241,6 +2270,11 @@ private:
             }
             instruction.uses.push_back(source);
             instruction.defs.push_back(reg(value.id));
+            if (options_.machine_combine && instruction.opcode == Opcode::Sext &&
+                mir::known_leading_zeros(*source_, hir_,
+                                         value.operands.front()) != 0) {
+                instruction.opcode = Opcode::Zext;
+            }
             const auto append_clobber = [&](std::string_view name,
                                             machine::IntegerMode mode) {
                 append_fixed_clobber(instruction, name, mode);
@@ -7266,6 +7300,273 @@ private:
             "anchor register");
     }
 
+    void reuse_arithmetic_flags() {
+        if (!options_.machine_combine) return;
+        const auto flag = machine::Register::physical_register(flags_storage,
+                                                                machine::i64);
+        const auto preserves = [](const machine::Instruction& value) {
+            return value.kind == machine::InstructionKind::Target &&
+                !value.patch && !value.has_side_effects &&
+                value.defs.size() <= 1 &&
+                (value.defs.empty() || value.defs.front().mode.bits <= 64) &&
+                (value.opcode == Opcode::Reinterpret || value.opcode == Opcode::Trunc ||
+                 value.opcode == Opcode::Sext || value.opcode == Opcode::Zext ||
+                 value.opcode == Opcode::Expect);
+        };
+        for (auto& block : current_.blocks) {
+            auto& code = block.instructions;
+            const auto at = [&](std::size_t index) {
+                return code.begin() + static_cast<std::ptrdiff_t>(index);
+            };
+            bool changed = true;
+            while (changed) {
+                changed = false;
+                for (std::size_t c = 0; c < code.size() && !changed; ++c) {
+                    const auto& comparison = code[c];
+                    const bool fused = !comparison.condition_predicate.empty();
+                    const auto predicate = fused ? comparison.condition_predicate
+                                                 : comparison.opcode;
+                    if (!has_property(predicate, OpcodeProperty::Comparison) ||
+                        !has_property(predicate, OpcodeProperty::Immediate) ||
+                        has_property(predicate, OpcodeProperty::Floating) ||
+                        has_property(predicate, OpcodeProperty::Vector) ||
+                        comparison.uses.empty() || comparison.patch) continue;
+                    const auto input = comparison.uses.front();
+                    const auto bits = input.mode.bits;
+                    if (bits != 32 && bits != 64) continue;
+                    const auto literal = std::find_if(comparison.operands.begin(),
+                        comparison.operands.end(), [](const auto& operand) {
+                            return std::holds_alternative<machine::ImmediateOperand>(operand);
+                        });
+                    if (literal == comparison.operands.end()) continue;
+                    const auto constant = std::get<machine::ImmediateOperand>(*literal);
+                    if (constant.high != 0) continue;
+                    const auto mask = bits == 64 ? ~std::uint64_t{0}
+                                                : (std::uint64_t{1} << bits) - 1;
+                    const auto bound = constant.value & mask;
+                    const auto base = x86_64::base_opcode(predicate);
+                    const auto first = c > 8 ? c - 8 : 0;
+                    const auto last = std::min(code.size(), c + 9);
+                    for (auto p = first; p < last && !changed; ++p) {
+                        if (p == c) continue;
+                        const auto& arithmetic = code[p];
+                        const auto operation = x86_64::base_opcode(arithmetic.opcode);
+                        if (arithmetic.kind != machine::InstructionKind::Target ||
+                            arithmetic.patch || arithmetic.has_side_effects ||
+                            arithmetic.defs.size() != 1 || arithmetic.uses.empty() ||
+                            arithmetic.defs.front().mode.bits != bits ||
+                            arithmetic.uses.front().mode.bits != bits ||
+                            (operation != Opcode::Add && operation != Opcode::Sub &&
+                             operation != Opcode::And && operation != Opcode::Or &&
+                             operation != Opcode::Xor)) continue;
+                        machine::TargetOpcodeId selected;
+                        if (input == arithmetic.uses.front() &&
+                            arithmetic.opcode == Opcode::SubImm) {
+                            const auto* amount = arithmetic.operands.size() >= 2
+                                ? std::get_if<machine::ImmediateOperand>(&arithmetic.operands[1]) : nullptr;
+                            if (!amount || amount->high != 0) continue;
+                            auto threshold = bound;
+                            auto condition = base;
+                            // Strict/inclusive neighbors in the same signed or unsigned domain.
+                            if ((amount->value & mask) != bound &&
+                                (base == Opcode::CmpSgt || base == Opcode::CmpSle ||
+                                 base == Opcode::CmpUgt || base == Opcode::CmpUle)) {
+                                const bool sign = base == Opcode::CmpSgt || base == Opcode::CmpSle;
+                                const auto maximum = sign ? mask >> 1 : mask;
+                                if (bound == maximum) continue;
+                                threshold = (bound + 1) & mask;
+                                condition = base == Opcode::CmpSgt ? Opcode::CmpSge :
+                                    base == Opcode::CmpSle ? Opcode::CmpSlt :
+                                    base == Opcode::CmpUgt ? Opcode::CmpUge : Opcode::CmpUlt;
+                            }
+                            if (bound == 0 && (amount->value & mask) == 1 &&
+                                (base == Opcode::CmpEq || base == Opcode::CmpNe)) {
+                                threshold = 1;
+                                condition = base == Opcode::CmpEq ? Opcode::CmpUlt : Opcode::CmpUge;
+                            }
+                            if ((amount->value & mask) != threshold) continue;
+                            switch (decode_opcode(condition)) {
+                            case Opcode::CmpEq: selected = Opcode::FlagsEq; break;
+                            case Opcode::CmpNe: selected = Opcode::FlagsNe; break;
+                            case Opcode::CmpSle: selected = Opcode::FlagsSle; break;
+                            case Opcode::CmpSgt: selected = Opcode::FlagsSgt; break;
+                            case Opcode::CmpUle: selected = Opcode::FlagsUle; break;
+                            case Opcode::CmpUgt: selected = Opcode::FlagsUgt; break;
+                            case Opcode::CmpSlt: selected = Opcode::FlagsSlt; break;
+                            case Opcode::CmpSge: selected = Opcode::FlagsSge; break;
+                            case Opcode::CmpUlt: selected = Opcode::FlagsUlt; break;
+                            case Opcode::CmpUge: selected = Opcode::FlagsUge; break;
+                            default: break;
+                            }
+                        } else if (input == arithmetic.defs.front() && bound == 0) {
+                            const bool logical = operation == Opcode::And ||
+                                operation == Opcode::Or || operation == Opcode::Xor;
+                            // ANDQ masks that fit u32 emit as ANDL. Its SF is
+                            // bit 31, whereas a 64-bit comparison reads bit 63.
+                            const auto* mask_operand = arithmetic.opcode == Opcode::AndImm &&
+                                    arithmetic.operands.size() >= 2
+                                ? std::get_if<machine::ImmediateOperand>(&arithmetic.operands[1]) : nullptr;
+                            if (bits == 64 && mask_operand && mask_operand->high == 0 &&
+                                mask_operand->value > 0x7fffffffULL &&
+                                mask_operand->value <= 0xffffffffULL &&
+                                (base == Opcode::CmpSlt || base == Opcode::CmpSge ||
+                                 base == Opcode::CmpSgt || base == Opcode::CmpSle)) continue;
+                            switch (decode_opcode(base)) {
+                            case Opcode::CmpEq:
+                            case Opcode::CmpUle: selected = Opcode::FlagsEq; break;
+                            case Opcode::CmpNe:
+                            case Opcode::CmpUgt: selected = Opcode::FlagsNe; break;
+                            case Opcode::CmpSlt: selected = Opcode::FlagsSign; break;
+                            case Opcode::CmpSge: selected = Opcode::FlagsNotSign; break;
+                            case Opcode::CmpSle: if (logical) selected = Opcode::FlagsSle; break;
+                            case Opcode::CmpSgt: if (logical) selected = Opcode::FlagsSgt; break;
+                            default: break;
+                            }
+                        }
+                        if (selected.empty()) continue;
+                        auto consumer = c;
+                        auto producer = p;
+                        if (p > c) {
+                            // The immediate update reads only the comparison's old input.
+                            if (arithmetic.uses.size() != 1 ||
+                                std::any_of(at(c + 1), at(p),
+                                    [](const auto& value) {
+                                        return value.kind != machine::InstructionKind::Target ||
+                                            value.patch || value.has_side_effects ||
+                                            !value.clobbers.empty();
+                                    })) continue;
+                            std::rotate(at(c), at(p), at(p + 1));
+                            producer = c;
+                            consumer = c + 1;
+                        } else if (!fused) {
+                            std::rotate(at(p + 1), at(c),
+                                        at(c + 1));
+                            consumer = p + 1;
+                        } else if (!std::all_of(at(p + 1),
+                                               at(c), preserves)) {
+                            continue;
+                        }
+                        auto& use = code[consumer];
+                        if (fused) use.condition_predicate = selected;
+                        else use.opcode = selected;
+                        use.uses.front() = flag;
+                        // Only the compared operand reads the flags; a
+                        // select's arms may name the same register.
+                        for (auto& operand : use.operands) {
+                            if (auto* reg = std::get_if<machine::RegisterOperand>(&operand);
+                                reg && reg->value == input) {
+                                reg->value = flag;
+                                break;
+                            }
+                        }
+                        // Force a flag-setting encoding: LEA and INC/DEC cannot
+                        // supply the full SUB flag set, in particular CF.
+                        code[producer].clobbers.push_back(flag);
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    void fold_phi_flag_branches() {
+        if (!options_.machine_combine || !options_.compare_branch_fusion) return;
+        const CopyLocations locations(current_);
+        const auto phi = [](const machine::Instruction& value) {
+            return value.opcode == Opcode::Phi || value.opcode == Opcode::Fphi ||
+                   value.opcode == Opcode::Vphi;
+        };
+        std::vector<unsigned> uses(current_.virtual_registers.size());
+        for (const auto& block : current_.blocks)
+            for (const auto& value : block.instructions)
+                for (const auto reg : value.uses)
+                    if (reg.kind == machine::RegisterKind::Virtual) ++uses[reg.id];
+        bool changed = false;
+        for (auto& tested : current_.blocks) {
+            if (tested.predecessors.size() < 2 || tested.instructions.empty() ||
+                std::any_of(current_.labels.begin(), current_.labels.end(), [&](const auto& label) {
+                    return label.block == tested.id;
+                }) || !std::all_of(tested.instructions.begin(), tested.instructions.end() - 1, phi)) continue;
+            const auto test = tested.instructions.back();
+            if (std::find(tested.successors.begin(), tested.successors.end(), tested.id) !=
+                    tested.successors.end()) continue;
+            if (test.kind != machine::InstructionKind::ConditionalBranch ||
+                !test.condition_predicate.empty() || test.uses.size() != 1 ||
+                test.uses.front().kind != machine::RegisterKind::Virtual ||
+                uses[test.uses.front().id] != 1) continue;
+            const auto predecessors = tested.predecessors;
+            for (const auto from : predecessors) {
+                if (tested.predecessors.size() < 2 || from == tested.id) continue;
+                auto& source = current_.blocks[from.value];
+                if (source.instructions.empty() || source.successors != std::vector{tested.id} ||
+                    source.instructions.back().kind != machine::InstructionKind::Branch) continue;
+                std::unordered_map<std::uint32_t, machine::Register> incoming;
+                bool free = true;
+                for (const auto& value : tested.instructions) {
+                    if (!phi(value)) continue;
+                    for (std::size_t i = 0; i + 1 < value.operands.size(); i += 2) {
+                        if (std::get<machine::BlockOperand>(value.operands[i]).target != from) continue;
+                        const auto passed = std::get<machine::RegisterOperand>(value.operands[i + 1]).value;
+                        incoming.emplace(value.defs.front().id, passed);
+                        if (value.defs.front() != test.uses.front() &&
+                            locations(value.defs.front()) != locations(passed)) free = false;
+                    }
+                }
+                const auto condition = incoming.find(test.uses.front().id);
+                if (!free || condition == incoming.end() ||
+                    condition->second.kind != machine::RegisterKind::Virtual ||
+                    uses[condition->second.id] != 1) continue;
+                const auto definition = std::find_if(source.instructions.begin(), source.instructions.end() - 1,
+                    [&](const auto& value) {
+                        return !flags_condition(value.opcode).empty() && value.defs.size() == 1 &&
+                               value.defs.front() == condition->second;
+                    });
+                if (definition == source.instructions.end() - 1 ||
+                    definition + 1 != source.instructions.end() - 1) continue;
+                auto branch = test;
+                branch.condition_predicate = definition->opcode;
+                branch.uses = definition->uses;
+                branch.operands.front() = register_operand(branch.uses.front());
+                source.instructions.back() = std::move(branch);
+                source.instructions.erase(definition);
+                source.successors = tested.successors;
+                const auto rename = [&](machine::Register reg) {
+                    const auto found = incoming.find(reg.id);
+                    return reg.kind == machine::RegisterKind::Virtual && found != incoming.end()
+                        ? found->second : reg;
+                };
+                for (const auto to : source.successors) {
+                    auto& target = current_.blocks[to.value];
+                    target.predecessors.push_back(from);
+                    for (auto& value : target.instructions) {
+                        if (!phi(value)) continue;
+                        for (std::size_t i = 0; i + 1 < value.operands.size(); i += 2) {
+                            if (std::get<machine::BlockOperand>(value.operands[i]).target != tested.id) continue;
+                            const auto passed = rename(std::get<machine::RegisterOperand>(value.operands[i + 1]).value);
+                            value.operands.push_back(machine::BlockOperand{from});
+                            value.operands.push_back(register_operand(passed));
+                            value.uses.push_back(passed);
+                            break;
+                        }
+                    }
+                }
+                std::erase(tested.predecessors, from);
+                for (auto& value : tested.instructions) {
+                    if (!phi(value)) continue;
+                    for (std::size_t i = 0; i + 1 < value.operands.size(); i += 2) {
+                        if (std::get<machine::BlockOperand>(value.operands[i]).target != from) continue;
+                        const auto at = value.operands.begin() + static_cast<std::ptrdiff_t>(i);
+                        value.operands.erase(at, at + 2);
+                        value.uses.erase(value.uses.begin() + static_cast<std::ptrdiff_t>(i / 2));
+                        break;
+                    }
+                }
+                changed = true;
+            }
+        }
+        if (changed) schedule_block_layout();
+    }
+
     void allocate_registers() {
         if (!options_.register_allocation ||
             manual_plans_.find(current_.source) ||
@@ -7928,7 +8229,8 @@ private:
                     opcode == Opcode::Sdivrem ||
                     opcode == Opcode::Udivrem ||
                     opcode == Opcode::Mulhs || opcode == Opcode::Mulhu ||
-                    has_property(base, OpcodeProperty::Comparison)) {
+                    has_property(base, OpcodeProperty::Comparison) ||
+                    !flags_condition(opcode).empty()) {
                     return std::none_of(
                         instruction.defs.begin(), instruction.defs.end(),
                         [](const auto& reg) { return reg.mode.bits > 64; }) &&
@@ -7941,7 +8243,7 @@ private:
         std::vector<std::unordered_set<std::uint32_t>> interference(count);
         std::vector<std::unordered_set<std::uint32_t>> affinity(count);
         std::vector<std::unordered_set<std::uint32_t>>
-            backedge_affinity(count);
+            backedge_affinity(count), forward_phi_affinity(count);
         const Dominance dominance(
             current_.blocks.size(), current_.entry.value,
             [&](std::uint32_t block) -> const std::vector<machine::BlockId>& {
@@ -8141,13 +8443,14 @@ private:
                             target.id == source->value.id ||
                             current_.virtual_register_classes[target.id] !=
                                 current_.virtual_register_classes[
-                                    source->value.id] ||
-                            !dominance.dominates(block.id.value,
-                                                 predecessor->target.value)) {
+                                    source->value.id]) {
                             continue;
                         }
-                        backedge_affinity[target.id].insert(source->value.id);
-                        backedge_affinity[source->value.id].insert(target.id);
+                        auto& links = dominance.dominates(block.id.value,
+                                                          predecessor->target.value)
+                            ? backedge_affinity : forward_phi_affinity;
+                        links[target.id].insert(source->value.id);
+                        links[source->value.id].insert(target.id);
                     }
                 }
                 const auto base = binary_base_opcode(instruction.opcode);
@@ -8302,6 +8605,7 @@ private:
                 if (instruction.opcode == Opcode::Parameter ||
                     instruction.opcode == Opcode::Constant ||
                     instruction.opcode == Opcode::Fconstant ||
+                    !flags_condition(instruction.opcode).empty() ||
                     instruction.opcode == Opcode::Fphi ||
                     instruction.opcode == Opcode::FindexedLoad ||
                     base == Opcode::Fadd || base == Opcode::Fsub ||
@@ -9916,6 +10220,32 @@ private:
             }
         };
         for (const auto id : order) color_value(id);
+        // A forward phi can take a load directly in its own register after
+        // coloring, without reserving low-priority colors ahead of loop webs.
+        std::vector<const machine::Instruction*> defining(count);
+        for (const auto& block : current_.blocks)
+            for (const auto& value : block.instructions)
+                for (const auto reg : value.defs)
+                    if (reg.kind == machine::RegisterKind::Virtual) defining[reg.id] = &value;
+        for (std::uint32_t id = 0; id < count; ++id) {
+            if (!defining[id] || !is_phi(*defining[id])) continue;
+            const auto color = current_.virtual_register_assignments[id];
+            if (!color) continue;
+            for (const auto source : forward_phi_affinity[id]) {
+                const auto* definition = defining[source];
+                if (!definition || !eligible[source] || !backedge_affinity[source].empty() ||
+                    parameter_endpoints[source] || fixed_result_endpoints[source] ||
+                    fixed_argument_endpoints[source] || direct_return_endpoints[source] ||
+                    forbidden[source].contains(color->value) ||
+                    call_forbidden[source].contains(color->value) ||
+                    (definition->opcode != Opcode::Load && definition->opcode != Opcode::PointerLoad &&
+                     definition->opcode != Opcode::IndexedLoad && definition->opcode != Opcode::Constant)) continue;
+                if (std::none_of(interference[source].begin(), interference[source].end(),
+                    [&](std::uint32_t other) {
+                        return current_.virtual_register_assignments[other] == color;
+                    })) current_.virtual_register_assignments[source] = color;
+            }
+        }
 
         if (rax && rcx) {
             // An instruction that stages a home-resident integer operand or
@@ -10995,6 +11325,8 @@ private:
         add(LoweringPass::ClusterSharedCompareSelects, Stage::Scheduling,
             "cluster-shared-compare-selects",
             &MachineLowerer::cluster_shared_compare_selects);
+        add(LoweringPass::ReuseArithmeticFlags, Stage::InstructionCombining,
+            "reuse-arithmetic-flags", &MachineLowerer::reuse_arithmetic_flags);
         add(LoweringPass::SplitEntryParameters, Stage::RegisterAllocation,
             "split-entry-parameters",
             &MachineLowerer::split_entry_parameters);
@@ -11005,6 +11337,8 @@ private:
             "select-cfa-anchor", &MachineLowerer::select_cfa_anchor);
         add(LoweringPass::AllocateRegisters, Stage::RegisterAllocation,
             "allocate-registers", &MachineLowerer::allocate_registers);
+        add(LoweringPass::FoldPhiFlagBranches, Stage::RegisterAllocation,
+            "fold-phi-flag-branches", &MachineLowerer::fold_phi_flag_branches);
         add(LoweringPass::PreserveBoundaryContract,
             Stage::RegisterAllocation, "preserve-boundary-contract",
             &MachineLowerer::preserve_boundary_contract);
@@ -11473,6 +11807,32 @@ public:
             return result;
         }
         for (auto& function : module_.functions) {
+            copy_loop_depths_ = options_.cprop_registers &&
+                    options_.optimize_for == OptimizationGoal::Speed
+                ? native::loop_depths(function) : std::vector<unsigned>{};
+            zero_extended_dwords_.clear();
+            const bool inspect_dwords = options_.peephole2 && !has_calls(function);
+            for (const auto& block : function.blocks) {
+                for (const auto& value : block.instructions) {
+                    if (!inspect_dwords || value.defs.size() != 1 ||
+                        value.defs.front().mode.bits != 32)
+                        continue;
+                    const auto op = value.opcode;
+                    const auto base = x86_64::base_opcode(op);
+                    // A same-width extension may emit nothing, so only a
+                    // narrower source proves a 32-bit write.
+                    const bool widening = (op == Opcode::Zext || op == Opcode::Sext) &&
+                        !value.uses.empty() && value.uses.front().mode.bits < 32;
+                    if (base == Opcode::Add || base == Opcode::Sub ||
+                        base == Opcode::And || base == Opcode::Or ||
+                        base == Opcode::Xor || op == Opcode::Mul ||
+                        op == Opcode::PointerLoad ||
+                        op == Opcode::IndexedLoad || op == Opcode::Load ||
+                        op == Opcode::ZextLoad || op == Opcode::SextLoad || widening) {
+                        zero_extended_dwords_.insert(value.defs.front().id);
+                    }
+                }
+            }
             next_label_ = 0;
             collect_float_literals(function);
             collect_vector_literals(function);
@@ -13856,7 +14216,8 @@ private:
                     second.uses.size() != 1 || second.defs.size() != 1 ||
                     second.operands.size() < 2 || first->patch ||
                     second.patch || first->has_side_effects ||
-                    second.has_side_effects ||
+                    second.has_side_effects || defines_arithmetic_flags(*first) ||
+                    defines_arithmetic_flags(second) ||
                     first->defs.front() != second.uses.front()) {
                     for (const auto definition : second.defs) {
                         if (definition.kind ==
@@ -20587,6 +20948,29 @@ private:
         const auto* assigned_source = assigned_integer_register(function, source);
         const bool moved =
             !assigned_source || assigned_source->storage_name != destination;
+        if (options_.peephole2 && assigned_source && source_bits < target_bits &&
+            target_bits <= 64 &&
+            (value.opcode == Opcode::Sext || value.opcode == Opcode::Zext)) {
+            const bool sign = value.opcode == Opcode::Sext;
+            const auto from = register_name(assigned_source->storage_name,
+                                            source_bits);
+            const auto to = register_name(destination, target_bits <= 32 ? 32 : 64);
+            if (source_bits == 32 && !sign) {
+                if (moved || !zero_extended_dwords_.contains(source.id)) {
+                    instruction("movl", from + ", " + register_name(destination, 32));
+                }
+            } else {
+                const auto opcode = source_bits == 8
+                    ? (sign ? (target_bits <= 32 ? "movsbl" : "movsbq") : "movzbl")
+                    : source_bits == 16
+                    ? (sign ? (target_bits <= 32 ? "movswl" : "movswq") : "movzwl")
+                    : "movslq";
+                instruction(opcode, from + ", " +
+                    (!sign ? register_name(destination, 32) : to));
+            }
+            store(function, target, destination);
+            return;
+        }
         load(function, source, destination, "rdx");
         if (value.opcode == Opcode::Sext && target_bits > source_bits) {
             if (source_bits == 8) {
@@ -20641,6 +21025,7 @@ private:
     }
 
     std::string condition_code(machine::TargetOpcodeId opcode) const {
+        if (const auto code = flags_condition(opcode); !code.empty()) return std::string(code);
         if (opcode == Opcode::CmpEq) return "e";
         if (opcode == Opcode::CmpNe) return "ne";
         if (opcode == Opcode::CmpSlt) return "l";
@@ -20655,6 +21040,8 @@ private:
     }
 
     static std::string inverse_condition_code(std::string_view code) {
+        if (code == "s") return "ns";
+        if (code == "ns") return "s";
         if (code == "e") return "ne";
         if (code == "ne") return "e";
         if (code == "l") return "ge";
@@ -21038,7 +21425,7 @@ private:
                 return;
             }
         }
-        if (options_.peephole2 && bits >= 32 &&
+        if (options_.peephole2 && !defines_arithmetic_flags(value) && bits >= 32 &&
             (base == Opcode::Add || base == Opcode::Sub)) {
             const auto* assigned_source =
                 assigned_integer_register(function, source);
@@ -21091,7 +21478,7 @@ private:
                     base == Opcode::Rotr
                 ? std::to_string(immediate.value % bits)
                 : immediate_text;
-        if (options_.peephole2 &&
+        if (options_.peephole2 && !defines_arithmetic_flags(value) &&
             (options_.optimize_for == OptimizationGoal::Size ||
              options_.optimize_for == OptimizationGoal::MinimumSize) &&
             (base == Opcode::Add || base == Opcode::Sub) &&
@@ -21116,6 +21503,7 @@ private:
     bool emitted_instruction_preserves_flags(
         const machine::Function& function,
         const machine::Instruction& value) const {
+        if (defines_arithmetic_flags(value)) return false;
         if (fused_multiplications_.contains(&value) ||
             fused_integer_add_outputs_.contains(&value) ||
             fused_integer_adds_.contains(&value)) {
@@ -21509,7 +21897,10 @@ private:
 
         std::string truth_code = "ne";
         std::string falsity_code = "e";
-        if (value.condition_predicate.empty()) {
+        if (!flags_condition(value.condition_predicate).empty()) {
+            truth_code = condition_code(value.condition_predicate);
+            falsity_code = inverse_condition_code(truth_code);
+        } else if (value.condition_predicate.empty()) {
             const auto condition = value.uses.front();
             const auto* assigned_condition =
                 assigned_integer_register(function, condition);
@@ -21945,7 +22336,8 @@ private:
         auto destination = assigned_target
             ? std::string(assigned_target->storage_name)
             : std::string("rax");
-        if (options_.peephole2 && value.opcode == Opcode::Add &&
+        if (options_.peephole2 && !defines_arithmetic_flags(value) &&
+            value.opcode == Opcode::Add &&
             (bits == 32 || bits == 64) && assigned_target) {
             const auto* assigned_left =
                 assigned_integer_register(function, left);
@@ -24853,6 +25245,95 @@ private:
         }
     }
 
+    void hoist_dead_edge_copies(const machine::Function& function,
+                                machine::BlockId predecessor,
+                                const machine::Instruction& branch,
+                                machine::BlockId truth, machine::BlockId falsity) {
+        if (!options_.cprop_registers || truth == falsity ||
+            has_property(branch.condition_predicate, OpcodeProperty::Vector) ||
+            has_property(branch.condition_predicate, OpcodeProperty::Floating) ||
+            !std::all_of(branch.uses.begin(), branch.uses.end(), [&](auto reg) {
+                return (reg.kind == machine::RegisterKind::Physical &&
+                        reg.id == flags_storage.value) || assigned_integer_register(function, reg);
+            })) return;
+        const auto& location = *copy_locations_;
+        const auto true_copies = scalar_edge_copies(function, predecessor, truth);
+        const auto false_copies = scalar_edge_copies(function, predecessor, falsity);
+        const auto aliases = [&](machine::Register reg, CopyLocation target) {
+            return location(reg) == target ||
+                (reg.kind == machine::RegisterKind::Physical &&
+                 target.kind == CopyLocation::Kind::Physical && reg.id == target.id);
+        };
+        const auto try_edge = [&](const auto& copies, machine::BlockId other) {
+            for (const auto& [source, phi] : copies) {
+                const auto target = phi->defs.front();
+                if (phi->opcode != Opcode::Phi || target.mode.bits > 64 ||
+                    !assigned_integer_register(function, source) ||
+                    !assigned_integer_register(function, target) ||
+                    location(source) == location(target) ||
+                    hoisted_edge_copies_.contains({predecessor.value, target.id})) continue;
+                const auto destination = location(target);
+                const auto already_written = [&](const auto& edge) {
+                    return std::any_of(edge.begin(), edge.end(), [&](const auto& copy) {
+                        return location(copy.second->defs.front()) == destination &&
+                            hoisted_edge_copies_.contains(
+                                {predecessor.value, copy.second->defs.front().id});
+                    });
+                };
+                if (already_written(true_copies) || already_written(false_copies)) continue;
+                const auto reads = [&](const auto& edge) {
+                    return std::any_of(edge.begin(), edge.end(), [&](const auto& copy) {
+                        return aliases(copy.first, destination);
+                    });
+                };
+                if (reads(true_copies) || reads(false_copies) ||
+                    std::any_of(branch.uses.begin(), branch.uses.end(), [&](auto reg) {
+                        return aliases(reg, destination);
+                    }) || std::any_of(branch.clobbers.begin(), branch.clobbers.end(), [&](auto reg) {
+                        return aliases(reg, destination);
+                    })) continue;
+                std::unordered_set<std::uint32_t> visited;
+                const auto live = [&](auto&& self, machine::BlockId from,
+                                      machine::BlockId to) -> bool {
+                    const auto edge = scalar_edge_copies(function, from, to);
+                    if (reads(edge)) return true;
+                    if (std::any_of(edge.begin(), edge.end(), [&](const auto& copy) {
+                            return copy.second->defs.front().mode.bits >= 32 &&
+                                aliases(copy.second->defs.front(), destination);
+                        })) return false;
+                    // A cycle with no intervening definition is conservative.
+                    if (!visited.insert(to.value).second) return true;
+                    const auto& next = block(function, to);
+                    for (const auto& value : next.instructions) {
+                        if (value.opcode == Opcode::Phi || value.opcode == Opcode::Fphi ||
+                            value.opcode == Opcode::Vphi) continue;
+                        if (std::any_of(value.uses.begin(), value.uses.end(), [&](auto reg) {
+                                return aliases(reg, destination);
+                            })) return true;
+                        const auto writes = [&](const auto& regs) {
+                            return std::any_of(regs.begin(), regs.end(), [&](auto reg) {
+                                return reg.mode.bits >= 32 && aliases(reg, destination);
+                            });
+                        };
+                        if (writes(value.defs)) return false;
+                    }
+                    for (const auto successor : next.successors)
+                        if (self(self, to, successor)) return true;
+                    return false;
+                };
+                if (live(live, predecessor, other)) continue;
+                const auto* from = assigned_integer_register(function, source);
+                const auto* to = assigned_integer_register(function, target);
+                instruction("mov" + std::string(1, suffix(target.mode.bits)),
+                    register_name(from->storage_name, target.mode.bits) + ", " +
+                    register_name(to->storage_name, target.mode.bits));
+                hoisted_edge_copies_.insert({predecessor.value, target.id});
+            }
+        };
+        try_edge(true_copies, falsity);
+        try_edge(false_copies, truth);
+    }
+
     bool edge_requires_copies(const machine::Function& function,
                               machine::BlockId predecessor,
                               machine::BlockId successor) const {
@@ -25822,13 +26303,19 @@ private:
             const auto* speculative_advance =
                 advance_found == speculative_vector_advances_.end()
                     ? nullptr : &advance_found->second;
-            if (!speculative_advance) {
+            if (!speculative_advance && flags_condition(value.condition_predicate).empty()) {
                 hoist_shared_edge_copies(function, owner.id, value, truth,
                                          falsity);
             }
+            if (!speculative_advance) {
+                hoist_dead_edge_copies(function, owner.id, value, truth, falsity);
+            }
             std::string truth_code = "ne";
             std::string falsity_code = "e";
-            if (value.condition_predicate == Opcode::VcmpNone) {
+            if (!flags_condition(value.condition_predicate).empty()) {
+                truth_code = condition_code(value.condition_predicate);
+                falsity_code = inverse_condition_code(truth_code);
+            } else if (value.condition_predicate == Opcode::VcmpNone) {
                 if ((value.uses.size() != 2 && value.uses.size() != 3) ||
                     value.operands.size() < 6 ||
                     value.uses[0].mode != value.uses[1].mode ||
@@ -26088,12 +26575,30 @@ private:
                 }
                 return;
             }
+            // A loop join bypassing optional update work can carry a
+            // recurrence copy. Inline it rather than taking a stub round trip.
+            const auto bypasses_loop_work = [&](machine::BlockId copied,
+                                                 machine::BlockId work) {
+                if (copy_loop_depths_.empty() || copy_loop_depths_[owner.id.value] == 0 ||
+                    copy_loop_depths_[copied.value] != copy_loop_depths_[owner.id.value] ||
+                    copy_loop_depths_[work.value] != copy_loop_depths_[owner.id.value]) return false;
+                const auto& successors = block(function, work).successors;
+                if (std::find(successors.begin(), successors.end(), copied) == successors.end()) return false;
+                const auto copies = scalar_edge_copies(function, owner.id, copied);
+                return std::any_of(copies.begin(), copies.end(), [&](const auto& copy) {
+                    return copy.second->opcode == Opcode::Phi &&
+                        copy.second->defs.front().mode.bits >= 32 &&
+                        copy.second->defs.front().mode.bits <= 64 &&
+                        !same_physical_assignment(function, copy.first, copy.second->defs.front());
+                });
+            };
             // Put copies for a cold edge in a function-tail stub when the
             // copy-free successor is already the next layout block.  This
             // preserves the hot fallthrough and avoids forcing either an
             // extra jump or an always-taken forward branch through a loop.
             if (truth != falsity && next_block &&
-                *next_block == truth && !truth_copies && falsity_copies) {
+                *next_block == truth && !truth_copies && falsity_copies &&
+                !bypasses_loop_work(falsity, truth)) {
                 const auto stub = private_label(function, "edge.stub");
                 instruction("j" + falsity_code, stub);
                 deferred_edge_stubs_.push_back(
@@ -26101,7 +26606,8 @@ private:
                 return;
             }
             if (truth != falsity && next_block &&
-                *next_block == falsity && truth_copies && !falsity_copies) {
+                *next_block == falsity && truth_copies && !falsity_copies &&
+                !bypasses_loop_work(truth, falsity)) {
                 const auto stub = private_label(function, "edge.stub");
                 instruction("j" + truth_code, stub);
                 deferred_edge_stubs_.push_back(
@@ -26392,6 +26898,12 @@ private:
         } else if (value.opcode == Opcode::Fneg ||
                    value.opcode == Opcode::Fiszero) {
             emit_float_unary(function, value);
+        } else if (!flags_condition(value.opcode).empty()) {
+            const auto target = value.defs.front();
+            const auto* assigned = assigned_integer_register(function, target);
+            const auto destination = assigned ? assigned->storage_name : "rax";
+            instruction("set" + condition_code(value.opcode), register_name(destination, 8));
+            store(function, target, destination);
         } else if (value.opcode == Opcode::Sext ||
                    value.opcode == Opcode::Zext ||
                    value.opcode == Opcode::Trunc ||
@@ -27245,6 +27757,7 @@ private:
     std::vector<VectorLiteral> vector_literals_;
     std::vector<JumpTable> jump_tables_;
     std::vector<DeferredEdgeStub> deferred_edge_stubs_;
+    std::vector<unsigned> copy_loop_depths_;
     std::uint32_t next_label_{};
     std::uint32_t frame_size_{};
     std::uint32_t frame_pointer_save_size_{};
@@ -27295,6 +27808,7 @@ private:
         speculative_vector_advance_adds_;
     std::unordered_set<const machine::Instruction*> early_select_tests_;
     std::unordered_set<const machine::Instruction*> shared_select_flags_;
+    std::unordered_set<std::uint32_t> zero_extended_dwords_;
     std::unordered_set<std::uint32_t> loop_headers_;
 };
 

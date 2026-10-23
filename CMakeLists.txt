@@ -5257,6 +5257,41 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/middle/floating_select_codegen.cmake")
     set_tests_properties(cross_floating_select_codegen PROPERTIES
         LABELS "check.compile;arch.x86_64;arch.mips;middle;backend.native;feature.optimization;feature.floating;feature.model;isa.mips4;isa.vr4300;opt.O0;opt.O2")
+    add_test(NAME cross_x86_64_loop_codegen
+        COMMAND "${CMAKE_COMMAND}" -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/machine/x86_loops.x
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/x86-loop-codegen
+            -P "${CMAKE_SOURCE_DIR}/test/backend/machine/x86_loops.cmake")
+    set_tests_properties(cross_x86_64_loop_codegen PROPERTIES
+        LABELS "check.compile;arch.x86_64;backend.native;feature.optimization;feature.control;opt.O2;opt.Oz")
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+       CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+        foreach(loop_mode O2 O3 Oz O2-no-if-conversion O2-no-cprop-registers
+                          O2-no-machine-combine O2-no-peephole2
+                          O2-no-compare-branch-fusion O2-no-register-allocation
+                          O2-no-reorder-blocks O2-no-schedule-insns
+                          O2-limit-zero O2-limit-large)
+            string(REGEX MATCH "^O[0-9sz]+" loop_level "${loop_mode}")
+            set(loop_flags "-${loop_level}")
+            if(loop_mode MATCHES "-no-(.*)$")
+                list(APPEND loop_flags "-fno-${CMAKE_MATCH_1}")
+            elseif(loop_mode MATCHES "-limit-zero$")
+                list(APPEND loop_flags "-fif-conversion-limit=0" "-fif-conversion-memory-limit=0")
+            elseif(loop_mode MATCHES "-limit-large$")
+                list(APPEND loop_flags "-fif-conversion-limit=100" "-fif-conversion-memory-limit=100")
+            endif()
+            add_test(NAME cross_runtime_x86_loops_${loop_mode}
+                COMMAND "${CMAKE_COMMAND}" -DCC=$<TARGET_FILE:cross_cc>
+                    -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/machine/x86_loops.x
+                    -DRUNNER=${CMAKE_SOURCE_DIR}/test/backend/machine/x86_loops.cpp
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/x86-loops-${loop_mode}
+                    "-DCC_FLAGS=${loop_flags}"
+                    -P "${CMAKE_SOURCE_DIR}/test/backend/machine/x86_loops_runtime.cmake")
+            set_tests_properties(cross_runtime_x86_loops_${loop_mode} PROPERTIES
+                LABELS "check.runtime;arch.x86_64;backend.native;feature.optimization;feature.control;opt.${loop_level}")
+        endforeach()
+    endif()
     add_test(NAME cross_x86_64_shared_edge_copies
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

@@ -47,6 +47,11 @@ canonicalize_bitwise_operations(ManagedFunction& function,
 [[nodiscard]] std::optional<UInt128> fold_integer_binary(
     BinaryOperation operation, UInt128 left, UInt128 right, unsigned bits);
 
+// Conservative high-zero-bit proof through integer operations, casts and phis.
+[[nodiscard]] unsigned known_leading_zeros(const ManagedFunction& function,
+                                          const hir::Module& hir_module,
+                                          ValueId value);
+
 // Convert a legal top-tested natural loop into an initial zero-trip guard
 // and a bottom-tested loop. The transform repairs value SSA and effect SSA
 // and deliberately rejects secondary exits, multiple latches, and

@@ -1850,6 +1850,12 @@ private:
 
 } // namespace
 
+unsigned known_leading_zeros(const ManagedFunction& function,
+                             const hir::Module& hir_module, ValueId value) {
+    std::unordered_set<std::uint32_t> phis;
+    return known_leading_zeros(function, hir_module, value, phis);
+}
+
 bool canonicalize_bitwise_operations(ManagedFunction& function,
                                      const hir::Module& hir_module) {
     return canonicalize_bitwise_operations_impl(function, hir_module);
