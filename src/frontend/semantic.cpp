@@ -19425,7 +19425,8 @@ public:
 private:
     static bool same_value_type(const TypePtr& literal, const TypePtr& destination) {
         if (!literal || !destination || literal->kind != destination->kind ||
-            (literal->kind != Type::Kind::Record && literal->kind != Type::Kind::Vector)) return false;
+            (literal->kind != Type::Kind::Record && literal->kind != Type::Kind::Vector &&
+             !is_scalar(literal))) return false;
         auto left = without_alignment(literal), right = without_alignment(destination);
         left->is_const = left->is_volatile = right->is_const = right->is_volatile = false;
         return same_type(left, right);

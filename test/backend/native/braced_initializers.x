@@ -34,6 +34,8 @@ global struct named record = { { "abcd" }, { 7u16 }, { "text" } };
 global u8 rows[][4] = { { "ab" }, "cd", { "e" } };
 global u32 from_literal = (u32){ 9u32 };
 global u32 *literal_address = &(u32){ 11u32 };
+// A scalar literal of the object's type is its brace list, relocations kept.
+global u32 *literal_pointer = (u32 *){ &scalar };
 global u32 folded = { 2u32 + 3u32 * 4u32 };
 global uptr layout = { sizeof(u64) + 1uptr };
 global struct bits fields = { { 5u32 }, { 17u32 }, { 9u8 } };
@@ -109,7 +111,8 @@ global i32 braced_initializers_entry() {
         return 5;
     if (sizeof(rows) != 12uptr || rows[0][1] != 'b' || rows[1][0] != 'c' || rows[2][0] != 'e' ||
         rows[2][1] != 0u8) return 6;
-    if (from_literal != 9u32 || *literal_address != 11u32 || folded != 14u32 || layout != 9uptr) return 7;
+    if (from_literal != 9u32 || *literal_address != 11u32 || folded != 14u32 || layout != 9uptr ||
+        literal_pointer != &scalar) return 7;
     if (fields.low != 5u32 || fields.high != 17u32 || fields.tag != 9u8) return 8;
     if (overlay.bits != 0x3f800000u32 || hue != blue || callback(4u32) != 8u32) return 9;
     if (evaluated_value != $::runtime(evaluated(4u32)) || evaluated_value != 8u32 + 1u32 + 'y' + 4u32 +
