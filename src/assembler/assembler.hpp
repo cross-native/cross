@@ -414,6 +414,10 @@ public:
     // A private label name of the target, beyond the format's `.L` (`L` in
     // Mach-O); private labels stay out of the symbol table.
     [[nodiscard]] virtual bool private_label(std::string_view) const { return false; }
+    // Whether '#' starts a comment anywhere, as in GNU as for MIPS and x86;
+    // otherwise only as the first character of a line that is not blank,
+    // and "//" starts one anywhere, as in GNU as for AArch64.
+    [[nodiscard]] virtual bool hash_comments() const { return true; }
     // Whether `.file` alone, without `.loc` rows, yields a line table, as in
     // LLVM MC; GNU as writes none.
     [[nodiscard]] virtual bool line_table_without_rows() const { return true; }
@@ -454,6 +458,8 @@ public:
     // Runs before a directive emits something other than an instruction or
     // changes the section, and after the last statement.
     virtual void flush(Assembler&) {}
+    // Runs before a directive emits data into the current section.
+    virtual void data(Assembler&) {}
     // Runs after the last statement and before layout.
     virtual void finish(Assembler& assembler) = 0;
     // Runs after layout and the call-frame tables, before the line table.

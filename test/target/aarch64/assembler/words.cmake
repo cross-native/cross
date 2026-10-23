@@ -1,0 +1,45 @@
+# Copyright (C) 2026 Cross contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# `as` encodes SOURCE to the words in its comments (`// 12345678`), read in
+# little-endian order from .text.
+
+foreach(required AS SOURCE OUTPUT)
+    if(NOT DEFINED ${required} OR "${${required}}" STREQUAL "")
+        message(FATAL_ERROR "${required} must name a path")
+    endif()
+endforeach()
+find_program(LLVM_OBJCOPY NAMES llvm-objcopy)
+if(NOT LLVM_OBJCOPY)
+    message(STATUS "skipping: llvm-objcopy is required")
+    return()
+endif()
+file(MAKE_DIRECTORY "${OUTPUT}")
+execute_process(COMMAND "${AS}" -target aarch64-none-elf "${SOURCE}" -o "${OUTPUT}/words.o"
+                RESULT_VARIABLE status ERROR_VARIABLE err)
+if(NOT status EQUAL 0)
+    message(FATAL_ERROR "as failed\n${err}")
+endif()
+execute_process(COMMAND "${LLVM_OBJCOPY}" -O binary --only-section=.text "${OUTPUT}/words.o"
+                        "${OUTPUT}/words.text" RESULT_VARIABLE status)
+file(READ "${OUTPUT}/words.text" hex HEX)
+string(LENGTH "${hex}" length)
+set(words "")
+set(index 0)
+while(index LESS length)
+    string(SUBSTRING "${hex}" ${index} 8 word)
+    string(REGEX REPLACE "(..)(..)(..)(..)" "\\4\\3\\2\\1" word "${word}")
+    list(APPEND words "${word}")
+    math(EXPR index "${index} + 8")
+endwhile()
+file(STRINGS "${SOURCE}" lines REGEX "// [0-9a-f]+$")
+set(expected "")
+foreach(line IN LISTS lines)
+    string(REGEX REPLACE "^.*// " "" word "${line}")
+    list(APPEND expected "${word}")
+endforeach()
+if(NOT words STREQUAL expected)
+    message(FATAL_ERROR "words differ\nexpected: ${expected}\nactual:   ${words}")
+endif()
+list(LENGTH words count)
+message(STATUS "${count} words matched")

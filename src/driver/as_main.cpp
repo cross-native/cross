@@ -75,9 +75,7 @@ int assemble_main(int argc, char** argv) {
         return 1;
     }
     if (!target->integrated_assembler) {
-        diagnostics.command_error("target '" + options.target +
-                                  "' has no integrated assembler yet; select a MIPS "
-                                  "target with -target or -mprofile");
+        diagnostics.command_error("target '" + options.target + "' has no assembler");
         return 1;
     }
     auto subtarget = resolve_subtarget(*target, options, diagnostics);

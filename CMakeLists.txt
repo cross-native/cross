@@ -122,6 +122,7 @@ cross_component(cross_linker)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
              "${CMAKE_CURRENT_SOURCE_DIR}/model/common.xm"
              "${CMAKE_CURRENT_SOURCE_DIR}/model/aarch64.xm"
+             "${CMAKE_CURRENT_SOURCE_DIR}/model/aarch64_instructions.xm"
              "${CMAKE_CURRENT_SOURCE_DIR}/model/x86_64.xm"
              "${CMAKE_CURRENT_SOURCE_DIR}/model/mips.xm"
              "${CMAKE_CURRENT_SOURCE_DIR}/model/mips_instructions.xm"
@@ -142,6 +143,8 @@ function(cross_model_text variable path)
 endfunction()
 cross_model_text(CROSS_COMMON_MODEL "${CMAKE_CURRENT_SOURCE_DIR}/model/common.xm")
 cross_model_text(CROSS_AARCH64_MODEL "${CMAKE_CURRENT_SOURCE_DIR}/model/aarch64.xm")
+cross_model_text(CROSS_AARCH64_INSTRUCTIONS_MODEL
+                 "${CMAKE_CURRENT_SOURCE_DIR}/model/aarch64_instructions.xm")
 cross_model_text(CROSS_X86_64_MODEL "${CMAKE_CURRENT_SOURCE_DIR}/model/x86_64.xm")
 cross_model_text(CROSS_MIPS_MODEL "${CMAKE_CURRENT_SOURCE_DIR}/model/mips.xm")
 cross_model_text(CROSS_MIPS_INSTRUCTIONS_MODEL
@@ -167,10 +170,13 @@ add_library(cross_targets
     src/target/assembly_format.cpp
     src/target/registry.cpp
     src/target/subtarget.cpp
+    src/target/aarch64/assembler.cpp
+    src/target/aarch64/instructions.cpp
     src/target/aarch64/target.cpp
     src/target/mips/assembler.cpp
     src/target/mips/linker.cpp
     src/target/mips/target.cpp
+    src/target/operand_encoders.cpp
     src/target/x86_64/assembler.cpp
     src/target/x86_64/encodings.cpp
     src/target/x86_64/manual_endpoint.cpp
@@ -3480,6 +3486,78 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/target/aarch64/codegen_unavailable.cmake")
     set_tests_properties(cross_aarch64_codegen_unavailable PROPERTIES
         LABELS "check.compile;diagnostics;arch.aarch64;feature.driver")
+    # The AArch64 assembler: every form of the shipped table, relocations,
+    # and directives against llvm-mc (and GNU as, where installed); values
+    # that only Cross takes; diagnostics; a bare-metal link with ld.lld and
+    # GNU ld, run on QEMU where installed; and user instruction entries.
+    set(aarch64_assembler ${CMAKE_SOURCE_DIR}/test/target/aarch64/assembler)
+    add_test(NAME cross_aarch64_assembler_table
+        COMMAND "${CMAKE_COMMAND}"
+                -DAS=$<TARGET_FILE:cross_as>
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${aarch64_assembler}/table.s
+                -DGNU_SOURCES=${aarch64_assembler}/table_gnu.s
+                "-DOPTIONS=-march=armv8.2-a+fp16+crc+lse+sb+jscvt"
+                "-DMC_OPTIONS=-mattr=+v8.2a,+fullfp16,+crc,+lse,+sb,+jsconv"
+                "-DGNU_OPTIONS=-march=armv8.3-a+fp16+crc+lse+sb"
+                -DGNU_TEXT=1
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aarch64-assembler/table
+                -P "${aarch64_assembler}/differential.cmake")
+    set_tests_properties(cross_aarch64_assembler_table PROPERTIES
+        LABELS "feature.assembler;feature.model;arch.aarch64;check.compile;endian.little;feature.floating;feature.atomics")
+    foreach(case relocations directives)
+        add_test(NAME cross_aarch64_assembler_${case}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DAS=$<TARGET_FILE:cross_as>
+                    -DSOURCE=${aarch64_assembler}/${case}.s
+                    "-DOPTIONS=-march=armv8-a"
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aarch64-assembler/${case}
+                    -P "${aarch64_assembler}/differential.cmake")
+    endforeach()
+    set_tests_properties(cross_aarch64_assembler_relocations PROPERTIES
+        LABELS "feature.assembler;arch.aarch64;check.compile;feature.object;feature.tls;feature.pic")
+    set_tests_properties(cross_aarch64_assembler_directives PROPERTIES
+        LABELS "feature.assembler;arch.aarch64;check.compile;feature.object;feature.debug")
+    add_test(NAME cross_aarch64_assembler_gnu
+        COMMAND "${CMAKE_COMMAND}"
+                -DAS=$<TARGET_FILE:cross_as>
+                -DSOURCE=${aarch64_assembler}/relocations_gnu.s
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aarch64-assembler/gnu
+                -P "${aarch64_assembler}/gnu.cmake")
+    set_tests_properties(cross_aarch64_assembler_gnu PROPERTIES
+        LABELS "feature.assembler;arch.aarch64;check.compile;feature.object;feature.tls")
+    add_test(NAME cross_aarch64_assembler_words
+        COMMAND "${CMAKE_COMMAND}"
+                -DAS=$<TARGET_FILE:cross_as>
+                -DSOURCE=${aarch64_assembler}/words.s
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aarch64-assembler/words
+                -P "${aarch64_assembler}/words.cmake")
+    set_tests_properties(cross_aarch64_assembler_words PROPERTIES
+        LABELS "feature.assembler;arch.aarch64;check.compile")
+    add_test(NAME cross_aarch64_assembler_diagnostics
+        COMMAND "${CMAKE_COMMAND}"
+                -DAS=$<TARGET_FILE:cross_as>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aarch64-assembler/diagnostics
+                -P "${aarch64_assembler}/diagnostics.cmake")
+    set_tests_properties(cross_aarch64_assembler_diagnostics PROPERTIES
+        LABELS "feature.assembler;arch.aarch64;diagnostics")
+    add_test(NAME cross_aarch64_assembler_link
+        COMMAND "${CMAKE_COMMAND}"
+                -DAS=$<TARGET_FILE:cross_as>
+                -DSOURCE=${aarch64_assembler}/link.s
+                -DSCRIPT=${aarch64_assembler}/bare.ld
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aarch64-assembler/link
+                -P "${aarch64_assembler}/link.cmake")
+    set_tests_properties(cross_aarch64_assembler_link PROPERTIES
+        LABELS "feature.assembler;feature.linker;arch.aarch64;check.runtime;feature.tls;feature.pic;feature.floating;feature.atomics")
+    add_test(NAME cross_aarch64_instruction_entries
+        COMMAND "${CMAKE_COMMAND}"
+                -DAS=$<TARGET_FILE:cross_as>
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aarch64-instruction-entries
+                -P "${CMAKE_SOURCE_DIR}/test/target/aarch64/instruction_entries.cmake")
+    set_tests_properties(cross_aarch64_instruction_entries PROPERTIES
+        LABELS "feature.model;feature.assembler;arch.aarch64;diagnostics")
     # Loading checks of uniform_members, max_members, exhaust, implications,
     # and call_preserved_views.
     add_test(NAME cross_model_homogeneous_validation

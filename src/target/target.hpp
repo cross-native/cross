@@ -851,17 +851,28 @@ struct OperandWidth {
     std::string_view feature{};
 };
 
+// Bits of a relocated value in the instruction word: `width` bits of the
+// value from its bit `low`, at bit `shift` of the word.
+struct RelocatedSlice {
+    unsigned shift{};
+    unsigned width{};
+    unsigned low{};
+};
+
 // An operand type that a target's `instruction` entries may name.
 struct OperandType {
     OperandKind kind{};
     std::string_view register_class{};
-    // The field values: register numbers or immediates.
+    // The field values: register numbers, immediates, or what an encoder
+    // makes of an operand's value.
     std::int64_t minimum{};
     std::int64_t maximum{};
-    // A value that a relocation operator gives or layout settles goes into
-    // the low `relocated_bits` bits of the word.
+    // A value that a relocation operator gives or layout settles has
+    // `relocated_bits` bits, which go into the low bits of the word unless
+    // `relocated_slices` places them.
     unsigned relocated_bits{};
-    // Memory: the range of offsets and the accessed width, 0 for any.
+    // Memory: the range of the offset's field values and the accessed
+    // width, 0 for any.
     std::int64_t offset_minimum{};
     std::int64_t offset_maximum{};
     unsigned memory_bits{};
@@ -875,6 +886,8 @@ struct OperandType {
     bool register_syntax{};
     // The target's identity of the type.
     std::uint16_t id{};
+    // Where the word holds a relocated value, from its low bits up.
+    std::vector<RelocatedSlice> relocated_slices{};
 };
 
 // A macro of the target's assembler that an entry's `macro` names, the

@@ -21,11 +21,12 @@ global void divide(u32 a, u32 b, out u32 quotient, out u32 remainder) {
 }
 ```
 
-This repository contains the compiler `cc`, the preprocessor `cpp`, the MIPS
-assembler `as` and linker `ld`, the compiler models, tests, and benchmarks.
-One `cc` build targets x86-64 (ELF, COFF, and Mach-O) and MIPS (MIPS I to
-MIPS64, including the VR4300 and Allegrex), and has models of AArch64 but no
-AArch64 code generator. Cross is a pre-1.0 draft: the compiler implements
+This repository contains the compiler `cc`, the preprocessor `cpp`, the
+assembler `as` (x86-64, MIPS, and AArch64) and the MIPS linker `ld`, the
+compiler models, tests, and benchmarks. One `cc` build targets x86-64 (ELF,
+COFF, and Mach-O) and MIPS (MIPS I to MIPS64, including the VR4300 and
+Allegrex), and has models and an assembler for AArch64 but no AArch64 code
+generator. Cross is a pre-1.0 draft: the compiler implements
 part of the current specification draft ([doc/spec.md](doc/spec.md), 0.9),
 `cc --version` reports the draft it conforms to, and drafts do not promise
 source or binary compatibility with one another.

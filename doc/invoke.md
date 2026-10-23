@@ -236,18 +236,19 @@ fail when a header is deleted.
 
 `as` reads the assembly `cc -S` emits, and writes one relocatable object from
 all its inputs (`-` reads standard input). The target selects the syntax and
-object format: GNU-syntax MIPS into ELF, or AT&T-syntax x86-64 into ELF,
+object format: GNU-syntax MIPS into ELF, AT&T-syntax x86-64 into ELF,
 COFF/PE, or Mach-O as the triple names (`x86_64-unknown-linux-gnu`,
-`x86_64-w64-windows-gnu`, `x86_64-apple-darwin`).
+`x86_64-w64-windows-gnu`, `x86_64-apple-darwin`), or GNU-syntax A64 into
+little-endian ELF64 (`aarch64-unknown-linux-gnu`, `aarch64-none-elf`).
 
 | Option | Selects |
 | --- | --- |
 | `-o FILE` | The object file (default `a.out`). |
 | `-target TRIPLE`, `-mprofile=NAME` | The target and its defaults, as for `cc`. |
-| `-march=CPU`, `-mips1` ... `-mips64r6` | The CPU or ISA level whose instructions are accepted, until a `.set` directive changes it. |
+| `-march=CPU`, `-mips1` ... `-mips64r6` | The CPU or ISA level whose instructions are accepted, until a directive changes it: MIPS `.set`, or AArch64 `.arch`, `.cpu`, and `.arch_extension`. AArch64 levels and CPUs take `+FEATURE` and `+noFEATURE`, as `-march=armv8-a+crc`. |
 | `-mabi=NAME`, `-32`, `-64` | The ABI, which fixes the ELF class and ABI flags: `-mabi=32` and `-32` select o32, `-mabi=64` and `-64` n64 (also switching the triple to `mips64`), `-mabi=eabi` EABI32. An ABI without a fixed address width, such as `x64`, takes the ELF class of the triple. |
 | `-EB`, `-EL` | Big- or little-endian output. |
-| `-mFEATURE`, `-mno-FEATURE`, `-mnan=2008\|legacy` | Target features, such as `-msoft-float`, `-msingle-float`, `-mfp32`, `-mfpxx`, and `-mfp64`, which set the floating-point ABI that `.MIPS.abiflags` records, and the errata workarounds `-mfix-r5900` and `-mfix-loongson3-llsc`, which the `-march` CPU may enable ([targets.md](targets.md#mips)). |
+| `-mFEATURE`, `-mno-FEATURE`, `-mnan=2008\|legacy` | Target features: for MIPS, such as `-msoft-float`, `-msingle-float`, `-mfp32`, `-mfpxx`, and `-mfp64`, which set the floating-point ABI that `.MIPS.abiflags` records, and the errata workarounds `-mfix-r5900` and `-mfix-loongson3-llsc`, which the `-march` CPU may enable ([targets.md](targets.md#mips)); for AArch64, the extensions whose instructions are accepted, such as `-mlse` and `-mno-fp`. |
 | `-mgp32`, `-mgp64` | MIPS: the width of the general registers that `.MIPS.abiflags` records and the macros assume, as `.module gp=32` or `gp=64` sets it; by default the narrower of the ISA's and the ABI's registers, 32 bits for o32. |
 | `-KPIC`, `-call_shared`, `-mabicalls`, `-call_nonpic`, `-non_shared` | MIPS PIC modes, of which the last applies: SVR4 PIC code as after `.abicalls` (the first three), abicalls code without PIC as after `.abicalls` and `.option pic0`, or neither (the default). With `-mno-shared`, `.cpload` takes `$gp` from `__gnu_local_gp`. |
 | `-O0`, `-O1`, `-O2` | MIPS `.set reorder` code: keep every hazard `nop` the CPU might need, keep only the needed ones, or also fill delay slots (the default; `-O` is `-O1`). |
@@ -261,9 +262,9 @@ directives include sections and their flags and COMDAT groups (`.section`,
 other section directives with a number, `.pushsection NAME, N`), symbols
 (`.globl`, `.local`, `.weak`, `.hidden`, `.internal`, `.protected`, `.type`,
 `.size`, `.set` and `=`, `.equ`, `.equiv`, `.comm`, `.lcomm`), data (`.byte`,
-`.2byte`, `.half`, `.short`, `.4byte`, `.word`, `.long`, `.8byte`, `.dword`,
-`.quad`, `.uleb128`, `.sleb128`, `.ascii`, `.asciz`, `.string`, `.float`,
-`.double`, `.zero`, `.space`, `.fill`, `.incbin`), layout (`.p2align`,
+`.2byte`, `.half`, `.hword`, `.short`, `.4byte`, `.word`, `.long`, `.8byte`,
+`.dword`, `.quad`, `.uleb128`, `.sleb128`, `.ascii`, `.asciz`, `.string`,
+`.float`, `.double`, `.zero`, `.space`, `.fill`, `.incbin`), layout (`.p2align`,
 `.balign`, `.align`, `.org`), source structure (`.include`, `.macro`,
 `.altmacro` and `.noaltmacro`, `.rept`, `.if` and its variants, `.error`),
 and DWARF (`.file`, `.loc`, and the `.cfi_*` directives, which produce
@@ -425,6 +426,50 @@ needs; Win64 `.seh_*` directives produce `.pdata` and `.xdata`, and Mach-O
 objects honor `.subsections_via_symbols`. Only 64-bit AT&T syntax is
 accepted: Intel syntax, `.code16` and `.code32`, the APX and AVX10 encodings,
 and `.reloc` are rejected, and an unknown mnemonic is an error.
+
+For an AArch64 target `as` reads the A64 syntax of GNU as and LLVM MC: `//`
+comments, and `#` comments only at the start of a line; `#` before an
+immediate, which may be left out; registers in either case, with `fp` and
+`lr` for `x29` and `x30`; memory operands `[base, offset]`, `[base, offset]!`,
+`[base], offset`, and `[base, index, extend #amount]`; and the relocation
+operators, written before a symbol as in `adrp x0, :got:name` and `ldr x0,
+[x0, :got_lo12:name]`: `:lo12:`, `:pg_hi21:`, `:pg_hi21_nc:`, `:got:`,
+`:got_lo12:`, the TLS operators (`:tprel_hi12:`, `:tprel_lo12:`,
+`:tprel_lo12_nc:`, `:tprel_g0:` to `:tprel_g2:`, `:gottprel:`,
+`:gottprel_lo12:`, `:gottprel_g1:`, `:gottprel_g0_nc:`, `:dtprel_*:`,
+`:tlsdesc:`, `:tlsdesc_lo12:`, `:tlsgd:`, and `:tlsgd_lo12:`), and the move
+operators `:abs_g0:` to `:abs_g3:` with their `_nc` and `_s` forms
+([models.md](models.md#aarch64-instructions)). The instructions are those of
+the loaded AArch64 instruction table, each accepted where the current
+features have it, and `cc --print-instructions` lists them. The shipped table
+has the integer instructions (arithmetic, logical, move wide, bit-field,
+extract, shifts, multiply and divide, conditional select and compare, and the
+`crc` checksums), the loads and stores of every addressing mode with pairs,
+literals, unprivileged, exclusive, and acquire-release forms and the `lse`
+atomics, the branches, `adr` and `adrp`, exception generation, hints,
+barriers, `mrs` and `msr`, and scalar floating point, with half precision
+under `fp16`; and the aliases of GNU as, among them `mov`, `cmp`, `cmn`,
+`tst`, `neg`, `mvn`, `lsl`, `lsr`, `asr`, and `ror` by an immediate, `mul`,
+`sxtb` to `uxth`, `cset`, `cinc`, and the bit-field extracts and inserts.
+`.arch NAME`, `.cpu NAME` (each with `+FEATURE` and `+noFEATURE`), and
+`.arch_extension [no]FEATURE` change the features; `.inst` emits instruction
+words and `.xword` 8-byte data. A64 instructions start on a word: one that
+follows data in its section is preceded by zeros up to the next word.
+
+The objects are little-endian ELF64 with RELA relocations. Code sections are
+aligned to 4 bytes and padded with `nop`s; `$x` and `$d` mapping symbols
+mark the instructions and the data of sections that hold code, but not the
+data of sections without code, as in GNU as. As in LLVM MC, relocations of
+GOT and TLS operators name their symbol, also a local one, and a `movz` whose
+signed TLS move relocation (`:tprel_g2:`, `:tprel_g1:`, `:tprel_g0:`,
+`:dtprel_g2:` to `:dtprel_g0:`, `:gottprel_g1:`) chooses `movz` or `movn` is
+written as a `movn`. Unlike GNU as and LLVM MC, `as` takes `:lo12:` and the
+unsigned `:abs_g` operators of constants, and `movz` immediates that only
+layout settles; `prfm` with an unscaled offset becomes `prfum` as in GNU as.
+Advanced SIMD, SVE, pointer authentication, `sys` and its aliases (`dc`,
+`ic`, `tlbi`, `at`), `ldr REG, =value` and literal pools (`.ltorg`, `.pool`),
+`.req`, `.tlsdesccall`, `.variant_pcs`, and big-endian and ILP32 objects are
+not available.
 
 ## Linking
 

@@ -3,10 +3,13 @@
 #include "target/aarch64/target.hpp"
 
 #include "common/options.hpp"
+#include "target/aarch64/assembler.hpp"
+#include "target/aarch64/instructions.hpp"
 #include "target/subtarget.hpp"
 #include "target/target.hpp"
 
 #include <array>
+#include <charconv>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -132,7 +135,8 @@ const SubtargetTable subtargets{
 
 std::vector<OptionDefinition> target_options() {
     // Code generation for AArch64 does not exist, so every option is
-    // partial: it selects model entries and features only.
+    // partial: it selects model entries and the features that the
+    // assembler accepts instructions of.
     std::vector<OptionDefinition> result{
         {"m.arch", {}, OptionValueKind::Text, std::string("generic"), {}, 0, 0,
          OptionCategory::Target, false, OptionImplementation::Partial,
@@ -156,6 +160,28 @@ std::vector<OptionDefinition> target_options() {
     return result;
 }
 
+// The number that encodes a general or SIMD and floating-point register:
+// 31 for sp, wsp, xzr, and wzr.
+std::optional<unsigned> register_number(std::string_view name) {
+    if (name == "sp" || name == "wsp" || name == "xzr" || name == "wzr") return 31;
+    if (name.size() < 2 || std::string_view("xwvqdshb").find(name[0]) == std::string_view::npos) {
+        return std::nullopt;
+    }
+    unsigned value{};
+    const auto* end = name.data() + name.size();
+    const auto parsed = std::from_chars(name.data() + 1, end, value);
+    const unsigned limit = name[0] == 'x' || name[0] == 'w' ? 30 : 31;
+    if (parsed.ec != std::errc{} || parsed.ptr != end || value > limit ||
+        (name.size() > 2 && name[1] == '0')) {
+        return std::nullopt;
+    }
+    return value;
+}
+
+const InstructionModel instruction_model{
+    32, aarch64::operand_type, register_number, {}, {}, {}, {},
+};
+
 TargetInfo make_target() {
     TargetInfo result;
     result.architecture = "aarch64";
@@ -178,10 +204,15 @@ TargetInfo make_target() {
     result.options = target_options();
     result.subtargets = &subtargets;
     result.address_spaces = {{0, 0, 0, 0, true, true, true, true, false, true, true}};
+    // The models give the instruction table, which Cross's assembler
+    // encodes.
+    result.instruction_model = &instruction_model;
+    result.integrated_assembler = &aarch64::assemble;
     return result;
 }
 
-const TargetInfo target = make_target();
+// Not const: loading the models installs their instruction table.
+TargetInfo target = make_target();
 
 } // namespace
 

@@ -759,10 +759,14 @@ linker gives `_gp` before such code runs, and its linker script keeps
 | `aarch64-none-elf` | ELF | `aarch64-elf` | `x` |
 
 The AArch64 target describes A64 code with little-endian ELF64 objects and
-64-bit pointers. It has models, but no code generator: for `aarch64-*`
-triples, `cc` preprocesses (`-E`, `-M`) and answers the `--print-*` queries,
-and every output that needs code, such as `-S`, `-c`, or `-emit-llvm`, fails
-with one diagnostic. `as` and `ld` do not accept AArch64. A triple with
+64-bit pointers. It has models and an assembler, but no code generator: for
+`aarch64-*` triples, `cc` preprocesses (`-E`, `-M`) and answers the
+`--print-*` queries, and every output that needs code, such as `-S`, `-c`,
+or `-emit-llvm`, fails with one diagnostic. `as` assembles A64 into
+relocatable objects ([invoke.md](invoke.md#assembling)) with the
+instructions of `model/aarch64_instructions.xm`
+([models.md](models.md#aarch64-instructions)); `ld` does not accept AArch64
+objects. A triple with
 `linux` selects the `aarch64-linux` profile and any other `aarch64-*` triple
 `aarch64-elf`; the models describe ELF systems, not Darwin's or Windows'
 variants of AAPCS64.

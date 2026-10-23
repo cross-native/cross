@@ -1435,7 +1435,11 @@ void Assembler::Impl::process_line(std::string_view line, SourceLocation locatio
             if (index + 1 < text.size() && text[index + 1] == '\\') index += 2;
             else ++index;
             if (index + 1 < text.size() && text[index + 1] == '\'') ++index;
-        } else if (c == '#') {
+        } else if ((c == '#' &&
+                    (as.target_.hash_comments() ||
+                     text.find_first_not_of(" \t") == index)) ||
+                   (c == '/' && !as.target_.hash_comments() &&
+                    text.compare(index, 2, "//") == 0)) {
             text.resize(index);
             break;
         } else if (c == '/' && index + 1 < text.size() && text[index + 1] == '*') {
@@ -2590,6 +2594,7 @@ bool Assembler::Impl::macho_directive(std::string_view name, Statement& statemen
 void Assembler::Impl::data(Statement& statement, unsigned size) {
     auto& cursor = statement.operands;
     as.target_.flush(as);
+    as.target_.data(as);
     if (cursor.at_end()) return;
     do {
         const auto location = cursor.location();
@@ -2619,6 +2624,7 @@ void Assembler::Impl::data(Statement& statement, unsigned size) {
 void Assembler::Impl::leb(Statement& statement, bool is_signed) {
     auto& cursor = statement.operands;
     as.target_.flush(as);
+    as.target_.data(as);
     do {
         const auto location = cursor.location();
         const auto expression = as.parse_expression(cursor);
@@ -2644,6 +2650,7 @@ void Assembler::Impl::leb(Statement& statement, bool is_signed) {
 void Assembler::Impl::ascii(Statement& statement, bool terminate) {
     auto& cursor = statement.operands;
     as.target_.flush(as);
+    as.target_.data(as);
     do {
         const auto text = cursor.string_literal(as.diagnostics_);
         if (!text) {
@@ -2661,6 +2668,7 @@ void Assembler::Impl::ascii(Statement& statement, bool terminate) {
 void Assembler::Impl::floating(Statement& statement, unsigned size) {
     auto& cursor = statement.operands;
     as.target_.flush(as);
+    as.target_.data(as);
     do {
         cursor.skip_space();
         const auto location = cursor.location();
@@ -2704,6 +2712,7 @@ void Assembler::Impl::floating(Statement& statement, unsigned size) {
 void Assembler::Impl::reserve(Statement& statement, bool zero) {
     auto& cursor = statement.operands;
     as.target_.flush(as);
+    as.target_.data(as);
     const auto location = cursor.location();
     const auto count = as.parse_expression(cursor);
     if (!count) return;
@@ -2738,6 +2747,7 @@ void Assembler::Impl::reserve(Statement& statement, bool zero) {
 void Assembler::Impl::fill(Statement& statement) {
     auto& cursor = statement.operands;
     as.target_.flush(as);
+    as.target_.data(as);
     const auto repeat_count = as.parse_absolute(cursor);
     if (!repeat_count) return;
     std::int64_t size = 1;
@@ -2845,6 +2855,7 @@ std::optional<std::filesystem::path> find_file(
 void Assembler::Impl::incbin(Statement& statement) {
     auto& cursor = statement.operands;
     as.target_.flush(as);
+    as.target_.data(as);
     const auto name = cursor.string_literal(as.diagnostics_);
     if (!name) {
         as.error(cursor.location(), "expected a file name");

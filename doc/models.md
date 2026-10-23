@@ -39,8 +39,9 @@ properties, options, and entry names are errors.
 The shipped models are built into `cc` and `cpp`, so no data files need to be
 installed. Their readable sources are `model/common.xm` (the optimization
 presets), `model/x86_64.xm`, `model/mips.xm`,
-`model/mips_instructions.xm` (the MIPS instruction table), and
-`model/aarch64.xm`. These options
+`model/mips_instructions.xm` (the MIPS instruction table), `model/aarch64.xm`,
+and `model/aarch64_instructions.xm` (the AArch64 instruction table). These
+options
 load more files:
 
 ```text
@@ -1180,9 +1181,10 @@ the machine instruction built-in (`$::_NAME`,
 [spec.md](spec.md#machine-instruction-built-ins)) that exposes it. The entries of
 an architecture form its instruction table, which the assembler, the
 built-ins, `cpu` entries, `cc --print-instructions`, and `cc --print-costs`
-share. Architectures whose instructions have one width take entries: MIPS,
-whose shipped table is `model/mips_instructions.xm`. The x86-64 table is
-built into the compiler, and an x86-64 entry is an error.
+share. Architectures whose instructions have one width take entries: MIPS
+and AArch64, whose shipped tables are `model/mips_instructions.xm` and
+`model/aarch64_instructions.xm`. The x86-64 table is built into the
+compiler, and an x86-64 entry is an error.
 
 ```text
 instruction "addu" {
@@ -1255,18 +1257,40 @@ down, in runs of `0` and `1` and in fields:
 - `EXPR:WIDTH`, the low `WIDTH` bits of `EXPR`: an operand name, a part of a
   memory operand (`NAME.base`, `NAME.offset`), or a sum of names and
   integers with `+` and `-`, such as `size-1` or `pos+size-1`;
-- `NAME[HIGH:LOW]` or `NAME[BIT]`, those bits of an operand's value; and
+- `NAME[HIGH:LOW]` or `NAME[BIT]`, those bits of an operand's field value,
+  or of a memory operand's part (`NAME.offset[8:4]`); and
 - `REGISTER:WIDTH`, the number of a register, such as `zero:5`, which counts
   as a register that the instruction uses.
 
 Spaces separate the runs and fields, whose widths add up to the
-architecture's instruction width. Each operand other than a literal register
-appears in a field. A field of one operand holds each value of the operand,
-a signed one in two's complement, and the slices of an operand hold each bit
-of its values once; a field of several operands must hold their value when
-an instruction is assembled. A value that a relocation gives or layout
-settles goes into a field of its own in the low bits that the architecture
-names. Fields cannot overlap.
+architecture's instruction width. Each operand appears in a field, a memory
+operand with its base and its offset, except a literal register and an
+operand or offset whose type has one value. A field holds the low bits of
+its value. A field of one operand must tell the operand's field values
+apart, as a field as wide as the values in two's complement does, and so
+does `-shift:6` for shifts from 0 to 63, which holds 64 minus the shift; the
+slices of an operand, or of a part of a memory operand, hold each bit of its
+field values once; and a field of several operands must hold their value
+when an instruction is assembled. A value that a relocation gives or layout
+settles goes into fields of its own in the bits that the architecture names
+for the operand's type. Fields cannot overlap.
+
+### Encoders
+
+An operand type gives each value of its operands a field value: a
+register's number, the value itself, or what an encoder makes of the value.
+The encoders are general, and an architecture's operand types name the ones
+they use. A form takes a value only where its encoder encodes it, so the
+forms of one mnemonic may divide its values among them.
+
+| Encoder | Values | Field value |
+| --- | --- | --- |
+| `bitmask` | A value of N bits, 32 or 64, that repeats an element of 2, 4, 8, 16, 32, or 64 bits holding one rotated run of ones; not 0 or all ones. | N:immr:imms in 13 bits: N is 1 for an element of 64 bits, immr the rotation, and imms the element's size and the run's length. |
+| `fp8` | A floating value of ±(16 + m)/16 × 2^e, with m from 0 to 15 and e from −3 to 4. | Its sign, exponent, and mantissa in 8 bits. |
+| `shifted` | A value of B bits, or one shifted left by S bits. | shift:value in B + 1 bits; unshifted where both apply. |
+| `wide` | A value of N bits, 32 or 64, whose set bits lie within one 16-bit piece at a multiple of 16. | hw:imm16: the piece's number and its bits. |
+| `scaled` | A multiple of a scale whose quotient lies within a range. | The quotient. |
+| `page` | An address. | Its distance in 4 KiB pages from the page of the instruction. |
 
 ### Effects
 
@@ -1416,6 +1440,88 @@ instruction "vmix" {
     writes = ["rd"];
     volatile = true;
     latency = 4;
+}
+```
+
+### AArch64 instructions
+
+AArch64 instructions are A64 words of 32 bits. An immediate may be written
+with or without `#`. The operand types:
+
+| Type | Assembler operand | Field value | As a built-in operand |
+| --- | --- | --- | --- |
+| `x`, `w` | A general register: `x0` to `x30` or `xzr`, and `w0` to `w30` or `wzr`; `fp` and `lr` name `x29` and `x30`. | Its number, 31 for the zero register. | A general register of 64 or 32 bits. |
+| `xsp`, `wsp` | `x0` to `x30` or `sp`, and `w0` to `w30` or `wsp`. | Its number, 31 for `sp`. | None. |
+| `b`, `h`, `s`, `d`, `q` | A view of a SIMD and floating-point register, such as `d0` to `d31`. | Its number. | A floating register of 8, 16, 32, 64, or 128 bits; needs `fp`. |
+| `uimmN`, `simmN`, `LOW..HIGH` | An integer, as for MIPS. | The value. | A constant. |
+| `bitmask32`, `bitmask64` | An integer that `bitmask` encodes for 32 or 64 bits; a 32-bit one may be written signed or unsigned. | `bitmask`, without N for 32 bits: 12 and 13 bits. | None. |
+| `fp8` | A floating constant or an integer, such as `#-1.5`. | `fp8`. | None. |
+| `fzero` | `#0.0` or `#0`. | None. | None. |
+| `uimm12_lsl12` | An integer that `shifted` encodes with 12 bits and a shift of 12, or `#IMM, lsl #12`. | sh:imm12. | None. |
+| `uimm12_lsl12_neg` | A negative integer whose negation `uimm12_lsl12` takes. | That of the negation. | None. |
+| `movw32`, `movw64` | `#IMM` of 16 bits and an optional `lsl #16`, `#32`, or `#48`, the larger shifts for 64 bits only. | hw:imm16 in 17 and 18 bits. | None. |
+| `wide32`, `wide64` | An integer that `wide` encodes for 32 or 64 bits. | `wide`. | None. |
+| `wide32_inverted`, `wide64_inverted` | An integer whose complement `wide` encodes. | `wide` of the complement. | None. |
+| `shift32`, `shift64` | `lsl`, `lsr`, or `asr` and an amount below 32 or 64, such as `lsl #3`. | type:amount in 8 bits, `lsl` 0, `lsr` 1, `asr` 2. | None. |
+| `shift32_ror`, `shift64_ror` | As `shift32` and `shift64`, or `ror` (3). | type:amount. | None. |
+| `extend32` | `uxtb`, `uxth`, `uxtw`, `uxtx`, `sxtb`, `sxth`, `sxtw`, or `sxtx`, or `lsl` for `uxtw`, and an optional amount from 0 to 4. | option:amount in 6 bits. | None. |
+| `extend64_w`, `extend64_x` | As `extend32`: `uxtb` to `sxtw` but `uxtx` and `sxtx`; and `uxtx`, `sxtx`, or `lsl` for `uxtx`. | option:amount. | None. |
+| `cond`, `cond_inverted` | A condition: `eq`, `ne`, `cs` or `hs`, `cc` or `lo`, `mi`, `pl`, `vs`, `vc`, `hi`, `ls`, `ge`, `lt`, `gt`, `le`, `al`, or `nv`; not `al` or `nv` for `cond_inverted`. | Its number, or for `cond_inverted` that of the opposite condition. | None. |
+| `sysreg` | A system register by name, such as `tpidr_el0`, or as `sOP0_OP1_cN_cM_OP2`. | op0:op1:CRn:CRm:op2 in 16 bits. | None. |
+| `pstate` | A PSTATE field of `msr`: `spsel`, `daifset`, `daifclr`, `uao`, `pan`, `dit`, `ssbs`, or `tco`. | op1:op2 in 6 bits. | None. |
+| `barrier` | `sy`, `st`, `ld`, `ish`, `ishst`, `ishld`, `nsh`, `nshst`, `nshld`, `osh`, `oshst`, `oshld`, or an integer from 0 to 15. | CRm. | None. |
+| `prfop` | A prefetch operation from `pldl1keep` to `pstslcstrm`, or an integer from 0 to 31. | type:target:policy. | None. |
+| `mem` | `[BASE]` or `[BASE, #0]`; every base is `x0` to `x30` or `sp`. | Part `.base`. | None. |
+| `mem8` to `mem128` | `[BASE]` or `[BASE, OFFSET]`, a multiple of the access size of that many bits from 0 to 4095 times it. | Parts `.base` and `.offset`, `scaled` in 12 bits. | None. |
+| `mem_simm9` | `[BASE]` or `[BASE, OFFSET]`, from −256 to 255. | Parts `.base` and `.offset`. | None. |
+| `mem_pre`, `mem_post` | `[BASE, OFFSET]!` and `[BASE], OFFSET`, from −256 to 255. | Parts `.base` and `.offset`. | None. |
+| `mem8_reg` to `mem128_reg` | `[BASE, Xm{, lsl #A}]`, `[BASE, Xm, sxtx {#A}]`, or `[BASE, Wm, uxtw` or `sxtw {#A}]`, the shift A 0 or the access size's logarithm (only 0 for bytes). | Parts `.base` and `.offset`, Rm:option:S in 9 bits. | None. |
+| `pair32`, `pair64`, `pair128` | `[BASE]` or `[BASE, OFFSET]`, a multiple of 4, 8, or 16 bytes from −64 to 63 times it. | Parts `.base` and `.offset`, `scaled` in 7 bits. | None. |
+| `pairN_pre`, `pairN_post` | As `pairN`, as `[BASE, OFFSET]!` and `[BASE], OFFSET`. | As `pairN`. | None. |
+| `branch26`, `call26`, `branch19`, `branch14`, `literal19` | A label, or an offset from the instruction that is a multiple of 4. | The offset in words. | None. |
+| `adr21` | A label, or an offset from the instruction. | The offset in bytes. | None. |
+| `adrp21` | A label, or an offset from the instruction that is a multiple of 4096. | `page` of the label, or the offset in pages. | None. |
+
+A statement takes a form when each operand has the form's shape: a register
+of the operand's type, a memory operand of its addressing, a modifier such
+as `lsl #3` where it has one, and otherwise an immediate or a label. The
+forms of a mnemonic divide its values: the shipped `mov` takes an immediate
+as `movz`, then as `movn`, then as `orr` of a logical immediate; `ldr` and
+the other loads and stores take an offset that their scaled form cannot hold
+as `ldur`, and `prfm` as `prfum`; and `add`, `sub`, `adds`, `subs`, `cmp`,
+and `cmn` take a negative immediate as the opposite instruction. A
+conditional branch is spelled `b.eq` or `beq` (`b.al` and `b.nv` only so).
+
+These types take relocation operators, written before the symbol, as
+`:lo12:symbol` or `#:lo12:symbol`, whose relocations fill the bits that the
+table lists; the instruction's other bits hold the operator's shift or
+piece, `lsl #12` for `:tprel_hi12:` and `:dtprel_hi12:`, and the piece of a
+`_g` operator. The operand of `:lo12:` and of the `:abs_g` operators other
+than the `_s` ones may be a constant, which gives the operator's bits of it;
+the other operators need a symbol.
+
+| Type | Operators | Relocated bits |
+| --- | --- | --- |
+| `branch26`, `call26` | None: `R_AARCH64_JUMP26` and `R_AARCH64_CALL26`. | 25-0 |
+| `branch19`, `literal19`, `branch14` | None: `R_AARCH64_CONDBR19`, `R_AARCH64_LD_PREL_LO19`, and `R_AARCH64_TSTBR14`. | 23-5, 23-5, and 18-5 |
+| `adr21` | None. | 1-0 in 30-29 and 20-2 in 23-5 |
+| `adrp21` | None, `:pg_hi21:`, `:pg_hi21_nc:`, `:got:`, `:gottprel:`, `:tlsdesc:`, and `:tlsgd:`. | As `adr21` |
+| `uimm12_lsl12` | `:lo12:`, `:tprel_hi12:`, `:tprel_lo12:`, `:tprel_lo12_nc:`, `:dtprel_hi12:`, `:dtprel_lo12:`, `:dtprel_lo12_nc:`, `:tlsdesc_lo12:`, and `:tlsgd_lo12:`. | 21-10 |
+| `mem8` to `mem128` | `:lo12:`, `:tprel_lo12:`, `:tprel_lo12_nc:`, `:dtprel_lo12:`, and `:dtprel_lo12_nc:`; for `mem64` also `:got_lo12:`, `:gottprel_lo12:`, and `:tlsdesc_lo12:`. | 21-10 |
+| `movw32`, `movw64` | `:abs_g0:` to `:abs_g3:`, `:abs_g0_nc:` to `:abs_g2_nc:`, `:abs_g0_s:` to `:abs_g2_s:`, `:tprel_g0:` to `:tprel_g2:`, `:tprel_g0_nc:`, `:tprel_g1_nc:`, `:dtprel_g0:` to `:dtprel_g2:`, `:dtprel_g0_nc:`, `:dtprel_g1_nc:`, `:gottprel_g1:`, and `:gottprel_g0_nc:`; pieces 2 and 3 need `movw64`. | 20-5 |
+
+Immediates of `uimm12_lsl12`, `movw32`, and `movw64`, and offsets of `mem8`
+to `mem128`, may be values that only layout settles; such an immediate is
+shifted only as the statement writes.
+
+This user model adds `cfinv`, which the shipped table lacks:
+
+```text
+instruction "cfinv" {
+    architecture = "aarch64";
+    encoding = "11010101000000000100 0000 000 11111";
+    features = ["flagm"];
+    writes = ["nzcv"];
 }
 ```
 

@@ -69,11 +69,12 @@ unsigned value_bits(std::int64_t minimum, std::int64_t maximum) {
     return bits;
 }
 
+// Whether the low `width` bits of the values from `minimum` to `maximum`
+// tell them apart.
 bool fits_field(std::int64_t minimum, std::int64_t maximum, unsigned width) {
     if (width >= 63) return true;
-    if (minimum >= 0) return maximum < (std::int64_t{1} << width);
-    return minimum >= -(std::int64_t{1} << (width - 1)) &&
-           maximum < (std::int64_t{1} << (width - 1));
+    return static_cast<std::uint64_t>(maximum) - static_cast<std::uint64_t>(minimum) <
+           (std::uint64_t{1} << width);
 }
 
 std::string_view control_name(InstructionControlEffect control) {
@@ -431,7 +432,8 @@ public:
         }
         // Bits from the most significant down.
         unsigned next = total;
-        std::vector<std::vector<std::pair<unsigned, unsigned>>> slices(entry_.operands.size());
+        // The slices of each part of each operand, by operand * 3 + part.
+        std::vector<std::vector<std::pair<unsigned, unsigned>>> slices(entry_.operands.size() * 3);
         std::vector<bool> placed(entry_.operands.size() * 3);
         for (auto& group : groups) {
             next -= group.width;
@@ -444,9 +446,10 @@ public:
             field.width = group.width;
             for (const auto& item : field.terms) placed[item.operand * 3 + item.part] = true;
             if (group.slice) {
-                slices[field.terms.front().operand].emplace_back(field.low, field.width);
+                const auto& item = field.terms.front();
+                slices[item.operand * 3 + item.part].emplace_back(field.low, field.width);
             } else if (field.terms.size() == 1) {
-                // A field of one operand holds each of its values.
+                // A field of one operand tells its values apart.
                 const auto& item = field.terms.front();
                 const auto& operand = entry_.operands[item.operand];
                 auto [minimum, maximum] = term_range(item);
@@ -467,17 +470,29 @@ public:
             }
             entry_.fields.push_back(field);
         }
+        const auto mentions = [](const ModelField& field, std::size_t index, unsigned part) {
+            return std::any_of(field.terms.begin(), field.terms.end(), [&](const ModelTerm& item) {
+                return item.operand == index && item.part == part;
+            });
+        };
         for (std::size_t index = 0; index < entry_.operands.size(); ++index) {
             const auto& operand = entry_.operands[index];
             if (operand.name.empty()) continue;
-            const bool memory = operand.type.kind == OperandKind::Memory;
-            if (!placed[index * 3 + (memory ? 1 : 0)] || (memory && !placed[index * 3 + 2])) {
+            const auto& type = operand.type;
+            const bool memory = type.kind == OperandKind::Memory;
+            // An operand of one value needs no field.
+            const bool single = memory ? type.offset_minimum == type.offset_maximum
+                                       : type.kind != OperandKind::Label &&
+                                             type.minimum == type.maximum;
+            if ((!placed[index * 3 + (memory ? 1 : 0)] && (memory || !single)) ||
+                (memory && !single && !placed[index * 3 + 2])) {
                 return fail(line, "the encoding does not place operand '" + operand.name + "'");
             }
-            // Slices hold each bit of the operand's values once, and no other
-            // field holds the operand.
-            if (!slices[index].empty()) {
-                auto pieces = slices[index];
+            // Slices hold each bit of a part's values once, and no other field
+            // holds the part.
+            for (unsigned part = 0; part < 3; ++part) {
+                auto pieces = slices[index * 3 + part];
+                if (pieces.empty()) continue;
                 std::sort(pieces.begin(), pieces.end());
                 unsigned covered = 0;
                 bool tiled = true;
@@ -485,12 +500,11 @@ public:
                     tiled = tiled && low == covered;
                     covered += width;
                 }
-                const auto bits = value_bits(operand.type.minimum, operand.type.maximum);
+                const auto bits = part == 2 ? value_bits(type.offset_minimum, type.offset_maximum)
+                                            : value_bits(type.minimum, type.maximum);
                 const auto others = std::count_if(
-                    entry_.fields.begin(), entry_.fields.end(), [&](const ModelField& field) {
-                        return std::any_of(field.terms.begin(), field.terms.end(),
-                                           [&](const ModelTerm& item) { return item.operand == index; });
-                    });
+                    entry_.fields.begin(), entry_.fields.end(),
+                    [&](const ModelField& field) { return mentions(field, index, part); });
                 if (!tiled || covered != bits ||
                     static_cast<std::size_t>(others) != pieces.size()) {
                     return fail(line, "the slices of operand '" + operand.name +
@@ -498,27 +512,57 @@ public:
                                           " bits once");
                 }
             }
-            // A relocated value needs a field of its own in the low bits.
-            if (operand.type.relocated_bits != 0) {
+            // A relocated value needs fields of its own that put its bits
+            // where the architecture names.
+            if (type.relocated_bits != 0) {
                 const unsigned part = memory ? 2U : 0U;
-                const auto uses = std::count_if(
-                    entry_.fields.begin(), entry_.fields.end(), [&](const ModelField& field) {
-                        return std::any_of(field.terms.begin(), field.terms.end(),
-                                           [&](const ModelTerm& item) {
-                                               return item.operand == index && item.part == part;
-                                           });
-                    });
-                const auto found = std::find_if(
-                    entry_.fields.begin(), entry_.fields.end(), [&](const ModelField& field) {
-                        return field.terms.size() == 1 && field.terms[0].operand == index &&
-                               field.terms[0].part == part;
-                    });
-                if (uses != 1 || found == entry_.fields.end() || found->shift != 0 ||
-                    found->width != operand.type.relocated_bits || found->low != 0 ||
-                    found->constant != 0 || found->terms[0].negative) {
-                    return fail(line, "operand '" + operand.name +
-                                          "' needs a field of its own in bits " +
-                                          std::to_string(operand.type.relocated_bits - 1) + "-0");
+                const auto wanted = type.relocated_slices.empty()
+                                        ? std::vector<RelocatedSlice>{{0, type.relocated_bits, 0}}
+                                        : type.relocated_slices;
+                // Fields of the value alone, one unless they are slices.
+                bool own = true;
+                std::size_t uses = 0;
+                for (const auto& field : entry_.fields) {
+                    if (!mentions(field, index, part)) continue;
+                    ++uses;
+                    if (field.terms.size() != 1 || field.constant != 0 ||
+                        field.terms[0].negative) {
+                        own = false;
+                    }
+                }
+                own = own && (uses == 1 || !slices[index * 3 + part].empty());
+                const auto holds = [&](unsigned bit, unsigned at) {
+                    return std::any_of(
+                        entry_.fields.begin(), entry_.fields.end(), [&](const ModelField& field) {
+                            return mentions(field, index, part) && bit >= field.low &&
+                                   bit < field.low + field.width &&
+                                   field.shift + (bit - field.low) == at;
+                        });
+                };
+                for (const auto& slice : wanted) {
+                    for (unsigned bit = 0; own && bit < slice.width; ++bit) {
+                        own = holds(slice.low + bit, slice.shift + bit);
+                    }
+                }
+                if (!own) {
+                    const auto range = [](unsigned low, unsigned width) {
+                        return std::to_string(low + width - 1) + "-" + std::to_string(low);
+                    };
+                    if (wanted.size() == 1 && wanted[0].low == 0 &&
+                        wanted[0].width == type.relocated_bits) {
+                        return fail(line, "operand '" + operand.name +
+                                              "' needs a field of its own in bits " +
+                                              range(wanted[0].shift, wanted[0].width));
+                    }
+                    std::string places;
+                    for (std::size_t slice = 0; slice < wanted.size(); ++slice) {
+                        places += slice == 0 ? "" : slice + 1 == wanted.size() ? " and " : ", ";
+                        places += "bits " + range(wanted[slice].low, wanted[slice].width) +
+                                  (slice == 0 ? " of its value" : "") + " in bits " +
+                                  range(wanted[slice].shift, wanted[slice].width);
+                    }
+                    return fail(line, "operand '" + operand.name + "' needs fields of its own "
+                                          "that hold " + places);
                 }
             }
         }
