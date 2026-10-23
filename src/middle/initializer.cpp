@@ -133,7 +133,14 @@ public:
             result_.valid = false;
             return std::move(result_);
         }
-        list(source, type, types_only_ ? std::nullopt : std::optional<std::uint64_t>{0}, {});
+        const auto offset = types_only_ ? std::nullopt : std::optional<std::uint64_t>{0};
+        const auto* value = unbraced(source, type);
+        if (value == &source) list(source, type, offset, {});
+        else if (value) {
+            if (dynamic_outer_ && module_.type(type).lanes == 0 && value->kind == Expr::Kind::String)
+                result_.minimum_elements = value->string_value.size() + 1U;
+            item(*value, {type, offset, {}, Position{std::uint64_t{0}}, std::nullopt, 0});
+        }
         return std::move(result_);
     }
 
@@ -155,6 +162,34 @@ private:
         std::optional<unsigned> bit_width;
         unsigned bit_offset{};
     };
+
+    // The initializer a brace list applies to a scalar or u8 array `type`:
+    // the enclosed value, `source` itself, or null after a diagnostic.
+    const Expr* unbraced(const Expr& source, hir::TypeId type) {
+        const auto result = unbrace(source, module_, type);
+        if (!result.value) {
+            if (result.error) error(result.error_location, result.error);
+            result_.valid = false;
+        }
+        return result.value;
+    }
+
+    void item(const Expr& value, const Selection& selection) {
+        if (types_only_ || !deferred_indices_.empty())
+            result_.type_items.emplace_back(&value, selection.type);
+        if (!selection.offset) return;
+        const auto natural_value =
+            hir::layout_alignment(module_, selection.type, target_)
+                .value_or(1);
+        const auto natural = natural_value <=
+                                     std::numeric_limits<unsigned>::max()
+                                 ? static_cast<unsigned>(natural_value)
+                                 : 1U;
+        result_.items.push_back(
+            {&value, selection.type, *selection.offset,
+             offset_alignment(natural, *selection.offset),
+             selection.bit_width, selection.bit_offset});
+    }
 
     std::optional<Position> index_value(const Expr& expression) {
         if (std::find(deferred_indices_.begin(), deferred_indices_.end(), &expression) != deferred_indices_.end())
@@ -355,7 +390,7 @@ private:
               Path path) {
         if (!aggregate(module_, type)) {
             error(source.location,
-                               "brace initializer requires an aggregate destination");
+                               "brace initializer requires an aggregate or scalar destination");
             result_.valid = false;
             return;
         }
@@ -405,27 +440,18 @@ private:
             }
             if (!selection) continue;
             if (overlaps(destinations, path.size(), selection->path, entry.location)) continue;
-            if (entry.value->kind == Expr::Kind::AggregateInitializer) {
-                // The nested list initializes its whole destination, so its
-                // own entries need only be distinct from each other.
-                list(*entry.value, selection->type, selection->offset,
-                     selection->path);
-                continue;
+            const auto* value = entry.value.get();
+            if (value->kind == Expr::Kind::AggregateInitializer) {
+                value = unbraced(*value, selection->type);
+                if (!value) continue;
+                if (value == entry.value.get()) {
+                    // The nested list initializes its whole destination, so
+                    // its own entries need only be distinct from each other.
+                    list(*value, selection->type, selection->offset, selection->path);
+                    continue;
+                }
             }
-            if (types_only_ || !deferred_indices_.empty())
-                result_.type_items.emplace_back(entry.value.get(), selection->type);
-            if (!selection->offset) continue;
-            const auto natural_value =
-                hir::layout_alignment(module_, selection->type, target_)
-                    .value_or(1);
-            const auto natural = natural_value <=
-                                         std::numeric_limits<unsigned>::max()
-                                     ? static_cast<unsigned>(natural_value)
-                                     : 1U;
-            result_.items.push_back(
-                {entry.value.get(), selection->type, *selection->offset,
-                 offset_alignment(natural, *selection->offset),
-                 selection->bit_width, selection->bit_offset});
+            item(*value, *selection);
         }
         for (std::size_t index = 0; index < named.size(); ++index) {
             const auto& member = exhaustive->members[index];
@@ -494,6 +520,16 @@ SourceTypes source_types_for(const TypePtr& destination, const Program& program,
 }
 
 } // namespace
+
+UnbracedInitializer unbrace(const Expr& source, const hir::Module& module, hir::TypeId type) {
+    const auto& destination = module.type(type);
+    const bool scalar = destination.kind == hir::Type::Kind::Pointer ||
+        (destination.kind == hir::Type::Kind::Builtin && destination.builtin != BuiltinType::Void);
+    const bool byte_array = destination.kind == hir::Type::Kind::Array && destination.element &&
+        module.type(*destination.element).kind == hir::Type::Kind::Builtin &&
+        module.type(*destination.element).builtin == BuiltinType::U8;
+    return unbrace_initializer(source, scalar, byte_array);
+}
 
 Plan build(const Expr& source, hir::TypeId type, const hir::Module& module,
            const TargetInfo& target, Diagnostics& diagnostics) {

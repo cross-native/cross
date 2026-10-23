@@ -1127,7 +1127,12 @@ bool lower_initializer(Object& result, const hir::Module& module,
                        const Subtarget& subtarget,
                        Diagnostics& diagnostics) {
     if (!declaration.initializer) return true;
-    const auto& expression = *declaration.initializer;
+    const auto unbraced = initializer::unbrace(*declaration.initializer, module, entity.type);
+    if (!unbraced.value) {
+        if (unbraced.error) diagnostics.error(unbraced.error_location, unbraced.error);
+        return false;
+    }
+    const auto& expression = *unbraced.value;
     const auto& type = module.type(entity.type);
     if (expression.kind == Expr::Kind::ByteSequence && expression.type) {
         if (expression.string_value.size() != result.size) {
@@ -1178,7 +1183,7 @@ bool lower_initializer(Object& result, const hir::Module& module,
         type.kind != hir::Type::Kind::Record) {
         if (expression.kind == Expr::Kind::AggregateInitializer) {
             diagnostics.error(expression.location,
-                              "brace initializer requires an aggregate object");
+                              "brace initializer requires an aggregate or scalar object");
             return false;
         }
         const auto value_size =

@@ -1744,7 +1744,17 @@ private:
             scopes_.back().slots.push_back(slot);
             (void)lifetime(ValueKind::LifetimeStart, slot, expression.location);
             const LocalBinding binding{slot, type, std::nullopt, std::nullopt};
-            (void)initialize_aggregate(binding, *expression.left);
+            // Braces may enclose a scalar's value or a u8 array's string.
+            const auto* value = initializer::unbrace(*expression.left, hir_, type).value;
+            if (!value || value == expression.left.get()) {
+                (void)initialize_aggregate(binding, *expression.left);
+            } else if (array_type(hir_, type)) {
+                (void)initialize_string_array(binding, *value);
+            } else {
+                const auto stored = co_await lower_expression_async(*value, type);
+                if (!stored) co_return std::nullopt;
+                (void)store_slot(binding, *stored, expression.location);
+            }
             co_return DesignatorAddress{slot_address(binding, expression.location),
                 type, storage_alignment(hir_, type, target_)};
         }
@@ -6761,9 +6771,19 @@ private:
                 failed_ = true;
                 return;
             }
+            const Expr* initializer_source = declaration.initializer.get();
+            if (initializer_source) {
+                const auto unbraced = initializer::unbrace(*initializer_source, hir_, type);
+                if (!unbraced.value) {
+                    if (unbraced.error) diagnostics_.error(unbraced.error_location, unbraced.error);
+                    failed_ = true;
+                    return;
+                }
+                initializer_source = unbraced.value;
+            }
             const bool string_array_initializer =
-                array && declaration.initializer &&
-                declaration.initializer->kind == Expr::Kind::String &&
+                array && initializer_source &&
+                initializer_source->kind == Expr::Kind::String &&
                 hir_.type(type).lanes != 0 &&
                 hir_.type(type).element &&
                 hir_.type(*hir_.type(type).element).kind ==
@@ -6860,9 +6880,9 @@ private:
                     declaration.location);
                 const LocalBinding binding{{}, type, address, dynamic_size};
                 dynamic_counts_.emplace(address.value, dynamic_count);
-                if (declaration.initializer &&
+                if (initializer_source &&
                     !initialize_dynamic_array(
-                        binding, *declaration.initializer, dynamic_count)) {
+                        binding, *initializer_source, dynamic_count)) {
                     failed_ = true;
                     return;
                 }
@@ -6887,24 +6907,24 @@ private:
             forget_types();
             scopes_.back().slots.push_back(slot);
             (void)lifetime(ValueKind::LifetimeStart, slot, declaration.location);
-            if (declaration.initializer) {
+            if (initializer_source) {
                 if (string_array_initializer) {
                     if (!initialize_string_array(
-                            binding, *declaration.initializer)) {
+                            binding, *initializer_source)) {
                         diagnostics_.error(
-                            declaration.initializer->location,
+                            initializer_source->location,
                             "aggregate array initializers are not implemented yet");
                         failed_ = true;
                     }
                     return;
                 }
-                if (declaration.initializer->kind ==
+                if (initializer_source->kind ==
                     Expr::Kind::AggregateInitializer) {
                     (void)initialize_aggregate(binding,
-                                               *declaration.initializer);
+                                               *initializer_source);
                     return;
                 }
-                auto initializer = lower_expression(*declaration.initializer, type);
+                auto initializer = lower_expression(*initializer_source, type);
                 if (!initializer) { failed_ = true; return; }
                 (void)store_slot(binding, *initializer, declaration.location);
             }

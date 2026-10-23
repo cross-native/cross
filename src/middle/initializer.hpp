@@ -42,9 +42,15 @@ struct Plan {
     std::string error_message;
 };
 
+// unbrace_initializer for a destination of HIR type `type`.
+[[nodiscard]] UnbracedInitializer unbrace(const Expr& source, const hir::Module& module,
+                                          hir::TypeId type);
+
 // Resolves successive and designated aggregate entries into typed byte-offset
 // destinations. Missing storage is deliberately absent from the plan: static
 // and automatic consumers zero the complete aggregate before applying items.
+// Braces around a scalar's value or a u8 array's string, also at the root,
+// yield one item for the enclosed initializer.
 [[nodiscard]] Plan build(const Expr& initializer, hir::TypeId type,
                          const hir::Module& module,
                          const TargetInfo& target,

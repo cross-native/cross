@@ -108,8 +108,12 @@ $::static_assert(inner() == 9, "block");
 ]=])
 
 set(record "struct point { i32 x; i32 y; };\nstruct other { i32 x; };\n")
-reject(scalar "brace initializer requires an aggregate destination"
-    "global u32 f() { return (u32){ 5u32 }; }")
+# A scalar literal takes its value in braces, as a scalar's initializer may.
+accept(scalar [=[
+global u32 *saved = &(u32){ 7u32 };
+global u32 f(in u32 v) { u32 *p = &(u32){ v }; *p += 1u32; return *p + (u32){ 5u32 } + *saved; }
+$::static_assert((u32){ 5u32 } == 5u32, "scalar literal");
+]=])
 reject(named "a compound literal type name cannot declare an object"
     "global u32 f() { return (u32 named[]){ 5u32 }[0]; }")
 reject(incomplete "local object requires a complete record type"

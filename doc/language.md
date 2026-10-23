@@ -234,8 +234,10 @@ A `static` or `global` object without an initializer is zero-initialized.
 Exported names are the qualified source names (`net::send`) unless
 `-mmangling` selects another encoding or `[[link_name("send")]]` gives an exact
 spelling. Initializers support C99 designators; missing members are zero, and
-static initializers must be constants or relocatable addresses. No
-initialization code runs before your entry point.
+static initializers must be constants or relocatable addresses. As in C,
+braces may enclose a scalar's initializer, `u32 n = { 5 };`, and the string
+that initializes a `u8` array, `u8 name[] = { "abc" };`. No initialization
+code runs before your entry point.
 
 Local storage can be constrained: `register T x;` has no address and never
 spills, `stack T x;` always gets an addressable frame slot, and
@@ -352,8 +354,8 @@ Statements are C99's. The differences in expressions:
   declaration of `T`, as in C99; an omitted array bound comes from the
   initializer. In a function it lives until its enclosing block exits and is
   initialized anew each time it is evaluated; outside a function it is a static
-  object. As with other brace initializers, `T` is an array, record, or union
-  type.
+  object. `T` is an array, record, or union type, or a scalar type whose value
+  the braces enclose: `(u32){ x }`.
 
 ```x
 struct range { u32 low; u32 high; };
@@ -369,7 +371,9 @@ static u32 width(in const struct range *r) { return r->high - r->low; }
 global const u32 *primes = (const u32[]){ 2, 3, 5, 7 };   // a static object
 
 global u32 weigh(in u32 scale) {
-    return sum((u32[]){ scale, scale * 2 }, 2) + width(&(struct range){ 1, 9 });
+    u32 *cell = &(u32){ scale };
+    *cell += 1;
+    return sum((u32[]){ scale, *cell }, 2) + width(&(struct range){ 1, 9 });
 }
 ```
 

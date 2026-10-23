@@ -52,7 +52,7 @@ reject_body(brace_duplicate "duplicate destination" "u32 values[2] = {[0uptr] = 
 reject_body(brace_range "out of range" "u32 values[2] = {[2uptr] = 1u32};")
 reject_body(brace_excess "excess entry" "struct Left value = {1u32, 2u32};")
 reject_body(brace_union "excess entry in union" "union Other value = {.value = 1u32, .value = 2u32};")
-reject_body(brace_scalar "brace initializer requires an aggregate" "u32 value = {1u32};")
+reject_body(brace_scalar "excess entry in scalar initializer" "u32 value = {1u32, 2u32};")
 reject_body(brace_runtime_index "constant|uninitialized|runtime" "uptr index = 0uptr; u32 values[2] = {[index] = 1u32};")
 reject_body(brace_string "string initializer does not fit" "struct Text { u8 bytes[2]; } value = {\"ab\"};")
 reject_body(array_scalar "aggregate initializer requires a brace list" "u32 values[2] = 3u32;")

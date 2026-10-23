@@ -382,6 +382,14 @@ object that an earlier entry initialized as a whole (a nested brace list
 initializes its whole destination) or the reverse, and a second member of one
 union.
 
+Braces may also enclose an initializer that is one expression, at the top
+level or as an entry. `{ value }` initializes a scalar, an object of a scalar
+keyword, pointer, `label`, enumeration, or target-registered scalar type, as
+`value` does; these braces hold exactly one entry, without a designator, that
+is not itself a brace list. In a brace list that initializes a `u8` array, a
+string literal as the first entry, without a designator, initializes the array
+as that string does, and no other entry may follow it.
+
 For an automatic variable-length array, the bound is evaluated once before
 initialization. The runtime bound must include every explicitly initialized
 element (including the terminating zero of a direct `u8` string initializer);
@@ -393,10 +401,14 @@ in source order.
 struct point { i32 x; i32 y; };
 struct point origin = { .x = 0, .y = 0 };
 u32 powers[4] = { 1, 2, [3] = 8 };
+u32 answer = { 42 };
+struct point unit = { { 1 }, { 0 } };
+u8 greeting[] = { "hi" };          // three elements
 ```
 
-An array of `u8` may be initialized by a UTF-8 string when the array is large
-enough for its bytes and terminating zero; an omitted bound is inferred.
+An array of `u8` may be initialized by a UTF-8 string, optionally enclosed in
+braces, when the array is large enough for its bytes and terminating zero; an
+omitted bound is inferred.
 Static-duration initializers must be translation-time values or
 target/object-format relocatable address expressions; a pointer derived from
 an integer translation-time value initializes static storage with its address

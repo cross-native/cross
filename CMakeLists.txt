@@ -5961,9 +5961,10 @@ if(BUILD_TESTING)
                 SKIP_REGULAR_EXPRESSION "skipping MIPS")
         endforeach()
     endforeach()
-    # Under-aligned typedefs and compound literals: x86-64 natively and through
-    # LLVM IR, o32 on R3000 and VR4300 and n64, each in both byte orders.
-    foreach(case underaligned_typedef compound_literals)
+    # Under-aligned typedefs, compound literals, and braced initializers: x86-64
+    # natively and through LLVM IR, o32 on R3000 and VR4300 and n64, each in both
+    # byte orders.
+    foreach(case underaligned_typedef compound_literals braced_initializers)
         string(REPLACE "_" "-" case_path "${case}")
         if(case STREQUAL underaligned_typedef)
             set(case_labels "feature.layout;feature.records;feature.pointer;feature.evaluation")
@@ -7762,6 +7763,13 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/language/compound_literals.cmake")
     set_tests_properties(cross_compound_literals PROPERTIES
         LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;frontend;feature.initializer;feature.syntax_tree;feature.semantics")
+    add_test(NAME cross_braced_initializers
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/braced-initializers
+                -P "${CMAKE_SOURCE_DIR}/test/language/braced_initializers.cmake")
+    set_tests_properties(cross_braced_initializers PROPERTIES
+        LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;frontend;backend.native;feature.initializer;feature.semantics;feature.raw;feature.calls")
     foreach(forms_level O0 O2)
         add_test(NAME cross_runtime_native_forms_${forms_level}
             COMMAND "${CMAKE_COMMAND}"

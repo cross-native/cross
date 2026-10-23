@@ -276,12 +276,12 @@ void validate_table_attributes(const std::vector<Attribute>& attributes,
         const auto subject = "attribute '" + attribute.name + "'";
         const bool is_constructor = attribute.name == "constructor";
         auto& seen = is_constructor ? constructor : destructor;
-        const auto* other = is_constructor ? destructor : constructor;
+        const auto* opposite = is_constructor ? destructor : constructor;
         if (attribute.arguments.size() > 1) {
             diagnostics.error(attribute.location, subject + " takes at most one priority");
         } else if (seen) {
             diagnostics.error(attribute.location, subject + " appears more than once");
-        } else if (object && other) {
+        } else if (object && opposite) {
             diagnostics.error(attribute.location,
                 "an object cannot be both a constructor and a destructor entry");
         } else if (function && !function->generic_parameters.empty()) {
@@ -3935,6 +3935,8 @@ private:
                         position = *selected + 1;
             } else if (destination && destination->kind == Type::Kind::Array) {
                 target = qualified_element_type(destination);
+            } else if (is_scalar(destination)) {
+                target = destination; // braces around a scalar's value
             } else if (record && position) {
                 named_members([&](const RecordMemberDecl& member, std::size_t logical) {
                     if (logical != *position) return false;
@@ -5751,7 +5753,12 @@ EvaluationTask<bool> prepare_inferred_array_async(VariableDecl& declaration, Pro
     const auto& type = declaration.type;
     if (!type || type->kind != Type::Kind::Array || type->lanes || type->array_bound ||
         declaration.dynamic_array_bound || !declaration.initializer) co_return true;
-    const auto& source = *declaration.initializer;
+    const auto unbraced = unbrace_initializer(*declaration.initializer, type);
+    if (!unbraced.value) {
+        if (unbraced.error) report(unbraced.error_location, unbraced.error);
+        co_return false;
+    }
+    const auto& source = *unbraced.value;
     if (source.kind == Expr::Kind::String && type->element && type->element->kind == Type::Kind::Builtin &&
         type->element->builtin == BuiltinType::U8) {
         const auto text = source.string_value.empty() ? decode_string_literal(source.text)
@@ -6748,6 +6755,12 @@ private:
                                      const VariableDecl* declaration = nullptr, bool static_storage = false,
                                      bool literal = false) {
         if (!valid_ || !destination) co_return;
+        if (const auto unbraced = unbrace_initializer(source, destination); unbraced.value != &source) {
+            if (unbraced.value) co_await initializer(*unbraced.value, destination, declaration, static_storage, literal);
+            else if (unbraced.error) error(unbraced.error_location, unbraced.error);
+            else valid_ = false;
+            co_return;
+        }
         const bool inferred = ((declaration && !declaration->dynamic_array_bound) || literal) &&
             destination->kind == Type::Kind::Array && !destination->lanes && !destination->array_bound;
         if (source.kind == Expr::Kind::String && destination->kind == Type::Kind::Array &&
@@ -8393,8 +8406,12 @@ public:
         const LayoutQuery size_of = size_of_ ? *size_of_ : LayoutQuery{};
         const LayoutQuery align_of = align_of_ ? *align_of_ : LayoutQuery{};
         std::uint64_t count{};
-        const auto& source = *object->initializer;
-        if (source.kind == Expr::Kind::AggregateInitializer) {
+        const auto* unbraced = unbrace_initializer(*object->initializer, type).value;
+        if (!unbraced) co_return;
+        const auto& source = *unbraced;
+        if (source.kind == Expr::Kind::String) {
+            count = source.string_value.size() + 1;
+        } else if (source.kind == Expr::Kind::AggregateInitializer) {
             std::uint64_t cursor{};
             for (const auto& entry : source.initializer_entries) {
                 auto selected = cursor;
@@ -8412,7 +8429,7 @@ public:
                 cursor = selected + 1;
                 count = std::max(count, cursor);
             }
-        } else if (source.kind != Expr::Kind::String && type->element &&
+        } else if (type->element &&
                    type->element->kind == Type::Kind::Builtin && type->element->builtin == BuiltinType::U8) {
             Expr length;
             length.kind = Expr::Kind::Call;
@@ -11564,11 +11581,26 @@ private:
         co_return (co_await normalize(normalize, *normalized)) ? std::move(normalized) : nullptr;
     }
 
-    EvaluationTask<std::optional<EvalValue>> initialize_object_async(const Expr& source,
+    EvaluationTask<std::optional<EvalValue>> initialize_object_async(const Expr& initializer,
                                                const TypePtr& type,
                                                const PreparedObjectInitializer* prepared = nullptr) {
-        auto value = co_await new_object_async(type, source.location, true);
+        auto value = co_await new_object_async(type, initializer.location, true);
         if (!value) co_return std::nullopt;
+        const auto unbraced = unbrace_initializer(initializer, type);
+        if (!unbraced.value) {
+            fail(unbraced.error ? unbraced.error_location : initializer.location,
+                 unbraced.error ? unbraced.error : "invalid initializer");
+            co_return std::nullopt;
+        }
+        const auto& source = *unbraced.value;
+        if (is_scalar(type)) {
+            // A scalar's value, as a lifted compound literal object keeps it.
+            auto pointer = object_pointer(*value);
+            pointer.type->pointee->is_const = false;
+            if (!(co_await store_meta_pointer_async(pointer, (co_await this->expression_async(source)),
+                    source.location))) co_return std::nullopt;
+            co_return value;
+        }
         if (source.kind == Expr::Kind::String && type->kind == Type::Kind::Array &&
             type->element->kind == Type::Kind::Builtin && type->element->builtin == BuiltinType::U8) {
             auto text = source.string_value.empty() ? decode_string_literal(source.text)
@@ -15652,7 +15684,13 @@ private:
             scopes_.back()[name_key(*statement.declaration)] = {
                 value, value.object != nullptr, statement.declaration->type->is_const};
             if (statement.declaration->initializer) {
-                const auto& source = *statement.declaration->initializer;
+                const auto unbraced = unbrace_initializer(*statement.declaration->initializer, value.type);
+                if (!unbraced.value) {
+                    fail(unbraced.error ? unbraced.error_location : statement.location,
+                         unbraced.error ? unbraced.error : "invalid initializer");
+                    co_return {Flow::Failed};
+                }
+                const auto& source = *unbraced.value;
                 const bool aggregate = source.kind == Expr::Kind::AggregateInitializer ||
                     (source.kind == Expr::Kind::String && value.type->kind == Type::Kind::Array);
                 std::optional<EvalValue> initializer;
@@ -17132,10 +17170,16 @@ EvaluationTask<void> rewrite_eval_expr_async(std::unique_ptr<Expr>& expression,
 void infer_initializer_array_bound(TypePtr& type, const Expr* initializer,
                                    Diagnostics& diagnostics) {
     if (!type || type->kind != Type::Kind::Array || type->lanes != 0 || type->array_bound ||
-        !initializer ||
-        initializer->kind != Expr::Kind::AggregateInitializer) {
+        !initializer) {
         return;
     }
+    initializer = unbrace_initializer(*initializer, type).value;
+    if (initializer && initializer->kind == Expr::Kind::String && type->element &&
+        type->element->kind == Type::Kind::Builtin && type->element->builtin == BuiltinType::U8) {
+        type->lanes = static_cast<std::uint32_t>(initializer->string_value.size() + 1);
+        return;
+    }
+    if (!initializer || initializer->kind != Expr::Kind::AggregateInitializer) return;
     std::uint64_t cursor{};
     std::uint64_t count{};
     for (const auto& entry : initializer->initializer_entries) {
@@ -17275,6 +17319,15 @@ EvaluationTask<void> fold_static_initializer_async(Expr& initializer, TypePtr ty
                 program, destination, &entry.designators[index], 0);
         }
         if (!destination || !entry.value) continue;
+        if (const auto unbraced = unbrace_initializer(*entry.value, destination);
+            unbraced.value != entry.value.get()) {
+            if (!unbraced.value) {
+                if (unbraced.error) diagnostics.error(unbraced.error_location, unbraced.error);
+                continue;
+            }
+            auto enclosed = std::move(entry.value->initializer_entries.front().value);
+            entry.value = std::move(enclosed);
+        }
         if (entry.value->kind == Expr::Kind::AggregateInitializer) {
             co_await fold_static_initializer_async(*entry.value, destination, program,
                                     diagnostics, size_of, align_of,
@@ -17606,6 +17659,15 @@ EvaluationTask<bool> expand_evaluation_impl_async(Program& program, Diagnostics&
             continue;
         }
         if (object->initializer) {
+            if (const auto unbraced = unbrace_initializer(*object->initializer, object->type);
+                unbraced.value != object->initializer.get()) {
+                if (!unbraced.value) {
+                    if (unbraced.error) diagnostics.error(unbraced.error_location, unbraced.error);
+                    continue;
+                }
+                auto value = std::move(object->initializer->initializer_entries.front().value);
+                object->initializer = std::move(value);
+            }
             if (const auto* builtin = uncalled_builtin(*object->initializer)) {
                 diagnostics.error(builtin->location, builtin_value_error(builtin->text));
                 continue;
@@ -17978,7 +18040,14 @@ private:
             return;
         }
         if (u8_array_string(destination, expression)) return;
+        if (expression->kind == Expr::Kind::CompoundLiteral) {
+            rewrite(expression->left, expression->type);
+            return;
+        }
         if (expression->kind == Expr::Kind::AggregateInitializer) {
+            // A string in braces initializes a u8 array as the string alone does.
+            if (destination && destination->kind == Type::Kind::Array &&
+                unbrace_initializer(*expression, destination).value != expression.get()) return;
             std::size_t cursor{};
             for (auto& entry : expression->initializer_entries) {
                 for (auto& designator : entry.designators) {

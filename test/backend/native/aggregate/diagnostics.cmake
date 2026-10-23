@@ -61,7 +61,7 @@ expect_aggregate_error(initializer_member
 expect_aggregate_error(initializer_excess
     "excess entry in aggregate initializer")
 expect_aggregate_error(initializer_scalar_braces
-    "brace initializer requires an aggregate object")
+    "too many braces around scalar initializer")
 
 execute_process(
     COMMAND "${CC}" -S "${SOURCE_DIR}/packed_address.x"

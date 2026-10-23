@@ -1148,6 +1148,38 @@ std::string encode_link_name(std::string_view qualified_name, bool label,
     return encode_model_link_name(qualified_name, label, mangling_name);
 }
 
+UnbracedInitializer unbrace_initializer(const Expr& source, bool scalar, bool byte_array) {
+    if (source.kind != Expr::Kind::AggregateInitializer || (!scalar && !byte_array))
+        return {&source, {}, nullptr};
+    const auto& entries = source.initializer_entries;
+    const auto* first = entries.empty() ? nullptr : &entries.front();
+    if (byte_array) {
+        // A leading string initializes the whole array; nothing may follow it.
+        if (!first || !first->designators.empty() || !first->value ||
+            first->value->kind != Expr::Kind::String) return {&source, {}, nullptr};
+        if (entries.size() > 1) return {nullptr, entries[1].location, "excess entry in u8 array initializer"};
+        return {first->value.get(), {}, nullptr};
+    }
+    if (!first) return {nullptr, source.location, "empty scalar initializer"};
+    if (!first->designators.empty()) {
+        const auto& designator = first->designators.front();
+        return {nullptr, designator.location, designator.kind == Expr::InitializerDesignator::Kind::Index
+            ? "array designator requires an array destination"
+            : "member designator requires a record destination"};
+    }
+    if (!first->value) return {};
+    if (first->value->kind == Expr::Kind::AggregateInitializer)
+        return {nullptr, first->value->location, "too many braces around scalar initializer"};
+    if (entries.size() > 1) return {nullptr, entries[1].location, "excess entry in scalar initializer"};
+    return {first->value.get(), {}, nullptr};
+}
+
+UnbracedInitializer unbrace_initializer(const Expr& source, const TypePtr& destination) {
+    const bool byte_array = destination && destination->kind == Type::Kind::Array && destination->element &&
+        destination->element->kind == Type::Kind::Builtin && destination->element->builtin == BuiltinType::U8;
+    return unbrace_initializer(source, is_scalar(destination), byte_array);
+}
+
 std::optional<std::string> decode_string_literal(std::string_view text) {
     if (text.size() < 2 || text.front() != '"' || text.back() != '"') return std::nullopt;
     std::string result;

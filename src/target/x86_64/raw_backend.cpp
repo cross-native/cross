@@ -1028,6 +1028,15 @@ private:
     }
 
     void lower_declaration(const VariableDecl& declaration) {
+        const Expr* initializer = declaration.initializer.get();
+        if (initializer) {
+            const auto unbraced = unbrace_initializer(*initializer, declaration.type);
+            if (!unbraced.value) {
+                if (unbraced.error) diagnostics_.error(unbraced.error_location, unbraced.error);
+                return;
+            }
+            initializer = unbraced.value;
+        }
         if (!inline_frames_.empty() && !declaration.storage_register &&
             !declaration.storage_stack && !declaration.storage_static &&
             !declaration.location_name) {
@@ -1047,8 +1056,8 @@ private:
             binding_signed_[name_key(declaration)] =
                 signed_integer_type(declaration.type);
             inline_frames_.back().readonly_names.erase(name_key(declaration));
-            if (declaration.initializer) {
-                (void)lower_inline_value(*declaration.initializer, *entry,
+            if (initializer) {
+                (void)lower_inline_value(*initializer, *entry,
                                          declaration.type);
             }
             return;
@@ -1094,14 +1103,14 @@ private:
             declaration.type->builtin == BuiltinType::Label) {
             label_bindings_.insert(name_key(declaration));
         }
-        if (!declaration.initializer) return;
+        if (!initializer) return;
         if (!raw_integer_type(declaration.type) &&
             !raw_scalar_float_type(declaration.type)) {
-            diagnostics_.error(declaration.initializer->location,
+            diagnostics_.error(initializer->location,
                                "raw register initializer requires a supported scalar register value");
             return;
         }
-        (void)lower_inline_value(*declaration.initializer, *entry,
+        (void)lower_inline_value(*initializer, *entry,
                                  declaration.type);
     }
 

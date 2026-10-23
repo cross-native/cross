@@ -383,6 +383,19 @@ inline void bind_exact_name(Expr& expression, std::string name) {
     expression.name_context = std::move(context);
 }
 
+// Braces may enclose an initializer that is one expression: a scalar's value
+// (`{ 5u32 }`) or the string literal of a u8 array (`{ "abc" }`). `value` is
+// the initializer that applies in place of `source`: the enclosed one, or
+// `source` itself. Malformed braces leave it null with `error` set, unless a
+// parse error already left the entry without a value.
+struct UnbracedInitializer {
+    const Expr* value{};
+    SourceLocation error_location;
+    const char* error{};
+};
+UnbracedInitializer unbrace_initializer(const Expr& source, bool scalar, bool byte_array);
+UnbracedInitializer unbrace_initializer(const Expr& source, const TypePtr& destination);
+
 struct VariableDecl {
     SourceLocation location;
     std::string name;
