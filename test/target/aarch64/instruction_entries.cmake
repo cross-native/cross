@@ -5,8 +5,9 @@
 # that the shipped table lacks, with encoded immediates in slices, a
 # relocated page address, a field that holds a negated value, and an
 # operand of one value without a field; loading rejects encoders whose
-# slices do not tile their values and relocated values that a linker would
-# not find, at their file and line.
+# slices do not tile their values, relocated values that a linker would
+# not find, and forms of instructions that code generation selects, at
+# their file and line.
 
 foreach(required AS CC OUTPUT)
     if(NOT DEFINED ${required} OR "${${required}}" STREQUAL "")
@@ -152,6 +153,18 @@ instruction "frob" {
     architecture = "aarch64";
     operands = ["rd:x", "amount:0..63"];
     encoding = "1 10 100110 1 0 -amount:5 111111 11111 rd:5";
+}
+]=])
+# A form of an instruction that code generation selects.
+expect_rejected(selected-form 1
+    "instruction 'csel/always' adds a form to 'csel', which the compiler selects with its shipped forms" [=[
+instruction "csel/always" {
+    architecture = "aarch64";
+    mnemonic = "csel";
+    operands = ["rd:w", "rn:w", "rm:w"];
+    encoding = "0 0 0 11010100 rm:5 1110 0 0 rn:5 rd:5";
+    reads = ["rn", "rm"];
+    writes = ["rd"];
 }
 ]=])
 message(STATUS "${cases} faults reported")

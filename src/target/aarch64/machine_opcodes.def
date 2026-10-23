@@ -1,0 +1,82 @@
+// The AArch64 Machine IR opcodes: name, diagnostic spelling. Each prints
+// as the instruction forms of the selection contract (instructions.def);
+// the frame and pseudo opcodes are listed first.
+X(FrameAdjust, "aarch64.frame.adjust")
+X(FrameCopy, "aarch64.frame.copy")
+X(FrameSave, "aarch64.frame.save")
+X(FrameRestore, "aarch64.frame.restore")
+// PHIs, which the spill stage turns into copies on the incoming edges.
+X(Phi, "aarch64.phi")
+// A constant: movz or movn and movk, or orr from the zero register.
+X(MovImmediate, "aarch64.mov.immediate")
+// The address of a frame slot plus an offset: add from sp.
+X(StackAddress, "aarch64.stack.address")
+// Symbol addresses: the page, the low 12 bits added to a page, the GOT
+// page, and the GOT entry; a block address.
+X(Adrp, "aarch64.adrp")
+X(AddLow, "aarch64.add.low")
+X(AdrpGot, "aarch64.adrp.got")
+X(LoadGot, "aarch64.load.got")
+X(Adr, "aarch64.adr")
+// Integer operations on w or x registers by the mode of their result.
+X(Add, "aarch64.add")
+X(AddImmediate, "aarch64.add.immediate")
+X(AddShifted, "aarch64.add.shifted")
+X(Sub, "aarch64.sub")
+X(SubImmediate, "aarch64.sub.immediate")
+X(Neg, "aarch64.neg")
+X(Mul, "aarch64.mul")
+X(Madd, "aarch64.madd")
+X(Msub, "aarch64.msub")
+X(Sdiv, "aarch64.sdiv")
+X(Udiv, "aarch64.udiv")
+X(And, "aarch64.and")
+X(AndImmediate, "aarch64.and.immediate")
+X(Orr, "aarch64.orr")
+X(OrrImmediate, "aarch64.orr.immediate")
+X(Eor, "aarch64.eor")
+X(EorImmediate, "aarch64.eor.immediate")
+X(Mvn, "aarch64.mvn")
+X(Lslv, "aarch64.lslv")
+X(Lsrv, "aarch64.lsrv")
+X(Asrv, "aarch64.asrv")
+X(LslImmediate, "aarch64.lsl.immediate")
+X(LsrImmediate, "aarch64.lsr.immediate")
+X(AsrImmediate, "aarch64.asr.immediate")
+X(Rorv, "aarch64.rorv")
+X(RorImmediate, "aarch64.ror.immediate")
+X(Clz, "aarch64.clz")
+X(Rbit, "aarch64.rbit")
+X(Rev, "aarch64.rev")
+X(Rev16, "aarch64.rev16")
+X(Sxtb, "aarch64.sxtb")
+X(Sxth, "aarch64.sxth")
+X(Sxtw, "aarch64.sxtw")
+X(Uxtb, "aarch64.uxtb")
+X(Uxth, "aarch64.uxth")
+// mov wd, wn: the low word, zero-extended into the x register.
+X(Uxtw, "aarch64.uxtw")
+// Comparisons write the flags; cset and csel read them.
+X(Cmp, "aarch64.cmp")
+X(CmpImmediate, "aarch64.cmp.immediate")
+X(CmnImmediate, "aarch64.cmn.immediate")
+X(TstImmediate, "aarch64.tst.immediate")
+X(Cset, "aarch64.cset")
+X(Csel, "aarch64.csel")
+// Loads by access width and extension, and stores by width. Their address
+// is a frame slot, a base and an offset, a base and a shifted index, or a
+// base and the low 12 bits of a symbol.
+X(LoadU8, "aarch64.load.u8")
+X(LoadS8, "aarch64.load.s8")
+X(LoadU16, "aarch64.load.u16")
+X(LoadS16, "aarch64.load.s16")
+X(Load32, "aarch64.load.32")
+X(LoadS32, "aarch64.load.s32")
+X(Load64, "aarch64.load.64")
+X(Store8, "aarch64.store.8")
+X(Store16, "aarch64.store.16")
+X(Store32, "aarch64.store.32")
+X(Store64, "aarch64.store.64")
+// brk #1000, as GCC's __builtin_trap, and nop.
+X(Brk, "aarch64.brk")
+X(Nop, "aarch64.nop")

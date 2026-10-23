@@ -4,6 +4,7 @@
 
 #include "common/options.hpp"
 #include "target/aarch64/assembler.hpp"
+#include "target/aarch64/costs.hpp"
 #include "target/aarch64/elf.hpp"
 #include "target/aarch64/instructions.hpp"
 #include "target/aarch64/linker.hpp"
@@ -136,8 +137,8 @@ const SubtargetTable subtargets{
 #undef LIST
 
 std::vector<OptionDefinition> target_options() {
-    // Code generation for AArch64 does not exist, so every option is
-    // partial: it selects model entries and the features that the
+    // Code generation selects base A64 integer instructions only, so every
+    // option is partial: it selects model entries and the features that the
     // assembler accepts instructions of.
     std::vector<OptionDefinition> result{
         {"m.arch", {}, OptionValueKind::Text, std::string("generic"), {}, 0, 0,
@@ -181,7 +182,12 @@ std::optional<unsigned> register_number(std::string_view name) {
 }
 
 const InstructionModel instruction_model{
-    32, aarch64::operand_type, register_number, {}, {}, {}, {},
+    32, aarch64::operand_type, register_number, {}, {}, {},
+    {
+#define X(name, mnemonic, ...) SelectedInstruction{mnemonic, {__VA_ARGS__}},
+#include "target/aarch64/instructions.def"
+#undef X
+    },
 };
 
 TargetInfo make_target() {
@@ -205,10 +211,16 @@ TargetInfo make_target() {
     result.registers = target_registers();
     result.options = target_options();
     result.subtargets = &subtargets;
+    result.cost_model.bit_operation = &aarch64::bit_operation_instructions;
+    result.cost_model.integer_register_bits = &aarch64::integer_register_bits;
+    result.cost_model.select = &aarch64::select_instructions;
     result.address_spaces = {{0, 0, 0, 0, true, true, true, true, false, true, true}};
+    result.language_features = {{"integer128", {}}};
     // The models give the instruction table, which Cross's assembler
     // encodes.
     result.instruction_model = &instruction_model;
+    // MIR splits 128-bit integers into 64-bit halves.
+    result.selected_integer_bits = 64;
     result.integrated_assembler = &aarch64::assemble;
     result.elf_machine = aarch64::em_aarch64;
     result.linker = &aarch64::make_linker_target;

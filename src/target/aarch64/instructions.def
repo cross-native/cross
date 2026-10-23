@@ -1,0 +1,222 @@
+// The instructions the AArch64 backend selects, in the order of the
+// instructions that cpu entries cost: the enumerator, the mnemonic, and
+// each form the backend emits as "OPERANDS | EFFECTS" in the spelling of
+// instruction entries. Loading checks that the shipped instruction table
+// defines them so and that no other model adds forms to them.
+X(Add, "add",
+  "rd:x, rn:x, rm:x, shift:shift64=0 | reads=rn,rm writes=rd",
+  "rd:w, rn:w, rm:w, shift:shift32=0 | reads=rn,rm writes=rd",
+  "rd:xsp, rn:xsp, imm:uimm12_lsl12 | reads=rn writes=rd",
+  "rd:wsp, rn:wsp, imm:uimm12_lsl12 | reads=rn writes=rd")
+X(Sub, "sub",
+  "rd:x, rn:x, rm:x, shift:shift64=0 | reads=rn,rm writes=rd",
+  "rd:w, rn:w, rm:w, shift:shift32=0 | reads=rn,rm writes=rd",
+  "rd:xsp, rn:xsp, imm:uimm12_lsl12 | reads=rn writes=rd",
+  "rd:wsp, rn:wsp, imm:uimm12_lsl12 | reads=rn writes=rd")
+X(Neg, "neg",
+  "rd:x, rm:x, shift:shift64=0 | reads=rm writes=rd",
+  "rd:w, rm:w, shift:shift32=0 | reads=rm writes=rd")
+X(Mul, "mul",
+  "rd:x, rn:x, rm:x | reads=rn,rm writes=rd",
+  "rd:w, rn:w, rm:w | reads=rn,rm writes=rd")
+X(Madd, "madd",
+  "rd:x, rn:x, rm:x, ra:x | reads=rn,rm,ra writes=rd",
+  "rd:w, rn:w, rm:w, ra:w | reads=rn,rm,ra writes=rd")
+X(Msub, "msub",
+  "rd:x, rn:x, rm:x, ra:x | reads=rn,rm,ra writes=rd",
+  "rd:w, rn:w, rm:w, ra:w | reads=rn,rm,ra writes=rd")
+X(Sdiv, "sdiv",
+  "rd:x, rn:x, rm:x | reads=rn,rm writes=rd",
+  "rd:w, rn:w, rm:w | reads=rn,rm writes=rd")
+X(Udiv, "udiv",
+  "rd:x, rn:x, rm:x | reads=rn,rm writes=rd",
+  "rd:w, rn:w, rm:w | reads=rn,rm writes=rd")
+X(And, "and",
+  "rd:x, rn:x, rm:x, shift:shift64_ror=0 | reads=rn,rm writes=rd",
+  "rd:w, rn:w, rm:w, shift:shift32_ror=0 | reads=rn,rm writes=rd",
+  "rd:xsp, rn:x, imm:bitmask64 | reads=rn writes=rd",
+  "rd:wsp, rn:w, imm:bitmask32 | reads=rn writes=rd")
+X(Orr, "orr",
+  "rd:x, rn:x, rm:x, shift:shift64_ror=0 | reads=rn,rm writes=rd",
+  "rd:w, rn:w, rm:w, shift:shift32_ror=0 | reads=rn,rm writes=rd",
+  "rd:xsp, rn:x, imm:bitmask64 | reads=rn writes=rd",
+  "rd:wsp, rn:w, imm:bitmask32 | reads=rn writes=rd")
+X(Eor, "eor",
+  "rd:x, rn:x, rm:x, shift:shift64_ror=0 | reads=rn,rm writes=rd",
+  "rd:w, rn:w, rm:w, shift:shift32_ror=0 | reads=rn,rm writes=rd",
+  "rd:xsp, rn:x, imm:bitmask64 | reads=rn writes=rd",
+  "rd:wsp, rn:w, imm:bitmask32 | reads=rn writes=rd")
+X(Mvn, "mvn",
+  "rd:x, rm:x, shift:shift64_ror=0 | reads=rm writes=rd",
+  "rd:w, rm:w, shift:shift32_ror=0 | reads=rm writes=rd")
+X(Lslv, "lslv",
+  "rd:x, rn:x, rm:x | reads=rn,rm writes=rd",
+  "rd:w, rn:w, rm:w | reads=rn,rm writes=rd")
+X(Lsrv, "lsrv",
+  "rd:x, rn:x, rm:x | reads=rn,rm writes=rd",
+  "rd:w, rn:w, rm:w | reads=rn,rm writes=rd")
+X(Asrv, "asrv",
+  "rd:x, rn:x, rm:x | reads=rn,rm writes=rd",
+  "rd:w, rn:w, rm:w | reads=rn,rm writes=rd")
+X(Lsl, "lsl",
+  "rd:x, rn:x, shift:0..63 | reads=rn writes=rd",
+  "rd:w, rn:w, shift:0..31 | reads=rn writes=rd")
+X(Lsr, "lsr",
+  "rd:x, rn:x, shift:0..63 | reads=rn writes=rd",
+  "rd:w, rn:w, shift:0..31 | reads=rn writes=rd")
+X(Asr, "asr",
+  "rd:x, rn:x, shift:0..63 | reads=rn writes=rd",
+  "rd:w, rn:w, shift:0..31 | reads=rn writes=rd")
+X(Rorv, "rorv",
+  "rd:x, rn:x, rm:x | reads=rn,rm writes=rd",
+  "rd:w, rn:w, rm:w | reads=rn,rm writes=rd")
+X(Ror, "ror",
+  "rd:x, rn:x, shift:0..63 | reads=rn writes=rd",
+  "rd:w, rn:w, shift:0..31 | reads=rn writes=rd")
+X(Clz, "clz",
+  "rd:x, rn:x | reads=rn writes=rd",
+  "rd:w, rn:w | reads=rn writes=rd")
+X(Rbit, "rbit",
+  "rd:x, rn:x | reads=rn writes=rd",
+  "rd:w, rn:w | reads=rn writes=rd")
+X(Rev, "rev",
+  "rd:x, rn:x | reads=rn writes=rd",
+  "rd:w, rn:w | reads=rn writes=rd")
+X(Rev16, "rev16",
+  "rd:w, rn:w | reads=rn writes=rd")
+X(Sxtb, "sxtb",
+  "rd:w, rn:w | reads=rn writes=rd",
+  "rd:x, rn:w | reads=rn writes=rd")
+X(Sxth, "sxth",
+  "rd:w, rn:w | reads=rn writes=rd",
+  "rd:x, rn:w | reads=rn writes=rd")
+X(Sxtw, "sxtw",
+  "rd:x, rn:w | reads=rn writes=rd")
+X(Uxtb, "uxtb",
+  "rd:w, rn:w | reads=rn writes=rd")
+X(Uxth, "uxth",
+  "rd:w, rn:w | reads=rn writes=rd")
+X(Mov, "mov",
+  "rd:x, rm:x | reads=rm writes=rd",
+  "rd:w, rm:w | reads=rm writes=rd",
+  "rd:xsp, rn:xsp | reads=rn writes=rd")
+X(Movz, "movz",
+  "rd:x, imm:movw64 | writes=rd",
+  "rd:w, imm:movw32 | writes=rd")
+X(Movn, "movn",
+  "rd:x, imm:movw64 | writes=rd",
+  "rd:w, imm:movw32 | writes=rd")
+X(Movk, "movk",
+  "rd:x, imm:movw64 | writes=rd",
+  "rd:w, imm:movw32 | writes=rd")
+X(Cmp, "cmp",
+  "rn:x, rm:x, shift:shift64=0 | reads=rn,rm writes=nzcv",
+  "rn:w, rm:w, shift:shift32=0 | reads=rn,rm writes=nzcv",
+  "rn:xsp, imm:uimm12_lsl12 | reads=rn writes=nzcv",
+  "rn:wsp, imm:uimm12_lsl12 | reads=rn writes=nzcv")
+X(Cmn, "cmn",
+  "rn:xsp, imm:uimm12_lsl12 | reads=rn writes=nzcv",
+  "rn:wsp, imm:uimm12_lsl12 | reads=rn writes=nzcv")
+X(Tst, "tst",
+  "rn:w, imm:bitmask32 | reads=rn writes=nzcv")
+X(Cset, "cset",
+  "rd:x, cond:cond_inverted | reads=nzcv writes=rd",
+  "rd:w, cond:cond_inverted | reads=nzcv writes=rd")
+X(Csel, "csel",
+  "rd:x, rn:x, rm:x, cond:cond | reads=rn,rm,nzcv writes=rd",
+  "rd:w, rn:w, rm:w, cond:cond | reads=rn,rm,nzcv writes=rd")
+X(Ldrb, "ldrb",
+  "rt:w, address:mem8 | reads=memory writes=rt",
+  "rt:w, address:mem8_reg | reads=memory writes=rt")
+X(Ldurb, "ldurb",
+  "rt:w, address:mem_simm9 | reads=memory writes=rt")
+X(Ldrsb, "ldrsb",
+  "rt:w, address:mem8 | reads=memory writes=rt",
+  "rt:x, address:mem8 | reads=memory writes=rt",
+  "rt:w, address:mem8_reg | reads=memory writes=rt",
+  "rt:x, address:mem8_reg | reads=memory writes=rt")
+X(Ldursb, "ldursb",
+  "rt:w, address:mem_simm9 | reads=memory writes=rt",
+  "rt:x, address:mem_simm9 | reads=memory writes=rt")
+X(Ldrh, "ldrh",
+  "rt:w, address:mem16 | reads=memory writes=rt",
+  "rt:w, address:mem16_reg | reads=memory writes=rt")
+X(Ldurh, "ldurh",
+  "rt:w, address:mem_simm9 | reads=memory writes=rt")
+X(Ldrsh, "ldrsh",
+  "rt:w, address:mem16 | reads=memory writes=rt",
+  "rt:x, address:mem16 | reads=memory writes=rt",
+  "rt:w, address:mem16_reg | reads=memory writes=rt",
+  "rt:x, address:mem16_reg | reads=memory writes=rt")
+X(Ldursh, "ldursh",
+  "rt:w, address:mem_simm9 | reads=memory writes=rt",
+  "rt:x, address:mem_simm9 | reads=memory writes=rt")
+X(Ldr, "ldr",
+  "rt:w, address:mem32 | reads=memory writes=rt",
+  "rt:x, address:mem64 | reads=memory writes=rt",
+  "rt:w, address:mem32_reg | reads=memory writes=rt",
+  "rt:x, address:mem64_reg | reads=memory writes=rt")
+X(Ldur, "ldur",
+  "rt:w, address:mem_simm9 | reads=memory writes=rt",
+  "rt:x, address:mem_simm9 | reads=memory writes=rt")
+X(Ldrsw, "ldrsw",
+  "rt:x, address:mem32 | reads=memory writes=rt",
+  "rt:x, address:mem32_reg | reads=memory writes=rt")
+X(Ldursw, "ldursw",
+  "rt:x, address:mem_simm9 | reads=memory writes=rt")
+X(Strb, "strb",
+  "rt:w, address:mem8 | reads=rt,memory writes=memory",
+  "rt:w, address:mem8_reg | reads=rt,memory writes=memory")
+X(Sturb, "sturb",
+  "rt:w, address:mem_simm9 | reads=rt,memory writes=memory")
+X(Strh, "strh",
+  "rt:w, address:mem16 | reads=rt,memory writes=memory",
+  "rt:w, address:mem16_reg | reads=rt,memory writes=memory")
+X(Sturh, "sturh",
+  "rt:w, address:mem_simm9 | reads=rt,memory writes=memory")
+X(Str, "str",
+  "rt:w, address:mem32 | reads=rt,memory writes=memory",
+  "rt:x, address:mem64 | reads=rt,memory writes=memory",
+  "rt:w, address:mem32_reg | reads=rt,memory writes=memory",
+  "rt:x, address:mem64_reg | reads=rt,memory writes=memory")
+X(Stur, "stur",
+  "rt:w, address:mem_simm9 | reads=rt,memory writes=memory",
+  "rt:x, address:mem_simm9 | reads=rt,memory writes=memory")
+X(Ldp, "ldp",
+  "rt:x, rt2:x, address:pair64 | reads=memory writes=rt,rt2",
+  "rt:x, rt2:x, address:pair64_post | reads=memory writes=rt,rt2")
+X(Stp, "stp",
+  "rt:x, rt2:x, address:pair64 | reads=rt,rt2,memory writes=memory",
+  "rt:x, rt2:x, address:pair64_pre | reads=rt,rt2,memory writes=memory")
+X(Adrp, "adrp",
+  "rd:x, target:adrp21 | writes=rd")
+X(Adr, "adr",
+  "rd:x, target:adr21 | writes=rd")
+X(B, "b",
+  "target:branch26 | control=jump")
+X(Bl, "bl",
+  "target:call26 | writes=x30 control=jump")
+X(Br, "br",
+  "rn:x | reads=rn control=exit")
+X(Blr, "blr",
+  "rn:x | reads=rn writes=x30 control=jump")
+X(Ret, "ret",
+  "| control=exit")
+X(BEq, "b.eq", "target:branch19 | reads=nzcv control=branch")
+X(BNe, "b.ne", "target:branch19 | reads=nzcv control=branch")
+X(BCs, "b.cs", "target:branch19 | reads=nzcv control=branch")
+X(BCc, "b.cc", "target:branch19 | reads=nzcv control=branch")
+X(BMi, "b.mi", "target:branch19 | reads=nzcv control=branch")
+X(BPl, "b.pl", "target:branch19 | reads=nzcv control=branch")
+X(BVs, "b.vs", "target:branch19 | reads=nzcv control=branch")
+X(BVc, "b.vc", "target:branch19 | reads=nzcv control=branch")
+X(BHi, "b.hi", "target:branch19 | reads=nzcv control=branch")
+X(BLs, "b.ls", "target:branch19 | reads=nzcv control=branch")
+X(BGe, "b.ge", "target:branch19 | reads=nzcv control=branch")
+X(BLt, "b.lt", "target:branch19 | reads=nzcv control=branch")
+X(BGt, "b.gt", "target:branch19 | reads=nzcv control=branch")
+X(BLe, "b.le", "target:branch19 | reads=nzcv control=branch")
+X(Brk, "brk",
+  "imm:uimm16 | reads=memory writes=memory")
+X(Nop, "nop",
+  "|")

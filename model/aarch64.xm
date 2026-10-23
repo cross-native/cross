@@ -437,9 +437,9 @@ abi "aapcs64" {
 
 # Scheduling models: one pipeline- entry for each of LLVM's, with its issue
 # width (AArch64Sched*.td). The CPUs that LLVM schedules with a model
-# inherit its entry. No AArch64 instruction has costs, as the target has no
-# instruction table; the Cortex-A57 entry also has the 16-byte function
-# alignment of GCC's cortexa57 tuning and LLVM's A57 subtarget.
+# inherit its entry. No CPU states AArch64 instruction costs yet; the
+# Cortex-A57 entry has the 16-byte function alignment of GCC's cortexa57
+# tuning and LLVM's A57 subtarget.
 cpu "pipeline-a64fx" { architecture = "aarch64"; issue_width = 6; }
 cpu "pipeline-ampere1" { architecture = "aarch64"; issue_width = 4; }
 cpu "pipeline-ampere1b" { architecture = "aarch64"; issue_width = 12; }

@@ -753,7 +753,7 @@ a type.
 Integers are two's-complement; unsigned arithmetic is modulo 2^N. Signed
 overflow, minimum/-1 division, invalid shift counts, and unrepresentable signed
 left shifts are undefined; right shift of a negative value is target-defined.
-The x86-64 and MIPS targets define it as arithmetic (sign-extending)
+The x86-64, MIPS, and AArch64 targets define it as arithmetic (sign-extending)
 right shift, including during translation-time evaluation.
 Wrapping/saturating/checked operations require user code or instructions. The
 registered option `-fwrapv` instead makes signed `+`, `-` (binary and unary),
@@ -1064,8 +1064,8 @@ pointers convert to/from `void *` without changing their address and recover
 their original value when converted back. Function and object pointers are
 distinct; apart from a null pointer constant, conversion between them, and
 explicit conversion between a function pointer and `uptr`, exist only when the
-target defines them. The shipped x86-64 and MIPS targets define the `uptr`
-conversion as the code address, like `label`.
+target defines them. The shipped x86-64, MIPS, and AArch64 targets define the
+`uptr` conversion as the code address, like `label`.
 
 An object's lifetime begins after its storage and initialization are
 established and ends when its block exits, its dynamic stack region is

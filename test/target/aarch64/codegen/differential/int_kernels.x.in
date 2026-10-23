@@ -1,0 +1,727 @@
+// Copyright (C) 2026 Cross contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// Integer kernels: every kernel is u32 k(in u32 a, in u32 b, in u32 c),
+// free of undefined behavior for every input: no signed overflow, nonzero
+// divisors, shift counts below the width, and bounded loops.
+
+[[abi("@ABI@"), noinline]]
+static u64 helper64(in u64 x, in u64 y) {
+    return (x + y) ^ (x - (y << 3));
+}
+
+[[abi("@ABI@"), noinline]]
+static u32 helper1(in u32 x) {
+    return x * 3u32 + 1u32;
+}
+
+[[abi("@ABI@"), noinline]]
+static u32 helper2(in u32 x) {
+    return (x ^ 0x5a5a5a5au32) + 7u32;
+}
+
+// Ten arguments: the last ones travel on the stack under aapcs64, in
+// x8-x9 under x.
+[[abi("@ABI@"), noinline]]
+static u64 helper10(in u64 p1, in u32 p2, in u8 p3, in i16 p4, in u64 p5,
+                    in u32 p6, in i8 p7, in u16 p8, in u64 p9, in i32 p10) {
+    i64 s4 = p4;
+    i64 s7 = p7;
+    i64 s10 = p10;
+    u64 u4 = s4;
+    u64 u7 = s7;
+    u64 u10 = s10;
+    return p1 + p2 * 3u64 + p3 * 5u64 + u4 * 7u64 + p5 * 11u64 + p6 * 13u64 +
+           u7 * 17u64 + p8 * 19u64 + p9 * 23u64 + u10 * 29u64;
+}
+
+// Twenty arguments: past the stack under aapcs64, through x19-x22 under x.
+[[abi("@ABI@"), noinline]]
+static u32 helper20(in u32 a1, in u32 a2, in u32 a3, in u32 a4, in u32 a5,
+                    in u32 a6, in u32 a7, in u32 a8, in u32 a9, in u32 a10,
+                    in u32 a11, in u32 a12, in u32 a13, in u32 a14, in u32 a15,
+                    in u32 a16, in u32 a17, in u32 a18, in u32 a19, in u32 a20) {
+    return a1 ^ (a2 * 2u32) ^ (a3 * 3u32) ^ (a4 * 5u32) ^ (a5 * 7u32) ^
+           (a6 * 11u32) ^ (a7 * 13u32) ^ (a8 * 17u32) ^ (a9 * 19u32) ^
+           (a10 * 23u32) ^ (a11 * 29u32) ^ (a12 * 31u32) ^ (a13 * 37u32) ^
+           (a14 * 41u32) ^ (a15 * 43u32) ^ (a16 * 47u32) ^ (a17 * 53u32) ^
+           (a18 * 59u32) ^ (a19 * 61u32) ^ (a20 * 67u32);
+}
+
+[[abi("@ABI@"), noinline]]
+static void split(in u64 v, out u32 low, out u32 high) {
+    low = v;
+    high = v >> 32;
+}
+
+[[abi("@ABI@"), noinline]]
+static void accumulate(inout u32 total, in u32 step) {
+    total = total * 31u32 + step;
+}
+
+[[abi("@ABI@"), noinline]]
+static u32 recurse(in u32 n, in u32 b, in u32 c) {
+    if (n == 0u32) return b + c;
+    return recurse(n - 1u32, b * 2u32 + n, c) + n;
+}
+
+// 128-bit integers: a register pair under both ABIs, an even one under
+// aapcs64, and the stack once the registers run out.
+[[abi("@ABI@"), noinline]]
+static u128 wide_mix(in u128 x, in u32 shift, in u128 y) {
+    return (x << (shift & 127u32)) ^ (y >> 3) ^ (x * y);
+}
+
+[[abi("@ABI@"), noinline]]
+static i128 wide_late(in u64 p1, in u64 p2, in u64 p3, in u64 p4, in u64 p5, in u64 p6,
+                      in u64 p7, in i128 p8, in i128 p9) {
+    i128 sum = p8 + p9;
+    return sum + (i128)(p1 ^ p2 ^ p3 ^ p4 ^ p5 ^ p6 ^ p7);
+}
+
+u32 g_counter = 17u32;
+u64 g_wide = 0x0123456789abcdefu64;
+i16 g_halves[8] = {-1i16, 2i16, -3i16, 4i16, -5i16, 6i16, -7i16, 8i16};
+u8 g_bytes[16] = {1u8, 2u8, 3u8, 250u8, 5u8, 6u8, 7u8, 128u8,
+                  9u8, 10u8, 11u8, 12u8, 13u8, 14u8, 15u8, 255u8};
+u32 g_table[4] = {0x11111111u32, 0x22222222u32, 0x33333333u32, 0x44444444u32};
+
+[[abi("@ABI@"), noinline]]
+global u32 k_add_sub(in u32 a, in u32 b, in u32 c) {
+    u32 x = a + b - c;
+    u32 y = a + 4095u32 - (b - 4096u32);
+    u32 z = c + 0x123000u32 - 0x5000u32;
+    u32 w = a - 1u32 + (b + 0xfffffff0u32);
+    return x ^ y ^ z ^ w;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_add_sub64(in u32 a, in u32 b, in u32 c) {
+    u64 wa = a;
+    u64 wb = b;
+    u64 wc = c;
+    u64 x = (wa << 32) + wb - wc;
+    u64 y = x + 0xfff000u64 - 1u64;
+    u64 z = y - 0x123456789u64 + (wa << 20);
+    u32 lz = z;
+    u32 hz = z >> 32;
+    return lz ^ hz;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_multiply(in u32 a, in u32 b, in u32 c) {
+    u32 x = a * b;
+    u32 y = a * 1664525u32 + c * 9u32;
+    u64 wa = a;
+    u64 wb = b;
+    u64 p = wa * wb * 0x9e3779b97f4a7c15u64;
+    u32 lp = p;
+    u32 hp = p >> 32;
+    return x ^ y ^ lp ^ hp;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_negate(in u32 a, in u32 b, in u32 c) {
+    u32 x = 0u32 - a;
+    u64 wb = b;
+    u64 y = 0u64 - (wb << 31);
+    i32 sc = (c & 0x7fffffffu32);
+    i32 nc = -sc;
+    u32 unc = nc;
+    u32 ly = y;
+    u32 hy = y >> 32;
+    return x + ly * 3u32 + hy * 5u32 + unc * 7u32;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_logic_imm(in u32 a, in u32 b, in u32 c) {
+    u32 x = (a & 0xffu32) | (b & 0xff00ff00u32);
+    u32 y = (c ^ 0x0f0f0f0fu32) & 0x7ffffffeu32;
+    u32 z = (a | 0x80000001u32) ^ (b & 0x12345678u32);
+    u64 wa = a;
+    u64 m = (wa | 0xffff000000000000u64) & 0x00ff00ff00ff00ffu64;
+    u32 lm = m;
+    u32 hm = m >> 32;
+    return x ^ y ^ z ^ lm ^ hm;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_logic_reg(in u32 a, in u32 b, in u32 c) {
+    u32 x = a & b;
+    u32 y = b | c;
+    u32 z = a ^ c;
+    u32 n = ~a;
+    u64 wa = a;
+    u64 wb = b;
+    u64 w = ~((wa << 32) | wb) & ((wb << 16) ^ wa);
+    u32 lw = w;
+    u32 hw = w >> 32;
+    return x + y * 3u32 + z * 5u32 + n * 7u32 + lw + hw;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_shift_imm(in u32 a, in u32 b, in u32 c) {
+    i32 sb = b;
+    u64 wc = c;
+    i64 sw = (wc << 32) | a;
+    i64 sr = sw >> 17;
+    u64 usr = sr;
+    i32 sh = sb >> 5;
+    u32 ush = sh;
+    return (a << 3) ^ (a >> 7) ^ ush ^ (usr >> 3) ^ (c << 31);
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_shift_var(in u32 a, in u32 b, in u32 c) {
+    i32 sa = a;
+    i32 sr = sa >> (b & 31u32);
+    u32 usr = sr;
+    u64 wa = a;
+    u64 wc = c;
+    u64 w = (wa << 32) | wc;
+    u64 l = w << (c & 63u32);
+    u64 r = w >> (b & 63u32);
+    i64 sw = w;
+    i64 ar = sw >> (a & 63u32);
+    u64 uar = ar;
+    u32 ll = l;
+    u32 lr = r >> 32;
+    u32 la = uar;
+    return (a << (b & 31u32)) ^ (a >> (c & 31u32)) ^ usr ^ ll ^ lr ^ la;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_narrow_ops(in u32 a, in u32 b, in u32 c) {
+    u8 x = a;
+    u8 y = b;
+    i8 sx = c;
+    i8 sy = a >> 8;
+    u16 h = b;
+    i16 sh = c >> 3;
+    u8 q = x / (y | 1u8);
+    u8 r = x % (y | 1u8);
+    i8 sq = sx / ((sy & 0x3fi8) | 1i8);
+    i8 sr = sx % ((sy & 0x3fi8) | 1i8);
+    u16 hq = h / 7u16;
+    i16 shr = sh >> 3;
+    u8 ushr = x >> 2;
+    i8 sshr = sx >> 3;
+    u32 t = q + r * 3u32;
+    i32 st = sq + sr * 5 + shr + sshr;
+    u32 ust = st;
+    return t + ust * 7u32 + hq + ushr;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_narrow_wrap(in u32 a, in u32 b, in u32 c) {
+    u8 x = a;
+    u8 y = b;
+    u8 sum = x + y;
+    u8 product = x * y;
+    u16 h = c;
+    u16 hs = h + 40000u16;
+    u16 hp = h * 3u16;
+    u8 shifted = x << 3;
+    u32 r = sum;
+    r = r * 256u32 + product;
+    r = r * 65536u32 + hs;
+    return r ^ hp ^ shifted;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_compare_unsigned(in u32 a, in u32 b, in u32 c) {
+    u32 bits = 0u32;
+    if (a < b) bits = bits | 1u32;
+    if (a <= b) bits = bits | 2u32;
+    if (a > b) bits = bits | 4u32;
+    if (a >= b) bits = bits | 8u32;
+    if (a == c) bits = bits | 16u32;
+    if (a != c) bits = bits | 32u32;
+    if (c < 16u32) bits = bits | 64u32;
+    if (c >= 0x7fffffffu32) bits = bits | 128u32;
+    if (b > 4096u32) bits = bits | 256u32;
+    if (b == 0x80000000u32) bits = bits | 512u32;
+    return bits;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_compare_signed(in u32 a, in u32 b, in u32 c) {
+    i32 sa = a;
+    i32 sb = b;
+    i32 sc = c;
+    u32 bits = 0u32;
+    if (sa < sb) bits = bits | 1u32;
+    if (sa <= sb) bits = bits | 2u32;
+    if (sa > sb) bits = bits | 4u32;
+    if (sa >= sb) bits = bits | 8u32;
+    if (sc < -5) bits = bits | 16u32;
+    if (sc > -4096) bits = bits | 32u32;
+    if (sb <= 0) bits = bits | 64u32;
+    if (sa >= -1) bits = bits | 128u32;
+    if (sc < 33) bits = bits | 256u32;
+    return bits;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_compare64(in u32 a, in u32 b, in u32 c) {
+    u64 wa = a;
+    u64 wb = b;
+    u64 wc = c;
+    u64 x = (wa << 32) | wb;
+    u64 y = (wc << 32) | wa;
+    i64 sx = x;
+    i64 sy = y;
+    u32 bits = 0u32;
+    if (x < y) bits = bits | 1u32;
+    if (x <= y) bits = bits | 2u32;
+    if (x == y) bits = bits | 4u32;
+    if (sx < sy) bits = bits | 8u32;
+    if (sx >= sy) bits = bits | 16u32;
+    if (x != y) bits = bits | 32u32;
+    if (sx < -1i64) bits = bits | 64u32;
+    if (x > 0xffffffffu64) bits = bits | 128u32;
+    return bits;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_compare_narrow(in u32 a, in u32 b, in u32 c) {
+    u8 x = a;
+    u8 y = b;
+    i8 sx = a;
+    i8 sy = b;
+    u16 h = c;
+    i16 sh = c;
+    u32 bits = 0u32;
+    if (x < y) bits = bits | 1u32;
+    if (sx < sy) bits = bits | 2u32;
+    if (x == 0u8) bits = bits | 4u32;
+    if (sx > -3i8) bits = bits | 8u32;
+    if (h >= 1000u16) bits = bits | 16u32;
+    if (sh < 0i16) bits = bits | 32u32;
+    if (x != y) bits = bits | 64u32;
+    if (sy <= sx) bits = bits | 128u32;
+    return bits;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_bool_values(in u32 a, in u32 b, in u32 c) {
+    i32 sa = a;
+    i32 sc = c;
+    bool p = a == b;
+    bool q = a < c;
+    bool r = sa < sc;
+    bool s = (b & 1u32) != 0u32;
+    u32 t0 = p;
+    u32 t1 = q;
+    u32 t2 = r;
+    u32 t3 = s;
+    u32 t4 = p && q;
+    u32 t5 = r || s;
+    u32 t6 = !q;
+    return t0 + t1 * 2u32 + t2 * 4u32 + t3 * 8u32 + t4 * 16u32 + t5 * 32u32 + t6 * 64u32;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_select(in u32 a, in u32 b, in u32 c) {
+    i32 sa = a;
+    i32 sb = b;
+    u32 x = (a < b) ? a + c : b - c;
+    u32 y = (sa < sb) ? a : b;
+    u32 z = (c != 0u32) ? x : y;
+    bool flag = (a & 4u32) != 0u32;
+    u32 w = flag ? x ^ y : z + 1u32;
+    u64 wa = a;
+    u64 wb = b;
+    u64 v = (wa > wb) ? wa * 3u64 : wb << 33;
+    u32 lv = v;
+    u32 hv = v >> 32;
+    return x + y * 3u32 + z * 5u32 + w * 7u32 + lv + hv;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_divide(in u32 a, in u32 b, in u32 c) {
+    u32 y = b | 1u32;
+    i32 sa = a;
+    i32 sy = (b & 0x7fffffffu32) | 1u32;
+    i32 sq = sa / sy;
+    i32 sr = sa % sy;
+    u32 usq = sq;
+    u32 usr = sr;
+    return a / y + a % y + a / 7u32 + a % 10u32 + c / 3u32 + usq * 3u32 + usr * 5u32;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_divide64(in u32 a, in u32 b, in u32 c) {
+    u64 wa = a;
+    u64 wb = b;
+    u64 wc = c | 1u32;
+    u64 x = (wa << 32) | wb;
+    u64 y = wc * 3u64;
+    u64 q = x / y;
+    u64 r = x % y;
+    i32 sa = a;
+    i64 sx = sa;
+    sx = sx * 100003i64;
+    i64 sy = (c & 0xffffu32) | 1u32;
+    i64 sq = sx / sy;
+    i64 sr = sx % sy;
+    u64 usq = sq;
+    u64 usr = sr;
+    u32 lq = q;
+    u32 hq = q >> 32;
+    u32 lr = r;
+    u32 lsq = usq;
+    u32 hsq = usq >> 32;
+    u32 lsr = usr;
+    return lq ^ hq ^ lr ^ lsq ^ hsq ^ lsr;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_extend(in u32 a, in u32 b, in u32 c) {
+    i8 sb = a;
+    i16 sh = b;
+    i32 sw = c;
+    u8 ub = a;
+    u16 uh = b;
+    i64 e1 = sb;
+    i64 e2 = sh;
+    i64 e3 = sw;
+    u64 z1 = ub;
+    u64 z2 = uh;
+    u64 z3 = c;
+    i32 e4 = sb;
+    u32 z4 = uh;
+    u64 s1 = e1;
+    u64 s2 = e2;
+    u64 s3 = e3;
+    u64 sum = s1 * 3u64 + s2 * 5u64 + s3 * 7u64 + z1 * 11u64 + z2 * 13u64 + z3 * 17u64;
+    u32 ls = sum;
+    u32 hs = sum >> 32;
+    u32 u4 = e4;
+    return ls ^ hs ^ u4 ^ z4;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_truncate(in u32 a, in u32 b, in u32 c) {
+    u64 wa = a;
+    u64 wb = b;
+    u64 w = (wa << 32) | wb;
+    u32 low = w;
+    u16 half = w;
+    u8 byte = w >> 4;
+    i8 sbyte = w >> 12;
+    i16 shalf = w >> 20;
+    i32 sbyte32 = sbyte;
+    i32 shalf32 = shalf;
+    u32 u1 = sbyte32;
+    u32 u2 = shalf32;
+    return low ^ half ^ byte ^ u1 ^ u2 ^ c;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_constants(in u32 a, in u32 b, in u32 c) {
+    u64 k1 = 0x123456789abcdef0u64;
+    u64 k2 = 0xffffffff00000000u64;
+    u64 k3 = 0xfffffffffffffffeu64;
+    u64 k4 = 0x00ff00ff00ff00ffu64;
+    u64 k5 = 0x0000123400000000u64;
+    u64 k6 = 0xffff1234ffffffffu64;
+    u32 k7 = 0xfffffff0u32;
+    u32 k8 = 0x12345678u32;
+    u32 k9 = 0x0000ffffu32;
+    u32 k10 = 0xaaaaaaaau32;
+    u64 wa = a;
+    u64 wb = b;
+    u64 wc = c;
+    u64 m = (wa * k1) ^ (wb + k2) ^ (wc * k3) ^ (wa & k4) ^ (wb | k5) ^ (wc + k6);
+    u32 lm = m;
+    u32 hm = m >> 32;
+    return lm ^ hm ^ (a * k7) ^ (b + k8) ^ (c & k9) ^ (a ^ k10);
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_stack_memory(in u32 a, in u32 b, in u32 c) {
+    u8 bytes[16];
+    i8 sbytes[4];
+    u16 halves[8];
+    i16 shalves[4];
+    u32 words[4];
+    i32 swords[2];
+    u64 doubles[2];
+    for (u32 i = 0u32; i < 16u32; i = i + 1u32) bytes[i] = a + i * b;
+    for (u32 i = 0u32; i < 8u32; i = i + 1u32) halves[i] = b - i * c;
+    for (u32 i = 0u32; i < 4u32; i = i + 1u32) {
+        sbytes[i] = c >> i;
+        shalves[i] = a >> (i * 3u32);
+        words[i] = a ^ (i << 8);
+    }
+    swords[0] = a;
+    swords[1] = b;
+    u64 wa = a;
+    doubles[0] = (wa << 32) | c;
+    doubles[1] = doubles[0] >> 3;
+    u32 r = 0u32;
+    for (u32 i = 0u32; i < 16u32; i = i + 1u32) r = r * 31u32 + bytes[i];
+    for (u32 i = 0u32; i < 8u32; i = i + 1u32) r = r * 17u32 + halves[i];
+    for (u32 i = 0u32; i < 4u32; i = i + 1u32) {
+        i32 sb = sbytes[i];
+        i32 sh = shalves[i];
+        u32 usb = sb;
+        u32 ush = sh;
+        r = r * 13u32 + usb + ush + words[i];
+    }
+    i64 sw = swords[0];
+    u64 usw = sw;
+    u32 lusw = usw >> 32;
+    u32 sw1 = swords[1];
+    u32 d0 = doubles[0] >> 32;
+    u32 d1 = doubles[1];
+    return r ^ lusw ^ sw1 ^ d0 ^ d1;
+}
+
+struct record {
+    u8 tag;
+    u32 value;
+    u16 count;
+    i8 delta;
+    u64 wide;
+};
+
+[[abi("@ABI@"), noinline]]
+static u32 read_record(in struct record *r) {
+    u32 tag = r->tag;
+    u32 count = r->count;
+    i32 delta = r->delta;
+    u32 udelta = delta;
+    u32 wide = r->wide >> 16;
+    return tag + r->value * 3u32 + count * 5u32 + udelta * 7u32 + wide;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_record(in u32 a, in u32 b, in u32 c) {
+    struct record r;
+    r.tag = a;
+    r.value = b;
+    r.count = c;
+    r.delta = a - b;
+    u64 wc = c;
+    r.wide = (wc << 32) | a;
+    return read_record(&r) ^ r.tag;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_pointer_walk(in u32 a, in u32 b, in u32 c) {
+    u32 data[12];
+    for (u32 i = 0u32; i < 12u32; i = i + 1u32) data[i] = a * i + b;
+    u32 *p = &data[11];
+    u32 sum = c;
+    while (p != &data[0]) {
+        sum = sum * 3u32 + *p + p[-1];
+        p = p - 1;
+    }
+    u16 *h = (u16 *)&data[2];
+    return sum ^ h[1] ^ h[3];
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_globals(in u32 a, in u32 b, in u32 c) {
+    g_counter = g_counter + a;
+    g_wide = g_wide ^ ((u64)b << 13);
+    u32 index = c & 7u32;
+    i32 h = g_halves[index];
+    u32 uh = h;
+    u32 byte = g_bytes[(a ^ c) & 15u32];
+    g_table[b & 3u32] = g_table[b & 3u32] + c;
+    u32 sum = g_table[0] ^ g_table[1] ^ g_table[2] ^ g_table[3];
+    u32 lw = g_wide;
+    u32 hw = g_wide >> 32;
+    return g_counter ^ lw ^ hw ^ uh ^ byte ^ sum;
+}
+
+[[abi("@ABI@"), noinline]]
+static u32 *table_entry(in u32 index) {
+    return &g_table[index & 3u32];
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_global_addresses(in u32 a, in u32 b, in u32 c) {
+    u32 *p = table_entry(a);
+    u32 *q = table_entry(b);
+    *p = *p + c;
+    u8 *bytes = &g_bytes[0];
+    u32 x = bytes[c & 15u32];
+    return *p ^ *q ^ x ^ (u32)(p == q);
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_loops(in u32 a, in u32 b, in u32 c) {
+    u32 sum = 0u32;
+    u32 n = a & 31u32;
+    for (u32 i = 0u32; i < n; i = i + 1u32) {
+        if ((i & 3u32) == 1u32) continue;
+        sum = sum + i * b;
+        if (sum > 0xf0000000u32) break;
+    }
+    u32 m = b & 15u32;
+    u32 j = 0u32;
+    do {
+        sum = sum ^ (c >> j);
+        j = j + 1u32;
+    } while (j < m);
+    u32 k = c & 7u32;
+    while (k != 0u32) {
+        for (u32 t = 0u32; t < k; t = t + 1u32) sum = sum + t;
+        k = k - 1u32;
+    }
+    return sum;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_branch_chain(in u32 a, in u32 b, in u32 c) {
+    u32 selector = a & 15u32;
+    u32 r;
+    if (selector == 0u32) r = b;
+    else if (selector == 1u32) r = c;
+    else if (selector == 2u32) r = b + c;
+    else if (selector == 3u32) r = b - c;
+    else if (selector == 4u32) r = b * c;
+    else if (selector == 5u32) r = b ^ c;
+    else if (selector < 10u32) r = b | c;
+    else r = b & c;
+    return r + selector;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_early_exit(in u32 a, in u32 b, in u32 c) {
+    u32 data[8];
+    for (u32 i = 0u32; i < 8u32; i = i + 1u32) data[i] = a + i * b;
+    for (u32 i = 0u32; i < 8u32; i = i + 1u32) {
+        if (data[i] == c) return i;
+        if (data[i] < (a >> 1)) return 100u32 + i;
+    }
+    return 99u32;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_phi_rotate(in u32 a, in u32 b, in u32 c) {
+    u32 x = a;
+    u32 y = b;
+    u32 z = c;
+    u32 n = (a ^ b) & 15u32;
+    for (u32 i = 0u32; i < n; i = i + 1u32) {
+        u32 t = x;
+        x = y;
+        y = z;
+        z = t + i;
+    }
+    return x * 3u32 + y * 5u32 + z * 7u32;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_calls(in u32 a, in u32 b, in u32 c) {
+    u64 wa = a;
+    u64 wb = b;
+    u64 x = (wa << 32) | wb;
+    u64 y = c;
+    u64 r = helper64(x, y) + helper64(y, x);
+    u32 lr = r;
+    u32 hr = r >> 32;
+    return lr ^ hr ^ helper1(a) ^ helper2(helper1(b));
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_many_arguments(in u32 a, in u32 b, in u32 c) {
+    u64 wa = a;
+    u64 wc = c;
+    u64 r = helper10((wa << 32) | b, b, a, c, wc * 3u64, a ^ c, b, a, wa + wc, c);
+    u32 s = helper20(a, b, c, a + 1u32, b + 2u32, c + 3u32, a ^ b, b ^ c, a ^ c,
+                     a * 3u32, b * 5u32, c * 7u32, a >> 1, b >> 2, c >> 3, a + b,
+                     b + c, a + c, a - b, b - c);
+    u32 lr = r;
+    u32 hr = r >> 32;
+    return lr ^ hr ^ s;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_out_parameters(in u32 a, in u32 b, in u32 c) {
+    u64 wa = a;
+    u64 wb = b;
+    u32 low;
+    u32 high;
+    split((wa << 40) ^ (wb << 3) ^ c, low, high);
+    u32 total = a;
+    accumulate(total, b);
+    accumulate(total, c);
+    return low ^ high ^ total;
+}
+
+[[abi("@ABI@")]] typedef u32 (*unary)(in u32 x);
+
+// A pointer of the compilation's ABI takes a wrapper where the kernels'
+// ABI differs; one of theirs takes the functions themselves.
+[[abi("@ABI@"), noinline]]
+global u32 k_function_pointers(in u32 a, in u32 b, in u32 c) {
+    u32 (*f)(in u32) = helper1;
+    if ((a & 1u32) != 0u32) f = helper2;
+    u32 x = f(b);
+    unary g = (c & 2u32) != 0u32 ? helper1 : helper2;
+    return x ^ g(c) ^ g(x);
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_recursion(in u32 a, in u32 b, in u32 c) {
+    return recurse(a & 15u32, b, c);
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_volatile(in u32 a, in u32 b, in u32 c) {
+    u32 cells[2];
+    volatile u32 *cell = &cells[0];
+    *cell = a;
+    *cell = *cell + b;
+    *cell = *cell * c;
+    u32 first = *cell;
+    *cell = first + 1u32;
+    return first + *cell;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_large_frame(in u32 a, in u32 b, in u32 c) {
+    u32 big[5000];
+    u8 small[300];
+    for (u32 i = 0u32; i < 5000u32; i = i + 1u32) big[i] = a + i * b;
+    for (u32 i = 0u32; i < 300u32; i = i + 1u32) small[i] = c ^ i;
+    u32 sum = 0u32;
+    for (u32 i = 0u32; i < 5000u32; i = i + 97u32) sum = sum * 3u32 + big[i];
+    for (u32 i = 0u32; i < 300u32; i = i + 7u32) sum = sum ^ small[i];
+    return sum + big[4999] + small[299];
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_wide_arithmetic(in u32 a, in u32 b, in u32 c) {
+    u128 wa = a;
+    u128 wb = b;
+    u128 x = (wa << 96) | (wb << 32) | c;
+    u128 y = x * 0x9e3779b97f4a7c15u128 + (x >> 17);
+    i128 s = (i128)y;
+    i128 t = s >> 70;
+    u128 q = y / ((wb << 40) | 1u128);
+    u128 r = y % ((wb << 40) | 1u128);
+    u32 bits = 0u32;
+    if (x < y) bits = bits | 1u32;
+    if (s < 0i128) bits = bits | 2u32;
+    if (t == -1i128) bits = bits | 4u32;
+    u64 fold = (u64)y ^ (u64)(y >> 64) ^ (u64)t ^ (u64)q ^ (u64)(r >> 32);
+    return (u32)fold ^ (u32)(fold >> 32) ^ bits;
+}
+
+[[abi("@ABI@"), noinline]]
+global u32 k_wide_calls(in u32 a, in u32 b, in u32 c) {
+    u128 wa = a;
+    u128 wc = c;
+    u128 x = (wa << 64) | b;
+    u128 m = wide_mix(x, c, wc << 77);
+    u64 w1 = a;
+    i128 late = wide_late(w1, w1 * 3u64, b, c, w1 << 7, b ^ c, 42u64, -(i128)m, (i128)x);
+    return (u32)m ^ (u32)(m >> 96) ^ (u32)late ^ (u32)((u128)late >> 64);
+}

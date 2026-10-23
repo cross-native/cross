@@ -248,6 +248,13 @@ add_library(cross_native_backend
     src/backend/native/machine_pipeline.cpp
     src/backend/native/machine_transform.cpp
     src/backend/native/standalone_audit.cpp
+    src/target/aarch64/abi.cpp
+    src/target/aarch64/backend.cpp
+    src/target/aarch64/emission.cpp
+    src/target/aarch64/frame.cpp
+    src/target/aarch64/machine.cpp
+    src/target/aarch64/selection.cpp
+    src/target/aarch64/spill.cpp
     src/target/backend.cpp
     src/target/mips/backend.cpp
     src/target/mips/machine_description.cpp
@@ -3538,8 +3545,7 @@ if(BUILD_TESTING)
     set_tests_properties(cross_model_inheritance PROPERTIES
         LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;feature.model;feature.optimization")
     # The AArch64 architecture: registers, features and their implications,
-    # -march modifiers, the CPU catalog, ABIs, profiles, and the absence of
-    # code generation.
+    # -march modifiers, the CPU catalog, ABIs, and profiles.
     add_test(NAME cross_aarch64_models
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
@@ -3549,13 +3555,169 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/target/aarch64/models.cmake")
     set_tests_properties(cross_aarch64_models PROPERTIES
         LABELS "check.compile;diagnostics;arch.aarch64;feature.model;feature.driver;feature.abi")
-    add_test(NAME cross_aarch64_codegen_unavailable
+    # AArch64 code generation: programs run on QEMU's virt machine at each
+    # optimization level, in position-independent code, for the Linux
+    # triple, and with unwind tables and debugging information; the integer
+    # kernels against the x86-64 host under both ABIs; instruction forms,
+    # frames, and call sequences in the assembly; and the diagnostics of
+    # what it does not support.
+    set(aarch64_codegen ${CMAKE_SOURCE_DIR}/test/target/aarch64/codegen)
+    foreach(runtime_case calls memory control bits noreturn records)
+        foreach(runtime_level O0 O2)
+            add_test(NAME cross_aarch64_codegen_${runtime_case}_${runtime_level}
+                COMMAND "${CMAKE_COMMAND}"
+                        -DCC=$<TARGET_FILE:cross_cc>
+                        -DAS=$<TARGET_FILE:cross_as>
+                        -DLD=$<TARGET_FILE:cross_ld>
+                        -DSOURCE=${aarch64_codegen}/${runtime_case}.x
+                        -DOPT_LEVEL=-${runtime_level}
+                        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aarch64-codegen/${runtime_case}-${runtime_level}
+                        -P "${aarch64_codegen}/runtime.cmake")
+            set_tests_properties(cross_aarch64_codegen_${runtime_case}_${runtime_level} PROPERTIES
+                LABELS "check.runtime;arch.aarch64;backend.native;feature.codegen;endian.little;opt.${runtime_level}")
+        endforeach()
+    endforeach()
+    set_property(TEST cross_aarch64_codegen_calls_O0 cross_aarch64_codegen_calls_O2
+                 APPEND PROPERTY LABELS "feature.abi;feature.calls;feature.musttail")
+    set_property(TEST cross_aarch64_codegen_memory_O0 cross_aarch64_codegen_memory_O2
+                 APPEND PROPERTY LABELS "feature.frame;feature.pointer")
+    set_property(TEST cross_aarch64_codegen_control_O0 cross_aarch64_codegen_control_O2
+                 APPEND PROPERTY LABELS "feature.control;feature.labels")
+    set_property(TEST cross_aarch64_codegen_bits_O0 cross_aarch64_codegen_bits_O2
+                 APPEND PROPERTY LABELS "feature.intrinsics")
+    set_property(TEST cross_aarch64_codegen_noreturn_O0 cross_aarch64_codegen_noreturn_O2
+                 APPEND PROPERTY LABELS "feature.frame;feature.calls")
+    set_property(TEST cross_aarch64_codegen_records_O0 cross_aarch64_codegen_records_O2
+                 APPEND PROPERTY LABELS "feature.abi;feature.calls;feature.records;feature.array")
+    foreach(variant pic linux unwind)
+        if(variant STREQUAL "pic")
+            set(variant_flags "-fpic")
+            set(variant_target aarch64-none-elf)
+            set(variant_labels "feature.pic")
+        elseif(variant STREQUAL "linux")
+            set(variant_flags "")
+            set(variant_target aarch64-unknown-linux-gnu)
+            set(variant_labels "feature.abi")
+        else()
+            set(variant_flags "-funwind-tables -g -ffunction-sections -fdata-sections")
+            set(variant_target aarch64-none-elf)
+            set(variant_labels "feature.debug;feature.object")
+        endif()
+        foreach(runtime_case calls memory control records)
+            add_test(NAME cross_aarch64_codegen_${runtime_case}_${variant}
+                COMMAND "${CMAKE_COMMAND}"
+                        -DCC=$<TARGET_FILE:cross_cc>
+                        -DAS=$<TARGET_FILE:cross_as>
+                        -DLD=$<TARGET_FILE:cross_ld>
+                        -DSOURCE=${aarch64_codegen}/${runtime_case}.x
+                        -DTARGET=${variant_target}
+                        "-DFLAGS=${variant_flags}"
+                        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aarch64-codegen/${runtime_case}-${variant}
+                        -P "${aarch64_codegen}/runtime.cmake")
+            set_tests_properties(cross_aarch64_codegen_${runtime_case}_${variant} PROPERTIES
+                LABELS "check.runtime;arch.aarch64;backend.native;feature.codegen;endian.little;opt.O2;${variant_labels}")
+        endforeach()
+    endforeach()
+    foreach(runtime_level O0 O2)
+        add_test(NAME cross_aarch64_codegen_custom_abi_${runtime_level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DAS=$<TARGET_FILE:cross_as>
+                    -DLD=$<TARGET_FILE:cross_ld>
+                    -DSOURCE=${aarch64_codegen}/custom_abi.x
+                    -DOPT_LEVEL=-${runtime_level}
+                    "-DFLAGS=--model=${aarch64_codegen}/custom_abi.xm"
+                    -DEXTRA_ASSEMBLY=${aarch64_codegen}/custom_abi_probe.s
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aarch64-codegen/custom-abi-${runtime_level}
+                    -P "${aarch64_codegen}/runtime.cmake")
+        set_tests_properties(cross_aarch64_codegen_custom_abi_${runtime_level} PROPERTIES
+            LABELS "check.runtime;arch.aarch64;backend.native;feature.codegen;feature.abi;feature.model;feature.frame;endian.little;opt.${runtime_level}")
+    endforeach()
+    # The bit intrinsics at every width, 128 bits included, as on the other
+    # targets.
+    foreach(runtime_level O0 O2)
+        add_test(NAME cross_aarch64_codegen_bit_intrinsics_${runtime_level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DAS=$<TARGET_FILE:cross_as>
+                    -DLD=$<TARGET_FILE:cross_ld>
+                    "-DSOURCE=${CMAKE_SOURCE_DIR}/test/language/semantics/bit_intrinsics.x;${aarch64_codegen}/entry.x"
+                    -DOPT_LEVEL=-${runtime_level}
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aarch64-codegen/bit-intrinsics-${runtime_level}
+                    -P "${aarch64_codegen}/runtime.cmake")
+        set_tests_properties(cross_aarch64_codegen_bit_intrinsics_${runtime_level} PROPERTIES
+            LABELS "check.runtime;arch.aarch64;backend.native;feature.codegen;feature.intrinsics;feature.evaluation;endian.little;opt.${runtime_level}")
+    endforeach()
+    # Calls to and from Clang-compiled C under aapcs64.
+    find_program(CROSS_TEST_CLANG NAMES clang)
+    foreach(runtime_level O0 O2)
+        add_test(NAME cross_aarch64_codegen_interop_${runtime_level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DAS=$<TARGET_FILE:cross_as>
+                    -DLD=$<TARGET_FILE:cross_ld>
+                    -DSOURCE=${aarch64_codegen}/interop.x
+                    -DC_SOURCE=${aarch64_codegen}/interop.c
+                    -DCLANG=${CROSS_TEST_CLANG}
+                    -DOPT_LEVEL=-${runtime_level}
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aarch64-codegen/interop-${runtime_level}
+                    -P "${aarch64_codegen}/runtime.cmake")
+        set_tests_properties(cross_aarch64_codegen_interop_${runtime_level} PROPERTIES
+            LABELS "check.runtime;arch.aarch64;backend.native;feature.codegen;feature.abi;feature.interop;endian.little;opt.${runtime_level}")
+    endforeach()
+    foreach(differential_abi aapcs64 x)
+        foreach(differential_level O0 O2)
+            add_test(NAME cross_aarch64_codegen_differential_${differential_abi}_${differential_level}
+                COMMAND "${CMAKE_COMMAND}"
+                        -DCC=$<TARGET_FILE:cross_cc>
+                        -DAS=$<TARGET_FILE:cross_as>
+                        -DLD=$<TARGET_FILE:cross_ld>
+                        -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                        -DTEMPLATE=${aarch64_codegen}/differential/int_kernels.x.in
+                        -DSTARTUP=${aarch64_codegen}/differential/start_int.s
+                        -DHOST_MAIN=${aarch64_codegen}/differential/main_int.cpp
+                        -DSCRIPT=${aarch64_codegen}/bare.ld
+                        -DABI=${differential_abi}
+                        -DOPT_LEVEL=-${differential_level}
+                        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aarch64-codegen/differential-${differential_abi}-${differential_level}/int
+                        -P "${aarch64_codegen}/differential/differential.cmake")
+            set_tests_properties(cross_aarch64_codegen_differential_${differential_abi}_${differential_level} PROPERTIES
+                LABELS "check.runtime;arch.aarch64;arch.x86_64;backend.native;feature.codegen;feature.abi;endian.little;opt.${differential_level}")
+        endforeach()
+    endforeach()
+    add_test(NAME cross_aarch64_codegen_differential_pic
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>
-                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aarch64-codegen-unavailable
-                -P "${CMAKE_SOURCE_DIR}/test/target/aarch64/codegen_unavailable.cmake")
-    set_tests_properties(cross_aarch64_codegen_unavailable PROPERTIES
-        LABELS "check.compile;diagnostics;arch.aarch64;feature.driver")
+                -DAS=$<TARGET_FILE:cross_as>
+                -DLD=$<TARGET_FILE:cross_ld>
+                -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                -DTEMPLATE=${aarch64_codegen}/differential/int_kernels.x.in
+                -DSTARTUP=${aarch64_codegen}/differential/start_int.s
+                -DHOST_MAIN=${aarch64_codegen}/differential/main_int.cpp
+                -DSCRIPT=${aarch64_codegen}/bare.ld
+                -DABI=aapcs64
+                -DOPT_LEVEL=-O2
+                -DEXTRA_FLAGS=-fpic
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aarch64-codegen/differential-pic/int
+                -P "${aarch64_codegen}/differential/differential.cmake")
+    set_tests_properties(cross_aarch64_codegen_differential_pic PROPERTIES
+        LABELS "check.runtime;arch.aarch64;arch.x86_64;backend.native;feature.codegen;feature.pic;endian.little;opt.O2")
+    add_test(NAME cross_aarch64_codegen_forms
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DAS=$<TARGET_FILE:cross_as>
+                -DSOURCE=${aarch64_codegen}/forms.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aarch64-codegen/forms
+                -P "${aarch64_codegen}/forms.cmake")
+    set_tests_properties(cross_aarch64_codegen_forms PROPERTIES
+        LABELS "check.compile;arch.aarch64;backend.native;feature.codegen;feature.abi;feature.frame;feature.assembler;feature.pic;feature.debug;opt.O0;opt.O2")
+    add_test(NAME cross_aarch64_codegen_errors
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aarch64-codegen/errors
+                -P "${aarch64_codegen}/errors.cmake")
+    set_tests_properties(cross_aarch64_codegen_errors PROPERTIES
+        LABELS "check.compile;diagnostics;arch.aarch64;backend.native;feature.codegen;feature.driver")
     # The AArch64 assembler: every form of the shipped table, relocations,
     # and directives against llvm-mc (and GNU as, where installed); values
     # that only Cross takes; diagnostics; a bare-metal link with ld.lld and

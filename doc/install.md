@@ -87,7 +87,7 @@ run the output natively or under emulation. They use these external tools:
 | The host C++ compiler and `gcc` | Linking generated x86-64 code into host test programs. |
 | `qemu-system-mips64`, `qemu-system-mips64el` | MIPS runtime tests; skipped when missing. |
 | `qemu-system-aarch64` | AArch64 runtime tests on the virt machine; skipped when missing. |
-| `clang` | Compiling `-emit-llvm` output in x86-64 runtime tests, with the MIPS targets the C side of the MIPS o32 interoperation tests, and the C programs of the AArch64 linker tests; skipped when missing. |
+| `clang` | Compiling `-emit-llvm` output in x86-64 runtime tests, with the MIPS targets the C side of the MIPS o32 interoperation tests, and the C programs of the AArch64 linker and interoperation tests; skipped when missing. |
 | `mips64-elf-as`, `mips64-elf-ld`, `mips64-elf-objdump`, `mips64-elf-gcc` | Cross-checking MIPS encodings, objects, and links with GNU binutils and GCC; skipped when missing. |
 | `aarch64-linux-gnu-as`, `aarch64-linux-gnu-ld` (or `aarch64-none-elf-`) | Cross-checking AArch64 encodings, objects, and links with GNU binutils; skipped when missing. |
 | Python 3.11 or later with pytest | Benchmark-driver tests; omitted when Python is missing. |

@@ -14,6 +14,14 @@ struct RelocatedSlice;
 
 namespace cross::aarch64 {
 
+// The instructions the AArch64 backend selects, which name the first
+// entries of `TargetInfo::instruction_costs`.
+enum class Instruction : std::uint16_t {
+#define X(name, mnemonic, ...) name,
+#include "target/aarch64/instructions.def"
+#undef X
+};
+
 // The operand types of AArch64 `instruction` model entries, by
 // OperandType::id.
 enum class OperandTypeId : std::uint16_t {

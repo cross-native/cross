@@ -759,10 +759,8 @@ linker gives `_gp` before such code runs, and its linker script keeps
 | `aarch64-none-elf` | ELF | `aarch64-elf` | `x` |
 
 The AArch64 target describes A64 code with little-endian ELF64 objects and
-64-bit pointers. It has models, an assembler, and a linker, but no code
-generator: for `aarch64-*` triples, `cc` preprocesses (`-E`, `-M`) and
-answers the `--print-*` queries, and every output that needs code, such as
-`-S`, `-c`, or `-emit-llvm`, fails with one diagnostic. `as` assembles A64
+64-bit pointers. `cc` compiles an integer subset of Cross for it
+([AArch64 code generation](#aarch64-code-generation)), `as` assembles A64
 into relocatable objects ([invoke.md](invoke.md#assembling)) with the
 instructions of `model/aarch64_instructions.xm`
 ([models.md](models.md#aarch64-instructions)), and `ld` links AArch64
@@ -825,6 +823,62 @@ be passed to a C function that takes a `va_list`. The Cross ABI `x` has no
 argument registers that follow the named arguments, and `overflow_arg_area`
 at the stack arguments that follow them.
 
+### AArch64 code generation
+
+`cc -S` writes GNU syntax that GNU `as`, LLVM's assembler, and `as` accept,
+and `cc -c` assembles it with `as`. Code generation covers:
+
+- integers of 8 to 128 bits, `bool`, pointers, and labels: arithmetic,
+  bitwise operations, shifts, comparisons, selection (`csel`),
+  multiplication, division and remainder (`sdiv` and `udiv`, with `msub`
+  for a remainder), extension, and truncation, and the bit intrinsics
+  ([Bit intrinsics](#bit-intrinsics)); a 128-bit integer is a pair of
+  general registers, and its operations are sequences on the halves;
+- constants, with `movz`, `movn`, `movk`, or one `orr` of a logical
+  immediate;
+- loads and stores of every integer width, signed and unsigned, in frame
+  slots, global objects, and through pointers, with immediate offsets, scaled
+  indexes, and the low 12 bits of a symbol;
+- addresses of objects, functions, and labels in the small code model:
+  `adrp` and `add`, and under `-fpic` a load from the GOT for a symbol that
+  another module may preempt;
+- records and arrays as values: whole copies, and arguments and results
+  in general registers, on the stack, by reference, and to a result
+  address, as the ABI places them;
+- branches and loops, computed `goto`, and `global label`s;
+- direct and indirect calls, `[[musttail]]` calls, and functions that never
+  return, under `x`, `aapcs64`, and ABI models of your own: arguments,
+  results, and `out` and `inout` parameters of the types above, in general
+  registers and on the stack, also as the pieces that a model splits a
+  value into.
+
+A function with frame storage or calls keeps a frame record (`stp x29, x30`
+and `mov x29, sp`) and a 16-byte aligned stack, and saves the registers that
+its ABI preserves and its code changes, such as `x19` and `x20` when it
+passes a seventeenth and eighteenth argument under `x`. `-funwind-tables`
+and `-g` describe its frame with CFI, and `-g` also gives line rows and the
+frame slots of local objects. `-ffunction-sections`, `-fdata-sections`,
+`[[section]]`, `[[weak]]`, and `[[visibility]]` apply as on the other ELF
+targets.
+
+There is no register allocator: at every optimization level each value
+lives in a frame slot, and each instruction loads its operands into `x9` to
+`x15` and stores its result, so the code is correct but large and slow. An
+indirect call branches through `x17`, and a frame slot that a load or store
+cannot reach from `sp` is reached through `x16`. Members of packed records
+are loaded and stored as aligned ones are, which needs memory that permits
+unaligned accesses: not the memory of an AArch64 CPU whose MMU is off.
+
+`cc` reports the following with an error at their source location instead:
+floating-point values and conversions, so also records whose ABI pieces go
+in SIMD and floating-point registers, vectors, variadic functions,
+`[[naked]]` functions, manual register locations of parameters and results,
+variable-length arrays, atomic operations, thread-local objects, `$::patch`
+values, machine instruction built-ins (`$::_name`), and a `[[musttail]]` call
+that needs stack arguments, passes an argument in a register that the
+caller's ABI preserves, or passes or returns a record in memory. Mach-O and
+COFF triples (`aarch64-apple-darwin`, Windows) have no code generator.
+
 Target options:
 
 | Option | Values |
@@ -879,13 +933,13 @@ inline sequence. A `cpu` entry that marks an instruction `available = false`
 or raises its `latency` therefore selects the sequence
 ([models.md](models.md#cpu-entries)). No form calls a function.
 
-| Operation | x86-64 | MIPS |
-| --- | --- | --- |
-| `$::clz` | `lzcnt` with LZCNT; otherwise `bsr`, `cmovne`, and `xor` | `clz` on MIPS32, MIPS64, and Allegrex, or `clo` for a complement `~x`; `dclz` or `dclo` for 64 bits on MIPS64 |
-| `$::ctz` | `tzcnt` with BMI; otherwise `bsf` and `cmovne` | the width less the leading ones of `x \| -x` (`clo`) where `clz` exists |
-| `$::popcount` | `popcnt` with POPCNT | none |
-| `$::bswap` | `bswap`, or `rolw $8` for 16 bits | `wsbh` and `rotr` on MIPS32 and MIPS64 Release 2, `wsbw` on Allegrex; `wsbh` and `andi` for 16 bits; `dsbh` and `dshd` for 64 bits on MIPS64 Release 2 |
-| `$::rotl`, `$::rotr` | `rol`, `ror` | `rotr` or `rotrv` with `-mrotate`, and for 64 bits `drotr`, `drotr32`, or `drotrv` on MIPS64 Release 2; otherwise two shifts and `or` |
+| Operation | x86-64 | MIPS | AArch64 |
+| --- | --- | --- | --- |
+| `$::clz` | `lzcnt` with LZCNT; otherwise `bsr`, `cmovne`, and `xor` | `clz` on MIPS32, MIPS64, and Allegrex, or `clo` for a complement `~x`; `dclz` or `dclo` for 64 bits on MIPS64 | `clz` |
+| `$::ctz` | `tzcnt` with BMI; otherwise `bsf` and `cmovne` | the width less the leading ones of `x \| -x` (`clo`) where `clz` exists | `rbit` and `clz` |
+| `$::popcount` | `popcnt` with POPCNT | none | none |
+| `$::bswap` | `bswap`, or `rolw $8` for 16 bits | `wsbh` and `rotr` on MIPS32 and MIPS64 Release 2, `wsbw` on Allegrex; `wsbh` and `andi` for 16 bits; `dsbh` and `dshd` for 64 bits on MIPS64 Release 2 | `rev`, or `rev16` for 16 bits |
+| `$::rotl`, `$::rotr` | `rol`, `ror` | `rotr` or `rotrv` with `-mrotate`, and for 64 bits `drotr`, `drotr32`, or `drotrv` on MIPS64 Release 2; otherwise two shifts and `or` | `ror` or `rorv`, after `neg` of a left rotation's count |
 
 The inline sequences use neither branches nor data tables:
 

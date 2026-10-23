@@ -412,7 +412,7 @@ whose general registers have that many bits: the shipped `x32` sets 32 for
 MIPS I and II, and `x64` sets 64 for MIPS III and later. At most one entry
 per `architecture`, address width, and register width may set it. A
 function whose signature the entry cannot place keeps its normal ABI.
-x86-64 ignores the property.
+x86-64 and AArch64 ignore the property.
 
 `natural_alignment_limit`, a power of two, is the largest alignment in bytes
 that a scalar type has by its size in compilations with the entry as their

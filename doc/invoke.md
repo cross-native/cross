@@ -10,8 +10,8 @@ ld [options] file ...
 `cc` preprocesses and compiles Cross source (`.x`) to assembly or object
 files. `cpp` only preprocesses, writing Cross to standard output or to `-o`.
 `as` assembles hand-written assembly into an object file
-([Assembling](#assembling)) -- GNU-syntax MIPS or AT&T-syntax x86-64 -- and
-`ld` links MIPS and AArch64 objects into a static executable
+([Assembling](#assembling)) -- GNU-syntax MIPS and AArch64, or AT&T-syntax
+x86-64 -- and `ld` links MIPS and AArch64 objects into a static executable
 ([Linking](#linking)).
 `cc --help`, `cpp --help`, `as --help`, and
 `ld --help` list every option. Options of `cc`, `cpp`, and `as` taking a value
@@ -34,7 +34,10 @@ of `-fstack-usage` and `-MD`, then take the names they have without `-o`.
 `-c` assembles the output in process with the assembler of `as`, for every
 target and object format. `-save-temps` keeps the assembly beside the object,
 named like it with `.s`. `cc` never runs another program: not a C compiler,
-LLVM's code generator, an assembler, or a linker.
+LLVM's code generator, an assembler, or a linker. For AArch64 triples, `-S`
+and `-c` compile the integer subset that
+[targets.md](targets.md#aarch64-code-generation) lists, and `cc` reports the
+rest, such as floating-point code, as an error at its source location.
 
 `-fstack-usage` writes one line per emitted function, in output order:
 `FILE:LINE:COLUMN:NAME`, a tab, the bytes, a tab, and `static` or `dynamic`.
