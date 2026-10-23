@@ -1055,11 +1055,22 @@ UInt128 load_bits(const std::vector<unsigned char>& bytes, unsigned offset,
     return value;
 }
 
+// With `regions`, only the relocations inside one of them.
 bool append_image_relocations(Object& result, const Expr& expression,
                               unsigned offset, const hir::Module& module,
                               const hir::Object& entity, const Subtarget& subtarget,
-                              Diagnostics& diagnostics) {
+                              Diagnostics& diagnostics,
+                              const std::vector<InitializerValueRegion>* regions = nullptr) {
+    const auto inside = [](const InitializerValueRegion& region, std::uint64_t at, std::uint64_t length) {
+        if (region.mask || at < region.offset) return false;
+        const auto distance = at - region.offset;
+        const auto copy = region.stride ? distance / region.stride : 0;
+        return copy < region.count && distance - copy * region.stride + length <= region.size;
+    };
     for (const auto& relocation : expression.object_relocations) {
+        if (regions && std::none_of(regions->begin(), regions->end(), [&](const InitializerValueRegion& region) {
+                return inside(region, relocation.offset, relocation.length);
+            })) continue;
         if (relocation.offset > expression.string_value.size() ||
             relocation.length > expression.string_value.size() - relocation.offset ||
             relocation.offset + offset > result.size ||
@@ -1236,6 +1247,38 @@ bool lower_initializer(Object& result, const hir::Module& module,
             continue;
         }
         const auto& item_type = module.type(item.type);
+        if (item.whole) {
+            // The frontend evaluated an aggregate value of a static
+            // initializer to its image.
+            const auto& image = *item.expression;
+            if (image.kind != Expr::Kind::ByteSequence || !image.type ||
+                image.string_value.size() != *item_size) {
+                diagnostics.error(image.location,
+                    "an aggregate value in a static initializer requires a translation-time value");
+                valid = false;
+                continue;
+            }
+            const auto order = subtarget.target().data_layout.byte_order;
+            for (const auto& region : item.regions)
+                for (std::uint64_t copy = 0; copy < region.count; ++copy) {
+                    const auto start = region.offset + copy * region.stride;
+                    const auto at = item.offset + start;
+                    const auto from = image.string_value.begin() + static_cast<std::ptrdiff_t>(start);
+                    if (!region.mask) {
+                        std::copy_n(from, region.size, result.bytes.begin() + static_cast<std::ptrdiff_t>(at));
+                        continue;
+                    }
+                    const auto size = static_cast<unsigned>(region.size);
+                    const std::vector<unsigned char> unit(from, from + static_cast<std::ptrdiff_t>(size));
+                    const auto bits = bit_or(bit_and(load_bits(result.bytes, static_cast<unsigned>(at), size, order),
+                                                     bit_not(*region.mask)),
+                                             bit_and(load_bits(unit, 0, size, order), *region.mask));
+                    store_bits(result.bytes, static_cast<unsigned>(at), size, bits, order);
+                }
+            valid &= append_image_relocations(result, image, static_cast<unsigned>(item.offset), module,
+                                              entity, subtarget, diagnostics, &item.regions);
+            continue;
+        }
         if (item.expression->kind == Expr::Kind::ByteSequence && item.expression->type) {
             if (item.expression->string_value.size() != *item_size) {
                 diagnostics.error(item.expression->location,

@@ -1164,10 +1164,14 @@ UnbracedInitializer unbrace_initializer(const Expr& source, bool scalar, bool by
     const auto& entries = source.initializer_entries;
     const auto* first = entries.empty() ? nullptr : &entries.front();
     if (byte_array) {
-        // A leading string initializes the whole array; nothing may follow it.
+        // A leading string initializes the whole array. Only designated
+        // entries, which replace elements, may follow it.
         if (!first || !first->designators.empty() || !first->value ||
             first->value->kind != Expr::Kind::String) return {&source, {}, nullptr};
-        if (entries.size() > 1) return {nullptr, entries[1].location, "excess entry in u8 array initializer"};
+        for (std::size_t index = 1; index < entries.size(); ++index)
+            if (entries[index].designators.empty())
+                return {nullptr, entries[index].location, "excess entry in u8 array initializer"};
+        if (entries.size() > 1) return {&source, {}, nullptr};
         return {first->value.get(), {}, nullptr};
     }
     if (!first) return {nullptr, source.location, "empty scalar initializer"};

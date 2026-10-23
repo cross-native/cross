@@ -370,25 +370,53 @@ A scalar initializer is one assignment expression. An aggregate initializer is
 a brace-enclosed, comma-separated list. Entries initialize successive members
 or elements; `.member = value` and `[constant_index] = value` select a
 destination and reset the successive position after it. A nested brace list
-initializes a nested aggregate. Missing members/elements and padding are zero
-initialized, except that a brace initializer of a structure declared
-`exhaustive` must initialize each member other than an unnamed bit-field, by
-position or by designator; an embedded member is initialized by an entry for it
-or for a member promoted from it.
-Excess entries, invalid member names, and out-of-range indices are errors, as
-is an entry that initializes an object, or part of one, that an earlier entry
-of the same initializer initialized: a repeated designator, a member of an
-object that an earlier entry initialized as a whole (a nested brace list
-initializes its whole destination) or the reverse, and a second member of one
-union.
+initializes a nested aggregate. An entry whose value is an expression rather
+than a brace list initializes a record, union, or array destination as a whole
+with that value; an array value, other than a string for a `u8` array, has the
+destination's array type and is not converted to a pointer. Entries are
+evaluated in source order, each once.
+Missing members/elements and padding are zero initialized, except that a brace
+initializer of a structure declared `exhaustive` must initialize each member
+other than an unnamed bit-field, by position, by designator, or through a
+base; an embedded member is initialized by an entry for it or for a member
+promoted from it.
+
+The first entry of a brace list, without a designator, whose value is not a
+brace list and has the list's own record, union, or array type, qualifiers
+aside, is the list's *base*: it initializes the whole destination, and only
+designated entries may follow it. An array base is not converted to a pointer
+and gives an omitted outer bound. In a brace list that initializes a `u8`
+array, a string literal as the first entry, without a designator, is the base:
+it initializes the array as that string does and gives an omitted bound. A
+variable-length array has no base.
+
+A later entry may initialize a part of an object that an earlier entry of the
+same list initialized from a value, the base or an entry whose value is an
+expression: that part takes the later entry's value, the rest keeps the earlier
+value, and a union whose member the later entry initializes takes that member,
+its other bytes zero. Excess entries, invalid member names, and out-of-range
+indices are errors, as is any other entry that initializes an object, or part
+of one, that an earlier entry of the same initializer initialized: a repeated
+designator, a part of an object that an earlier nested brace list initialized
+(the list initializes its whole destination), an object a part of which an
+earlier entry initialized, and a second member of one union.
+
+```x
+struct point { i32 x; i32 y; };
+struct segment { struct point from; struct point to; };
+
+static const struct segment base = { { 1, 2 }, { 3, 4 } };
+static const struct segment moved = { base, .to.y = 8 };         // { 1, 2 }, { 3, 8 }
+static const struct segment reset = { base, .to = { .x = 9 } };  // { 1, 2 }, { 9, 0 }
+static const struct segment start = { .from = base.to, .from.x = 0 };
+u8 name[8] = { "abc", [1] = 'X' };                               // "aXc"
+```
 
 Braces may also enclose an initializer that is one expression, at the top
 level or as an entry. `{ value }` initializes a scalar, an object of a scalar
 keyword, pointer, `label`, enumeration, or target-registered scalar type, as
 `value` does; these braces hold exactly one entry, without a designator, that
-is not itself a brace list. In a brace list that initializes a `u8` array, a
-string literal as the first entry, without a designator, initializes the array
-as that string does, and no other entry may follow it.
+is not itself a brace list.
 
 For an automatic variable-length array, the bound is evaluated once before
 initialization. The runtime bound must include every explicitly initialized
@@ -417,6 +445,25 @@ routine. A static-duration object whose value is all
 zero bits may be placed in storage the loader zeroes; `-fzero-init-in-data`
 places every such object, including a thread-local one, with the initialized
 data instead, so an image patcher can change it.
+
+A *constant object* is a static-duration object defined in the compilation
+group with a translation-time initializer, whose type is const-qualified (for
+an array, its element type at every level) and neither volatile nor atomic,
+and that no declaration makes `weak`, an `alias`, located at a fixed `address`,
+or `noinit`. Translation-time evaluation may read a constant object, any
+subobject of it, and it through any pointer that designates it; the value read
+is the one its initializer gives. The function, object, label, and string
+addresses in that value remain relocatable: evaluation may copy and store them,
+and a static initializer may use them, but evaluation cannot depend on their
+emitted values. An initializer that depends on the value of its own object,
+directly or through other constant objects, is an error.
+
+```x
+static const u32 widths[] = { 8, 16, 32 };
+static const u32 widest = widths[2];
+static u8 buffer[widest / 8];
+$::static_assert(sizeof(buffer) == 4, "a bound from a constant object");
+```
 
 A compound literal `(T){ entries }`, where `T` is a type name, designates an
 unnamed object of type `T` initialized as a declaration of `T` with that brace
@@ -1769,12 +1816,13 @@ floating formats, never host-language values. It may use scalar and aggregate
 values, local objects, pointers to translation-time objects, structured control
 flow, recursion, other evaluable calls, and deterministic runtime-free
 intrinsics documented as evaluator-capable, and it may modify its own automatic
-objects and allocated translation-time buffers. It cannot read or modify
-runtime or static state; escape a translation-time pointer; access volatile or
-atomic storage; use a machine instruction, patch site, runtime-only,
-unresolved, or indirect call, raw label, or explicitly located local; depend on
-emitted object addresses; or use any host service other than the declared
-`$::embed` file read.
+objects and allocated translation-time buffers. It cannot read runtime or
+static state other than constant objects (see “Definitions and
+initialization”) or modify either; escape a translation-time pointer; access
+volatile or atomic storage; use a machine instruction, patch site,
+runtime-only, unresolved, or indirect call, raw label, or explicitly located
+local; depend on emitted object addresses; or use any host service other than
+the declared `$::embed` file read.
 
 Source legality is separate from execution effects. Every concrete body is
 source-checked: uncalled definitions, untaken branches, and unevaluated

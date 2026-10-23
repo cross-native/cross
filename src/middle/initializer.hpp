@@ -24,6 +24,11 @@ struct Item {
     unsigned alignment{1};
     std::optional<unsigned> bit_width;
     unsigned bit_offset{};
+    // An aggregate initialized from a value, `expression`: the value supplies
+    // `regions` of the object at `offset`, the parts that no later entry of
+    // its list replaces.
+    bool whole{};
+    std::vector<InitializerValueRegion> regions{};
 };
 
 struct Plan {

@@ -656,6 +656,7 @@ ContinuationTask<std::unique_ptr<Expr>> clone_expr_async(const Expr& source,
             if (copy.initializer_entries.size() == frame.index) {
                 copy.initializer_entries.emplace_back();
                 copy.initializer_entries.back().location = entry.location;
+                copy.initializer_entries.back().base = entry.base;
             }
             auto& target = copy.initializer_entries.back();
             if (frame.designator == entry.designators.size()) {
@@ -916,6 +917,31 @@ FunctionDecl* object_lexical_function(Program& program, const ObjectDecl& object
 
 FunctionDecl* assertion_lexical_function(Program& program, const StaticAssertDecl& assertion) {
     return lexical_function(program, assertion.lexical_function);
+}
+
+// Why translation-time evaluation cannot read a static-duration object, or
+// null for a constant object: one defined in the compilation group with an
+// initializer, of a type const at every array level and neither volatile nor
+// atomic, that no declaration makes weak, an alias, located, or noinit.
+const char* constant_object_error(const Program& program, const ObjectDecl& object) {
+    bool constant{};
+    for (auto type = object.type; type; type = type->kind == Type::Kind::Array ? type->element : nullptr) {
+        if (type->is_volatile || type->is_atomic) return "has a volatile or atomic type";
+        constant = constant || type->is_const;
+    }
+    if (!constant) return "is not const";
+    for (const auto& declaration : program.objects) {
+        if (declaration->name != object.name || declaration->linkage != object.linkage ||
+            (object.linkage == Linkage::Static && declaration->source_unit != object.source_unit)) continue;
+        for (const auto& attribute : declaration->attributes) {
+            if (attribute.name == "weak" || attribute.name == "weakref") return "is weak";
+            if (attribute.name == "alias") return "is an alias";
+            if (attribute.name == "address") return "has a fixed address";
+            if (attribute.name == "noinit") return "is noinit";
+        }
+    }
+    if (!object.initializer) return "has no initializer in the compilation group";
+    return nullptr;
 }
 
 std::string lookup_source_unit(NameUse name, const FunctionDecl* caller) {
@@ -1263,7 +1289,7 @@ bool same_written_expression(const Expr* left, const Expr* right) {
     for (std::size_t index = 0; index < left->initializer_entries.size(); ++index) {
         const auto& a = left->initializer_entries[index];
         const auto& b = right->initializer_entries[index];
-        if (a.designators.size() != b.designators.size() ||
+        if (a.designators.size() != b.designators.size() || a.base != b.base ||
             !same_written_expression(a.value.get(), b.value.get())) return false;
         for (std::size_t at = 0; at < a.designators.size(); ++at)
             if (a.designators[at].kind != b.designators[at].kind ||
@@ -4422,6 +4448,9 @@ struct EvalMetaPointer {
     // An explicit cast discarded const. Whether the object itself is const is
     // not tracked, so evaluation does not write through this pointer.
     bool const_cast_away{};
+    // The constant object whose value the backing holds: the pointer stays
+    // that object's relocatable address.
+    const ObjectDecl* constant_object{};
     struct BitField {
         unsigned width{};
         unsigned offset{};
@@ -4541,6 +4570,16 @@ struct EvalValue {
         return floating ? floating::nonzero(*floating) : integer != UInt128{};
     }
 };
+
+} // namespace
+
+struct EvaluationConstantValues {
+    std::unordered_map<const ObjectDecl*, EvalValue> values;
+    // The objects whose initializers some evaluator is evaluating.
+    std::unordered_set<const ObjectDecl*> active;
+};
+
+namespace {
 
 BuiltinType floating_literal_type(std::string_view text) {
     if (text.ends_with("f32")) return BuiltinType::F32;
@@ -5084,6 +5123,124 @@ bool incompatible_records(const TypePtr& left, const TypePtr& right) {
     if (left->kind != Type::Kind::Record && right->kind != Type::Kind::Record) return false;
     return left->kind != right->kind || left->is_union != right->is_union ||
         left->nominal_key() != right->nominal_key();
+}
+
+// Whether a value of type `value` initializes a whole `destination`: the
+// same type without the qualifiers of the object and its array elements. A
+// destination array whose bound is omitted takes the value's bound.
+bool same_initializer_type(const TypePtr& value, const TypePtr& destination) {
+    if (!value || !destination) return false;
+    const auto strip = [](TypePtr type) {
+        type = clone_type(type);
+        for (auto* level = type.get(); level; level = level->kind == Type::Kind::Array ? level->element.get() : nullptr)
+            level->is_const = level->is_volatile = level->is_atomic = false;
+        return type;
+    };
+    auto left = strip(value), right = strip(destination);
+    if (left->kind == Type::Kind::Array && right->kind == Type::Kind::Array && !right->lanes &&
+        !right->array_bound && right->array_extent_dependency == Type::ArrayExtentDependency::None) {
+        if (!left->lanes) return false;
+        right->lanes = left->lanes;
+    }
+    return compare_source_types(left, right) != TypeComparison::Different;
+}
+
+TypePtr initializer_child_type(const Program& program, const TypePtr& parent,
+                               const Expr::InitializerDesignator* designator,
+                               std::size_t position);
+
+// Calls `visit(list, destination)` for a brace list that initializes a
+// `destination` and for each brace list nested in it, outer lists first.
+template<class Visit>
+void visit_initializer_lists(Expr& initializer, const TypePtr& destination, const Program& program,
+                             const Visit& visit) {
+    if (!destination || initializer.kind != Expr::Kind::AggregateInitializer) return;
+    visit(initializer, destination);
+    if (destination->kind != Type::Kind::Record && destination->kind != Type::Kind::Array) return;
+    std::size_t cursor{};
+    for (auto& entry : initializer.initializer_entries) {
+        if (!entry.value || entry.base) continue;
+        const auto* first = entry.designators.empty() ? nullptr : &entry.designators.front();
+        std::size_t selected = cursor;
+        if (first && first->kind == Expr::InitializerDesignator::Kind::Index && first->index &&
+            first->index->evaluated_integer && first->index->evaluated_integer->value.high == 0)
+            selected = static_cast<std::size_t>(first->index->evaluated_integer->value.low);
+        else if (first && first->kind == Expr::InitializerDesignator::Kind::Member &&
+                 destination->kind == Type::Kind::Record)
+            if (const auto record = program.record_definition(destination->nominal_key()))
+                if (const auto position = designated_position(program, *record, first->member_name()))
+                    selected = *position;
+        auto child = initializer_child_type(program, destination, first, selected);
+        cursor = selected + 1;
+        for (std::size_t index = first ? 1 : 0; child && index < entry.designators.size(); ++index)
+            child = initializer_child_type(program, child, &entry.designators[index], 0);
+        if (entry.value->kind == Expr::Kind::AggregateInitializer)
+            visit_initializer_lists(*entry.value, child, program, visit);
+    }
+}
+
+// Marks the base of each brace list in an initializer of a `destination`:
+// the first entry, without a designator, whose value is neither a brace list
+// nor a string and has the list's own type. `type_of` gives an expression's
+// type without array decay.
+template<class TypeOf>
+void mark_initializer_bases(Expr& initializer, const TypePtr& destination, const Program& program,
+                            const TypeOf& type_of) {
+    visit_initializer_lists(initializer, destination, program, [&](Expr& list, const TypePtr& type) {
+        if ((type->kind != Type::Kind::Record && type->kind != Type::Kind::Array) ||
+            list.initializer_entries.empty()) return;
+        auto& entry = list.initializer_entries.front();
+        if (!entry.value || !entry.designators.empty() ||
+            entry.value->kind == Expr::Kind::AggregateInitializer || entry.value->kind == Expr::Kind::String) return;
+        const auto value = type_of(*entry.value);
+        if (value && value->kind != Type::Kind::Generic && same_initializer_type(value, type)) entry.base = true;
+    });
+}
+
+// The error of a record list's first entry, without a designator, whose
+// record value has neither the list's type nor a record type, as its first
+// member would.
+template<class TypeOf>
+std::optional<std::pair<SourceLocation, std::string>> initializer_base_error(const Expr& initializer,
+    const TypePtr& destination, const Program& program, const TypeOf& type_of) {
+    std::optional<std::pair<SourceLocation, std::string>> issue;
+    visit_initializer_lists(const_cast<Expr&>(initializer), destination, program,
+        [&](const Expr& list, const TypePtr& type) {
+        if (issue || type->kind != Type::Kind::Record || list.initializer_entries.empty()) return;
+        const auto& entry = list.initializer_entries.front();
+        if (entry.base || !entry.value || !entry.designators.empty() ||
+            entry.value->kind == Expr::Kind::AggregateInitializer) return;
+        // A record member takes only its own record type, which the ordinary
+        // conversion check reports.
+        const auto value = type_of(*entry.value);
+        const auto member = initializer_child_type(program, type, nullptr, 0);
+        if (value && value->kind == Type::Kind::Record && member && member->kind != Type::Kind::Generic &&
+            member->kind != Type::Kind::Record)
+            issue.emplace(entry.value->location, "a first entry of type '" + type_name(value) +
+                "' is neither a base of type '" + type_name(type) + "' nor a value of its first member");
+    });
+    return issue;
+}
+
+// The bound that the base of a brace list gives an array whose bound is
+// omitted: that of its array value, or a u8 array's string with its zero.
+template<class TypeOf>
+std::optional<std::uint64_t> initializer_base_extent(const Expr& list, const TypePtr& destination,
+                                                     const TypeOf& type_of) {
+    if (list.kind != Expr::Kind::AggregateInitializer || list.initializer_entries.empty() || !destination ||
+        destination->kind != Type::Kind::Array) return std::nullopt;
+    const auto& entry = list.initializer_entries.front();
+    if (!entry.value || !entry.designators.empty()) return std::nullopt;
+    if (entry.value->kind == Expr::Kind::String && destination->element &&
+        destination->element->kind == Type::Kind::Builtin && destination->element->builtin == BuiltinType::U8) {
+        const auto text = entry.value->string_value.empty() ? decode_string_literal(entry.value->text)
+            : std::optional<std::string>(entry.value->string_value);
+        if (text) return text->size() + 1;
+    }
+    if (!entry.base) return std::nullopt;
+    const auto type = type_of(*entry.value);
+    if (type && type->kind == Type::Kind::Array && type->lanes) return type->lanes;
+    return std::nullopt;
 }
 
 struct SourceExpressionIssue {
@@ -5934,6 +6091,14 @@ EvaluationTask<bool> prepare_inferred_array_async(VariableDecl& declaration, Pro
     // extent inference.
     if (source.kind != Expr::Kind::AggregateInitializer) co_return true;
     NormalizedInitializer normalized{clone_expr(source), {}};
+    GenericExpansionState local_types;
+    local_types.local_types.assign(types.begin(), types.end());
+    const auto type_of = [&](const Expr& value) {
+        return infer_generic_actual(value, nullptr, program, local_types, false);
+    };
+    mark_initializer_bases(*normalized.source, type, program, type_of);
+    if (const auto extent = initializer_base_extent(*normalized.source, type, type_of))
+        co_return complete_source_array_extent(type, *extent, program.address_bits, source.location, report);
     if (!(co_await normalize_initializer_indices_async(*normalized.source, normalized.deferred_indices,
             types, constant, report))) co_return false;
     if (!program.evaluation_initializer_types) {
@@ -6900,10 +7065,11 @@ private:
     }
 
     // A declaration or compound literal (`literal`) completes an omitted
-    // outer bound from its initializer.
+    // outer bound from its initializer. An `entry` of a brace list may give
+    // an array the value of an array of its type.
     EvaluationTask<void> initializer(const Expr& source, const TypePtr& destination,
                                      const VariableDecl* declaration = nullptr, bool static_storage = false,
-                                     bool literal = false) {
+                                     bool literal = false, bool entry = false) {
         if (!valid_ || !destination) co_return;
         if (const auto unbraced = unbrace_initializer(source, destination); unbraced.value != &source) {
             if (unbraced.value) co_await initializer(*unbraced.value, destination, declaration, static_storage, literal);
@@ -6927,7 +7093,11 @@ private:
         }
         if (source.kind != Expr::Kind::AggregateInitializer) {
             if (destination->kind == Type::Kind::Array) {
-                error(source.location, "aggregate initializer requires a brace list");
+                const auto actual = type(source, false);
+                if (!entry) error(source.location, "aggregate initializer requires a brace list");
+                else if (actual && actual->kind != Type::Kind::Generic && !same_initializer_type(actual, destination))
+                    error(source.location, "aggregate initializer requires a brace list or an array of type '" +
+                        type_name(destination) + "', not '" + type_name(actual) + "'");
                 co_return;
             }
             co_await conversion(source, destination, "local initializer");
@@ -6942,6 +7112,18 @@ private:
         // Memoized types of the clone's nodes must not outlive it: a later
         // node can reuse a freed node's address.
         struct Forget { SourceTypeValidator& validator; ~Forget() { validator.forget_types(); } } forget{*this};
+        const auto type_of = [&](const Expr& value) { return type(value, false); };
+        mark_initializer_bases(*normalized, destination, program_, type_of);
+        if (const auto issue = initializer_base_error(*normalized, destination, program_, type_of)) {
+            error(issue->first, issue->second);
+            co_return;
+        }
+        // The base gives an omitted bound.
+        bool infer = inferred;
+        if (const auto extent = inferred ? initializer_base_extent(*normalized, destination, type_of) : std::nullopt) {
+            complete_initializer_array(destination, *extent, source.location);
+            infer = false;
+        }
         std::vector<const Expr*> deferred_indices;
         if (!(co_await normalize_initializer_indices_async(*normalized, deferred_indices, types_.local_types,
                 constant_, [&](SourceLocation at, std::string message) { error(at, std::move(message)); }))) co_return;
@@ -6957,8 +7139,9 @@ private:
                     plan.error_message.empty() ? "invalid aggregate initializer" : plan.error_message);
                 co_return;
             }
-            for (const auto& [value, type] : plan.items) co_await initializer(*value, type, nullptr, static_storage);
-            if (valid_ && inferred) {
+            for (const auto& [value, type] : plan.items)
+                co_await initializer(*value, type, nullptr, static_storage, false, true);
+            if (valid_ && infer) {
                 if (plan.outer_extent_deferred)
                     destination->array_extent_dependency = Type::ArrayExtentDependency::ExpansionContext;
                 else complete_initializer_array(destination, plan.minimum_elements, source.location);
@@ -6975,8 +7158,9 @@ private:
                 plan.error_message.empty() ? "invalid aggregate initializer" : plan.error_message);
             co_return;
         }
-        for (const auto& item : plan.items) co_await initializer(*item.expression, item.type, nullptr, static_storage);
-        if (valid_ && inferred) complete_initializer_array(destination, plan.minimum_elements, source.location);
+        for (const auto& item : plan.items)
+            co_await initializer(*item.expression, item.type, nullptr, static_storage, false, true);
+        if (valid_ && infer) complete_initializer_array(destination, plan.minimum_elements, source.location);
         if (valid_ && declaration)
             initializer_value_(*declaration, {std::move(normalized), destination, std::move(plan)});
     }
@@ -8396,7 +8580,8 @@ public:
         co_return co_await static_conversions_async(source, destination);
     }
 
-    EvaluationTask<bool> static_conversions_async(const Expr& source, const TypePtr& destination) {
+    EvaluationTask<bool> static_conversions_async(const Expr& source, const TypePtr& destination,
+                                                  bool in_list = false) {
         if (!destination) co_return true;
         const auto unbraced = unbrace_initializer(source, destination);
         if (!unbraced.value) co_return true;
@@ -8404,6 +8589,11 @@ public:
             co_return co_await static_conversions_async(*unbraced.value, destination);
         if (source.kind == Expr::Kind::AggregateInitializer) {
             if (!program_.evaluation_initializer_types) co_return true;
+            if (const auto issue = initializer_base_error(source, destination, program_,
+                    [&](const Expr& value) { return expression_type(value, false); })) {
+                fail(issue->first, issue->second);
+                co_return false;
+            }
             // Positions do not select types, so every index stays symbolic.
             std::vector<const Expr*> indices;
             std::vector<const Expr*> pending{&source};
@@ -8420,10 +8610,18 @@ public:
             const auto plan = co_await program_.evaluation_initializer_types.async(source, destination, indices);
             if (!plan.valid) co_return true;
             for (const auto& [value, type] : plan.items)
-                if (!(co_await static_conversions_async(*value, type))) co_return false;
+                if (!(co_await static_conversions_async(*value, type, true))) co_return false;
             co_return true;
         }
-        if (destination->kind == Type::Kind::Array) co_return true;
+        if (destination->kind == Type::Kind::Array) {
+            // An entry may give an array the value of an array of its type.
+            const auto actual = expression_type(source, false);
+            if (!in_list || source.kind == Expr::Kind::String || !actual || actual->kind == Type::Kind::Generic ||
+                actual->kind == Type::Kind::Bytes || same_initializer_type(actual, destination)) co_return true;
+            fail(source.location, "aggregate initializer requires a brace list or an array of type '" +
+                type_name(destination) + "', not '" + type_name(actual) + "'");
+            co_return false;
+        }
         const auto reason = co_await conversion_error_async(source, expression_type(source), destination);
         if (resource_exhausted_ || context_unavailable_) co_return false;
         if (!reason) co_return true;
@@ -8514,12 +8712,42 @@ public:
     }
 
     // The value of a pointer derived from an integer, an absolute address.
-    EvaluationTask<std::optional<EvalValue>> required_absolute_pointer_async(const Expr& source) {
+    // A pointer that a static initializer stores: absolute address bits, or
+    // a relocatable address, such as one that a constant object holds.
+    EvaluationTask<std::optional<EvalValue>> required_static_pointer_async(const Expr& source) {
         if (resource_exhausted_ || context_unavailable_) co_return std::nullopt;
         if (!(co_await validate_required_tree_async(source))) co_return std::nullopt;
         auto value = co_await expression_async(source);
-        if (!value || !value->address || value->address->kind != AddressConstant::Kind::Absolute ||
-            !value->type || value->type->kind != Type::Kind::Pointer) co_return std::nullopt;
+        if (value) relocate_constant_view(*value);
+        if (!value || !value->address || !value->type || value->type->kind != Type::Kind::Pointer)
+            co_return std::nullopt;
+        co_return value;
+    }
+
+    // A pointer into the value of a constant object is that object's address.
+    static void relocate_constant_view(EvalValue& value) {
+        if (!value.meta_pointer || !value.meta_pointer->constant_object) return;
+        value.address = AddressConstant{AddressConstant::Kind::Object, {}, value.meta_pointer->constant_object,
+            nullptr, static_cast<std::int64_t>(value.meta_pointer->view_offset + value.meta_pointer->position)};
+        value.meta_pointer.reset();
+    }
+
+    // The value of an aggregate expression as an object of `type`. An array
+    // does not decay.
+    EvaluationTask<std::optional<EvalValue>> required_object_async(const Expr& source, const TypePtr& type) {
+        if (resource_exhausted_ || context_unavailable_) co_return std::nullopt;
+        if (!(co_await validate_required_tree_async(source))) co_return std::nullopt;
+        if (type->kind != Type::Kind::Array) {
+            auto value = co_await expression_async(source);
+            if (!value) co_return std::nullopt;
+            co_return co_await convert_async(*value, type, source.location);
+        }
+        auto value = co_await new_object_async(type, source.location, true);
+        const auto size = co_await meta_object_size_async(type);
+        if (!value || !size) co_return std::nullopt;
+        const EvaluationInitializerItem item{&source, type, {0, 1, std::nullopt, 0}, true,
+                                             {{0, *size, std::nullopt, 1, 0}}};
+        if (!(co_await copy_initializer_value_async(*value, item))) co_return std::nullopt;
         co_return value;
     }
 
@@ -8653,11 +8881,15 @@ public:
         const LayoutQuery size_of = size_of_ ? *size_of_ : LayoutQuery{};
         const LayoutQuery align_of = align_of_ ? *align_of_ : LayoutQuery{};
         std::uint64_t count{};
+        const auto type_of = [&](const Expr& value) { return expression_type(value, false); };
+        mark_initializer_bases(*object->initializer, type, program_, type_of);
         const auto* unbraced = unbrace_initializer(*object->initializer, type).value;
         if (!unbraced) co_return;
         const auto& source = *unbraced;
         if (source.kind == Expr::Kind::String) {
             count = source.string_value.size() + 1;
+        } else if (const auto extent = initializer_base_extent(source, type, type_of)) {
+            count = *extent;
         } else if (source.kind == Expr::Kind::AggregateInitializer) {
             std::uint64_t cursor{};
             for (const auto& entry : source.initializer_entries) {
@@ -9258,9 +9490,9 @@ public:
             failure_reason_.value_or("expression is not a translation-time value"));
         for (auto frame = failure_trace_.rbegin();
              frame != failure_trace_.rend(); ++frame) {
-            diagnostics.note(
-                frame->location,
-                "while evaluating call to '" + frame->function + "'");
+            diagnostics.note(frame->location, frame->initializer
+                ? "while evaluating the initializer of '" + frame->function + "'"
+                : "while evaluating call to '" + frame->function + "'");
         }
     }
 
@@ -9641,6 +9873,13 @@ public:
         case Expr::Kind::Name:
             co_return (co_await lookup_async(expression));
         case Expr::Kind::Address: {
+            // A folded relocatable address stays one.
+            if (expression.evaluated_address && expression.type && expression.type->kind == Type::Kind::Pointer &&
+                expression.evaluated_address->kind != AddressConstant::Kind::Absolute) {
+                EvalValue value{UInt128{}, clone_type(expression.type)};
+                value.address = expression.evaluated_address;
+                co_return value;
+            }
             if (!pointer_resolver_ || !expression.evaluated_address) {
                 fail(expression.location,
                      "a runtime address cannot be inspected during translation-time execution");
@@ -11831,13 +12070,16 @@ private:
         co_return result;
     }
 
-    EvaluationTask<std::unique_ptr<Expr>> normalized_object_initializer_async(const Expr& source) {
+    EvaluationTask<std::unique_ptr<Expr>> normalized_object_initializer_async(const Expr& source,
+                                                                             const TypePtr& type) {
         // Designators are required constants, independent of current local values.
         std::vector<std::pair<NameKey, TypePtr>> local_types;
         for (auto scope = frame_base_; scope < scopes_.size(); ++scope)
             for (const auto& [name, cell] : scopes_[scope])
                 local_types.emplace_back(name, cell.value.type);
         auto normalized = clone_expr(source);
+        mark_initializer_bases(*normalized, type, program_,
+            [&](const Expr& value) { return expression_type(value, false); });
         const auto normalize = [&](const auto& self, Expr& list) -> EvaluationTask<bool> {
             for (auto& entry : list.initializer_entries) {
                 for (auto& designator : entry.designators) {
@@ -11899,7 +12141,7 @@ private:
         const EvaluationInitializerPlan* plan{};
         if (prepared) plan = &prepared->plan;
         else {
-            normalized = co_await normalized_object_initializer_async(source);
+            normalized = co_await normalized_object_initializer_async(source, type);
             if (!normalized) co_return std::nullopt;
             generated_plan = co_await program_.evaluation_initializer_plan.async(*normalized, type);
             plan = &generated_plan;
@@ -11915,6 +12157,10 @@ private:
         }
         for (const auto& item : plan->items) {
             if (!step(item.expression->location)) co_return std::nullopt;
+            if (item.whole) {
+                if (!(co_await copy_initializer_value_async(*value, item))) co_return std::nullopt;
+                continue;
+            }
             auto pointer = object_pointer(*value);
             auto destination = clone_type(item.type);
             destination->is_const = false; // Initialization, not a modifying const access.
@@ -11934,6 +12180,65 @@ private:
                                            item.expression->location))) co_return std::nullopt;
         }
         co_return value;
+    }
+
+    // Copies the regions of an aggregate value that initializes a part of
+    // `object`, before the entries that replace its other parts.
+    EvaluationTask<bool> copy_initializer_value_async(EvalValue& object, const EvaluationInitializerItem& item) {
+        const auto location = item.expression->location;
+        auto source = co_await meta_designator_pointer_async(*item.expression);
+        if (source && !source->meta_pointer) source = co_await constant_pointer_async(*source, location);
+        if (!source || !source->meta_pointer || !source->type || source->type->kind != Type::Kind::Pointer) {
+            fail(location, "aggregate initializer value is not a translation-time object");
+            co_return false;
+        }
+        source->type = pointer_type(item.type);
+        const auto from = co_await meta_access_index_async(*source, location);
+        if (!from) co_return false;
+        const auto& pointer = *source->meta_pointer;
+        const auto* backing = pointer.mutable_buffer.get();
+        const auto& data = backing ? backing->data : *pointer.immutable;
+        auto& destination = *object.object;
+        const auto order = program_.evaluation_layout.byte_order;
+        const auto unit = [&](const std::string& bytes, std::size_t at, std::size_t size) {
+            UInt128 bits;
+            for (std::size_t byte = 0; byte < size; ++byte) {
+                const auto lane = order == EvaluationByteOrder::Little ? byte : size - 1 - byte;
+                bits = bit_or(bits, shift_left(UInt128{static_cast<unsigned char>(bytes[at + byte])},
+                                              static_cast<unsigned>(lane * 8)));
+            }
+            return bits;
+        };
+        for (const auto& region : item.regions)
+            for (std::uint64_t copy = 0; copy < region.count; ++copy) {
+                if (!step(location)) co_return false;
+                const auto part = static_cast<std::size_t>(region.offset + copy * region.stride);
+                const auto at = static_cast<std::size_t>(item.layout.offset) + part;
+                const auto start = *from + part;
+                const auto size = static_cast<std::size_t>(region.size);
+                if (region.mask) {
+                    const auto bits = bit_or(bit_and(unit(destination.data, at, size), bit_not(*region.mask)),
+                                             bit_and(unit(data, start, size), *region.mask));
+                    for (std::size_t byte = 0; byte < size; ++byte) {
+                        const auto lane = order == EvaluationByteOrder::Little ? byte : size - 1 - byte;
+                        destination.data[at + byte] = static_cast<char>(shift_right(bits,
+                            static_cast<unsigned>(lane * 8)).low & 0xffU);
+                    }
+                    continue;
+                }
+                std::copy_n(data.begin() + static_cast<std::ptrdiff_t>(start), size,
+                            destination.data.begin() + static_cast<std::ptrdiff_t>(at));
+                if (!backing) continue;
+                std::copy_n(backing->assigned.begin() + static_cast<std::ptrdiff_t>(start), size,
+                            destination.assigned.begin() + static_cast<std::ptrdiff_t>(at));
+                for (const auto& slot : backing->pointers)
+                    if (slot.offset >= start && slot.offset + slot.length <= start + size) {
+                        auto moved = slot;
+                        moved.offset = slot.offset - start + at;
+                        destination.pointers.push_back(std::move(moved));
+                    }
+            }
+        co_return true;
     }
 
     // The offset of the embedded member a conversion's path leads to.
@@ -12248,6 +12553,18 @@ private:
                 co_return std::nullopt;
             }
         }
+        // A typed relocatable address keeps its identity in its own type.
+        if (type->kind == Type::Kind::Pointer && value.address && !value.function_designator && !explicit_cast &&
+            value.address->kind != AddressConstant::Kind::Absolute && value.type &&
+            value.type->kind == Type::Kind::Pointer) {
+            auto from = clone_type(value.type), to = clone_type(type);
+            from->is_const = from->is_volatile = from->is_restrict = false;
+            to->is_const = to->is_volatile = to->is_restrict = false;
+            if (same_type(from, to)) {
+                value.type = clone_type(type);
+                co_return value;
+            }
+        }
         if (pointer_resolver_ && type->kind == Type::Kind::Pointer && !value.string) {
             auto source = value_expression(value, location);
             if (!source) co_return std::nullopt;
@@ -12451,6 +12768,8 @@ private:
     struct CallFrame {
         std::string function;
         SourceLocation location;
+        // The initializer of the constant object `function` names.
+        bool initializer{};
     };
 
     void fail(SourceLocation location, std::string reason) {
@@ -12542,12 +12861,170 @@ private:
         co_return cell.value;
     }
 
+    // The value of the initializer of a constant object as an object of its type.
+    EvaluationTask<std::optional<EvalValue>> initial_value_async(const ObjectDecl& object, const Expr& initializer,
+                                                                 SourceLocation location) {
+        auto type = object.type;
+        if (type->kind == Type::Kind::Array && !type->lanes) co_await complete_initializer_extent_async(type);
+        const auto* source = unbrace_initializer(initializer, type).value;
+        if (!source || (type->kind == Type::Kind::Array && !type->lanes)) {
+            fail(location, "constant object '" + object.name + "' has no complete translation-time value");
+            co_return std::nullopt;
+        }
+        const bool bytes = type->kind == Type::Kind::Array && type->element &&
+            type->element->kind == Type::Kind::Builtin && type->element->builtin == BuiltinType::U8;
+        if (source->kind == Expr::Kind::AggregateInitializer || is_scalar(type) ||
+            (bytes && source->kind == Expr::Kind::String))
+            co_return co_await initialize_object_async(initializer, type);
+        if (source->kind == Expr::Kind::ByteSequence && !source->type) {
+            auto value = co_await new_object_async(type, location, true);
+            if (!value || source->string_value.size() != value->object->data.size()) {
+                fail(location, "materialized byte count does not match the u8 array bound");
+                co_return std::nullopt;
+            }
+            value->object->data = source->string_value;
+            co_return value;
+        }
+        auto value = co_await expression_async(*source);
+        if (!value) co_return std::nullopt;
+        if (bytes && value->bytes) {
+            auto object_value = co_await new_object_async(type, location, true);
+            if (!object_value || value->byte_length != object_value->object->data.size()) {
+                fail(location, "materialized byte count does not match the u8 array bound");
+                co_return std::nullopt;
+            }
+            object_value->object->data = value->bytes->substr(value->byte_offset, value->byte_length);
+            co_return object_value;
+        }
+        co_return co_await convert_async(*value, type, location);
+    }
+
+    // Whether an expression names a generic function or record instance.
+    static bool generic_syntax(const Expr& root) {
+        std::vector<const Expr*> pending{&root};
+        while (!pending.empty()) {
+            const auto* node = pending.back();
+            pending.pop_back();
+            if (!node) continue;
+            if (!node->generic_arguments.empty() || node->deferred_generic_signature) return true;
+            pending.push_back(node->left.get());
+            pending.push_back(node->right.get());
+            pending.push_back(node->third.get());
+            for (const auto& argument : node->arguments) pending.push_back(argument.get());
+            for (const auto& entry : node->initializer_entries) pending.push_back(entry.value.get());
+        }
+        return false;
+    }
+
+    // The value of a constant object, evaluated once from its initializer in
+    // the object's own scope. A cycle through initializers is an error.
+    EvaluationTask<const EvalValue*> constant_value_async(const ObjectDecl& object, SourceLocation location) {
+        if (const auto found = constant_values_.find(&object); found != constant_values_.end())
+            co_return &found->second;
+        if (const auto& shared = program_.evaluation_constant_values)
+            if (const auto found = shared->values.find(&object); found != shared->values.end())
+                co_return &found->second;
+        if (const auto* reason = constant_object_error(program_, object)) {
+            fail(location, "runtime/static storage cannot be read during translation-time evaluation: '" +
+                object.name + "' " + reason);
+            co_return nullptr;
+        }
+        const auto shared = program_.evaluation_constant_values;
+        auto& active = shared ? shared->active : active_constants_;
+        if (!active.insert(&object).second) {
+            fail(location, "the initializer of constant object '" + object.name + "' depends on its own value");
+            co_return nullptr;
+        }
+        if (++depth_ > program_.evaluation_limits.depth) {
+            fail_resource(location, "translation-time recursion depth exceeded " +
+                std::to_string(program_.evaluation_limits.depth));
+            --depth_;
+            active.erase(&object);
+            co_return nullptr;
+        }
+        // A file-scope object's names resolve in its own source unit.
+        auto* owner = object_lexical_function(program_, object);
+        FunctionDecl unit;
+        unit.source_namespace = namespace_prefix(object.name);
+        unit.source_unit = object.source_unit;
+        GenericExpansionState owner_scope;
+        if (owner) collect_function_types(*owner, owner_scope);
+        const auto previous_base = frame_base_;
+        const auto* previous_function = current_function_;
+        auto previous_namespace = std::move(current_namespace_);
+        frame_base_ = scopes_.size();
+        current_function_ = owner ? owner : &unit;
+        current_namespace_ = current_function_->source_namespace;
+        push_source_types(owner_scope.local_types);
+        call_stack_.push_back({object.name, location, true});
+        // An expansion prepares the generic code that the initializer names.
+        std::unique_ptr<Expr> prepared;
+        std::optional<EvalValue> value;
+        if (program_.evaluation_prepare_expression && generic_syntax(*object.initializer)) {
+            prepared = clone_expr(*object.initializer);
+            const auto prepare = program_.evaluation_prepare_expression;
+            if (!(co_await prepare.async(prepared, current_function_, owner_scope.local_types))) prepared.reset();
+            else value = co_await initial_value_async(object, *prepared, location);
+        } else {
+            value = co_await initial_value_async(object, *object.initializer, location);
+        }
+        call_stack_.pop_back();
+        pop_scope();
+        current_namespace_ = std::move(previous_namespace);
+        current_function_ = previous_function;
+        frame_base_ = previous_base;
+        --depth_;
+        active.erase(&object);
+        if (!value) co_return nullptr;
+        // A value with only relocatable addresses serves later evaluators too.
+        const bool relocatable = std::all_of(value->object->pointers.begin(), value->object->pointers.end(),
+            [](const EvalBuffer::PointerObject& slot) {
+                return slot.value->address || slot.value->label_address || slot.value->string ||
+                    (slot.value->meta_pointer && slot.value->meta_pointer->constant_object);
+            });
+        if (shared && relocatable) co_return &shared->values.emplace(&object, std::move(*value)).first->second;
+        co_return &constant_values_.emplace(&object, std::move(*value)).first->second;
+    }
+
+    // A read-only pointer of type `type` to `offset` bytes into the value of
+    // a constant object. It remains that object's relocatable address.
+    EvaluationTask<std::optional<EvalValue>> constant_view_async(const ObjectDecl& object, std::int64_t offset,
+                                                                 TypePtr type, SourceLocation location) {
+        const auto* value = co_await constant_value_async(object, location);
+        if (!value) co_return std::nullopt;
+        if (offset < 0 || static_cast<std::uint64_t>(offset) > value->object->data.size()) {
+            fail(location, "translation-time pointer is outside its constant object");
+            co_return std::nullopt;
+        }
+        type = clone_type(type);
+        type->pointee = clone_type(type->pointee);
+        type->pointee->is_const = true;
+        EvalValue view{UInt128{}, std::move(type)};
+        EvalMetaPointer pointer;
+        pointer.mutable_buffer = value->object;
+        pointer.view_length = value->object->data.size();
+        pointer.position = static_cast<std::size_t>(offset);
+        pointer.constant_object = &object;
+        view.meta_pointer = std::move(pointer);
+        co_return view;
+    }
+
+    // The view through which a pointer reads, if it is the address of a
+    // constant object.
+    EvaluationTask<std::optional<EvalValue>> constant_pointer_async(const EvalValue& pointer, SourceLocation location) {
+        if (!pointer.address || pointer.address->kind != AddressConstant::Kind::Object ||
+            !pointer.address->object || !pointer.type || pointer.type->kind != Type::Kind::Pointer)
+            co_return std::nullopt;
+        co_return co_await constant_view_async(*pointer.address->object, pointer.address->addend,
+                                               pointer.type, location);
+    }
+
     EvaluationTask<std::optional<EvalValue>> lookup_async(const Expr& expression) {
         const auto& name = expression.text;
         const auto location = expression.location;
         if (auto* cell = lookup_mutable(expression)) co_return (co_await read_cell_async(*cell, location));
         if (const auto* object = resolve_object(program_, current_function_, expression);
-            object && object->compound_literal && object->initializer) {
+            object && object->compound_literal && object->initializer && constant_object_error(program_, *object)) {
             // A read-only view of the initial value; its address stays symbolic.
             auto value = co_await compound_literal_async(object->type, *object->initializer);
             if (!value) co_return std::nullopt;
@@ -12578,12 +13055,24 @@ private:
                 found->enumerator->value->value,
                 enum_type(*found->enumeration)};
         }
+        const auto* object = resolve_object(program_, current_function_, expression);
+        if (object && !constant_object_error(program_, *object)) {
+            if (object->type->kind != Type::Kind::Array) {
+                const auto view = co_await constant_view_async(*object, 0, pointer_type(object->type), location);
+                if (!view) co_return std::nullopt;
+                co_return co_await read_meta_pointer_async(*view, location);
+            }
+            // An array designates its first element by a relocatable address.
+            EvalValue value{UInt128{}, expression_type(expression)};
+            value.address = AddressConstant{AddressConstant::Kind::Object, {}, object, nullptr, 0};
+            co_return value;
+        }
         if (pointer_resolver_) {
             auto source = clone_expr(expression);
             const auto type = expression_type(*source);
-            const auto* object = resolve_object(program_, current_function_, expression);
             if (object && object->type->kind != Type::Kind::Array) {
-                fail(location, "runtime/static storage cannot be read during translation-time evaluation");
+                fail(location, "runtime/static storage cannot be read during translation-time evaluation: '" +
+                    object->name + "' " + constant_object_error(program_, *object));
                 co_return std::nullopt;
             }
             if (type && type->kind == Type::Kind::Pointer) {
@@ -13361,6 +13850,8 @@ private:
         std::optional<EvalValue> base;
         if (expression.text == "member") base = co_await meta_designator_pointer_async(*expression.left);
         else base = co_await this->expression_async(*expression.left);
+        if (base && base->address)
+            if (auto view = co_await constant_pointer_async(*base, expression.location)) base = std::move(view);
         const auto record = base && base->type && base->type->kind == Type::Kind::Pointer &&
             base->type->pointee && base->type->pointee->kind == Type::Kind::Record
             ? program_.record_definition(base->type->pointee->nominal_key()) : nullptr;
@@ -13461,13 +13952,20 @@ private:
     // not completed comes from the initializer, whose values are not read.
     EvaluationTask<TypePtr> compound_literal_type_async(TypePtr type, const Expr& initializer) {
         if (!type || type->kind != Type::Kind::Array || type->lanes) co_return type;
-        auto normalized = co_await normalized_object_initializer_async(initializer);
+        auto normalized = co_await normalized_object_initializer_async(initializer, type);
         if (!normalized) co_return nullptr;
         if (!program_.evaluation_initializer_types) {
             fail(initializer.location, "target initializer layout is unavailable during translation-time execution");
             co_return nullptr;
         }
         type = clone_type(type);
+        if (const auto extent = initializer_base_extent(*normalized, type,
+                [&](const Expr& value) { return expression_type(value, false); })) {
+            if (!complete_source_array_extent(type, *extent, program_.address_bits, initializer.location,
+                    [&](SourceLocation at, std::string message) { fail(at, std::move(message)); }))
+                co_return nullptr;
+            co_return type;
+        }
         const auto plan = co_await program_.evaluation_initializer_types.async(*normalized, type, {});
         if (!plan.valid) {
             fail(plan.error_location.file ? plan.error_location : initializer.location,
@@ -13545,10 +14043,17 @@ private:
                 value.meta_pointer = std::move(pointer);
                 co_return value;
             }
+            if (const auto* object = cell ? nullptr : resolve_object(program_, current_function_, *designator);
+                object && !constant_object_error(program_, *object))
+                co_return co_await constant_view_async(*object, 0, pointer_type(object->type), designator->location);
         }
         if (designator->kind == Expr::Kind::Unary &&
-            designator->text == "*" && designator->left)
-            co_return (co_await this->expression_async(*designator->left));
+            designator->text == "*" && designator->left) {
+            auto pointer = co_await this->expression_async(*designator->left);
+            if (pointer && pointer->address)
+                if (auto view = co_await constant_pointer_async(*pointer, designator->location)) co_return view;
+            co_return pointer;
+        }
         if (designator->kind == Expr::Kind::Binary &&
             (designator->text == "member" ||
              designator->text == "pointer_member"))
@@ -13560,6 +14065,8 @@ private:
             if (owner && owner->kind == Type::Kind::Vector)
                 co_return (co_await meta_vector_lane_pointer_async(*designator));
             auto base = (co_await this->expression_async(*designator->left));
+            if (base && base->address)
+                if (auto view = co_await constant_pointer_async(*base, designator->location)) base = std::move(view);
             auto index = (co_await this->expression_async(*designator->right));
             if (!base || !index || !base->meta_pointer) co_return std::nullopt;
             co_return (co_await meta_pointer_offset_async(*base, *index, false,
@@ -13758,7 +14265,10 @@ private:
                             co_return std::nullopt;
                         }
                     }
-                    co_return (co_await convert_async(value, base.type->pointee, location, pointer.union_member_view));
+                    // The value of a const lvalue is unqualified.
+                    auto type = clone_type(base.type->pointee);
+                    type->is_const = false;
+                    co_return (co_await convert_async(value, type, location, pointer.union_member_view));
                 }
             }
             if (is_label_type(base.type->pointee)) {
@@ -13940,6 +14450,8 @@ private:
         if (!expression.left) co_return std::nullopt;
         if (expression.text == "*") {
             auto pointer = (co_await this->expression_async(*expression.left));
+            if (pointer && pointer->address)
+                if (auto view = co_await constant_pointer_async(*pointer, expression.location)) pointer = std::move(view);
             if (pointer && pointer->meta_pointer)
                 co_return (co_await read_meta_pointer_async(*pointer, expression.location));
             if (pointer && pointer->string)
@@ -14155,6 +14667,8 @@ private:
             co_return std::nullopt;
         }
         if (expression.text == "index") {
+            if (left->address)
+                if (auto view = co_await constant_pointer_async(*left, expression.location)) left = std::move(view);
             if (left->meta_pointer) {
                 auto pointer = (co_await meta_pointer_offset_async(*left, *right, false,
                                                    expression.location));
@@ -16231,6 +16745,11 @@ private:
     std::optional<std::string> failure_reason_;
     std::vector<CallFrame> call_stack_;
     std::vector<CallFrame> failure_trace_;
+    // The values of the constant objects this evaluator has read, and the
+    // objects whose initializers it is evaluating, unless the program shares
+    // them.
+    std::unordered_map<const ObjectDecl*, EvalValue> constant_values_;
+    std::unordered_set<const ObjectDecl*> active_constants_;
 };
 
 bool source_constant_candidate(const Expr& expression) {
@@ -16636,6 +17155,40 @@ bool contains_layout_query(const Expr& expression) {
 bool contains_relocation_candidate(const Expr& expression,
                                    const Program& program,
                                    std::string_view source_namespace) {
+    const auto object_named = [&](const Expr& name) -> const ObjectDecl* {
+        const auto selected = value_namespace(program, nullptr, name, source_namespace);
+        if (!selected) return nullptr;
+        for (const auto& object : program.objects)
+            if (object->name == *selected && (object->compound_literal || !constant_object_error(program, *object)))
+                return object.get();
+        return nullptr;
+    };
+    // The type of the part of a constant object that `node` reads, with the
+    // index operands on the way, or null when it reads no such part.
+    const auto constant_part = [&](const auto& self, const Expr* node, std::vector<const Expr*>& indices) -> TypePtr {
+        while (node->kind == Expr::Kind::Parenthesized && node->left) node = node->left.get();
+        if (node->kind == Expr::Kind::Name) {
+            const auto* object = object_named(*node);
+            return object ? object->type : nullptr;
+        }
+        if (!node->left) return nullptr;
+        if (node->kind == Expr::Kind::Binary && node->text == "member" && node->right &&
+            node->right->kind == Expr::Kind::Name) {
+            const auto type = self(self, node->left.get(), indices);
+            const auto record = type && type->kind == Type::Kind::Record
+                ? program.record_definition(type->nominal_key()) : nullptr;
+            const auto lookup = record ? find_record_member(program, *record, member_name(*node->right)) : MemberLookup{};
+            return lookup.member() ? lookup.member()->type : nullptr;
+        }
+        const bool index = node->kind == Expr::Kind::Binary && node->text == "index" && node->right;
+        const bool offset = node->kind == Expr::Kind::Binary && (node->text == "+" || node->text == "-") && node->right;
+        if (!index && !offset && !(node->kind == Expr::Kind::Unary && node->text == "*")) return nullptr;
+        const auto type = self(self, node->left.get(), indices);
+        if (!type || (type->kind != Type::Kind::Array && type->kind != Type::Kind::Pointer)) return nullptr;
+        if (index || offset) indices.push_back(node->right.get());
+        const auto element = type->kind == Type::Kind::Array ? qualified_element_type(type) : type->pointee;
+        return offset ? pointer_type(element) : element;
+    };
     std::vector<const Expr*> pending{&expression};
     while (!pending.empty()) {
         const auto* node = pending.back();
@@ -16650,15 +17203,14 @@ bool contains_relocation_candidate(const Expr& expression,
             continue;
         }
         if (node->kind == Expr::Kind::Unary && node->text == "&") return true;
-        // An element of a compound literal's static object is its initial value.
-        if (node->kind == Expr::Kind::Binary && node->text == "index" && node->left) {
-            const auto* base = node->left.get();
-            while (base->kind == Expr::Kind::Parenthesized && base->left) base = base->left.get();
-            const auto selected = base->kind == Expr::Kind::Name
-                ? value_namespace(program, nullptr, *base, source_namespace) : std::nullopt;
-            if (selected && std::any_of(program.objects.begin(), program.objects.end(),
-                    [&](const auto& object) { return object->compound_literal && object->name == *selected; })) {
-                pending.push_back(node->right.get());
+        // A part read from a constant object, or from a compound literal's
+        // static object, is its initial value, unless it is an array, which
+        // designates its address.
+        if ((node->kind == Expr::Kind::Binary && (node->text == "index" || node->text == "member")) ||
+            (node->kind == Expr::Kind::Unary && node->text == "*")) {
+            std::vector<const Expr*> indices;
+            if (const auto type = constant_part(constant_part, node, indices); type && type->kind != Type::Kind::Array) {
+                pending.insert(pending.end(), indices.begin(), indices.end());
                 continue;
             }
         }
@@ -16736,6 +17288,10 @@ void replace_eval_value(std::unique_ptr<Expr>& expression,
                 {slot.offset, slot.length, clone_type(slot.value->type), *slot.value->address});
             else if (slot.value->label_address) replacement->object_relocations.push_back(
                 {slot.offset, slot.length, clone_type(slot.value->type), *slot.value->label_address});
+            else if (const auto& pointer = slot.value->meta_pointer; pointer && pointer->constant_object)
+                replacement->object_relocations.push_back({slot.offset, slot.length, clone_type(slot.value->type),
+                    AddressConstant{AddressConstant::Kind::Object, {}, pointer->constant_object, nullptr,
+                        static_cast<std::int64_t>(pointer->view_offset + pointer->position)}});
         }
         expression = std::move(replacement);
         return;
@@ -16763,6 +17319,7 @@ bool materializable_eval_value(const EvalValue& value, SourceLocation location,
                                Diagnostics& diagnostics, bool required) {
     if (!value.object) return true;
     for (const auto& slot : value.object->pointers) {
+        if (slot.value->meta_pointer && slot.value->meta_pointer->constant_object) continue;
         if (slot.value->meta_pointer || slot.value->string ||
             (!slot.value->address && !slot.value->label_address)) {
             if (required) diagnostics.error(location,
@@ -16835,11 +17392,12 @@ EvaluationTask<bool> fold_pointer_integer_initializer_async(std::unique_ptr<Expr
          (!align_of && !program.evaluation_align_of));
     if (!evaluator.integer_expression(*expression)) {
         // A pointer derived from an integer is a translation-time value whose
-        // address bits initialize the object. Relocatable addresses and values
-        // that do not fold are left to static data lowering.
+        // address bits initialize the object, and a pointer read from a
+        // constant object keeps its relocatable address. Address expressions
+        // and values that do not fold are left to static data lowering.
         if (pending_layout || contains_relocation_candidate(*expression, program, source_namespace))
             co_return false;
-        const auto pointer = co_await evaluator.required_absolute_pointer_async(*expression);
+        const auto pointer = co_await evaluator.required_static_pointer_async(*expression);
         if (!pointer) {
             // An integer converted to a pointer is never relocatable.
             const Expr* source = expression.get();
@@ -17539,8 +18097,10 @@ EvaluationTask<void> rewrite_eval_expr_async(std::unique_ptr<Expr>& expression,
         replace_eval_value(expression, *value);
 }
 
+// `type_of` gives the type of a base, which gives the bound.
 void infer_initializer_array_bound(TypePtr& type, const Expr* initializer,
-                                   Diagnostics& diagnostics) {
+                                   Diagnostics& diagnostics,
+                                   const std::function<TypePtr(const Expr&)>& type_of = {}) {
     if (!type || type->kind != Type::Kind::Array || type->lanes != 0 || type->array_bound ||
         !initializer) {
         return;
@@ -17552,6 +18112,14 @@ void infer_initializer_array_bound(TypePtr& type, const Expr* initializer,
         return;
     }
     if (!initializer || initializer->kind != Expr::Kind::AggregateInitializer) return;
+    if (const auto extent = initializer_base_extent(*initializer, type, [&](const Expr& value) {
+            return value.kind == Expr::Kind::ByteSequence ? value.type : type_of ? type_of(value) : TypePtr{};
+        })) {
+        if (*extent >= std::numeric_limits<std::uint32_t>::max())
+            diagnostics.error(initializer->location, "inferred array bound exceeds the language limit");
+        else type->lanes = static_cast<std::uint32_t>(*extent);
+        return;
+    }
     std::uint64_t cursor{};
     std::uint64_t count{};
     for (const auto& entry : initializer->initializer_entries) {
@@ -17682,8 +18250,11 @@ EvaluationTask<void> fold_static_initializer_async(Expr& initializer, TypePtr ty
                 if (const auto position = designated_position(program, *record, first->member_name()))
                     selected = *position;
         }
-        auto destination = initializer_child_type(program, type, first,
-                                                  selected);
+        // A base, or a u8 array's leading string, has the list's own type.
+        const bool string_base = &entry == &initializer.initializer_entries.front() && !first && entry.value &&
+            entry.value->kind == Expr::Kind::String && type->kind == Type::Kind::Array && type->element &&
+            type->element->kind == Type::Kind::Builtin && type->element->builtin == BuiltinType::U8;
+        auto destination = entry.base || string_base ? type : initializer_child_type(program, type, first, selected);
         cursor = selected + 1;
         for (std::size_t index = first ? 1 : 0;
              destination && index < entry.designators.size(); ++index) {
@@ -17700,10 +18271,22 @@ EvaluationTask<void> fold_static_initializer_async(Expr& initializer, TypePtr ty
             auto enclosed = std::move(entry.value->initializer_entries.front().value);
             entry.value = std::move(enclosed);
         }
+        const bool byte_string = entry.value->kind == Expr::Kind::String &&
+            destination->kind == Type::Kind::Array && destination->element &&
+            destination->element->kind == Type::Kind::Builtin && destination->element->builtin == BuiltinType::U8;
         if (entry.value->kind == Expr::Kind::AggregateInitializer) {
             co_await fold_static_initializer_async(*entry.value, destination, program,
                                     diagnostics, size_of, align_of,
                                     source_namespace, caller);
+        } else if ((destination->kind == Type::Kind::Record || destination->kind == Type::Kind::Vector ||
+                    destination->kind == Type::Kind::Array) && !byte_string &&
+                   entry.value->kind != Expr::Kind::ByteSequence) {
+            // An aggregate value is the image of a translation-time value.
+            Evaluator evaluator(program, diagnostics, caller, std::string(source_namespace), size_of, align_of);
+            const auto value = co_await evaluator.required_object_async(*entry.value, destination);
+            if (!value) evaluator.diagnose(entry.value->location);
+            else if (materializable_eval_value(*value, entry.value->location, diagnostics, true))
+                replace_eval_value(entry.value, *value);
         } else if (is_label_type(destination)) {
             Evaluator evaluator(program, diagnostics, caller,
                                 std::string(source_namespace), size_of, align_of);
@@ -17768,9 +18351,16 @@ EvaluationTask<void> rewrite_eval_statement_async(Statement& statement, Function
                               program, diagnostics, opportunistic);
             if (stopped()) co_return;
             if (!statement.declaration->dynamic_array_bound) {
+                std::optional<GenericExpansionState> scope;
                 infer_initializer_array_bound(
                     statement.declaration->type,
-                    statement.declaration->initializer.get(), diagnostics);
+                    statement.declaration->initializer.get(), diagnostics, [&](const Expr& value) {
+                        if (!scope) {
+                            scope.emplace();
+                            if (caller) collect_function_types(*caller, *scope);
+                        }
+                        return infer_generic_actual(value, caller, program, *scope, false);
+                    });
             }
         }
     }
@@ -18873,8 +19463,74 @@ private:
     SourceTypeMemo memo_;
 };
 
+// Marks the bases of the brace lists of static initializers, local
+// declarations, and compound literals, for the passes up to lowering.
+void mark_program_initializer_bases(Program& program) {
+    const auto mark = [&](FunctionDecl* owner, const auto& visit) {
+        std::optional<GenericExpansionState> state;
+        const auto type_of = [&](const Expr& value) {
+            if (!state) {
+                state.emplace();
+                if (owner) collect_function_types(*owner, *state);
+            }
+            return infer_generic_actual(value, owner, program, *state, false);
+        };
+        visit([&](Expr* root, const TypePtr& type) {
+            if (root && type) mark_initializer_bases(*root, type, program, type_of);
+            std::vector<Expr*> pending{root};
+            while (!pending.empty()) {
+                auto* node = pending.back();
+                pending.pop_back();
+                if (!node) continue;
+                if (node->kind == Expr::Kind::CompoundLiteral && node->left)
+                    mark_initializer_bases(*node->left, node->type, program, type_of);
+                pending.push_back(node->left.get());
+                pending.push_back(node->right.get());
+                pending.push_back(node->third.get());
+                for (auto& argument : node->arguments) pending.push_back(argument.get());
+                for (auto& entry : node->initializer_entries) pending.push_back(entry.value.get());
+            }
+        });
+    };
+    for (auto& object : program.objects)
+        if (object->initializer)
+            mark(object_lexical_function(program, *object), [&](const auto& root) {
+                root(object->initializer.get(), object->type);
+            });
+    for (auto& function : program.functions) {
+        if (!function->body || !function->generic_parameters.empty()) continue;
+        mark(function.get(), [&](const auto& root) {
+            std::vector<Statement*> pending{function->body.get()};
+            while (!pending.empty()) {
+                auto& statement = *pending.back();
+                pending.pop_back();
+                if (statement.declaration) {
+                    root(statement.declaration->initializer.get(), statement.declaration->type);
+                    root(statement.declaration->dynamic_array_bound.get(), nullptr);
+                }
+                root(statement.expression.get(), nullptr);
+                root(statement.condition.get(), nullptr);
+                for (auto& increment : statement.increments) root(increment.get(), nullptr);
+                for (auto& child : statement.statements) pending.push_back(child.get());
+                if (statement.first) pending.push_back(statement.first.get());
+                if (statement.second) pending.push_back(statement.second.get());
+            }
+        });
+    }
+}
+
 EvaluationTask<bool> expand_evaluation_impl_async(Program& program, Diagnostics& diagnostics,
                        bool opportunistic) {
+    mark_program_initializer_bases(program);
+    // The evaluators of this phase share the values of the constant objects
+    // they read; later phases read the folded initializers.
+    struct ShareConstants {
+        Program& program;
+        explicit ShareConstants(Program& owner) : program(owner) {
+            program.evaluation_constant_values = std::make_shared<EvaluationConstantValues>();
+        }
+        ~ShareConstants() { program.evaluation_constant_values.reset(); }
+    } share_constants{program};
     const auto epoch = program.evaluation_resource_errors;
     const auto stopped = [&] { return program.evaluation_resource_errors != epoch; };
     const bool typed_warnings = TypedWarnings::wanted(program, diagnostics);
@@ -19213,6 +19869,22 @@ EvaluationTask<bool> expand_evaluation_impl_async(Program& program, Diagnostics&
                                   diagnostics, opportunistic, true);
             }
             if (stopped()) co_return false;
+            if (object->type && (object->type->kind == Type::Kind::Record ||
+                                 object->type->kind == Type::Kind::Vector) &&
+                object->initializer->kind != Expr::Kind::AggregateInitializer &&
+                object->initializer->kind != Expr::Kind::ByteSequence) {
+                // An aggregate value is the image of a translation-time value.
+                Evaluator evaluator(program, diagnostics, owner, source_namespace);
+                const auto value = co_await evaluator.required_object_async(*object->initializer, object->type);
+                if (!value) evaluator.diagnose(object->initializer->location);
+                else if (materializable_eval_value(*value, object->initializer->location, diagnostics, true))
+                    replace_eval_value(object->initializer, *value);
+                if (stopped()) co_return false;
+            }
+            if (object->type && object->type->kind == Type::Kind::Array && !object->type->lanes) {
+                Evaluator evaluator(program, diagnostics, owner, source_namespace);
+                co_await evaluator.complete_initializer_extent_async(object->type);
+            }
             infer_initializer_array_bound(object->type,
                                           object->initializer.get(),
                                           diagnostics);
@@ -19451,6 +20123,20 @@ public:
         rewrite(expression);
     }
 
+    // Lifts the strings that initialize pointers of the constant objects,
+    // so that their values hold relocatable string addresses.
+    void constant_pointers() {
+        const auto object_count = program_.objects.size();
+        static_initializer_ = pointers_ = true;
+        for (std::size_t index = 0; index < object_count; ++index) {
+            auto* object = program_.objects[index].get();
+            if (object->literal || constant_object_error(program_, *object)) continue;
+            source_unit_ = object->source_unit;
+            rewrite(object->initializer, object->type);
+        }
+        static_initializer_ = pointers_ = false;
+    }
+
     void run() {
         const auto object_count = program_.objects.size();
         for (std::size_t index = 0; index < object_count; ++index) {
@@ -19522,6 +20208,12 @@ private:
                 for (auto& designator : entry.designators) {
                     rewrite(designator.index);
                 }
+                // A base has the list's own type, as a u8 array's leading string does.
+                if (entry.base || (&entry == &expression->initializer_entries.front() &&
+                                   entry.designators.empty() && u8_array_string(destination, entry.value))) {
+                    rewrite(entry.value, destination);
+                    continue;
+                }
                 const auto* first = entry.designators.empty()
                                         ? nullptr
                                         : &entry.designators.front();
@@ -19552,6 +20244,19 @@ private:
             }
             return;
         }
+        // Only the strings a pointer takes directly.
+        if (pointers_ && expression->kind != Expr::Kind::String) {
+            if (!destination || destination->kind != Type::Kind::Pointer) return;
+            if (expression->kind == Expr::Kind::Parenthesized) rewrite(expression->left, destination);
+            else if (expression->kind == Expr::Kind::Cast && expression->type &&
+                     expression->type->kind == Type::Kind::Pointer) rewrite(expression->left, expression->type);
+            else if (expression->kind == Expr::Kind::Conditional) {
+                rewrite(expression->right, destination);
+                rewrite(expression->third, destination);
+            }
+            return;
+        }
+        if (pointers_ && (!destination || destination->kind != Type::Kind::Pointer)) return;
         if (expression->kind == Expr::Kind::String) {
             auto object = std::make_unique<ObjectDecl>();
             object->location = expression->location;
@@ -19603,6 +20308,7 @@ private:
     Program& program_;
     std::string source_unit_;
     bool static_initializer_{};
+    bool pointers_{};
 };
 
 void lift_string_literals(Program& program) {
@@ -19633,6 +20339,67 @@ private:
         auto left = without_alignment(literal), right = without_alignment(destination);
         left->is_const = left->is_volatile = right->is_const = right->is_volatile = false;
         return same_type(left, right);
+    }
+
+    // The steps of an entry's destination path in a list of `type`: members,
+    // and array indices, empty until known. Null for a malformed path.
+    using Step = std::variant<const RecordMemberDecl*, std::optional<std::uint64_t>>;
+    std::optional<std::vector<Step>> steps(TypePtr type, const Expr::InitializerEntry& entry,
+                                           std::size_t position) const {
+        std::vector<Step> result;
+        if (entry.designators.empty()) {
+            if (type && type->kind == Type::Kind::Array) result.emplace_back(std::optional<std::uint64_t>{position});
+            else if (const auto record = type && type->kind == Type::Kind::Record
+                         ? program_.record_definition(type->nominal_key()) : nullptr) {
+                std::size_t logical{};
+                for (const auto& member : record->members)
+                    if (member.initialized() && logical++ == position) result.emplace_back(&member);
+            }
+            if (result.empty()) return std::nullopt;
+            return result;
+        }
+        for (const auto& designator : entry.designators) {
+            if (!type) return std::nullopt;
+            if (designator.kind == Expr::InitializerDesignator::Kind::Index) {
+                if (type->kind != Type::Kind::Array) return std::nullopt;
+                std::optional<std::uint64_t> index;
+                if (designator.index && designator.index->evaluated_integer &&
+                    designator.index->evaluated_integer->value.high == 0)
+                    index = designator.index->evaluated_integer->value.low;
+                result.emplace_back(index);
+                type = type->element;
+                continue;
+            }
+            const auto record = type->kind == Type::Kind::Record ? program_.record_definition(type->nominal_key()) : nullptr;
+            const auto lookup = record ? find_record_member(program_, *record, designator.member_name()) : MemberLookup{};
+            if (!lookup.member()) return std::nullopt;
+            for (const auto* member : lookup.members) {
+                result.emplace_back(member);
+                type = member->type;
+            }
+        }
+        return result;
+    }
+
+    // Whether a later entry of a list of `type` initializes a part of the
+    // destination of entry `index`, which is at `position`.
+    bool replaced_later(const Expr& list, std::size_t index, const TypePtr& type, std::size_t position) const {
+        const auto mine = steps(type, list.initializer_entries[index], position);
+        if (!mine) return false;
+        for (auto later = index + 1; later < list.initializer_entries.size(); ++later) {
+            if (list.initializer_entries[later].designators.empty()) continue;
+            const auto theirs = steps(type, list.initializer_entries[later], 0);
+            if (!theirs || theirs->size() <= mine->size()) continue;
+            bool prefix = true;
+            for (std::size_t step = 0; prefix && step < mine->size(); ++step) {
+                const auto* a = std::get_if<std::optional<std::uint64_t>>(&(*mine)[step]);
+                const auto* b = std::get_if<std::optional<std::uint64_t>>(&(*theirs)[step]);
+                if (!a || !b) prefix = (*mine)[step] == (*theirs)[step];
+                else prefix = !*a || !*b || **a == **b;
+            }
+            if (prefix) return true;
+        }
+        return false;
     }
 
     void rewrite(std::unique_ptr<Expr>& expression, const TypePtr& destination = {}) {
@@ -19673,7 +20440,8 @@ private:
         }
         if (expression->kind == Expr::Kind::AggregateInitializer) {
             std::size_t cursor{};
-            for (auto& entry : expression->initializer_entries) {
+            for (std::size_t at = 0; at < expression->initializer_entries.size(); ++at) {
+                auto& entry = expression->initializer_entries[at];
                 const auto* first = entry.designators.empty() ? nullptr : &entry.designators.front();
                 std::size_t selected = cursor;
                 if (first && first->kind == Expr::InitializerDesignator::Kind::Index && first->index &&
@@ -19689,7 +20457,12 @@ private:
                 for (std::size_t index = first ? 1 : 0; child && index < entry.designators.size(); ++index)
                     child = initializer_child_type(program_, child, &entry.designators[index], 0);
                 for (auto& designator : entry.designators) rewrite(designator.index);
-                rewrite(entry.value, child);
+                // A literal whose part a later entry replaces stays a value.
+                const auto* literal = entry.value.get();
+                while (literal && literal->kind == Expr::Kind::Parenthesized) literal = literal->left.get();
+                const bool kept = literal && literal->kind == Expr::Kind::CompoundLiteral &&
+                    replaced_later(*expression, at, destination, selected);
+                rewrite(entry.value, kept ? TypePtr{} : child);
             }
             return;
         }
@@ -20087,6 +20860,7 @@ bool expand_semantics(Program& program, Diagnostics& diagnostics,
     if (diagnostics.errors() != 0) return false;
     lift_function_pointer_adapters(program, default_abi);
     CompoundLiteralLifter(program).run();
+    StringPoolLifter(program).constant_pointers();
     const auto remember_record_owner = [&](const FunctionDecl& function) {
         if (evaluation_only(function) && function.function_scope &&
             std::find(carried_owners.begin(), carried_owners.end(), function.function_scope) == carried_owners.end() &&

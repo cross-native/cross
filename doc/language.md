@@ -125,8 +125,9 @@ global void put_word(in u8 *bytes, in u32 value) {
 `$::offsetof(struct frame, lanes[2].low)`. It cannot name a bit-field.
 
 `[[exhaustive]]` on a structure definition requires every brace initializer of
-the structure to initialize each member, by position or designator, so adding
-a member finds every initializer to update:
+the structure to initialize each member, by position, by designator, or
+through a base (see [Declarations and linkage](#declarations-and-linkage)), so
+adding a member finds every initializer to update:
 
 ```x
 struct version [[exhaustive]] {
@@ -238,6 +239,63 @@ static initializers must be constants or relocatable addresses. As in C,
 braces may enclose a scalar's initializer, `u32 n = { 5 };`, and the string
 that initializes a `u8` array, `u8 name[] = { "abc" };`. No initialization
 code runs before your entry point.
+
+An entry whose value is a record, union, or array, rather than a brace list,
+initializes that member or element as a whole, and later entries of the same
+list may replace parts of it, as in C. A list may also start from a value of
+its own type, its base: the first entry, without a designator, after which
+only designated entries may follow. Any other overlap, such as naming one
+member twice, is an error. Interface records that differ from a common one in
+a few function pointers derive from it:
+
+```x
+struct entity { i32 hp; i32 x; };
+
+struct receiver {
+    i32 (*harm)(struct entity *self, i32 amount);
+    void (*push)(struct entity *self, i32 dx);
+};
+
+static i32 hero_harm(struct entity *self, i32 amount) { return self->hp -= amount; }
+static i32 partner_harm(struct entity *self, i32 amount) { return self->hp -= amount / 2; }
+static void hero_push(struct entity *self, i32 dx) { self->x += dx; }
+
+static const struct receiver hero = { .harm = hero_harm, .push = hero_push };
+static const struct receiver partner = { hero, .harm = partner_harm };
+
+global i32 hit(struct entity *e, bool by_partner) {
+    const struct receiver *r = by_partner ? &partner : &hero;
+    r->push(e, 1);
+    return r->harm(e, 10);
+}
+```
+
+A path designator replaces one member of a nested record and keeps the
+others, while a nested brace list initializes the whole member:
+
+```x
+struct motion { i32 dash; i32 jump; };
+struct row { i32 weight; struct motion motion; };
+
+static const struct row normal = { .weight = 4, .motion = { 3, 2 } };
+static const struct row hard = { normal, .motion.dash = 6 };          // jump stays 2
+static const struct row still = { normal, .motion = { .jump = 1 } };  // dash is 0
+$::static_assert(hard.motion.jump == 2 && still.motion.dash == 0, "rows");
+```
+
+The base is evaluated once, before the other entries, so a compound literal
+with a base is a functional update at run time. A `u8` array's leading string
+is its base too:
+
+```x
+struct point { i32 x; i32 y; };
+
+global struct point with_y(const struct point *p, i32 y) {
+    return (struct point){ *p, .y = y };
+}
+
+global u8 code[8] = { "abc", [1] = 'X' };   // "aXc"
+```
 
 Local storage can be constrained: `register T x;` has no address and never
 spills, `stack T x;` always gets an addressable frame slot, and
@@ -526,10 +584,31 @@ global u64 lookup(const u8 *name) {
 | `$::static_assert(condition, "message");` | Compile-time assertion. |
 
 Compile-time code uses the target's type sizes and arithmetic. It cannot
-access static or volatile storage, call through pointers, execute machine
-instructions, or read host files other than through `$::embed`. The
-`-feval-*-limit` options bound its work, and `-fno-eval-calls` disables the
-optional evaluation of ordinary calls.
+change static storage, access volatile storage, call through pointers,
+execute machine instructions, or read host files other than through
+`$::embed`, and it reads static storage only from constant objects: objects
+defined with an initializer whose type is `const` (for an array, its
+elements), neither volatile nor atomic, and not `weak`, an `alias`, at a fixed
+`address`, or `noinit`. It reads them, their parts, and them through
+pointers, so a compile-time function can work from a constant table; the
+addresses such an object holds can be copied into other static data but not
+inspected. The `-feval-*-limit` options bound its work, and
+`-fno-eval-calls` disables the optional evaluation of ordinary calls.
+
+```x
+static const u8 weights[] = { 3, 1, 4, 1, 5 };
+static const u8 count = sizeof(weights);
+
+[[eval_only]] static u32 weighted(u32 n) {
+    u32 total = 0;
+    for (uptr i = 0; i < count; ++i) total += weights[i] * n;
+    return total;
+}
+
+global u32 score = weighted(2);   // 28, computed by cc
+static u32 history[count];
+$::static_assert(weights[2] == 4 && sizeof(history) == 20, "constant objects");
+```
 
 ## Generics
 

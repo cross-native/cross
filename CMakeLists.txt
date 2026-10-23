@@ -1391,6 +1391,14 @@ if(BUILD_TESTING)
             -P "${CMAKE_SOURCE_DIR}/test/middle/data/relocatable_addresses.cmake")
     set_tests_properties(cross_relocatable_addresses_targets PROPERTIES
         LABELS "check.compile;arch.x86_64;arch.mips;middle;feature.object;feature.pointer")
+    add_test(NAME cross_initializer_values
+        COMMAND "${CMAKE_COMMAND}"
+            -DCC=$<TARGET_FILE:cross_cc>
+            -DSOURCE=${CMAKE_SOURCE_DIR}/test/middle/data/initializer_values.x
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/initializer-values
+            -P "${CMAKE_SOURCE_DIR}/test/middle/data/initializer_values.cmake")
+    set_tests_properties(cross_initializer_values PROPERTIES
+        LABELS "check.compile;arch.x86_64;arch.mips;middle;feature.initializer;feature.evaluation;feature.object;endian.big;endian.little")
     foreach(level IN ITEMS O0 O2)
         add_test(NAME cross_runtime_patch_relocatable_${level}
             COMMAND "${CMAKE_COMMAND}"
@@ -6553,10 +6561,10 @@ if(BUILD_TESTING)
                 SKIP_REGULAR_EXPRESSION "skipping MIPS")
         endforeach()
     endforeach()
-    # Under-aligned typedefs, compound literals, and braced initializers: x86-64
-    # natively and through LLVM IR, o32 on R3000 and VR4300 and n64, each in both
-    # byte orders.
-    foreach(case underaligned_typedef compound_literals braced_initializers)
+    # Under-aligned typedefs, compound literals, braced initializers, and
+    # initializer overrides: x86-64 natively and through LLVM IR, o32 on R3000
+    # and VR4300 and n64, each in both byte orders.
+    foreach(case underaligned_typedef compound_literals braced_initializers initializer_overrides)
         string(REPLACE "_" "-" case_path "${case}")
         if(case STREQUAL underaligned_typedef)
             set(case_labels "feature.layout;feature.records;feature.pointer;feature.evaluation")
@@ -8458,6 +8466,20 @@ if(BUILD_TESTING)
                 -P "${CMAKE_SOURCE_DIR}/test/language/braced_initializers.cmake")
     set_tests_properties(cross_braced_initializers PROPERTIES
         LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;frontend;backend.native;feature.initializer;feature.semantics;feature.raw;feature.calls")
+    add_test(NAME cross_initializer_overrides
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/initializer-overrides
+                -P "${CMAKE_SOURCE_DIR}/test/language/initializer_overrides.cmake")
+    set_tests_properties(cross_initializer_overrides PROPERTIES
+        LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;frontend;feature.initializer;feature.semantics")
+    add_test(NAME cross_constant_objects
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/constant-objects
+                -P "${CMAKE_SOURCE_DIR}/test/frontend/constant_objects.cmake")
+    set_tests_properties(cross_constant_objects PROPERTIES
+        LABELS "check.compile;diagnostics;arch.x86_64;arch.mips;frontend;feature.evaluation;feature.initializer;feature.meta")
     foreach(forms_level O0 O2)
         add_test(NAME cross_runtime_native_forms_${forms_level}
             COMMAND "${CMAKE_COMMAND}"

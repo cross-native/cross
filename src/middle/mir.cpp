@@ -2782,6 +2782,129 @@ private:
         enter(ready);
     }
 
+    // Copies the regions of an aggregate value that initializes a part of
+    // the object at `base`, before the entries that replace its other parts.
+    bool copy_initializer_value(ValueId base, bool object_volatile,
+                                const initializer::Item& item) {
+        const auto location = item.expression->location;
+        const auto source = lower_designator_address(*item.expression, ObjectAccess::Value);
+        if (!source) {
+            diagnostics_.error(location, "an aggregate initializer entry requires an object or value of its type");
+            return false;
+        }
+        const auto uptr = *hir_.builtin(BuiltinType::Uptr);
+        const auto byte = *hir_.builtin(BuiltinType::U8);
+        const bool source_volatile = hir_.type(source->type).is_volatile;
+        const auto unit_type = [&](std::uint64_t size, bool is_volatile) {
+            const auto builtin = size == 1 ? BuiltinType::U8 : size == 2 ? BuiltinType::U16
+                : size == 4 ? BuiltinType::U32 : size == 8 ? BuiltinType::U64 : BuiltinType::U128;
+            return hir_.add_qualifiers(*hir_.builtin(builtin), false, is_volatile);
+        };
+        // The address of unit `index`, of type `unit`, `offset` bytes plus
+        // `extra` into the object at `from`.
+        const auto address = [&](ValueId from, std::uint64_t offset, std::optional<ValueId> extra,
+                                 ValueId index, hir::TypeId unit) {
+            auto at = cast(from, hir_.pointer_to(byte), location);
+            if (offset != 0) at = indexed_address(at, constant(offset, uptr, location), byte, location);
+            if (extra) at = indexed_address(at, *extra, byte, location);
+            return indexed_address(cast(at, hir_.pointer_to(unit), location), index, unit, location);
+        };
+        const auto aligned = [](unsigned alignment, std::uint64_t offset) {
+            while (alignment > 1 && offset % alignment != 0) alignment /= 2;
+            return std::max(alignment, 1U);
+        };
+        // Emits `body(index)` for each index below `count`, in a loop unless
+        // there are few.
+        const auto repeat = [&](std::uint64_t count, std::uint64_t unrolled, const auto& body) {
+            if (count <= unrolled) {
+                for (std::uint64_t index = 0; index < count; ++index) body(constant(index, uptr, location));
+                return;
+            }
+            const auto preheader = *current_block_;
+            const auto test = new_block(location);
+            const auto loop = new_block(location);
+            const auto end = new_block(location);
+            const auto initial = constant(0, uptr, location);
+            terminate(TerminatorKind::Branch, location, std::nullopt, {test});
+            enter(test);
+            const auto index = add_value(ValueKind::Phi, uptr, location);
+            const auto condition = integer_binary(BinaryOperation::UnsignedLess,
+                *hir_.builtin(BuiltinType::Bool), index, constant(count, uptr, location), location);
+            terminate(TerminatorKind::ConditionalBranch, location, condition, {loop, end});
+            enter(loop);
+            body(index);
+            const auto next = integer_binary(BinaryOperation::Add, uptr, index,
+                                             constant(1, uptr, location), location);
+            const auto backedge = *current_block_;
+            terminate(TerminatorKind::Branch, location, std::nullopt, {test});
+            current_.values[index.value].incoming = {{preheader, initial}, {backedge, next}};
+            enter(end);
+        };
+        const auto widest = std::max(1U, hir_.address_bits / 8U);
+        // Copies one region, `extra` bytes past its offset.
+        const auto copy = [&](const InitializerValueRegion& region, std::optional<ValueId> extra,
+                              unsigned source_alignment, unsigned alignment) {
+            if (region.mask) {
+                // The other bits of a bit-field's unit keep the object's value.
+                const auto load_type = unit_type(region.size, source_volatile);
+                const auto store_type = unit_type(region.size, object_volatile);
+                const auto value_type = unit_type(region.size, false);
+                const auto zero = constant(0, uptr, location);
+                const auto unit = static_cast<unsigned>(region.size);
+                const auto from = load_pointer(address(source->address, region.offset, extra, zero, load_type),
+                                               location, std::min(unit, aligned(source_alignment, region.offset)));
+                const auto to = address(base, item.offset + region.offset, extra, zero, store_type);
+                const auto target_alignment = std::min(unit, aligned(alignment, region.offset));
+                const auto old = load_pointer(to, location, target_alignment);
+                if (!from || !old) {
+                    failed_ = true;
+                    return;
+                }
+                const auto mask = constant(*region.mask, value_type, location);
+                const auto keep = constant(mask_to(bit_not(*region.mask), unit * 8U), value_type, location);
+                const auto merged = integer_binary(BinaryOperation::BitOr, value_type,
+                    integer_binary(BinaryOperation::BitAnd, value_type, cast(*from, value_type, location), mask, location),
+                    integer_binary(BinaryOperation::BitAnd, value_type, cast(*old, value_type, location), keep, location),
+                    location);
+                if (!store_pointer(to, cast(merged, store_type, location), location, target_alignment))
+                    failed_ = true;
+                return;
+            }
+            for (std::uint64_t done = 0; done < region.size;) {
+                const auto offset = region.offset + done;
+                auto size = static_cast<std::uint64_t>(std::min({widest,
+                    aligned(source_alignment, offset), aligned(alignment, offset)}));
+                while (size > region.size - done) size /= 2;
+                const auto count = (region.size - done) / size;
+                const auto load_type = unit_type(size, source_volatile);
+                const auto store_type = unit_type(size, object_volatile);
+                const auto unit = static_cast<unsigned>(size);
+                repeat(count, 8, [&](ValueId index) {
+                    const auto value = load_pointer(address(source->address, offset, extra, index, load_type),
+                                                    location, unit);
+                    if (!value || !store_pointer(address(base, item.offset + offset, extra, index, store_type),
+                                                 cast(*value, store_type, location), location, unit))
+                        failed_ = true;
+                });
+                done += count * size;
+            }
+        };
+        for (const auto& region : item.regions) {
+            if (region.count == 1) {
+                copy(region, std::nullopt, source->alignment, item.alignment);
+                continue;
+            }
+            // Each copy of a repeated region is `stride` bytes after the last.
+            repeat(region.count, 2, [&](ValueId index) {
+                const auto extra = integer_binary(BinaryOperation::Multiply, uptr, index,
+                                                  constant(region.stride, uptr, location), location);
+                copy(region, extra, aligned(source->alignment, region.stride),
+                     aligned(item.alignment, region.stride));
+            });
+        }
+        return !failed_;
+    }
+
     bool initialize_aggregate_items(
         ValueId base, hir::TypeId byte, bool object_volatile,
         const initializer::Plan& plan) {
@@ -2796,6 +2919,10 @@ private:
         for (const auto& item : plan.items) {
             if (!item.expression) {
                 failed_ = true;
+                continue;
+            }
+            if (item.whole) {
+                (void)copy_initializer_value(base, object_volatile, item);
                 continue;
             }
             const auto& type = hir_.type(item.type);

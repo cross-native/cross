@@ -306,6 +306,9 @@ struct Expr {
         SourceLocation location;
         std::vector<InitializerDesignator> designators;
         std::unique_ptr<Expr> value;
+        // Set by semantic analysis: the first entry, without a designator,
+        // whose value has the list's own type and initializes it as a whole.
+        bool base{};
     };
     SourceLocation location;
     std::string text;
@@ -709,10 +712,26 @@ struct EvaluationMemberLayout {
     unsigned bit_offset{};
 };
 
+// A part of an aggregate value that its destination takes: `size` bytes at
+// `offset` in both objects, or with `mask`, the bits it selects of the
+// `size`-byte unit there, read as an integer in target byte order; repeated
+// `count` times, `stride` bytes apart.
+struct InitializerValueRegion {
+    std::uint64_t offset{};
+    std::uint64_t size{};
+    std::optional<UInt128> mask;
+    std::uint64_t count{1};
+    std::uint64_t stride{};
+};
+
 struct EvaluationInitializerItem {
     const Expr* expression{};
     TypePtr type;
     EvaluationMemberLayout layout;
+    // An aggregate initialized from a value, `expression`: the value supplies
+    // `regions` of the object at `layout.offset`.
+    bool whole{};
+    std::vector<InitializerValueRegion> regions{};
 };
 
 struct EvaluationInitializerPlan {
@@ -832,6 +851,10 @@ private:
     std::unordered_map<NominalTypeKey, std::vector<const RecordDecl*>, NominalTypeKeyHash> definitions_;
 };
 
+// The values of constant objects that the evaluators of one semantic phase
+// share; defined by the evaluator.
+struct EvaluationConstantValues;
+
 struct Program {
     using RequiredType = TypeRequirement;
     struct EnumerationPosition {
@@ -846,6 +869,9 @@ struct Program {
     // while the requesting declaration supplies lexical ownership and types only.
     EvaluationIntegerQuery evaluation_required_integer;
     EvaluationGenericValueQuery evaluation_generic_value;
+    // Installed while the evaluators of a semantic phase share the values of
+    // the constant objects they read.
+    std::shared_ptr<EvaluationConstantValues> evaluation_constant_values;
     // Monotonic typed failure sequence, not a work budget or a sticky failure.
     // Expansion parsing and semantic preparation share this channel while the
     // failing evaluator/matcher retains its precise diagnostic and ancestry.

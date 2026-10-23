@@ -45,19 +45,23 @@ bool aggregate(const hir::Module& module, hir::TypeId type) {
 }
 
 // The destinations of one brace list's entries as a prefix tree of the path
-// steps below the list's own destination. An entry overlaps an earlier one
-// when either path is a prefix of the other or the two diverge at a member
-// of one union.
+// steps below the list's own destination. An entry that initializes an
+// aggregate from a value initializes it as a whole, and a later entry may
+// replace a part of it. Any other overlap with an earlier entry is an error:
+// a repeated path, a part before its whole or after a brace list, and a
+// second member of one union.
 class Destinations {
 public:
     enum class Result { Added, Duplicate, Overlap };
 
     // Adds the steps of `path` from `depth` on; `unions[i]` tells whether
-    // step i selects a union member.
-    Result add(const Path& path, const std::vector<bool>& unions, std::size_t depth) {
-        std::uint32_t node = 0;
+    // step i selects a union member. `whole` marks an aggregate value whose
+    // parts later entries may replace. Sets `node` to the destination's node.
+    Result add(const Path& path, const std::vector<bool>& unions, std::size_t depth,
+               bool whole, std::uint32_t& node) {
+        node = 0;
         for (auto index = depth; index < path.size(); ++index) {
-            if (nodes_[node].terminal) return Result::Overlap;
+            if (nodes_[node].terminal && !nodes_[node].whole) return Result::Overlap;
             const auto found = edges_.find(edge(node, path[index]));
             const unsigned same = found != edges_.end() ? 1U : 0U;
             if (unions[index] && nodes_[node].children > same) return Result::Overlap;
@@ -70,6 +74,7 @@ public:
                     node = child;
                 }
                 nodes_[node].terminal = true;
+                nodes_[node].whole = whole;
                 return Result::Added;
             }
             node = found->second;
@@ -77,9 +82,32 @@ public:
         return nodes_[node].terminal ? Result::Duplicate : Result::Overlap;
     }
 
+    // A base initializes the list's own destination as a whole.
+    void base() { nodes_[0].terminal = nodes_[0].whole = true; }
+
+    // The node an entry's path reaches from `node` through `position`.
+    std::optional<std::uint32_t> child(std::uint32_t node, const Position& position) const {
+        const auto found = edges_.find(edge(node, position));
+        if (found == edges_.end()) return std::nullopt;
+        return found->second;
+    }
+    // The children of `node` at concrete positions, in position order.
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> children(std::uint32_t node) const {
+        std::vector<std::pair<std::uint64_t, std::uint32_t>> result;
+        for (const auto& [edge, child] : edges_)
+            if (edge.parent == node && !edge.origin) result.emplace_back(edge.value, child);
+        std::sort(result.begin(), result.end());
+        return result;
+    }
+    // Whether an entry initializes the whole object of `node`.
+    bool terminal(std::uint32_t node) const { return nodes_[node].terminal; }
+    // Whether no entry initializes a part of the object of `node`.
+    bool childless(std::uint32_t node) const { return nodes_[node].children == 0; }
+
 private:
     struct Node {
         bool terminal{};
+        bool whole{};
         unsigned children{};
     };
     struct Edge {
@@ -373,17 +401,197 @@ private:
     }
 
     // An entry may not initialize an object, or part of one, that an
-    // earlier entry of its list initialized: a destination covers its
-    // subobjects, and one member of a union covers the others. A list at
+    // earlier entry of its list initialized, except a part of an aggregate
+    // that an earlier entry initialized from a value: a destination covers
+    // its subobjects, and one member of a union covers the others. A list at
     // `depth` path steps holds the destinations of its entries.
     bool overlaps(Destinations& destinations, std::size_t depth, const Path& path,
-                  SourceLocation location) {
-        const auto result = destinations.add(path, union_steps(path), depth);
+                  SourceLocation location, bool whole, std::uint32_t& node) {
+        const auto result = destinations.add(path, union_steps(path), depth, whole, node);
         if (result == Destinations::Result::Added) return false;
         error(location, result == Destinations::Result::Duplicate
             ? "duplicate destination in aggregate initializer"
             : "aggregate initializer entry overlaps the destination of an earlier entry");
         return true;
+    }
+
+    // The bytes of a scalar's value: a requested alignment or the f80
+    // format pads its storage.
+    std::uint64_t value_size(hir::TypeId type) const {
+        const auto& current = module_.type(type);
+        if (current.kind == hir::Type::Kind::Builtin && current.builtin == BuiltinType::F80) return 10;
+        return hir::natural_size(module_, type, target_).value_or(0);
+    }
+
+    // Whether every byte of an object of `type` belongs to its value.
+    bool dense(hir::TypeId type) const {
+        const auto& current = module_.type(type);
+        if (current.kind == hir::Type::Kind::Array) return current.element && dense(*current.element);
+        const auto size = hir::layout_size(module_, type, target_);
+        if (!size) return false;
+        if (current.kind != hir::Type::Kind::Record) return value_size(type) == *size;
+        const auto& record = module_.record(*current.record);
+        if (record.is_union) return false;
+        std::uint64_t end = 0;
+        for (const auto& member : record.members) {
+            const auto member_size = hir::layout_size(module_, member.type, target_);
+            if (member.bit_width || !member.initialized() || member.offset != end || !member_size ||
+                !dense(member.type)) return false;
+            end += *member_size;
+        }
+        return end == *size;
+    }
+
+    void bit_field_region(const hir::RecordMember& member, std::uint64_t offset,
+                          std::vector<InitializerValueRegion>& regions) const {
+        const auto mask = shift_left(mask_to(bit_not(UInt128{}), *member.bit_width), member.bit_offset);
+        regions.push_back({offset + member.offset, value_size(member.type), mask, 1, 0});
+    }
+
+    // The regions of `count` elements of `type`, `stride` bytes apart from
+    // `offset` on.
+    void element_regions(hir::TypeId type, std::uint64_t offset, std::uint64_t count, std::uint64_t stride,
+                         std::vector<InitializerValueRegion>& regions) const {
+        if (count == 0) return;
+        if (dense(type)) {
+            regions.push_back({offset, stride * count, {}, 1, 0});
+            return;
+        }
+        std::vector<InitializerValueRegion> element;
+        whole_regions(type, 0, element);
+        merge_regions(element);
+        const bool flat = std::all_of(element.begin(), element.end(),
+            [](const InitializerValueRegion& region) { return region.count == 1; });
+        for (std::uint64_t index = 0; index < (flat ? 1 : count); ++index)
+            for (auto region : element) {
+                region.offset += offset + index * stride;
+                if (flat) {
+                    region.count = count;
+                    region.stride = stride;
+                }
+                regions.push_back(region);
+            }
+    }
+
+    // Every part of an object of `type`, `offset` bytes into a value,
+    // without its padding.
+    void whole_regions(hir::TypeId type, std::uint64_t offset,
+                       std::vector<InitializerValueRegion>& regions) const {
+        const auto& current = module_.type(type);
+        if (current.kind == hir::Type::Kind::Array && current.element) {
+            element_regions(*current.element, offset, current.lanes,
+                            hir::layout_size(module_, *current.element, target_).value_or(0), regions);
+            return;
+        }
+        if (current.kind == hir::Type::Kind::Record && current.record) {
+            const auto& record = module_.record(*current.record);
+            if (record.is_union) {
+                // A union takes the representation of its largest member.
+                std::uint64_t size = 0;
+                for (const auto& member : record.members)
+                    size = std::max(size, hir::layout_size(module_, member.type, target_).value_or(0));
+                regions.push_back({offset, size, {}, 1, 0});
+                return;
+            }
+            for (const auto& member : record.members) {
+                if (!member.initialized()) continue;
+                if (member.bit_width) bit_field_region(member, offset, regions);
+                else whole_regions(member.type, offset + member.offset, regions);
+            }
+            return;
+        }
+        regions.push_back({offset, value_size(type), {}, 1, 0});
+    }
+
+    // The parts of the object of `node`, of `type` and `offset` bytes into an
+    // aggregate value, that the value supplies: all but those that later
+    // entries of the list replace, and nothing of a union they enter.
+    void value_regions(const Destinations& destinations, std::uint32_t node, hir::TypeId type,
+                       std::uint64_t offset, std::vector<InitializerValueRegion>& regions) const {
+        if (destinations.childless(node)) {
+            whole_regions(type, offset, regions);
+            return;
+        }
+        const auto& current = module_.type(type);
+        if (current.kind == hir::Type::Kind::Array && current.element) {
+            const auto stride = hir::layout_size(module_, *current.element, target_).value_or(0);
+            std::uint64_t next = 0;
+            for (const auto& [index, child] : destinations.children(node)) {
+                if (index >= current.lanes) break;
+                element_regions(*current.element, offset + next * stride, index - next, stride, regions);
+                if (!destinations.terminal(child))
+                    value_regions(destinations, child, *current.element, offset + index * stride, regions);
+                next = index + 1;
+            }
+            element_regions(*current.element, offset + next * stride, current.lanes - next, stride, regions);
+            return;
+        }
+        const auto& record = module_.record(*current.record);
+        if (record.is_union) return;
+        for (std::size_t index = 0; index < record.members.size(); ++index) {
+            const auto& member = record.members[index];
+            if (!member.initialized()) continue;
+            const auto child = destinations.child(node, Position{std::uint64_t{index}});
+            if (member.bit_width) {
+                if (!child) bit_field_region(member, offset, regions);
+            } else if (!child) {
+                whole_regions(member.type, offset + member.offset, regions);
+            } else if (!destinations.terminal(*child)) {
+                value_regions(destinations, *child, member.type, offset + member.offset, regions);
+            }
+        }
+    }
+
+    // Orders the regions, joins adjacent bytes and the masks of one unit.
+    static void merge_regions(std::vector<InitializerValueRegion>& regions) {
+        std::stable_sort(regions.begin(), regions.end(), [](const auto& left, const auto& right) {
+            return left.offset != right.offset ? left.offset < right.offset
+                 : left.mask.has_value() < right.mask.has_value();
+        });
+        std::vector<InitializerValueRegion> merged;
+        for (auto& region : regions) {
+            if (region.size == 0 || region.count == 0) continue;
+            if (region.mask && *region.mask == mask_to(bit_not(UInt128{}), static_cast<unsigned>(region.size * 8)))
+                region.mask.reset();
+            if (!merged.empty() && region.count == 1 && merged.back().count == 1) {
+                auto& last = merged.back();
+                if (!region.mask && !last.mask && last.offset + last.size == region.offset) {
+                    last.size += region.size;
+                    continue;
+                }
+                if (region.mask && last.mask && last.offset == region.offset && last.size == region.size) {
+                    *last.mask = bit_or(*last.mask, *region.mask);
+                    if (*last.mask == mask_to(bit_not(UInt128{}), static_cast<unsigned>(last.size * 8)))
+                        last.mask.reset();
+                    continue;
+                }
+            }
+            merged.push_back(region);
+        }
+        regions = std::move(merged);
+    }
+
+    // Whether `type` is an array of u8, which a string initializes.
+    bool byte_array(hir::TypeId type) const {
+        const auto& current = module_.type(type);
+        return current.kind == hir::Type::Kind::Array && current.element &&
+               module_.type(*current.element).kind == hir::Type::Kind::Builtin &&
+               module_.type(*current.element).builtin == BuiltinType::U8;
+    }
+
+    // An entry that initializes an aggregate from a value. Unless it is a
+    // u8 array's string, its regions follow from the later entries of its list.
+    void whole(const Expr& value, const Selection& selection, std::uint32_t node,
+               std::vector<std::pair<std::size_t, std::uint32_t>>& wholes) {
+        if (types_only_ || !deferred_indices_.empty())
+            result_.type_items.emplace_back(&value, selection.type);
+        if (!selection.offset) return;
+        const auto natural = hir::layout_alignment(module_, selection.type, target_).value_or(1);
+        const bool string = value.kind == Expr::Kind::String && byte_array(selection.type);
+        result_.items.push_back({&value, selection.type, *selection.offset,
+            offset_alignment(static_cast<unsigned>(natural), *selection.offset),
+            std::nullopt, 0, !string, {}});
+        if (!string) wholes.emplace_back(result_.items.size() - 1, node);
     }
 
     void list(const Expr& source, hir::TypeId type, std::optional<std::uint64_t> offset,
@@ -407,13 +615,31 @@ private:
         std::vector<bool> named(exhaustive ? exhaustive->members.size() : 0);
         Destinations destinations;
         Position cursor{std::uint64_t{0}};
-        bool union_entry{};
+        bool union_entry{}, union_whole{}, based{};
+        std::vector<std::pair<std::size_t, std::uint32_t>> wholes;
         for (const auto& entry : source.initializer_entries) {
             if (!entry.value) {
                 result_.valid = false;
                 continue;
             }
-            if (is_union && union_entry) {
+            // The base: the first entry, a value of the list's own type or a
+            // u8 array's string, initializes the whole destination.
+            if (&entry == &source.initializer_entries.front() && entry.designators.empty() &&
+                (entry.base || (entry.value->kind == Expr::Kind::String && byte_array(type)))) {
+                if (dynamic_outer_ && path.empty() && !types_only_) {
+                    error(entry.location, "a variable-length array cannot take its initial value from an expression");
+                    continue;
+                }
+                destinations.base();
+                based = union_whole = union_entry = true;
+                whole(*entry.value, {type, offset, path, Position{std::uint64_t{0}}, std::nullopt, 0}, 0, wholes);
+                continue;
+            }
+            if (based && entry.designators.empty()) {
+                error(entry.location, "excess entry in aggregate initializer");
+                continue;
+            }
+            if (is_union && union_entry && !union_whole) {
                 error(entry.location,
                                    "excess entry in union initializer");
                 result_.valid = false;
@@ -431,6 +657,7 @@ private:
             if (exhaustive)
                 if (const auto index = concrete(selection->path[path.size()])) named[*index] = true;
             cursor = is_union ? Position{std::uint64_t{1}} : next_position(selection->direct_index);
+            const bool first_union_entry = !union_entry;
             union_entry = true;
             for (std::size_t index = 1;
                  index < entry.designators.size() && selection; ++index) {
@@ -439,21 +666,31 @@ private:
                                       entry.designators[index]);
             }
             if (!selection) continue;
-            if (overlaps(destinations, path.size(), selection->path, entry.location)) continue;
             const auto* value = entry.value.get();
             if (value->kind == Expr::Kind::AggregateInitializer) {
                 value = unbraced(*value, selection->type);
                 if (!value) continue;
-                if (value == entry.value.get()) {
-                    // The nested list initializes its whole destination, so
-                    // its own entries need only be distinct from each other.
-                    list(*value, selection->type, selection->offset, selection->path);
-                    continue;
-                }
             }
-            item(*value, *selection);
+            const bool nested = value == entry.value.get() && value->kind == Expr::Kind::AggregateInitializer;
+            const bool aggregate_value = !nested && aggregate(module_, selection->type);
+            if (first_union_entry) union_whole = aggregate_value;
+            std::uint32_t node{};
+            if (overlaps(destinations, path.size(), selection->path, entry.location, aggregate_value, node))
+                continue;
+            // A nested list initializes its whole destination, so its own
+            // entries need only be distinct from each other.
+            if (nested) list(*value, selection->type, selection->offset, selection->path);
+            else if (aggregate_value) whole(*value, *selection, node, wholes);
+            else item(*value, *selection);
         }
-        for (std::size_t index = 0; index < named.size(); ++index) {
+        if (!types_only_ && deferred_indices_.empty())
+            for (const auto& [index, node] : wholes) {
+                auto& copy = result_.items[index];
+                value_regions(destinations, node, copy.type, 0, copy.regions);
+                merge_regions(copy.regions);
+            }
+        // A base gives every member a value.
+        for (std::size_t index = 0; index < named.size() && !based; ++index) {
             const auto& member = exhaustive->members[index];
             if (named[index] || !member.initialized()) continue;
             error(source.location, "initializer of exhaustive record '" + exhaustive->source_name +
@@ -564,7 +801,7 @@ EvaluationInitializerPlan build_for_evaluation(
         const auto found = source_types.find(item.type);
         if (found == source_types.end()) { result.valid = false; break; }
         result.items.push_back({item.expression, found->second,
-            {item.offset, item.alignment, item.bit_width, item.bit_offset}});
+            {item.offset, item.alignment, item.bit_width, item.bit_offset}, item.whole, item.regions});
     }
     return result;
 }
