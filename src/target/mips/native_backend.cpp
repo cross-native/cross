@@ -1353,6 +1353,19 @@ private:
                    hir::natural_size(hir_, type, subtarget_.target()).value_or(0);
     }
 
+    // An unaligned access that goes through the frame carrier: floating and
+    // vector values, and integers on Release 6, which has no LWL/LWR.
+    bool unaligned_carrier_access(const mir::ManagedValue& value) const {
+        if (!unaligned_pointer_access(value)) return false;
+        const auto type =
+            value.kind == mir::ValueKind::PointerLoad
+                ? value.type
+                : source_->values[value.operands.back().value].type;
+        return is_floating(hir_, type) ||
+               hir_.type(type).kind == hir::Type::Kind::Vector ||
+               type_bits(hir_, type) > 64 || release6(subtarget_);
+    }
+
     void create_stack_slots(const mir::ManagedFunction& source) {
         const auto& layout = subtarget_.target();
         for (const auto& slot : source.slots) {
@@ -1485,7 +1498,7 @@ private:
                 current_.virtual_register_classes.end() ||
             std::any_of(source.values.begin(), source.values.end(),
                         [this](const mir::ManagedValue& value) {
-                            return unaligned_pointer_access(value) ||
+                            return unaligned_carrier_access(value) ||
                                    sign_word_in_memory(value);
                         })) {
             machine::StackSlot carrier;
@@ -15072,6 +15085,89 @@ private:
                               memory(word_offset(offset, true), base));
     }
 
+    // An unaligned integer access before Release 6: LWL/LWR, LDL/LDR,
+    // SWL/SWR, and SDL/SDR pairs assemble a word or doubleword in place, and
+    // halfwords take two byte accesses. MIPS I merges the second half into
+    // the register that the first is still loading, so only the pair's
+    // result has a load delay.
+    void emit_unaligned_integer(const machine::Function& function,
+                                const machine::Instruction& value,
+                                std::string_view address,
+                                machine::Register scalar, bool load,
+                                bool sign) {
+        const bool little = subtarget_.target().data_layout.byte_order ==
+                            ByteOrder::Little;
+        // The allocator keeps values that live across this instruction out
+        // of these scratches; none may be the address while it is read.
+        std::vector<std::string_view> taken{address};
+        const auto scratch = [&] {
+            for (const std::string_view name : {"at", "t1", "t2", "t3", "t0"}) {
+                if (std::find(taken.begin(), taken.end(), name) == taken.end()) {
+                    taken.push_back(name);
+                    return name;
+                }
+            }
+            return std::string_view{"at"};
+        };
+        const auto halves = [&](std::string_view left, std::string_view right,
+                                std::string_view reg, std::int64_t offset,
+                                unsigned bytes) {
+            const auto last = offset + static_cast<std::int64_t>(bytes) - 1;
+            instruction(left, reg_name(reg) + "," +
+                                  memory(little ? last : offset, address));
+            instruction(right, reg_name(reg) + "," +
+                                   memory(little ? offset : last, address));
+            if (load && !subtarget_.has_feature(Feature::LoadInterlocks)) {
+                delayed_register_ = std::string(reg);
+            }
+        };
+        if (legalizes_to_pair(scalar)) {
+            const auto low = scratch();
+            const auto high = scratch();
+            if (!load) load_vreg_pair(function, scalar, low, high, value.location);
+            const auto left = load ? "lwl" : "swl";
+            const auto right = load ? "lwr" : "swr";
+            halves(left, right, low, word_offset(0, false), 4);
+            halves(left, right, high, word_offset(0, true), 4);
+            if (load) store_vreg_pair(function, scalar, low, high, value.location);
+            return;
+        }
+        const auto bits = scalar.mode.bits;
+        // Big-endian memory holds a halfword's high byte first.
+        const std::int64_t high_byte = little ? 1 : 0;
+        if (!load) {
+            const auto source = input_gpr(function, scalar, scratch(), value.location);
+            taken.push_back(source);
+            if (bits <= 16) {
+                const auto shifted = scratch();
+                instruction("sb", reg_name(source) + "," + memory(1 - high_byte, address));
+                instruction("srl", reg_name(shifted) + "," + reg_name(source) + ",8");
+                instruction("sb", reg_name(shifted) + "," + memory(high_byte, address));
+            } else if (bits <= 32) {
+                halves("swl", "swr", source, 0, 4);
+            } else {
+                halves("sdl", "sdr", source, 0, 8);
+            }
+            return;
+        }
+        auto target = output_gpr(function, scalar, "t1");
+        if (target == address) target = scratch();
+        else taken.push_back(target);
+        if (bits <= 16) {
+            const auto first = scratch();
+            const auto second = scratch();
+            instruction(sign ? "lb" : "lbu", reg_name(first) + "," + memory(high_byte, address));
+            instruction("lbu", reg_name(second) + "," + memory(1 - high_byte, address));
+            instruction("sll", reg_name(first) + "," + reg_name(first) + ",8");
+            instruction("or", reg_name(target) + "," + reg_name(first) + "," + reg_name(second));
+        } else if (bits <= 32) {
+            halves("lwl", "lwr", target, 0, 4);
+        } else {
+            halves("ldl", "ldr", target, 0, 8);
+        }
+        store_vreg(function, scalar, target, value.location);
+    }
+
     void store_pair_memory(std::string_view low, std::string_view high,
                            std::int64_t offset,
                            std::string_view base = {}) {
@@ -21413,6 +21509,14 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
         const bool floating = scalar.kind == machine::RegisterKind::Virtual &&
                               function.virtual_register_classes[scalar.id] ==
                                   machine::VirtualRegisterClass::Floating;
+        if (scalar.kind == machine::RegisterKind::Virtual &&
+            function.virtual_register_classes[scalar.id] ==
+                machine::VirtualRegisterClass::Integer &&
+            scalar.mode.bits <= 64 && !release6(subtarget_)) {
+            emit_unaligned_integer(function, value, address, scalar, load,
+                                   opcode == Opcode::UnalignedLoadSigned);
+            return;
+        }
         const auto carrier = aggregate_carrier_offset(function, value.location);
         if (load) {
             copy_bytes(frame_base(), carrier, address, 0,

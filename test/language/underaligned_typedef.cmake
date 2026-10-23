@@ -22,7 +22,10 @@ endfunction()
 set(accesses [=[
 typedef u32 u32_any [[aligned(1)]];
 typedef u64 u64_any [[aligned(1)]];
+typedef u16 u16_any [[aligned(1)]];
 struct framed { u8 tag; u32_any value; };
+global void put16(in u8 *p, in u16 v) { *(u16_any *)p = v; }
+global u16 get16(in const u8 *p) { return *(const u16_any *)p; }
 global void put32(in u8 *p, in u32 v) { *(u32_any *)p = v; }
 global u32 get32(in const u8 *p) { return *(const u32_any *)p; }
 global void put64(in u8 *p, in u64 v) { *(u64_any *)p = v; }
@@ -46,8 +49,8 @@ function(function_body assembly name result)
     set(${result} "${body}" PARENT_SCOPE)
 endfunction()
 
-# Each word access through the pointer is a byte sequence, as for a packed
-# member; only frame-relative carriers use word-sized accesses.
+# Each word access through the pointer is a left/right pair (LWL/LWR,
+# SWL/SWR, LDL/LDR, SDL/SDR); no aligned access goes through it.
 function(require_unaligned target body)
     string(REGEX MATCHALL "\t(lw|sw|ld|sd|lh|lhu|sh)\t[^\n]*" accesses "${body}")
     foreach(access IN LISTS accesses)
@@ -55,14 +58,24 @@ function(require_unaligned target body)
             message(FATAL_ERROR "${target}: aligned access through the pointer: ${access}\n${body}")
         endif()
     endforeach()
-    string(REGEX MATCHALL "\t(lbu|sb)\t" bytes "${body}")
-    list(LENGTH bytes count)
-    if(count LESS 4)
-        message(FATAL_ERROR "${target}: no byte sequence\n${body}")
+    if(NOT body MATCHES "\t([ls][wd])l\t[^\n]*\n\t[ls][wd]r\t")
+        message(FATAL_ERROR "${target}: no left/right pair\n${body}")
     endif()
 endfunction()
 
-foreach(target mips-unknown-elf mipsel-unknown-elf "mips64-unknown-elf -mabi=n64" "mips64el-unknown-elf -mabi=n64")
+# A halfword access through the pointer is two byte accesses.
+function(require_bytes target body opcode)
+    string(REGEX MATCHALL "\t(lh|lhu|sh)\t[^\n]*" accesses "${body}")
+    string(REGEX MATCHALL "\t${opcode}\t" bytes "${body}")
+    list(LENGTH bytes count)
+    if(accesses OR count LESS 2)
+        message(FATAL_ERROR "${target}: no byte pair\n${body}")
+    endif()
+endfunction()
+
+foreach(target mips-unknown-elf mipsel-unknown-elf "mips-unknown-elf -march=r3000"
+               "mipsel-unknown-elf -march=r3000" "mips64-unknown-elf -mabi=n64"
+               "mips64el-unknown-elf -mabi=n64")
     separate_arguments(flags NATIVE_COMMAND "-target ${target}")
     string(REGEX REPLACE "[^A-Za-z0-9]+" "_" name "${target}")
     compile(${name} "${accesses}" ${flags})
@@ -74,6 +87,10 @@ foreach(target mips-unknown-elf mipsel-unknown-elf "mips64-unknown-elf -mabi=n64
         function_body("${assembly}" ${function} body)
         require_unaligned("${target} ${function}" "${body}")
     endforeach()
+    function_body("${assembly}" get16 body)
+    require_bytes("${target} get16" "${body}" "lbu")
+    function_body("${assembly}" put16 body)
+    require_bytes("${target} put16" "${body}" "sb")
 endforeach()
 
 compile(x86_64 "${accesses}" -target x86_64-unknown-linux-gnu)
