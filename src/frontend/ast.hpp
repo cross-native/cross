@@ -940,6 +940,7 @@ struct Program {
     // The source unit of the call checkers shipped with the compiler, when a
     // declaration names one; empty otherwise.
     std::string checker_library_unit;
+    std::shared_ptr<const FreshIdentifier> checker_library_namespace;
 };
 
 // A member of a record or union found directly or, failing that, through its

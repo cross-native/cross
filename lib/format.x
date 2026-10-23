@@ -232,7 +232,7 @@ static $::meta::bytes wanted(in $::meta::call call, in u32 conversion, in u32 le
                              in bool allocate) {
     u32 name = wanted_name(conversion, length, scan);
     if (conversion == 'p') return text(scan ? "a pointer to a pointer" : "a pointer");
-    if (scan && allocate && character_conversion(conversion)) return text("a pointer to a pointer");
+    if (scan && allocate && character_conversion(conversion)) return $::meta::concat(text("a pointer to "), pointer_to(name));
     if (scan || conversion == 'n' || conversion == 's' || conversion == 'S') return pointer_to(name);
     return c_type(call, name);
 }
@@ -260,9 +260,10 @@ static bool scanf_matches(in $::meta::call call, in $::meta::type type, in u32 c
                           in bool allocate) {
     if (!$::meta::is_type_kind(type, "pointer")) return 0;
     $::meta::type pointee = $::meta::element(type);
-    if (conversion == 'p' || (allocate && character_conversion(conversion)))
-        return $::meta::is_type_kind(pointee, "pointer");
+    if (conversion == 'p') return $::meta::is_type_kind(pointee, "pointer");
     u32 name = wanted_name(conversion, length, 1);
+    if (allocate && character_conversion(conversion))
+        return $::meta::is_type_kind(pointee, "pointer") && integer_of(call, $::meta::element(pointee), name);
     if (floating_conversion(conversion)) return $::meta::same_type(pointee, abi(call, name));
     return integer_of(call, pointee, name);
 }
@@ -362,7 +363,8 @@ static void missing(in $::meta::call call, in $::meta::bytes format, in uptr sta
 
 static void check(in $::meta::call call, in bool scan) {
     // The format: the last named parameter that points to an 8-bit integer.
-    uptr format_argument = $::meta::parameter_count(call);
+    uptr first_operand = $::meta::parameter_count(call);
+    uptr format_argument = first_operand;
     for (uptr i = 0; i < $::meta::parameter_count(call); ++i) {
         $::meta::type type = $::meta::parameter_type(call, i);
         if ($::meta::is_type_kind(type, "pointer") && integer_like($::meta::element(type)) &&
@@ -510,7 +512,7 @@ static void check(in $::meta::call call, in bool scan) {
                 bad_format(call, format_argument, join(directive(format, start, end),
                                                        "ignores the '0' flag because it has a precision"));
         }
-        if (!arguments || conversion == 'm') continue;
+        if (!arguments) continue;
         for (uptr i = 0; i < stars; ++i) {
             uptr operand = star_positions[i];
             if (operand == 0) {
@@ -521,7 +523,7 @@ static void check(in $::meta::call call, in bool scan) {
                 positional = 1;
             }
             if (operand > highest) highest = operand;
-            uptr argument = format_argument + operand;
+            uptr argument = first_operand + operand - 1;
             if (argument >= $::meta::argument_count(call)) {
                 missing(call, format, start, end, format_argument, c_type(call, name_int));
                 continue;
@@ -531,7 +533,7 @@ static void check(in $::meta::call call, in bool scan) {
             if (!integer_like(type) || promoted_bits(type) != promoted_bits(int_type))
                 mismatch(call, format, start, end, join(c_type(call, name_int), " for '*'"), argument);
         }
-        if (suppressed) continue;
+        if (suppressed || conversion == 'm') continue;
         uptr operand = position;
         if (operand == 0) {
             sequential = 1;
@@ -541,14 +543,14 @@ static void check(in $::meta::call call, in bool scan) {
             positional = 1;
         }
         if (operand > highest) highest = operand;
-        uptr argument = format_argument + operand;
+        uptr argument = first_operand + operand - 1;
         if (argument >= $::meta::argument_count(call)) {
             missing(call, format, start, end, format_argument, wanted(call, conversion, length, scan, allocate));
             continue;
         }
         if (!typed) continue;
         $::meta::type type = $::meta::argument_type(call, argument);
-        if (scan && $::meta::is_type_kind(type, "pointer") &&
+        if ((scan || conversion == 'n') && $::meta::is_type_kind(type, "pointer") &&
             starts_with($::meta::type_spelling($::meta::element(type)), "const ")) {
             $::meta::warning($::meta::argument_span(call, argument),
                 $::meta::concat(text("writing into a constant object (argument "), join(number(argument + 1), ")")));
@@ -562,8 +564,8 @@ static void check(in $::meta::call call, in bool scan) {
         bad_format(call, format_argument, text("missing $ operand number in format"));
         return;
     }
-    if (arguments && format_argument + highest + 1 < $::meta::argument_count(call))
-        $::meta::warning($::meta::argument_span(call, format_argument + highest + 1), "too many arguments for format");
+    if (arguments && first_operand + highest < $::meta::argument_count(call))
+        $::meta::warning($::meta::argument_span(call, first_operand + highest), "too many arguments for format");
 }
 
 [[checker("format")]]

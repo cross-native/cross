@@ -7330,7 +7330,8 @@ private:
             if (is_meta_type(declaration.type) &&
                 (declaration.type->is_volatile || declaration.type->is_atomic ||
                  declaration.storage_static || declaration.storage_register || declaration.storage_stack ||
-                 declaration.location_name || !declaration.attributes.empty()))
+                 declaration.location_name || std::any_of(declaration.attributes.begin(), declaration.attributes.end(),
+                     [](const Attribute& attribute) { return attribute.name != "maybe_unused"; })))
                 error(declaration.location,
                     "meta cells require automatic translation-only storage without runtime qualifiers");
             // Local alignment is a required source constraint, not an effect
@@ -17935,6 +17936,9 @@ private:
                     locals_[*index].used = true;
                     return;
                 }
+        const auto* target = resolve_function(program_, function_, expression,
+            [](const FunctionDecl&) { return true; });
+        if (target && same_function_entity(*function_, *target)) return;
         reference(expression, function_->source_namespace, function_->imports, function_->source_unit);
     }
 
@@ -18139,7 +18143,7 @@ FunctionDecl* checker_function(Program& program, const FunctionDecl& function,
         const auto* entry = find_core_expression_builtin(spelling);
         if (!entry || entry->kind != CoreBuiltinKind::Checker || program.checker_library_unit.empty())
             return nullptr;
-        const auto name = std::string_view(spelling).substr(3);
+        const auto name = fresh_identifier_name(*program.checker_library_namespace) + "::" + spelling.substr(3);
         for (const auto& candidate : program.functions)
             if (candidate->source_unit == program.checker_library_unit && candidate->name == name &&
                 candidate->attribute("checker")) return candidate.get();
@@ -18214,6 +18218,15 @@ public:
             for (const auto& binding : attribute.variadic_bindings)
                 types_.local_types.emplace_back(name_key(binding), binding.type);
         co_await statement_async(*function_.body);
+    }
+
+    EvaluationTask<void> root_async(const Expr& expression, const TypePtr& destination = {},
+                                   std::vector<std::pair<NameKey, TypePtr>> locals = {}) {
+        library_ = !program_.checker_library_unit.empty() &&
+            function_.source_unit == program_.checker_library_unit;
+        types_.local_types = std::move(locals);
+        co_await expression_async(expression);
+        if (destination) co_await conversion_async(expression, destination);
     }
 
 private:
@@ -18843,7 +18856,8 @@ EvaluationTask<bool> expand_evaluation_impl_async(Program& program, Diagnostics&
                 if (is_meta_type(declaration.type) &&
                     (declaration.type->is_volatile || declaration.type->is_atomic ||
                      declaration.storage_static || declaration.storage_register || declaration.storage_stack ||
-                     declaration.location_name || !declaration.attributes.empty()))
+                     declaration.location_name || std::any_of(declaration.attributes.begin(), declaration.attributes.end(),
+                         [](const Attribute& attribute) { return attribute.name != "maybe_unused"; })))
                     diagnostics.error(declaration.location,
                         "meta cells require automatic translation-only storage without runtime qualifiers");
                 scopes.back()[name_key(*statement.declaration)] = statement.declaration->type->is_const;
@@ -18863,6 +18877,31 @@ EvaluationTask<bool> expand_evaluation_impl_async(Program& program, Diagnostics&
         if (stopped()) co_return false;
         if (typed_warnings && diagnostics.errors() == errors_before_validation) {
             co_await TypedWarnings(program, diagnostics, *function, checkers).run_async();
+            if (stopped()) co_return false;
+        }
+    }
+    if (diagnostics.errors() != 0) co_return false;
+    if (typed_warnings) {
+        for (const auto& object : program.objects) {
+            if (!object->initializer) continue;
+            auto* owner = object_lexical_function(program, *object);
+            FunctionDecl context;
+            context.source_namespace = namespace_prefix(object->name);
+            context.source_unit = object->source_unit;
+            GenericExpansionState scope;
+            if (owner) collect_function_types(*owner, scope);
+            co_await TypedWarnings(program, diagnostics, owner ? *owner : context, checkers)
+                .root_async(*object->initializer, object->type, std::move(scope.local_types));
+            if (stopped()) co_return false;
+        }
+        for (const auto& assertion : program.static_assertions) {
+            auto* owner = assertion_lexical_function(program, assertion);
+            FunctionDecl context;
+            context.source_namespace = assertion.source_namespace;
+            if (assertion.location.file)
+                context.source_unit = assertion.location.file->source_unit_at(assertion.location.line);
+            co_await TypedWarnings(program, diagnostics, owner ? *owner : context, checkers)
+                .root_async(*assertion.condition, {}, assertion.local_types);
             if (stopped()) co_return false;
         }
     }

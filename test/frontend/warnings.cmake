@@ -428,3 +428,51 @@ if(NOT result EQUAL 0 OR
    out MATCHES "f\\.tree-ccp")
     message(FATAL_ERROR "--print-options=warning\n${out}${error}")
 endif()
+
+# File-scope scalar conversions use the same rules as local initializers.
+set(global_conversions [=[
+namespace values {
+global u8 narrow = 300;
+global u32 sign = -1;
+global f32 fraction = 1.23456789;
+global u8 fits = 200;
+}
+]=])
+expect(global_conversions "${global_conversions}" "conversion from 'i32' to 'u8' changes value from '300' to '44'" -Wconversion)
+foreach(expected "\\[-Wconversion\\]" "\\[-Wsign-conversion\\]" "\\[-Wfloat-conversion\\]")
+    if(NOT err MATCHES "${expected}")
+        message(FATAL_ERROR "global_conversions: missing '${expected}'\n${err}")
+    endif()
+endforeach()
+expect_count(global_conversions 3)
+expect_clean(global_conversions_disabled "${global_conversions}" -Wno-conversion)
+expect_error(global_conversions_error "${global_conversions}" "\\[-Werror=conversion\\]" -Werror=conversion)
+
+# maybe_unused changes diagnostics, including for translation-only cells.
+expect_clean(unused_meta_cell [=[
+[[eval_only]] static u32 helper() {
+    [[maybe_unused]] $::meta::buffer b = $::meta::alloc(1);
+    return 7;
+}
+global u32 result = helper();
+]=] -Wall -Werror)
+
+# A function's own references do not use its static definition.
+set(recursive_statics [=[
+namespace recursion {
+static u32 lonely(in u32 n);
+static u32 lonely(in u32 n) { return n ? recursion::lonely(n - 1) : 0; }
+static u32 addressed(in u32 n) {
+    u32 (*self)(in u32) = addressed;
+    return n ? self(n - 1) : 0;
+}
+static u32 called(in u32 n) { return n ? called(n - 1) : 0; }
+global u32 entry(in u32 n) { return called(n); }
+}
+]=])
+expect(recursive_statics "${recursive_statics}" "'recursion::lonely' defined but not used" -Wunused-function)
+if(NOT err MATCHES "'recursion::addressed' defined but not used")
+    message(FATAL_ERROR "recursive_statics: a self-address does not use the function\n${err}")
+endif()
+expect_count(recursive_statics 2)
+expect_clean(recursive_statics_disabled "${recursive_statics}" -Wno-unused-function)

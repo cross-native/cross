@@ -1988,6 +1988,7 @@ address. Helpers are called directly, may recurse within the evaluation
 budgets, and may hold meta values in automatic cells and pass or copy them by
 value; pointers, arrays, records, and runtime callable types containing meta
 values have no representation, and no runtime or static storage may hold one.
+Automatic meta cells may use `maybe_unused`, which does not request storage.
 
 Expansion functions (macros and syntax expanders) and translation-only
 helpers accept the hints
@@ -4244,16 +4245,17 @@ translation-only function that checks the arguments of each direct call of
 the declared function. `name` is resolved as a function name where the
 declaration is, and must name a function defined with `[[checker]]`;
 `$::format::printf` and `$::format::scanf` name the checkers built into the
-compiler. A declaration may name several checkers, and every checker that a
-declaration of the function names checks each call.
+compiler; their implementation names have private identities and do not merge
+with user declarations. A declaration may name several checkers, and every
+checker that a declaration of the function names checks each call.
 
 A checker is a `static`, nongeneric definition with one `in $::meta::call`
 parameter and a `void` result. At each direct call of a checked function,
-including calls in generated code, in generic instances, and in
-translation-only functions, the compiler evaluates the checker with that call
-after source validation and before translation-time evaluation folds the call
-or its arguments; an instance of a generic function reports a diagnostic at
-one source position once. A checker reports with `$::meta::warning`,
+including calls in file-scope initializers and assertions, in generated code,
+in generic instances, and in translation-only functions, the compiler evaluates
+the checker with that call after source validation and before translation-time
+evaluation folds the call or its arguments; an instance of a generic function
+reports a diagnostic at one source position once. A checker reports with `$::meta::warning`,
 `$::meta::note`, and `$::meta::error` at the spans the call provides. An
 error, or a failed evaluation, is an error at the call. `[[checker("warning")]]`
 names a warning that the implementation documents
@@ -4283,7 +4285,8 @@ against its arguments as the C printf and scanf functions read them, with the
 conversions, flags, length modifiers, `*` operands, and `N$` operand numbers
 of C and POSIX. The format is the callee's last named parameter that points to
 an 8-bit integer. A format that is not a string literal is not checked. When
-the callee is variadic, its unnamed arguments are the format's operands;
+the callee is variadic, its unnamed arguments are the format's operands,
+starting after all named parameters, including any after the format;
 otherwise only the format is checked. The C types that conversions and length
 modifiers name are the types that the callee's ABI names `char`, `short`,
 `int`, `long`, `long_long`, `size_t`, `ptrdiff_t`, `intmax_t`, `wchar_t`,
@@ -4291,7 +4294,11 @@ modifiers name are the types that the callee's ABI names `char`, `short`,
 the width of its type after the default argument promotions, whatever its
 signedness. When the ABI names no `int`, only the format and the number of
 arguments are checked. Their diagnostics are warnings of the format warning
-(`-Wformat`).
+(`-Wformat`). The printf `%m` conversion consumes no value operand, but its
+width and precision stars consume integer operands. Destinations of printf
+`%n` and scanf conversions must be writable. Allocating scanf `%ms`, `%mc`,
+and `%m[` conversions require a pointer to a pointer to the ABI's `char`;
+their `l` forms require a pointer to a pointer to the ABI's `wchar_t`.
 
 ```x
 [[abi("sysv_abi"), check($::format::printf)]]

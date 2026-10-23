@@ -228,3 +228,35 @@ compile(unknown_shipped "[[check($::format::print)]] i32 f(in const u8 *format, 
 if(NOT status EQUAL 1 OR NOT err MATCHES "'\\$::format::print' is not one")
     message(FATAL_ERROR "unknown_shipped: a misspelled shipped checker\n${err}")
 endif()
+
+# File-scope calls run their checker before required evaluation folds them.
+foreach(root initializer assertion)
+    if(root STREQUAL initializer)
+        set(expression "global u32 result = checked(1);")
+    else()
+        set(expression "$::static_assert(checked(1) == 1, \"value\");")
+    endif()
+    compile(file_scope_${root} "namespace scope {
+[[checker]] static void reject(in $::meta::call call) {
+    $::meta::error($::meta::call_span(call), \"file-scope call checked\");
+}
+[[check(reject)]] static u32 checked(in u32 value) { return value; }
+${expression}
+}
+" -w)
+    if(NOT status EQUAL 1 OR NOT err MATCHES "file_scope_${root}.x:6:[0-9]+: error: file-scope call checked")
+        message(FATAL_ERROR "file_scope_${root}: expected the checker error before folding\n${err}")
+    endif()
+endforeach()
+
+# Calls retain their written argument types in both kinds of file-scope roots.
+compile(file_scope_arguments [=[
+static u32 checked(in u8 value) { return value; }
+global u32 result = checked(300);
+$::static_assert(checked(300) == 44, "value");
+]=] -Wconversion)
+string(REGEX MATCHALL "warning: conversion from 'i32' to 'u8' changes value from '300' to '44'" reports "${err}")
+list(LENGTH reports count)
+if(NOT status EQUAL 0 OR NOT count EQUAL 2)
+    message(FATAL_ERROR "file_scope_arguments: expected two conversions before folding\n${err}")
+endif()

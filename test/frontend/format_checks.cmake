@@ -56,7 +56,29 @@ ${body}
     endif()
 endfunction()
 
+# Allocating scanf conversions require a pointer to the selected character pointer.
+function(allocating_scanf case target abi wide_type)
+    set(ARGN_EXPECTED
+        "9:[0-9]+: warning: format '%ms' expects a pointer to a pointer to C 'char'"
+        "9:[0-9]+: warning: format '%mc' expects a pointer to a pointer to C 'char'"
+        "9:[0-9]+: warning: format '%m\\[a-z\\]' expects a pointer to a pointer to C 'char'"
+        "10:[0-9]+: warning: format '%mls' expects a pointer to a pointer to C 'wchar_t'"
+        "10:[0-9]+: warning: format '%mlc' expects a pointer to a pointer to C 'wchar_t'"
+        "10:[0-9]+: warning: format '%ml\\[a-z\\]' expects a pointer to a pointer to C 'wchar_t'"
+        "11:[0-9]+: warning: format '%ms' expects a pointer to a pointer to C 'char'")
+    expect(${case} ${target} ${abi} "    u8 *bytes;
+    ${wide_type} *wide;
+    scanf(\"%ms %mc %m[a-z]\", &bytes, &bytes, &bytes);
+    scanf(\"%mls %mlc %ml[a-z]\", &wide, &wide, &wide);
+    scanf(\"%ms %mc %m[a-z]\", &wide, &wide, &wide);
+    scanf(\"%mls %mlc %ml[a-z]\", &bytes, &bytes, &bytes);
+    scanf(\"%ms\", bytes);")
+endfunction()
+
 if(ARCH STREQUAL mips)
+    allocating_scanf(allocate_o32 mips-unknown-elf o32 i32)
+    allocating_scanf(allocate_eabi32 mips-unknown-elf eabi32 i32)
+    allocating_scanf(allocate_n64 mips64-unknown-elf n64 i32)
 # MIPS: o32 and EABI32 have 32-bit long and size_t; n64 has 64-bit long and
 # a binary128 long double.
 set(mips_body [=[
@@ -191,3 +213,88 @@ list(LENGTH reports total)
 if(NOT status EQUAL 0 OR NOT total EQUAL 4)
     message(FATAL_ERROR "forms: expected four warnings\n${err}")
 endif()
+
+allocating_scanf(allocate_sysv ${x86} sysv_abi i32)
+allocating_scanf(allocate_ms ${x86} ms_abi u16)
+
+# A shipped library's types cannot merge with user tags or enumerators.
+set(private_types [=[
+namespace format {
+enum length { mine };
+enum c_name { custom };
+static u32 length_spelling(in enum length value) { return (u32)value; }
+global u32 entry() { return length_spelling(mine) + (u32)custom; }
+}
+[[abi("sysv_abi"), check($::format::printf)]] i32 printf(in const u8 *format, ...);
+global void report() { printf("%d", 1); }
+]=])
+foreach(flag -w -Werror=format)
+    compile(private_types ${x86} "${private_types}" ${flag})
+    if(NOT status EQUAL 0 OR NOT err STREQUAL "")
+        message(FATAL_ERROR "private_types: user tags stay independent under ${flag}\n${err}")
+    endif()
+endforeach()
+
+# GCC format(printf, 1, 3): format operands start at the first unnamed argument.
+compile(named_after_format ${x86} [=[
+[[abi("sysv_abi"), check($::format::printf)]] i32 log(in const u8 *fmt, in i32 level, ...);
+global void entry(in i32 width) {
+    log("%s", 0, "hello");
+    log("%*s", 0, width, "hello");
+    log("%2$*1$s", 0, width, "hello");
+    log("%m", 0);
+    log("%*m", 0, width);
+}
+]=] -Werror=format)
+if(NOT status EQUAL 0 OR NOT err STREQUAL "")
+    message(FATAL_ERROR "named_after_format: valid unnamed operands\n${err}")
+endif()
+compile(named_after_format_errors ${x86} [=[
+[[abi("sysv_abi"), check($::format::printf)]] i32 log(in const u8 *fmt, in i32 level, ...);
+global void entry(in i64 wrong, in i32 width) {
+    log("%s", 0, wrong);
+    log("%*s", 0, wrong, "hello");
+    log("%s", 0, "hello", width);
+    log("%s", 0);
+}
+]=])
+foreach(expected
+        "argument 3 has type 'i64'"
+        "C 'int' \\(i32\\) for '\\*', but argument 3"
+        "too many arguments for format"
+        "expects a matching a pointer to C 'char' argument")
+    if(NOT err MATCHES "${expected}")
+        message(FATAL_ERROR "named_after_format_errors: missing '${expected}'\n${err}")
+    endif()
+endforeach()
+string(REGEX MATCHALL "warning:" reports "${err}")
+list(LENGTH reports count)
+if(NOT status EQUAL 0 OR NOT count EQUAL 4)
+    message(FATAL_ERROR "named_after_format_errors: expected four warnings\n${err}")
+endif()
+
+# %m has no value operand, but width and precision stars still consume ints.
+set(ARGN_EXPECTED clean)
+expect(message_stars ${x86} sysv_abi [=[
+    printf("%*m %.*m %*.*m %d", i, i, i, i, i);
+    printf("%*1$m", i);
+]=] -Werror=format)
+set(ARGN_EXPECTED
+    "5:[0-9]+: warning: format '%\\*m' expects C 'int' \\(i32\\) for '\\*', but argument 2 has type 'i64'"
+    "6:[0-9]+: warning: format '%\\*m' expects a matching C 'int' \\(i32\\) argument")
+expect(message_star_errors ${x86} sysv_abi [=[
+    printf("%*m", l);
+    printf("%*m");
+]=])
+
+# printf %n writes through its destination just as scanf does.
+set(ARGN_EXPECTED
+    "5:[0-9]+: warning: writing into a constant object \\(argument 2\\)"
+    "6:[0-9]+: warning: writing into a constant object \\(argument 2\\)"
+    "7:[0-9]+: warning: writing into a constant object \\(argument 2\\)")
+expect(count_const ${x86} sysv_abi [=[
+    printf("%n", (const i32 *)&i);
+    printf("%hhn", (const u8 *)&c);
+    printf("%ln", (const i64 *)&l);
+    printf("%n %hhn %ln", &i, &c, &l);
+]=])

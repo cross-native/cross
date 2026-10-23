@@ -290,7 +290,8 @@ finishes.
 ## Call checkers
 
 `[[check(name)]]` on a function declaration runs the call checker `name` at
-every direct call of the function, during compilation. A checker is a
+every direct call of the function, including calls in file-scope initializers
+and assertions, before translation-time evaluation folds it. A checker is a
 `static` function marked `[[checker]]` that takes one `$::meta::call`; it
 reads the call's arguments and reports problems with `$::meta::warning`,
 `$::meta::note`, and `$::meta::error`. `[[checker("format")]]` ties the

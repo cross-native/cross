@@ -1291,8 +1291,20 @@ int run_cc(int argc, char** argv, Diagnostics& diagnostics, CompilerOptions& opt
                         attribute.arguments.front().starts_with("$::format::");
                 });
         })) {
-        const auto* library = sources.add("shipped:format.x", shipped_checker_source());
+        const std::string text = "namespace implementation {\n" + shipped_checker_source() + "}\n";
+        const auto* library = sources.add("shipped:format.x", text);
         auto tokens = Lexer(*library, diagnostics).lex();
+        auto identity = std::make_shared<FreshIdentifier>();
+        identity->expansion = sources.next_expansion();
+        identity->prefix = std::string(tokens[1].text);
+        identity->source_unit = library->source_unit_at(1);
+        auto origin = token_origin(tokens[1].location);
+        origin.fresh = identity;
+        // A private namespace uses the same identity as a source gensym.
+        library = sources.add("shipped:format.x", text, {},
+            {{tokens[1].location.offset, tokens[1].location.offset + tokens[1].text.size(), origin}});
+        tokens = Lexer(*library, diagnostics).lex();
+        program.checker_library_namespace = std::move(identity);
         Parser parser(std::move(tokens), diagnostics,
                       std::make_shared<SyntaxExecution>(sources, diagnostics,
                           program.address_bits, macro_size, macro_align,

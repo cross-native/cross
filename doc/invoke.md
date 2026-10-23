@@ -187,7 +187,7 @@ keeps that setting whatever groups it also enables, wherever they appear, so
 | `-Wcpp` | default | `#warning` directives. |
 | `-Wformat` | `-Wall` | Calls whose arguments do not match their format string, as checked by `$::format::printf` and `$::format::scanf` ([language.md](language.md#abis-and-interoperability)) or by any call checker declared for this warning ([metaprogramming.md](metaprogramming.md#call-checkers)). |
 | `-Wunused-variable` | `-Wunused`, which `-Wall` enables | A local variable that nothing uses, and a `static` object outside functions that nothing uses; a `const` one only in the input file itself, not in a file it includes. |
-| `-Wunused-function` | `-Wunused` | A `static` function definition that nothing uses. Inline, translation-only, and generic functions do not count. |
+| `-Wunused-function` | `-Wunused` | A `static` function definition that nothing outside its own definition uses. Inline, translation-only, and generic functions do not count. |
 | `-Wunused-parameter` | `-Wunused` with `-Wextra` | A parameter of a function definition that the body does not use. Unnamed parameters, the parameter of a macro, syntax expander, or call checker, and those of `[[naked]]` functions do not count. |
 | `-Wimplicit-fallthrough` | `-Wextra` | A statement that can complete normally before a `case` or `default` label of the same `switch`. |
 | `-Wsign-compare` | `-Wextra` | A comparison that converts a signed operand to an unsigned type, unless the operand is known to be nonnegative. |
@@ -200,7 +200,8 @@ keeps that setting whatever groups it also enables, wherever they appear, so
 ([language.md](language.md#other-attributes)). `-Wimplicit-fallthrough`
 recognizes only the attribute, as GCC's `-Wimplicit-fallthrough=5`; comments
 never matter. Conversions of constants are reported only when they change the
-value: `u8 x = 200;` is quiet and `u8 x = 300;` is not. Compound assignments
+value: `u8 x = 200;` is quiet and `u8 x = 300;` is not. Initializers and
+assertions outside functions are checked too. Compound assignments
 and the entries of brace initializers are not checked for conversions.
 
 Each warning ends with the option that controls it, as in `warning: unused
