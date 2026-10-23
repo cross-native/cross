@@ -2131,6 +2131,8 @@ private:
             co_return std::nullopt;
         }
         const auto& object = hir_.type(*object_type);
+        // Lowering adds types, which may move this one.
+        const bool is_volatile = object.is_volatile;
         if (object.is_const) {
             diagnostics_.error(expression.location,
                                "cannot modify a const atomic object");
@@ -2158,7 +2160,7 @@ private:
                 co_return std::nullopt;
             }
             co_return AtomicLvalue{designator->address, *object_type,
-                                object.is_volatile};
+                                is_volatile};
         }
 
         const Expr* source = &expression;
@@ -2195,7 +2197,7 @@ private:
             }
         }
         if (!address) co_return std::nullopt;
-        co_return AtomicLvalue{*address, *object_type, object.is_volatile};
+        co_return AtomicLvalue{*address, *object_type, is_volatile};
     }
 
     std::optional<AtomicLvalue> lower_atomic_lvalue(
