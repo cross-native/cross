@@ -605,6 +605,15 @@ global uptr address(in const u8 *text) {
 }
 ```
 
+An assignment, initializer, base, or entry whose value is read from an
+object of record, union, or array type copies that object into its
+destination: the assigned object, or the object or part of one that it
+initializes. If the two objects share storage, they must be the same object;
+a copy between objects that overlap only partly is undefined. Thus
+`*p = *p` is defined. A compound literal is an object of its own:
+`*p = (T){ *q }` copies `*q` into the literal and the literal into `*p`, and
+neither copy overlaps.
+
 ### Conditional pointer result types
 
 After ordinary value conversions, if one arm of `condition ? yes : no` is a

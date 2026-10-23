@@ -737,6 +737,15 @@ struct SelectCostQuery {
     bool constant_operands{};
 };
 
+// One load or store of an integer of `bytes` bytes, or of a vector when
+// `vector`, at an address aligned to `alignment` bytes.
+struct MemoryAccessCostQuery {
+    unsigned bytes{};
+    unsigned alignment{};
+    bool store{};
+    bool vector{};
+};
+
 // A packed operation that target-independent vectorization creates on
 // vectors of `vector_bits` holding lanes of `element_bits`; a uniform shift
 // moves every lane by one immediate amount.
@@ -811,6 +820,10 @@ struct TargetCostModel {
     // none when it computes the lanes one at a time.
     using VectorOperationInstructions = std::vector<InstructionCostId> (*)(
         const Subtarget&, const VectorOperationCostQuery&);
+    // The instructions of a memory access, or zero when the target has no
+    // sequence for it other than one access per byte.
+    using MemoryAccessInstructions = unsigned (*)(
+        const Subtarget&, const MemoryAccessCostQuery&);
 
     IntegerConstantMaterializationCost integer_constant_materialization{};
     IntegerOperationInstructions integer_operation{};
@@ -822,6 +835,7 @@ struct TargetCostModel {
     RegisterPressureModel (*register_pressure)(
         const Subtarget&, const CompilerOptions&,
         const RegisterPressureQuery&){};
+    MemoryAccessInstructions memory_access{};
 };
 
 // Direct typed instruction-memory addressing. These are encoding constraints,

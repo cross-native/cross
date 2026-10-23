@@ -49,6 +49,68 @@ AccessAnalysis::AccessAnalysis(const ManagedFunction& function,
             addressed_[value.slot->value] = true;
         }
     }
+    // A slot whose address only reaches the loads and stores that decompose
+    // to it, through address arithmetic, is out of reach of other pointers.
+    std::vector<std::optional<std::uint32_t>> pointee(function.values.size());
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (const auto& value : function.values) {
+            if (pointee[value.id.value]) continue;
+            std::optional<std::uint32_t> slot;
+            if (value.kind == ValueKind::SlotAddress && value.slot) {
+                slot = value.slot->value;
+            } else if ((value.kind == ValueKind::IndexedAddress ||
+                        (value.kind == ValueKind::Cast &&
+                         value.cast == CastOperation::Reinterpret)) &&
+                       !value.operands.empty()) {
+                slot = pointee[value.operands[0].value];
+            }
+            if (slot) {
+                pointee[value.id.value] = slot;
+                changed = true;
+            }
+        }
+    }
+    std::vector<bool> reached(function.slots.size());
+    const auto escape = [&](ValueId id) {
+        if (const auto slot = pointee[id.value]) reached[*slot] = true;
+    };
+    for (const auto& value : function.values) {
+        const bool access = value.kind == ValueKind::PointerLoad ||
+                            value.kind == ValueKind::IndexedLoad ||
+                            value.kind == ValueKind::PointerStore;
+        for (std::size_t index = 0; index < value.operands.size(); ++index) {
+            const bool address = index == 0 &&
+                (access || value.kind == ValueKind::IndexedAddress ||
+                 (value.kind == ValueKind::Cast &&
+                  value.cast == CastOperation::Reinterpret));
+            if (!address) escape(value.operands[index]);
+        }
+        if (access && !value.operands.empty()) {
+            if (const auto slot = pointee[value.operands[0].value]) {
+                auto at = decompose(value.operands[0]);
+                if (value.kind == ValueKind::IndexedLoad &&
+                    !displace(at, value.operands[1],
+                              stride(function.values[value.operands[0].value].type)))
+                    at.base = MemoryAddress::Base::Value;
+                if (at.base != MemoryAddress::Base::Slot) reached[*slot] = true;
+            }
+        }
+        for (const auto& argument : value.call_arguments) {
+            if (argument.value) escape(*argument.value);
+            if (argument.cell && argument.cell->value < reached.size())
+                reached[argument.cell->value] = true;
+        }
+        for (const auto& incoming : value.incoming) escape(incoming.value);
+    }
+    for (const auto& block : function.blocks)
+        if (block.terminator.value) escape(*block.terminator.value);
+    for (const auto& slot : function.slots) {
+        if (!reached[slot.id.value] && !slot.is_volatile && !slot.physical_location &&
+            !slot.live_on_return) {
+            addressed_[slot.id.value] = false;
+        }
+    }
 }
 
 std::optional<MemoryAccess> AccessAnalysis::access(
@@ -486,12 +548,21 @@ bool forward_memory_values(ManagedFunction& function,
                 }
                 state.push_back({*access, id});
             } else if (store_kind(value.kind) && access) {
+                const auto stored = value.kind == ValueKind::PointerStore
+                                        ? value.operands[1]
+                                        : value.operands[0];
+                // A store of what its location already holds changes nothing.
+                if (rewrite &&
+                    std::any_of(state.begin(), state.end(), [&](const Available& entry) {
+                        return entry.access == *access &&
+                               replacements.resolve(entry.value) == replacements.resolve(stored);
+                    })) {
+                    removed.insert(id.value);
+                }
                 std::erase_if(state, [&](const Available& entry) {
                     return analysis.may_alias(entry.access, *access);
                 });
-                state.push_back({*access, value.kind == ValueKind::PointerStore
-                                              ? value.operands[1]
-                                              : value.operands[0]});
+                state.push_back({*access, stored});
             } else if ((value.kind == ValueKind::LifetimeStart ||
                         value.kind == ValueKind::LifetimeEnd) && value.slot) {
                 std::erase_if(state, [&](const Available& entry) {
@@ -644,6 +715,57 @@ bool forward_memory_values(ManagedFunction& function,
         function.values.push_back(std::move(cast));
     }
     replacements.apply(function);
+    remove_effectful_values(function, removed);
+    return true;
+}
+
+bool eliminate_overwritten_stores(ManagedFunction& function,
+                                  const hir::Module& hir_module,
+                                  const TargetInfo& target) {
+    const AccessAnalysis analysis(function, hir_module, target);
+    std::unordered_set<std::uint32_t> removed;
+    for (const auto& block : function.blocks) {
+        // What later stores of the block write before anything may read it.
+        std::vector<Access> written;
+        const auto covered = [&](const Access& access) {
+            std::vector<std::pair<std::int64_t, std::int64_t>> spans;
+            for (const auto& entry : written) {
+                if (entry.address.base != access.address.base ||
+                    entry.address.id != access.address.id ||
+                    entry.address.index != access.address.index ||
+                    entry.address.scale != access.address.scale) continue;
+                spans.push_back({entry.address.offset,
+                                 entry.address.offset + static_cast<std::int64_t>(entry.size)});
+            }
+            std::sort(spans.begin(), spans.end());
+            auto reached = access.address.offset;
+            const auto end = access.address.offset + static_cast<std::int64_t>(access.size);
+            for (const auto& [from, to] : spans) {
+                if (from > reached) break;
+                reached = std::max(reached, to);
+            }
+            return reached >= end;
+        };
+        for (auto item = block.values.rbegin(); item != block.values.rend(); ++item) {
+            const auto& value = function.values[item->value];
+            if (!value.effect_input && !value.effect_output) continue;
+            const auto access = load_kind(value.kind) || store_kind(value.kind)
+                                    ? analysis.access(value) : std::nullopt;
+            if (store_kind(value.kind) && access) {
+                if (covered(*access)) removed.insert(value.id.value);
+                else written.push_back(*access);
+            } else if (load_kind(value.kind) && access) {
+                std::erase_if(written, [&](const Access& entry) {
+                    return analysis.may_alias(entry, *access);
+                });
+            } else {
+                // Calls, atomics, volatile accesses, lifetime markers, and
+                // other effects may read memory or end its life.
+                written.clear();
+            }
+        }
+    }
+    if (removed.empty()) return false;
     remove_effectful_values(function, removed);
     return true;
 }

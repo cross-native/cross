@@ -91,6 +91,39 @@ canonicalize_bitwise_operations(ManagedFunction& function,
 bool expand_wide_integers(ManagedFunction& function, hir::Module& hir_module,
                           const Subtarget& subtarget, Diagnostics& diagnostics);
 
+// The widest native vector that the subtarget and -mprefer-vector-width
+// allow for at least two lanes of `element_bits`, or zero.
+[[nodiscard]] unsigned preferred_vector_bits(const Subtarget& subtarget,
+                                             const CompilerOptions& options,
+                                             bool floating, unsigned element_bits);
+
+// A part of an aggregate that one register-wide access moves: an unsigned
+// integer, or a vector of u64 lanes.
+struct MemoryUnit {
+    std::uint64_t offset{};
+    unsigned bytes{};
+    bool vector{};
+};
+
+// The units that cover `size` bytes with the fewest instructions per byte
+// that the target's memory accesses allow, preferring naturally aligned
+// accesses on a tie: stores at `store_alignment` and, unless absent, loads
+// at `load_alignment`, both the alignment of offset zero.
+[[nodiscard]] std::vector<MemoryUnit> plan_memory_units(
+    std::uint64_t size, std::optional<unsigned> load_alignment,
+    unsigned store_alignment, const Subtarget& subtarget,
+    const CompilerOptions& options);
+// The type through which a unit is accessed, which may alias any object.
+[[nodiscard]] hir::TypeId memory_unit_type(hir::Module& module, const MemoryUnit& unit);
+// How many equal units a copy or fill repeats in straight-line code before
+// a loop is shorter (size goals) or the code grows too large (speed goals).
+[[nodiscard]] unsigned straight_unit_limit(const CompilerOptions& options);
+
+// Copies the records that only stores consume as units, without the
+// temporary that holds a record value (-ftree-sra).
+bool copy_records_by_units(ManagedFunction& function, hir::Module& module,
+                           const Subtarget& subtarget, const CompilerOptions& options);
+
 // Value replacements collected by one sweep and applied to every use at once,
 // instead of rescanning the function per replaced value. Chains resolve to
 // their final value. A sweep that inspects operands rewrites each value with
@@ -123,6 +156,12 @@ void remove_effectful_values(ManagedFunction& function,
 [[nodiscard]] bool forward_memory_values(ManagedFunction& function,
                                          const hir::Module& hir_module,
                                          const TargetInfo& target);
+
+// Removes the non-volatile stores whose bytes later stores of their block
+// write before any operation may read them.
+bool eliminate_overwritten_stores(ManagedFunction& function,
+                                  const hir::Module& hir_module,
+                                  const TargetInfo& target);
 
 // Moves a non-volatile store to a slot or object at a constant offset out of
 // a natural loop when it runs before every exit and no other memory operation

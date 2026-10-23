@@ -11637,6 +11637,14 @@ private:
             });
     }
 
+    // An lvalue that designates an existing object, not a new literal.
+    bool object_designator(const Expr& node) {
+        const auto* designator = &node;
+        while (designator->kind == Expr::Kind::Parenthesized && designator->left)
+            designator = designator->left.get();
+        return designator->kind != Expr::Kind::CompoundLiteral && translation_lvalue(*designator);
+    }
+
 
     bool meta_pointer_source(const Expr& source) {
         std::vector<const Expr*> work{&source};
@@ -14296,6 +14304,10 @@ private:
             const auto& pointer = *base.meta_pointer;
             if (size > std::numeric_limits<std::size_t>::max() / 3 ||
                 !charge_meta_bytes(size * 3, location)) co_return std::nullopt;
+            if (base.type->pointee->kind == Type::Kind::Record)
+                record_read_ = RecordRead{pointer.mutable_buffer
+                    ? static_cast<const void*>(pointer.mutable_buffer.get())
+                    : static_cast<const void*>(pointer.immutable.get()), *index, size};
             EvalValue value{UInt128{}, clone_type(base.type->pointee)};
             value.object = std::make_shared<EvalBuffer>();
             value.object->data = pointer.mutable_buffer
@@ -14990,8 +15002,20 @@ private:
                 if (!prior_value) co_return std::nullopt;
                 if (previous_value) *previous_value = prior_value;
             }
+            record_read_.reset();
             auto source = (co_await this->expression_async(*expression.right));
             if (!source) co_return std::nullopt;
+            if (expression.text == "=" && pointer->type->pointee->kind == Type::Kind::Record &&
+                record_read_ && record_read_->storage == pointer->meta_pointer->mutable_buffer.get() &&
+                object_designator(*expression.right)) {
+                // The source read last is the object the lvalue designates.
+                const auto size = *(co_await meta_object_size_async(pointer->type->pointee));
+                if (record_read_->offset < *offset + size && *offset < record_read_->offset + record_read_->size &&
+                    (record_read_->offset != *offset || record_read_->size != size)) {
+                    fail(expression.location, "record assignment source partially overlaps its destination");
+                    co_return std::nullopt;
+                }
+            }
             if (prior_value) {
                 if (prior_value->meta_pointer && expression.text != "+=" && expression.text != "-=") {
                     fail(expression.location, "pointer compound assignment requires += or -=");
@@ -16750,6 +16774,14 @@ private:
     // them.
     std::unordered_map<const ObjectDecl*, EvalValue> constant_values_;
     std::unordered_set<const ObjectDecl*> active_constants_;
+    // The storage of the record value read last, which an assignment from
+    // an lvalue compares with its destination.
+    struct RecordRead {
+        const void* storage{};
+        std::size_t offset{};
+        std::size_t size{};
+    };
+    std::optional<RecordRead> record_read_;
 };
 
 bool source_constant_candidate(const Expr& expression) {

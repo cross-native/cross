@@ -15,13 +15,19 @@ static i32 aligned_vla_manual_callee(in i32 value "r15d") -> "eax" {
     return value + 1;
 }
 
+// The cell's address escapes, so its over-aligned slot stays in the frame.
+[[runtime_only, noinline]]
+static i32 aligned_vla_read(in const struct aligned_vla_cell *cell) {
+    return cell->value;
+}
+
 [[runtime_only, noinline]]
 static i32 overaligned_vla_helper(in uptr count) {
     struct aligned_vla_cell cell;
     stack u8 values[count];
     cell.value = 39;
     values[0] = 2u8;
-    return aligned_vla_callee(cell.value) + values[0] +
+    return aligned_vla_callee(aligned_vla_read(&cell)) + values[0] +
            aligned_vla_manual_callee(3);
 }
 

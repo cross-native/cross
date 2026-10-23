@@ -1374,6 +1374,32 @@ private:
                !subtarget_.has_feature(Feature::Mips32r2);
     }
 
+    // The alignment proven for the record that an aggregate load or store
+    // accesses in memory or, for a qualifier conversion, in another home.
+    unsigned aggregate_alignment(const mir::ManagedValue& value) const {
+        const auto& layout = subtarget_.target();
+        const auto type = value.kind == mir::ValueKind::Store ||
+                                  value.kind == mir::ValueKind::PointerStore ||
+                                  value.kind == mir::ValueKind::GlobalStore
+            ? source_->values[value.operands.back().value].type : value.type;
+        const auto natural = [&](hir::TypeId id) {
+            return std::max(1U, static_cast<unsigned>(
+                hir::natural_alignment(hir_, id, layout).value_or(1)));
+        };
+        if (value.slot) {
+            const auto& slot = source_->slots[value.slot->value];
+            return std::max({storage_alignment(hir_, slot.type, layout), natural(slot.type),
+                             slot.minimum_alignment});
+        }
+        if (value.object) {
+            const auto& object = hir_.object(*value.object);
+            return std::max(natural(object.type), object.minimum_alignment);
+        }
+        if (value.kind == mir::ValueKind::Cast)
+            return storage_size(hir_, type, layout) >= 8 ? 8U : 4U;
+        return value.memory_alignment != 0 ? value.memory_alignment : natural(type);
+    }
+
     // A scalar pointer access below its natural alignment, which goes
     // through bytes unless ordinary accesses take misaligned addresses.
     bool unaligned_pointer_access(const mir::ManagedValue& value) const {
@@ -2049,6 +2075,10 @@ private:
                 result.operands.push_back(register_operand(source));
                 result.uses.push_back(source);
             }
+            // The alignment of the memory side, which the copy's units keep;
+            // a volatile record keeps its byte accesses.
+            result.operands.push_back(immediate_operand(
+                value.is_volatile_access ? 1U : aggregate_alignment(value), 0, machine::i32));
             if (value.kind == ValueKind::IndexedLoad) {
                 result.operands.push_back(immediate_operand(
                     storage_size(hir_, value.type, subtarget_.target()),
@@ -5665,13 +5695,20 @@ private:
                               changed;
                     continue;
                 }
+                const bool unaligned_access =
+                    opcode == Opcode::UnalignedLoadSigned ||
+                    opcode == Opcode::UnalignedLoadUnsigned ||
+                    opcode == Opcode::UnalignedStore;
                 const bool pointer_access =
                     opcode == Opcode::PointerLoadSigned ||
                     opcode == Opcode::PointerLoadUnsigned ||
                     opcode == Opcode::FpointerLoad ||
                     opcode == Opcode::PointerStore ||
-                    opcode == Opcode::FpointerStore;
-                if (!pointer_access || instruction.uses.empty()) continue;
+                    opcode == Opcode::FpointerStore || unaligned_access;
+                if (!pointer_access || instruction.uses.empty() ||
+                    (unaligned_access &&
+                     instruction.operands.size() != (opcode == Opcode::UnalignedStore ? 2U : 1U)))
+                    continue;
                 const auto address = instruction.uses.front();
                 if (address.kind != machine::RegisterKind::Virtual ||
                     address.id >= definitions.size() ||
@@ -5684,7 +5721,10 @@ private:
                 const auto* offset =
                     std::get_if<machine::ImmediateOperand>(
                         &definitions[address.id]->operands.back());
-                if (!offset) continue;
+                // An unaligned access also addresses its last byte.
+                if (!offset || (unaligned_access &&
+                                static_cast<std::int64_t>(offset->value) >
+                                    std::numeric_limits<std::int16_t>::max() - 7)) continue;
                 const auto base = definitions[address.id]->uses.front();
                 instruction.uses.front() = base;
                 instruction.operands.front() =
@@ -15503,7 +15543,7 @@ private:
                                 const machine::Instruction& value,
                                 std::string_view address,
                                 machine::Register scalar, bool load,
-                                bool sign) {
+                                bool sign, std::int64_t displacement = 0) {
         const bool little = subtarget_.target().data_layout.byte_order ==
                             ByteOrder::Little;
         // The allocator keeps values that live across this instruction out
@@ -15521,6 +15561,7 @@ private:
         const auto halves = [&](std::string_view left, std::string_view right,
                                 std::string_view reg, std::int64_t offset,
                                 unsigned bytes) {
+            offset += displacement;
             const auto last = offset + static_cast<std::int64_t>(bytes) - 1;
             instruction(left, reg_name(reg) + "," +
                                   memory(little ? last : offset, address));
@@ -15549,9 +15590,11 @@ private:
             taken.push_back(source);
             if (bits <= 16) {
                 const auto shifted = scratch();
-                instruction("sb", reg_name(source) + "," + memory(1 - high_byte, address));
+                instruction("sb", reg_name(source) + "," +
+                                      memory(displacement + 1 - high_byte, address));
                 instruction("srl", reg_name(shifted) + "," + reg_name(source) + ",8");
-                instruction("sb", reg_name(shifted) + "," + memory(high_byte, address));
+                instruction("sb", reg_name(shifted) + "," +
+                                      memory(displacement + high_byte, address));
             } else if (bits <= 32) {
                 halves("swl", "swr", source, 0, 4);
             } else {
@@ -15565,8 +15608,10 @@ private:
         if (bits <= 16) {
             const auto first = scratch();
             const auto second = scratch();
-            instruction(sign ? "lb" : "lbu", reg_name(first) + "," + memory(high_byte, address));
-            instruction("lbu", reg_name(second) + "," + memory(1 - high_byte, address));
+            instruction(sign ? "lb" : "lbu", reg_name(first) + "," +
+                                                  memory(displacement + high_byte, address));
+            instruction("lbu", reg_name(second) + "," +
+                                   memory(displacement + 1 - high_byte, address));
             instruction("sll", reg_name(first) + "," + reg_name(first) + ",8");
             instruction("or", reg_name(target) + "," + reg_name(first) + "," + reg_name(second));
         } else if (bits <= 32) {
@@ -15696,17 +15741,47 @@ private:
                value.mode.bits >= 8;
     }
 
+    // The alignment of the frame and stack pointers: at least 8 bytes in
+    // every MIPS ABI, as frame realignment also assumes.
+    static constexpr unsigned frame_alignment() { return 8; }
+
+    // Copies `bytes` bytes between bases that `alignment` divides, in the
+    // widest units that it and the offsets allow, each loaded before the
+    // previous one is stored, through $at and, when the instruction
+    // clobbers it and no base needs it, $t0. Homes are disjoint from
+    // source-language objects, and units in address order preserve the
+    // object representation on either endian; alignment one, as volatile
+    // records have, copies bytes.
     void copy_bytes(std::string_view destination_base, std::int64_t destination,
                     std::string_view source_base, std::int64_t source,
-                    unsigned bytes) {
-        // Homes are disjoint from source-language objects. Byte accesses also
-        // handle packed records and preserve object representation on either
-        // endian. No implicit memcpy helper or alignment assumption is needed.
-        for (unsigned index = 0; index < bytes; ++index) {
-            instruction("lbu", "$at," + memory(source + index, source_base));
-            instruction("sb",
-                        "$at," + memory(destination + index, destination_base));
+                    unsigned bytes, unsigned alignment = 1, bool clobbers_t0 = false) {
+        const unsigned widest = subtarget_.has_feature(Feature::Mips3) ? 8U : 4U;
+        std::vector<std::string_view> scratch{"at"};
+        if (clobbers_t0 && destination_base != "t0" && source_base != "t0")
+            scratch.push_back("t0");
+        const auto aligned = [](std::int64_t offset, unsigned unit) {
+            return offset % static_cast<std::int64_t>(unit) == 0;
+        };
+        std::optional<std::pair<std::string, std::string>> pending;
+        unsigned count = 0;
+        for (unsigned done = 0; done < bytes; ++count) {
+            unsigned unit = std::min(widest, alignment);
+            while (unit > 1 && (unit > bytes - done || !aligned(source + done, unit) ||
+                                !aligned(destination + done, unit))) unit /= 2;
+            const auto data = std::string(scratch[count % scratch.size()]);
+            instruction(unit == 8 ? "ld" : unit == 4 ? "lw" : unit == 2 ? "lhu" : "lbu",
+                        "$" + data + "," + memory(source + done, source_base));
+            if (pending) instruction(pending->first, pending->second);
+            pending = {unit == 8 ? "sd" : unit == 4 ? "sw" : unit == 2 ? "sh" : "sb",
+                       "$" + data + "," + memory(destination + done, destination_base)};
+            // One register holds one unit at a time.
+            if (scratch.size() == 1) {
+                instruction(pending->first, pending->second);
+                pending.reset();
+            }
+            done += unit;
         }
+        if (pending) instruction(pending->first, pending->second);
     }
 
     // A planned delay-slot instruction: one move or one target operation,
@@ -15776,7 +15851,7 @@ private:
         if (aggregate_vreg(function, target)) {
             copy_bytes(frame_base(), vreg_offset(function, target, location),
                        frame_base(), vreg_offset(function, source, location),
-                       target.mode.bits / 8U);
+                       target.mode.bits / 8U, frame_alignment());
         } else if (floating) {
             load_fvreg(function, source, "f0", location);
             store_fvreg(function, target, "f0", location);
@@ -15857,18 +15932,22 @@ private:
         if (piece.location.kind == LocationKind::Stack) {
             copy_bytes("sp",
                        static_cast<std::int64_t>(piece.location.stack_offset),
-                       frame_base(), offset, piece.value_bits / 8U);
+                       frame_base(), offset, piece.value_bits / 8U, frame_alignment());
             return;
         }
-        const auto carrier = aggregate_carrier_offset(function, location);
-        for (unsigned byte = 0; byte < (piece.carrier_bits + 7U) / 8U; ++byte) {
-            instruction("sb", "$zero," + memory(carrier + byte));
+        // A piece that fills its carrier at an aligned offset of the home
+        // loads from the home.
+        auto carrier = offset;
+        if (!whole_piece(piece, offset)) {
+            carrier = aggregate_carrier_offset(function, location);
+            zero_frame_bytes(carrier, (piece.carrier_bits + 7U) / 8U);
+            // Aggregate offsets describe address-ordered object bytes, not
+            // scalar significance. A short piece occupies the beginning of
+            // its carrier on both endians (high bits on big endian, low bits
+            // on little endian).
+            copy_bytes(frame_base(), carrier, frame_base(), offset,
+                       piece.value_bits / 8U, frame_alignment());
         }
-        // Aggregate offsets describe address-ordered object bytes, not scalar
-        // significance. A short piece occupies the beginning of its carrier
-        // on both endians (high bits on big endian, low bits on little endian).
-        copy_bytes(frame_base(), carrier, frame_base(), offset,
-                   piece.value_bits / 8U);
         if (fpr(piece.location.reg)) {
             if (piece.carrier_bits != 32 && piece.carrier_bits != 64) {
                 diagnostics_.error(
@@ -15922,7 +16001,10 @@ private:
             }
             offset = *home->frame_offset;
         } else {
-            offset = aggregate_carrier_offset(function, location);
+            // A piece that fills its carrier at an aligned offset of the
+            // home stores there.
+            const bool whole = whole_piece(piece, destination);
+            offset = whole ? destination : aggregate_carrier_offset(function, location);
             if (fpr(piece.location.reg)) {
                 if (piece.carrier_bits != 32 && piece.carrier_bits != 64) {
                     diagnostics_.error(location,
@@ -15937,9 +16019,31 @@ private:
                 store_integer_memory(piece.location.reg, memory(offset),
                                      piece.carrier_bits);
             }
+            if (whole) return;
         }
         copy_bytes(frame_base(), destination, base, offset,
-                   piece.value_bits / 8U);
+                   piece.value_bits / 8U, frame_alignment());
+    }
+
+    // Whether a register piece fills its carrier and lies at a frame offset
+    // that the carrier's width divides.
+    static bool whole_piece(const ValuePiece& piece, std::int64_t offset) {
+        const auto bytes = (piece.carrier_bits + 7U) / 8U;
+        return piece.value_bits == piece.carrier_bits && piece.value_bit_offset % 8U == 0 &&
+               (bytes == 4 || bytes == 8) && offset % static_cast<std::int64_t>(bytes) == 0;
+    }
+
+    // Zeroes `bytes` bytes at a frame offset in the widest aligned units.
+    void zero_frame_bytes(std::int64_t offset, unsigned bytes) {
+        const unsigned widest = subtarget_.has_feature(Feature::Mips3) ? 8U : 4U;
+        for (unsigned done = 0; done < bytes;) {
+            unsigned unit = widest;
+            while (unit > 1 && (unit > bytes - done ||
+                                (offset + done) % static_cast<std::int64_t>(unit) != 0)) unit /= 2;
+            instruction(unit == 8 ? "sd" : unit == 4 ? "sw" : unit == 2 ? "sh" : "sb",
+                        "$zero," + memory(offset + done));
+            done += unit;
+        }
     }
 
     std::uint32_t outgoing_size(const machine::Function& function) {
@@ -21901,6 +22005,10 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
             input_gpr(function, value.uses.front(), "t0", value.location);
         const bool load = opcode != Opcode::UnalignedStore;
         const auto scalar = load ? value.defs.front() : value.uses.back();
+        // A folded constant offset follows the register operands.
+        const auto* folded = value.operands.size() == (load ? 2U : 3U)
+            ? std::get_if<machine::ImmediateOperand>(&value.operands.back()) : nullptr;
+        const auto displacement = folded ? static_cast<std::int64_t>(folded->value) : 0;
         const bool floating = scalar.kind == machine::RegisterKind::Virtual &&
                               function.virtual_register_classes[scalar.id] ==
                                   machine::VirtualRegisterClass::Floating;
@@ -21909,12 +22017,12 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
                 machine::VirtualRegisterClass::Integer &&
             scalar.mode.bits <= 64 && !release6(subtarget_)) {
             emit_unaligned_integer(function, value, address, scalar, load,
-                                   opcode == Opcode::UnalignedLoadSigned);
+                                   opcode == Opcode::UnalignedLoadSigned, displacement);
             return;
         }
         const auto carrier = aggregate_carrier_offset(function, value.location);
         if (load) {
-            copy_bytes(frame_base(), carrier, address, 0,
+            copy_bytes(frame_base(), carrier, address, displacement,
                        (scalar.mode.bits + 7U) / 8U);
             if (floating) {
                 instruction(scalar.mode.bits == 32 ? "lwc1" : "ldc1",
@@ -21942,7 +22050,7 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
                     input_gpr(function, scalar, "t1", value.location);
                 store_integer_memory(source, memory(carrier), scalar.mode.bits);
             }
-            copy_bytes(address, 0, frame_base(), carrier,
+            copy_bytes(address, displacement, frame_base(), carrier,
                        (scalar.mode.bits + 7U) / 8U);
         }
         return;
@@ -21977,12 +22085,18 @@ void AssemblyEmitter::emit_target(const machine::Function& function,
                                    ? value.uses.back()
                                    : value.defs.front();
         const auto home = vreg_offset(function, aggregate, value.location);
+        // The memory side's proven alignment precedes an indexed load's
+        // scale; the home's is that of its spill slot.
+        const auto& proven = value.operands[value.operands.size() -
+                                            (opcode == Opcode::AggregateIndexedLoad ? 2U : 1U)];
+        const auto bytes = aggregate.mode.bits / 8U;
+        const auto alignment = std::min(
+            static_cast<unsigned>(std::get<machine::ImmediateOperand>(proven).value),
+            bytes >= 8 ? 8U : 4U);
         if (opcode == Opcode::AggregateStore) {
-            copy_bytes(base, offset, frame_base(), home,
-                       aggregate.mode.bits / 8U);
+            copy_bytes(base, offset, frame_base(), home, bytes, alignment, true);
         } else {
-            copy_bytes(frame_base(), home, base, offset,
-                       aggregate.mode.bits / 8U);
+            copy_bytes(frame_base(), home, base, offset, bytes, alignment, true);
         }
         return;
     }

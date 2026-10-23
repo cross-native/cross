@@ -477,6 +477,9 @@ std::span<const OptionDefinition> common_option_definitions() {
         {"f.tree-fre", {}, OptionValueKind::Boolean, false, {}, 0, 0,
          OptionCategory::Optimization, true, OptionImplementation::Implemented,
          "redundant expression and load elimination over the dominator tree"},
+        {"f.tree-sra", {}, OptionValueKind::Boolean, false, {}, 0, 0,
+         OptionCategory::Optimization, true, OptionImplementation::Partial,
+         "copy records in register-wide units instead of through temporaries"},
         {"f.tree-tail-merge", {}, OptionValueKind::Boolean, false, {}, 0, 0,
          OptionCategory::Optimization, true, OptionImplementation::Partial,
          "factor profitable common SSA tails before machine selection"},
@@ -1025,6 +1028,7 @@ bool resolve_registered_options(
     options.tree_dce = resolved_bool(options, "f.tree-dce");
     options.tree_dse = resolved_bool(options, "f.tree-dse");
     options.tree_fre = resolved_bool(options, "f.tree-fre");
+    options.tree_sra = resolved_bool(options, "f.tree-sra");
     options.tree_tail_merge =
         resolved_bool(options, "f.tree-tail-merge");
     options.thread_jumps = resolved_bool(options, "f.thread-jumps");

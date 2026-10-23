@@ -216,6 +216,7 @@ add_library(cross_middle
     src/middle/frame_ir.cpp
     src/middle/mir.cpp
     src/middle/mir_analysis.cpp
+    src/middle/mir_aggregate.cpp
     src/middle/mir_assignment.cpp
     src/middle/mir_bits.cpp
     src/middle/mir_memory.cpp
@@ -472,6 +473,14 @@ if(BUILD_TESTING)
                      -P "${CMAKE_SOURCE_DIR}/test/language/may_alias_checks.cmake")
     set_tests_properties(cross_may_alias_checks PROPERTIES
         LABELS "frontend;arch.x86_64;arch.mips;endian.big;endian.little;check.compile;diagnostics;feature.attributes;feature.evaluation")
+    add_test(NAME cross_record_copy_overlap
+             COMMAND "${CMAKE_COMMAND}"
+                     -DCC=$<TARGET_FILE:cross_cc>
+                     -DSOURCE=${CMAKE_SOURCE_DIR}/test/language/record_copy_overlap.x
+                     -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/record-copy-overlap
+                     -P "${CMAKE_SOURCE_DIR}/test/language/record_copy_overlap.cmake")
+    set_tests_properties(cross_record_copy_overlap PROPERTIES
+        LABELS "frontend;arch.x86_64;arch.mips;endian.big;endian.little;check.compile;diagnostics;feature.records;feature.evaluation")
     foreach(arch x86_64 mips)
         add_test(NAME cross_aligned_typedef_${arch}
                  COMMAND "${CMAKE_COMMAND}"
@@ -6623,6 +6632,79 @@ if(BUILD_TESTING)
             endforeach()
         endforeach()
     endforeach()
+    # Record copies and initializers in register-wide units: x86-64 natively
+    # and through LLVM IR, o32 on R3000 and VR4300 and n64, each in both byte
+    # orders, and AArch64 on the virt machine without the packed records,
+    # whose misaligned accesses fault there; and the code of the copies at O2.
+    foreach(level O0 O2 Os)
+        set(copies_labels "feature.records;feature.initializer;feature.optimization;opt.${level}")
+        set(copies_flags "-${level};-fno-eval-calls")
+        add_test(NAME cross_runtime_aggregate_copies_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DHOST_CXX=${CMAKE_CXX_COMPILER}
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/aggregate_copies.x
+                    -DRUNNER=${CMAKE_SOURCE_DIR}/test/support/native_entry.cpp
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aggregate-copies-runtime-${level}
+                    -DENTRY=aggregate_copies_entry -DEXPECTED=1 "-DCC_FLAGS=${copies_flags}"
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_native.cmake")
+        set_tests_properties(cross_runtime_aggregate_copies_${level} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.native;middle;${copies_labels}")
+        add_test(NAME cross_runtime_aggregate_copies_llvm_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc> "-DCC_FLAGS=${copies_flags}"
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/aggregate_copies.x
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aggregate-copies-llvm-${level}.ll
+                    -DENTRY=aggregate_copies_entry -DEXPECTED=1
+                    -P "${CMAKE_SOURCE_DIR}/test/support/run_ir.cmake")
+        set_tests_properties(cross_runtime_aggregate_copies_llvm_${level} PROPERTIES
+            LABELS "check.runtime;arch.x86_64;backend.llvm;middle;${copies_labels}")
+        add_test(NAME cross_mips_aggregate_copies_o32_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/aggregate_copies.x
+                    -DSTARTUP=${CMAKE_SOURCE_DIR}/test/backend/native/aggregate_copies_start.s
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aggregate-copies-o32-${level}
+                    -DEXPECTED=P "-DCC_FLAGS=${copies_flags}"
+                    -P "${CMAKE_SOURCE_DIR}/test/language/semantics/mips.cmake")
+        set_tests_properties(cross_mips_aggregate_copies_o32_${level} PROPERTIES
+            LABELS "check.runtime;arch.mips;backend.native;middle;${copies_labels};profile.o32;isa.vr4300;isa.r3000;endian.big;endian.little"
+            SKIP_REGULAR_EXPRESSION "skipping MIPS")
+        foreach(endian big little)
+            add_test(NAME cross_mips_aggregate_copies_n64_${level}_${endian}
+                COMMAND "${CMAKE_COMMAND}"
+                        -DCC=$<TARGET_FILE:cross_cc>
+                        -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/aggregate_copies.x
+                        -DSTARTUP=${CMAKE_SOURCE_DIR}/test/backend/native/aggregate_copies_start.s
+                        -DLINKER=${CMAKE_SOURCE_DIR}/test/target/mips/bare-n64.ld
+                        -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aggregate-copies-n64-${level}-${endian}
+                        -DN64_ENDIAN=${endian} "-DEXTRA_FLAGS=-${level} -fno-eval-calls"
+                        -P "${CMAKE_SOURCE_DIR}/test/target/mips/n64_runtime.cmake")
+            set_tests_properties(cross_mips_aggregate_copies_n64_${level}_${endian} PROPERTIES
+                LABELS "check.runtime;arch.mips;backend.native;middle;${copies_labels};profile.n64;endian.${endian}"
+                SKIP_REGULAR_EXPRESSION "skipping MIPS")
+        endforeach()
+        add_test(NAME cross_aarch64_aggregate_copies_${level}
+            COMMAND "${CMAKE_COMMAND}"
+                    -DCC=$<TARGET_FILE:cross_cc>
+                    -DAS=$<TARGET_FILE:cross_as>
+                    -DLD=$<TARGET_FILE:cross_ld>
+                    "-DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/aggregate_copies.x;${CMAKE_SOURCE_DIR}/test/target/aarch64/codegen/aggregate_copies_main.x"
+                    -DOPT_LEVEL=-${level} -DFLAGS=-fno-eval-calls
+                    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aggregate-copies-aarch64-${level}
+                    -P "${CMAKE_SOURCE_DIR}/test/target/aarch64/codegen/runtime.cmake")
+        set_tests_properties(cross_aarch64_aggregate_copies_${level} PROPERTIES
+            LABELS "check.runtime;arch.aarch64;backend.native;middle;${copies_labels};endian.little"
+            SKIP_REGULAR_EXPRESSION "skipping")
+    endforeach()
+    add_test(NAME cross_aggregate_copies_codegen
+        COMMAND "${CMAKE_COMMAND}"
+                -DCC=$<TARGET_FILE:cross_cc>
+                -DSOURCE=${CMAKE_SOURCE_DIR}/test/backend/native/aggregate_copies_codegen.x
+                -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/aggregate-copies-codegen
+                -P "${CMAKE_SOURCE_DIR}/test/backend/native/aggregate_copies_codegen.cmake")
+    set_tests_properties(cross_aggregate_copies_codegen PROPERTIES
+        LABELS "check.compile;arch.x86_64;arch.mips;middle;backend.native;feature.records;feature.initializer;feature.optimization;isa.vr4300;profile.o32;profile.n64;opt.O2")
     add_test(NAME cross_underaligned_typedef_codegen
         COMMAND "${CMAKE_COMMAND}"
                 -DCC=$<TARGET_FILE:cross_cc>

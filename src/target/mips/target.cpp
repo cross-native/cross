@@ -326,6 +326,19 @@ unsigned integer_register_bits(const Subtarget& subtarget) {
     return subtarget.has_feature(mips::Feature::Mips3) ? 64U : 32U;
 }
 
+// An under-aligned word or doubleword is an LWL/LWR-style pair before
+// Release 6, and a halfword two byte accesses with a shift.
+unsigned memory_access_instructions(const Subtarget& subtarget,
+                                    const MemoryAccessCostQuery& query) {
+    if (query.vector || query.bytes == 0 ||
+        query.bytes * 8U > integer_register_bits(subtarget)) return 0;
+    if (query.alignment >= query.bytes ||
+        subtarget.has_feature(mips::Feature::UnalignedAccess)) return 1;
+    if (mips::release6(subtarget)) return 0;
+    if (query.bytes == 2) return query.store ? 3U : 4U;
+    return 2;
+}
+
 unsigned integer_constant_materialization_cost(
     const Subtarget& subtarget, const IntegerConstantCostQuery& query) {
     if (query.bits == 0) return 1;
@@ -719,6 +732,7 @@ TargetInfo make_target(ByteOrder order, std::vector<TriplePrefix> prefixes) {
     // The models give the instruction table.
     result.instruction_model = &instruction_model;
     result.cost_model.register_pressure = register_pressure;
+    result.cost_model.memory_access = memory_access_instructions;
     // %gp_rel offsets are relative to _gp, which $gp holds.
     result.data_base_registers = {"gp"};
     // 64-bit integers are native from MIPS III and word pairs before it.

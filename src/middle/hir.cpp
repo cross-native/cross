@@ -3052,14 +3052,20 @@ std::optional<TypeId> Module::common_pointer_type(TypeId left, TypeId right, con
 }
 
 TypeId Module::pointer_to(TypeId pointee) {
+    return pointer_to(pointee, 0);
+}
+
+TypeId Module::pointer_to(TypeId pointee, std::uint32_t address_space) {
     Type type;
     type.kind = Type::Kind::Pointer;
     type.pointee = pointee;
+    type.address_space = address_space;
     if (const auto found = find_type(*this, type, [&](const Type& candidate) {
             return candidate.kind == Type::Kind::Pointer &&
                 candidate.pointee == pointee && !candidate.is_const &&
                 !candidate.is_volatile && !candidate.is_atomic &&
-                !candidate.is_restrict && !candidate.may_alias && candidate.address_space == 0 &&
+                !candidate.is_restrict && !candidate.may_alias &&
+                candidate.address_space == address_space &&
                 !candidate.alignment && candidate.nominal_key().empty();
         }))
         return *found;

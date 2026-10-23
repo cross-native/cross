@@ -18,6 +18,7 @@ optimization "O0" {
     f.tree-dce = false;
     f.tree-dse = false;
     f.tree-fre = false;
+    f.tree-sra = false;
     f.tree-tail-merge = false;
     f.thread-jumps = false;
     f.tree-cfg-cleanup = false;
@@ -115,6 +116,7 @@ optimization "O2" {
     f.ipa-pure-const = true;
     f.private-abi = true;
     f.tree-fre = true;
+    f.tree-sra = true;
     f.tree-tail-merge = true;
     f.thread-jumps = true;
     f.ivopts = true;

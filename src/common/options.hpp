@@ -215,6 +215,7 @@ struct CompilerOptions {
     bool tree_dce{};
     bool tree_dse{};
     bool tree_fre{};
+    bool tree_sra{};
     bool tree_tail_merge{};
     bool thread_jumps{};
     bool tree_cfg_cleanup{};

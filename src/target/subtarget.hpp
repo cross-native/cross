@@ -117,6 +117,11 @@ public:
     [[nodiscard]] std::optional<std::vector<InstructionCostId>>
     vector_operation(const VectorOperationCostQuery& query) const;
     [[nodiscard]] unsigned integer_register_bits() const;
+    // The instructions of one load or store, zero when it has none; without
+    // a target description, one for a naturally aligned integer that fits a
+    // general register.
+    [[nodiscard]] unsigned memory_access_instructions(
+        const MemoryAccessCostQuery& query) const;
     [[nodiscard]] floating::NanEncoding nan_encoding() const;
     [[nodiscard]] const std::vector<std::string>& enabled_features() const {
         return enabled_features_;

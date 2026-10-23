@@ -153,6 +153,15 @@ unsigned Subtarget::integer_register_bits() const {
         ? target_->cost_model.integer_register_bits(*this) : 64U;
 }
 
+unsigned Subtarget::memory_access_instructions(
+    const MemoryAccessCostQuery& query) const {
+    if (target_ && target_->cost_model.memory_access)
+        return target_->cost_model.memory_access(*this, query);
+    return !query.vector && query.alignment >= query.bytes &&
+                   query.bytes * 8U <= integer_register_bits()
+               ? 1U : 0U;
+}
+
 std::optional<InstructionFeatureConflict> Subtarget::form_conflict(
     const InstructionEntry& form) const {
     if (auto conflict = instruction_feature_conflict(

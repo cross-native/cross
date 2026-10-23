@@ -5467,9 +5467,11 @@ private:
         for (auto& block : current_.blocks) {
             for (auto& consumer : block.instructions) {
                 const bool load = consumer.opcode == Opcode::PointerLoad ||
-                                  consumer.opcode == Opcode::FpointerLoad;
+                                  consumer.opcode == Opcode::FpointerLoad ||
+                                  consumer.opcode == Opcode::VpointerLoad;
                 const bool store = consumer.opcode == Opcode::PointerStore ||
-                                   consumer.opcode == Opcode::FpointerStore;
+                                   consumer.opcode == Opcode::FpointerStore ||
+                                   consumer.opcode == Opcode::VpointerStore;
                 if ((!load && !store) || consumer.patch ||
                     consumer.operands.size() != (load ? 1U : 2U) ||
                     consumer.uses.empty() ||
@@ -16726,16 +16728,27 @@ private:
 
     void emit_vector_pointer_access(const machine::Function& function,
                                     const machine::Instruction& value) {
-        load(function, value.uses.front(), "rax");
-        if (value.opcode == Opcode::VpointerLoad) {
+        const bool load_access = value.opcode == Opcode::VpointerLoad;
+        const auto displacement =
+            pointer_displacement(value, load_access ? 1U : 2U);
+        // An address in a register is used in place.
+        const auto* assigned_address =
+            assigned_integer_register(function, value.uses.front());
+        const auto base = assigned_address
+            ? std::string(assigned_address->storage_name) : std::string("rax");
+        if (!assigned_address) load(function, value.uses.front(), "rax");
+        const auto at = [&](unsigned chunk, unsigned width) {
+            return std::to_string(displacement + chunk * (width / 8U)) +
+                   "(%" + base + ")";
+        };
+        if (load_access) {
             const auto target = value.defs.front();
             const auto width = memory_vector_width(target);
             const auto scratch = vector_register(target, 0, width);
             for (unsigned chunk = 0;
                  chunk < vector_chunks(target, width); ++chunk) {
                 instruction(vector_move_opcode(width),
-                            std::to_string(chunk * (width / 8U)) +
-                                "(%rax), %" + scratch);
+                            at(chunk, width) + ", %" + scratch);
                 store_vector(function, target, 0, chunk, width);
             }
         } else {
@@ -16746,9 +16759,7 @@ private:
                  chunk < vector_chunks(source, width); ++chunk) {
                 load_vector(function, source, 0, chunk, width);
                 instruction(vector_move_opcode(width),
-                            "%" + scratch + ", " +
-                                std::to_string(chunk * (width / 8U)) +
-                                "(%rax)");
+                            "%" + scratch + ", " + at(chunk, width));
             }
         }
     }

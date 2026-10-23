@@ -152,6 +152,16 @@ std::vector<InstructionCostId> integer_operation_instructions(
 
 unsigned integer_register_bits(const Subtarget&) { return 64; }
 
+// Moves take any alignment; a vector needs the feature of its width.
+unsigned memory_access_instructions(const Subtarget& subtarget,
+                                    const MemoryAccessCostQuery& query) {
+    if (!query.vector) return query.bytes != 0 && query.bytes <= 8 ? 1U : 0U;
+    if (query.bytes == 16) return 1;
+    if (query.bytes == 32) return subtarget.has_feature(x86_64::Feature::Avx) ? 1U : 0U;
+    if (query.bytes == 64) return subtarget.has_feature(x86_64::Feature::Avx512f) ? 1U : 0U;
+    return 0;
+}
+
 InstructionOperandEntry integer_register_operand(
     InstructionOperandRole role, unsigned bits) {
     return {role, true, false, bits, 0, false,
@@ -1008,6 +1018,7 @@ TargetInfo with_instruction_costs(TargetInfo info) {
     set_instruction_costs(info, declared_instructions());
     info.integrated_assembler = &x86_64::assemble;
     info.cost_model.register_pressure = register_pressure;
+    info.cost_model.memory_access = memory_access_instructions;
     return info;
 }
 

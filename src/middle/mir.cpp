@@ -889,7 +889,8 @@ public:
     ManagedLowerer(hir::Module& module, const Subtarget& subtarget,
                    const CompilerOptions& options, Diagnostics& diagnostics)
         : hir_(module), subtarget_(subtarget), target_(subtarget.target()),
-          diagnostics_(diagnostics), bounds_trap_(options.bounds_trap) {}
+          options_(options), diagnostics_(diagnostics),
+          bounds_trap_(options.bounds_trap) {}
 
     ManagedModule run() {
         for (auto& function : hir_.functions) {
@@ -1747,7 +1748,8 @@ private:
             const SlotId slot{static_cast<std::uint32_t>(current_.slots.size())};
             current_.slots.push_back({slot, expression.location, type,
                 "$compound." + std::to_string(slot.value), std::nullopt,
-                expression.type->is_volatile, true, false, 1, std::nullopt});
+                expression.type->is_volatile, true, false,
+                expression.type->is_volatile ? 1U : unit_slot_alignment(type), std::nullopt});
             scopes_.back().slots.push_back(slot);
             (void)lifetime(ValueKind::LifetimeStart, slot, expression.location);
             const LocalBinding binding{slot, type, std::nullopt, std::nullopt};
@@ -2365,6 +2367,18 @@ private:
         if (pointer.kind != hir::Type::Kind::Pointer || !pointer.pointee) {
             return std::nullopt;
         }
+        // A record's value is of its unqualified type: a const record loads
+        // through an unqualified pointer, so no conversion copies the value.
+        if (const auto& pointee = hir_.type(*pointer.pointee);
+            pointee.is_const && !pointee.is_volatile &&
+            record_value_type(hir_, *pointer.pointee)) {
+            const auto natural = pointee_alignment(*pointer.pointee, alignment);
+            auto unqualified = pointer;
+            unqualified.pointee = hir_.add_qualifiers(hir_.unqualified(*pointer.pointee), false,
+                                                      false, pointee.may_alias);
+            const auto type = hir_.pointer_to(*unqualified.pointee, pointer.address_space);
+            return load_pointer(cast(address, type, location), location, natural);
+        }
         if (array_type(hir_, *pointer.pointee)) {
             return decay_array_address(address, *pointer.pointee, location);
         }
@@ -2618,6 +2632,16 @@ private:
                 failed_ = true;
             }
         };
+        if (!source_element.is_volatile) {
+            initializer::Plan plan;
+            plan.items.push_back({&initializer, binding.type, 0, 1, std::nullopt});
+            if (store_initializer_image(base, array.lanes, slot_alignment(binding), plan,
+                                        initializer.location).front()) return true;
+            for (std::size_t index = 0; index < required; ++index)
+                store_byte(index, index < initializer.string_value.size()
+                    ? static_cast<std::uint8_t>(initializer.string_value[index]) : 0U);
+            return true;
+        }
         for (std::size_t index = 0;
              index < initializer.string_value.size(); ++index) {
             store_byte(index, static_cast<std::uint8_t>(
@@ -2639,9 +2663,11 @@ private:
     }
 
     // Zeroes the elements [first, limit) at `base`, at least one, in a loop
-    // that tests after its body, as the assignment proof can follow.
+    // that tests after its body, as the assignment proof can follow. Each
+    // element is aligned to `alignment`, zero meaning its natural alignment.
     void zero_fill(ValueId base, hir::TypeId element, std::uint64_t first,
-                   std::uint64_t limit, SourceLocation location) {
+                   std::uint64_t limit, SourceLocation location,
+                   unsigned alignment = 1) {
         const auto uptr = *hir_.builtin(BuiltinType::Uptr);
         const auto initial = constant(first, uptr, location);
         const auto preheader = *current_block_;
@@ -2653,7 +2679,14 @@ private:
         enter(body);
         const auto index = add_value(ValueKind::Phi, uptr, location);
         const auto address = indexed_address(base, index, element, location);
-        if (!store_pointer(address, constant(0, element, location), location, 1)) {
+        auto zero = constant(0, vector_type(hir_, element) ? *hir_.type(element).element : element,
+                             location);
+        if (vector_type(hir_, element)) {
+            const auto lanes = zero;
+            zero = add_value(ValueKind::Splat, hir_.unqualified(element), location);
+            current_.values[zero.value].operands.push_back(lanes);
+        }
+        if (!store_pointer(address, zero, location, alignment)) {
             failed_ = true;
         }
         const auto next = integer_binary(BinaryOperation::Add, uptr, index,
@@ -2870,6 +2903,47 @@ private:
                     failed_ = true;
                 return;
             }
+            if (!source_volatile && !object_volatile) {
+                // Runs of equal units, each in a loop unless short.
+                const auto units = plan_memory_units(
+                    region.size, aligned(source_alignment, region.offset),
+                    aligned(alignment, region.offset), subtarget_, options_);
+                for (std::size_t first = 0; first < units.size();) {
+                    auto last = first;
+                    while (last + 1 < units.size() && units[last + 1].bytes == units[first].bytes &&
+                           units[last + 1].vector == units[first].vector) ++last;
+                    const auto offset = region.offset + units[first].offset;
+                    const auto type = memory_unit_type(hir_, units[first]);
+                    const auto unit = units[first].bytes;
+                    const auto load_alignment = std::min(unit, aligned(source_alignment, offset));
+                    const auto store_alignment = std::min(unit, aligned(alignment, offset));
+                    const auto count = last - first + 1;
+                    // Units at constant offsets, or a loop of them.
+                    const auto at = [&](ValueId from, std::uint64_t bytes) {
+                        auto pointer = cast(from, hir_.pointer_to(byte), location);
+                        if (bytes != 0)
+                            pointer = indexed_address(pointer, constant(bytes, uptr, location), byte, location);
+                        if (extra) pointer = indexed_address(pointer, *extra, byte, location);
+                        return cast(pointer, hir_.pointer_to(type), location);
+                    };
+                    const auto move = [&](ValueId from, ValueId to) {
+                        const auto value = load_pointer(from, location, load_alignment);
+                        if (!value || !store_pointer(to, *value, location, store_alignment)) failed_ = true;
+                    };
+                    if (count <= straight_unit_limit(options_)) {
+                        for (std::uint64_t index = 0; index < count; ++index)
+                            move(at(source->address, offset + index * unit),
+                                 at(base, item.offset + offset + index * unit));
+                    } else {
+                        repeat(count, 0, [&](ValueId index) {
+                            move(address(source->address, offset, extra, index, type),
+                                 address(base, item.offset + offset, extra, index, type));
+                        });
+                    }
+                    first = last + 1;
+                }
+                return;
+            }
             for (std::uint64_t done = 0; done < region.size;) {
                 const auto offset = region.offset + done;
                 auto size = static_cast<std::uint64_t>(std::min({widest,
@@ -2905,9 +2979,249 @@ private:
         return !failed_;
     }
 
+    // The alignment that lets the target store a local aggregate's
+    // register-wide units with single accesses where accesses below it take
+    // more, or one.
+    unsigned unit_slot_alignment(hir::TypeId type) const {
+        const auto& object = hir_.type(type);
+        if (object.kind != hir::Type::Kind::Record && object.kind != hir::Type::Kind::Array)
+            return 1;
+        const auto size = hir::layout_size(hir_, type, target_).value_or(0);
+        const auto natural = std::max(storage_alignment(hir_, type, target_),
+            static_cast<unsigned>(hir::natural_alignment(hir_, type, target_).value_or(1)));
+        const auto unit = static_cast<unsigned>(std::min<std::uint64_t>(
+            std::bit_floor(std::max<std::uint64_t>(size, 1)), subtarget_.integer_register_bits() / 8U));
+        return unit > natural &&
+                       subtarget_.memory_access_instructions({unit, natural, true, false}) != 1 &&
+                       subtarget_.memory_access_instructions({unit, unit, true, false}) == 1
+                   ? unit : 1U;
+    }
+
+    // The alignment of a slot's storage, as the targets lay it out.
+    unsigned slot_alignment(const LocalBinding& binding) const {
+        return std::max({storage_alignment(hir_, binding.type, target_),
+            static_cast<unsigned>(hir::natural_alignment(hir_, binding.type, target_).value_or(1)),
+            current_.slots[binding.slot.value].minimum_alignment});
+    }
+
+    // The bits a scalar entry stores when they are a translation-time
+    // constant: an integer, or a floating value of the entry's own format or
+    // zero, converted as assignment converts it.
+    std::optional<UInt128> constant_entry_bits(const Expr& entry, hir::TypeId type) {
+        const auto* expression = &entry;
+        while (expression->kind == Expr::Kind::Parenthesized && expression->left)
+            expression = expression->left.get();
+        const auto& destination = hir_.type(type);
+        if (destination.kind != hir::Type::Kind::Builtin || destination.is_volatile ||
+            destination.is_atomic) return std::nullopt;
+        const auto bits = type_bits(hir_, type);
+        // A literal integer, under signs and complements, evaluates nothing.
+        const auto* operand = expression;
+        while (operand && ((operand->kind == Expr::Kind::Unary &&
+                            (operand->text == "-" || operand->text == "+" || operand->text == "~")) ||
+                           operand->kind == Expr::Kind::Parenthesized))
+            operand = operand->left.get();
+        if (operand && operand->kind == Expr::Kind::Integer) {
+            const auto parsed = patch_initial(*expression, hir_.address_bits);
+            if (!parsed) return std::nullopt;
+            if (destination.builtin == BuiltinType::Bool) return UInt128{parsed->value != UInt128{} ? 1U : 0U};
+            if (integer_type(hir_, type)) return mask_to(parsed->value, bits);
+            if (floating_type(hir_, type) && parsed->value == UInt128{} &&
+                destination.builtin != BuiltinType::F80) return UInt128{};
+            return std::nullopt;
+        }
+        if (expression->kind == Expr::Kind::Floating && floating_type(hir_, type) &&
+            destination.builtin != BuiltinType::F80) {
+            const auto parsed = parse_floating(*expression, hir_.address_bits);
+            if (!parsed) return std::nullopt;
+            if (parsed->bits == 0 && parsed->bits_high == 0) return UInt128{};
+            if (parsed->type == destination.builtin && bits <= 64) return UInt128{parsed->bits};
+        }
+        return std::nullopt;
+    }
+
+    // Stores, before the entries of an initializer run, the zero of every
+    // byte that no entry writes as a whole and the bytes of the constant
+    // entries, in the target's widest units, and marks the items whose bytes
+    // they wrote. A unit is stored when it holds such a zero byte, or when
+    // two constant entries make up all of it.
+    std::vector<bool> store_initializer_image(ValueId base, std::uint64_t size,
+                                              unsigned alignment,
+                                              const initializer::Plan& plan,
+                                              SourceLocation location) {
+        enum class Kind : std::uint8_t { Zero, Constant, Runtime };
+        std::vector<Kind> kinds(size, Kind::Zero);
+        std::vector<std::uint8_t> image(size);
+        const bool little = target_.data_layout.byte_order == ByteOrder::Little;
+        // The bytes an entry stores, a bit-field's within its carrier.
+        struct Constant {
+            std::size_t item;
+            std::uint64_t offset;
+            std::vector<std::uint8_t> bytes;
+        };
+        std::vector<Constant> constants;
+        const auto mark = [&](std::uint64_t from, std::uint64_t length, Kind kind) {
+            for (auto at = from; at < std::min(size, from + length); ++at) kinds[at] = kind;
+        };
+        const auto encoded = [&](UInt128 value, unsigned bytes) {
+            std::vector<std::uint8_t> result(bytes);
+            for (unsigned index = 0; index < bytes; ++index)
+                result[little ? index : bytes - 1U - index] =
+                    static_cast<std::uint8_t>(shift_right(value, index * 8U).low & 0xFFU);
+            return result;
+        };
+        for (std::size_t index = 0; index < plan.items.size(); ++index) {
+            const auto& item = plan.items[index];
+            if (!item.expression) continue;
+            if (item.whole) {
+                for (const auto& region : item.regions) {
+                    if (region.mask) continue;
+                    for (std::uint64_t copy = 0; copy < region.count; ++copy)
+                        mark(item.offset + region.offset + copy * region.stride, region.size,
+                             Kind::Runtime);
+                }
+                continue;
+            }
+            const auto& type = hir_.type(item.type);
+            if (type.kind == hir::Type::Kind::Array && item.expression->kind == Expr::Kind::String) {
+                std::vector<std::uint8_t> bytes(item.expression->string_value.begin(),
+                                                item.expression->string_value.end());
+                bytes.push_back(0);
+                if (item.offset + bytes.size() > size) continue;
+                mark(item.offset, bytes.size(), Kind::Constant);
+                constants.push_back({index, item.offset, std::move(bytes)});
+                continue;
+            }
+            if (type.kind == hir::Type::Kind::Array || type.kind == hir::Type::Kind::Record) continue;
+            if (item.bit_width) {
+                // The carrier keeps its zero for the code that merges a
+                // field into it.
+                const auto value = constant_entry_bits(*item.expression, item.type);
+                const auto carrier = type_bits(hir_, item.type) / 8U;
+                if (!value || carrier == 0 || carrier > 8 || item.offset + carrier > size) continue;
+                const auto field = shift_left(mask_to(*value, *item.bit_width), item.bit_offset);
+                constants.push_back({index, item.offset, encoded(field, carrier)});
+                continue;
+            }
+            const auto value_size = type.kind == hir::Type::Kind::Builtin &&
+                    type.builtin == BuiltinType::F80
+                ? std::uint64_t{10} : hir::natural_size(hir_, item.type, target_).value_or(0);
+            const auto value = constant_entry_bits(*item.expression, item.type);
+            if (value && value_size <= 8) {
+                mark(item.offset, value_size, Kind::Constant);
+                constants.push_back({index, item.offset,
+                                     encoded(*value, static_cast<unsigned>(value_size))});
+            } else {
+                mark(item.offset, value_size, Kind::Runtime);
+            }
+        }
+
+        const auto units = plan_memory_units(size, std::nullopt, alignment, subtarget_, options_);
+        std::vector<bool> stored(units.size());
+        const auto overlapping = [&](std::uint64_t from, std::uint64_t length) {
+            std::vector<std::size_t> result;
+            for (std::size_t unit = 0; unit < units.size(); ++unit)
+                if (units[unit].offset < from + length && from < units[unit].offset + units[unit].bytes)
+                    result.push_back(unit);
+            return result;
+        };
+        for (std::size_t unit = 0; unit < units.size(); ++unit) {
+            const auto begin = units[unit].offset, end = begin + units[unit].bytes;
+            bool zero = false, runtime = false;
+            for (auto at = begin; at < end; ++at) {
+                zero = zero || kinds[at] == Kind::Zero;
+                runtime = runtime || kinds[at] == Kind::Runtime;
+            }
+            unsigned inside = 0;
+            for (const auto& constant : constants)
+                inside += constant.offset >= begin && constant.offset + constant.bytes.size() <= end;
+            stored[unit] = zero || (!runtime && inside >= 2);
+        }
+        std::vector<bool> folded(plan.items.size());
+        for (const auto& constant : constants) {
+            const auto covering = overlapping(constant.offset, constant.bytes.size());
+            const bool fits = std::all_of(covering.begin(), covering.end(), [&](std::size_t unit) {
+                if (!stored[unit]) return false;
+                if (!units[unit].vector) return true;
+                // A vector unit stores only zero.
+                for (std::uint64_t at = 0; at < constant.bytes.size(); ++at) {
+                    const auto offset = constant.offset + at;
+                    if (offset >= units[unit].offset &&
+                        offset < units[unit].offset + units[unit].bytes &&
+                        constant.bytes[at] != 0) return false;
+                }
+                return true;
+            });
+            if (!fits) continue;
+            folded[constant.item] = true;
+            for (std::uint64_t at = 0; at < constant.bytes.size(); ++at)
+                image[constant.offset + at] |= constant.bytes[at];
+        }
+
+        const auto uptr = *hir_.builtin(BuiltinType::Uptr);
+        const auto byte_pointer = current_.values[base.value].type;
+        const auto unit_value = [&](const MemoryUnit& unit, hir::TypeId type) {
+            if (unit.vector) {
+                const auto lanes = constant(0, *hir_.builtin(BuiltinType::U64), location);
+                const auto splat = add_value(ValueKind::Splat, hir_.unqualified(type), location);
+                current_.values[splat.value].operands.push_back(lanes);
+                return splat;
+            }
+            UInt128 value{};
+            for (unsigned index = 0; index < unit.bytes; ++index) {
+                const auto byte = image[unit.offset + (little ? index : unit.bytes - 1U - index)];
+                value = bit_or(value, shift_left(UInt128{byte}, index * 8U));
+            }
+            return constant(value, hir_.unqualified(type), location);
+        };
+        const auto unit_pointer = [&](std::uint64_t offset, hir::TypeId type) {
+            auto at = base;
+            if (offset != 0)
+                at = indexed_address(base, constant(offset, uptr, location),
+                                     *hir_.type(byte_pointer).pointee, location);
+            return cast(at, hir_.pointer_to(type, hir_.type(byte_pointer).address_space), location);
+        };
+        const auto limit = straight_unit_limit(options_);
+        for (std::size_t unit = 0; unit < units.size();) {
+            if (!stored[unit]) {
+                ++unit;
+                continue;
+            }
+            const auto type = memory_unit_type(hir_, units[unit]);
+            const auto zero_unit = [&](std::size_t index) {
+                if (!stored[index] || units[index].bytes != units[unit].bytes ||
+                    units[index].vector != units[unit].vector) return false;
+                for (std::uint64_t at = 0; at < units[index].bytes; ++at)
+                    if (image[units[index].offset + at] != 0) return false;
+                return true;
+            };
+            auto last = unit;
+            while (zero_unit(unit) && last + 1 < units.size() && zero_unit(last + 1) &&
+                   units[last + 1].offset == units[last].offset + units[last].bytes) ++last;
+            const auto alignment_at = [&](std::uint64_t offset) {
+                auto at = alignment;
+                while (at > 1 && offset % at != 0) at /= 2;
+                return at >= units[unit].bytes ? 0U : at;
+            };
+            if (last - unit + 1 > limit) {
+                zero_fill(unit_pointer(units[unit].offset, type), type, 0, last - unit + 1, location,
+                          alignment_at(units[unit].offset));
+            } else {
+                for (auto index = unit; index <= last; ++index) {
+                    const auto address = unit_pointer(units[index].offset, type);
+                    if (!store_pointer(address, unit_value(units[index], type), location,
+                                       alignment_at(units[index].offset)))
+                        failed_ = true;
+                }
+            }
+            unit = last + 1;
+        }
+        return folded;
+    }
+
     bool initialize_aggregate_items(
         ValueId base, hir::TypeId byte, bool object_volatile,
-        const initializer::Plan& plan) {
+        const initializer::Plan& plan, const std::vector<bool>& folded = {}) {
         const auto uptr = *hir_.builtin(BuiltinType::Uptr);
         const auto store_byte = [&](ValueId index, std::uint8_t value,
                                     SourceLocation location) {
@@ -2916,11 +3230,13 @@ private:
             if (!store_pointer(address, stored, location, 1)) failed_ = true;
         };
 
-        for (const auto& item : plan.items) {
+        for (std::size_t index = 0; index < plan.items.size(); ++index) {
+            const auto& item = plan.items[index];
             if (!item.expression) {
                 failed_ = true;
                 continue;
             }
+            if (index < folded.size() && folded[index]) continue;
             if (item.whole) {
                 (void)copy_initializer_value(base, object_volatile, item);
                 continue;
@@ -2940,13 +3256,13 @@ private:
                     failed_ = true;
                     continue;
                 }
-                for (std::size_t index = 0;
-                     index < item.expression->string_value.size(); ++index) {
+                for (std::size_t at = 0;
+                     at < item.expression->string_value.size(); ++at) {
                     const auto offset = constant(
-                        item.offset + index, uptr,
+                        item.offset + at, uptr,
                         item.expression->location);
                     store_byte(offset, static_cast<std::uint8_t>(
-                                           item.expression->string_value[index]),
+                                           item.expression->string_value[at]),
                                item.expression->location);
                 }
                 store_byte(constant(item.offset + required - 1, uptr,
@@ -3106,6 +3422,12 @@ private:
             *hir_.builtin(BuiltinType::U8), false, object_volatile);
         const auto base = cast(slot_address(binding, source.location),
                                hir_.pointer_to(byte), source.location);
+        if (!object_volatile) {
+            const auto folded = store_initializer_image(
+                base, *size, slot_alignment(binding), plan, source.location);
+            return initialize_aggregate_items(base, byte, object_volatile, plan, folded);
+        }
+        // A volatile object is zeroed byte by byte.
         const auto store_byte = [&](ValueId index, std::uint8_t value,
                                     SourceLocation location) {
             const auto address = indexed_address(base, index, byte, location);
@@ -5101,7 +5423,128 @@ private:
         return lower_atomic_assignment_async(expression, object_type).run();
     }
 
+    // Whether evaluating `expression` may access memory other than locals
+    // whose address no one takes, or names `local`.
+    bool accesses_memory(const Expr& expression, const std::optional<NameKey>& local) const {
+        const auto any = [&](const Expr* operand) {
+            return operand && accesses_memory(*operand, local);
+        };
+        switch (expression.kind) {
+        case Expr::Kind::Integer:
+        case Expr::Kind::Floating:
+        case Expr::Kind::String:
+        case Expr::Kind::Character:
+        case Expr::Kind::Offsetof:
+        case Expr::Kind::Address:
+        case Expr::Kind::VoidValue:
+            return false;
+        case Expr::Kind::Name: {
+            const auto key = name_key(expression);
+            if (local && key == *local) return true;
+            if (const auto* found = find_local(key)) {
+                const auto& slot = current_.slots[found->slot.value];
+                return found->dynamic_address || slot.address_taken || slot.is_volatile;
+            }
+            return !parameter_values_.contains(key) && !resolve_function(expression) &&
+                   !resolve_label(expression);
+        }
+        case Expr::Kind::Parenthesized:
+        case Expr::Kind::Cast:
+        case Expr::Kind::Sizeof:
+        case Expr::Kind::Alignof:
+        case Expr::Kind::CompoundLiteral:
+            return any(expression.left.get());
+        case Expr::Kind::Unary:
+            return (expression.text != "-" && expression.text != "+" &&
+                    expression.text != "~" && expression.text != "!") ||
+                   any(expression.left.get());
+        case Expr::Kind::Binary:
+            if (expression.text == "pointer_member" || expression.text == "index") return true;
+            if (expression.text == "member") return any(expression.left.get());
+            return any(expression.left.get()) || any(expression.right.get());
+        case Expr::Kind::Conditional:
+            return any(expression.left.get()) || any(expression.right.get()) ||
+                   any(expression.third.get());
+        case Expr::Kind::AggregateInitializer:
+            for (const auto& entry : expression.initializer_entries) {
+                if (any(entry.value.get())) return true;
+                for (const auto& designator : entry.designators)
+                    if (any(designator.index.get())) return true;
+            }
+            return false;
+        default:
+            return true;
+        }
+    }
+
+    // The brace list of a compound literal of `type` that can initialize an
+    // object of that type in place.
+    const Expr* literal_initializer(const Expr& expression, hir::TypeId type) {
+        const auto* literal = &expression;
+        while (literal->kind == Expr::Kind::Parenthesized && literal->left)
+            literal = literal->left.get();
+        if (literal->kind != Expr::Kind::CompoundLiteral || !literal->type || !literal->left ||
+            literal->left->kind != Expr::Kind::AggregateInitializer) return nullptr;
+        const auto literal_type = hir_.intern_type(literal->type);
+        const auto& object = hir_.type(type);
+        if ((object.kind != hir::Type::Kind::Record && object.kind != hir::Type::Kind::Array) ||
+            !managed_object_type(hir_, type) ||
+            !unqualified_representation_compatible(hir_, literal_type, type) ||
+            hir::layout_size(hir_, literal_type, target_) != hir::layout_size(hir_, type, target_))
+            return nullptr;
+        const auto* value = initializer::unbrace(*literal->left, hir_, literal_type).value;
+        return !value || value == literal->left.get() ? literal->left.get() : nullptr;
+    }
+
+    // `destination = (T){ entries }` that initializes the destination in
+    // place: the entries cannot see the destination, so evaluating them
+    // first, as the assignment does, changes nothing. A result that a use
+    // reads is loaded back.
+    std::optional<std::optional<ValueId>> lower_literal_assignment(const Expr& expression) {
+        if (expression.text != "=" || !expression.left || !expression.right) return std::nullopt;
+        const Expr* target = expression.left.get();
+        while (target->kind == Expr::Kind::Parenthesized && target->left) target = target->left.get();
+        const auto type = designator_type(*target);
+        if (!type) return std::nullopt;
+        const auto* initializer = literal_initializer(*expression.right, *type);
+        const auto& object = hir_.type(*type);
+        if (!initializer || object.is_volatile || object.is_const || object.is_atomic ||
+            object.kind != hir::Type::Kind::Record) return std::nullopt;
+        // A local whose address no one takes is out of reach of everything
+        // but its name.
+        std::optional<NameKey> local;
+        if (const auto name = local_name(*target)) {
+            if (const auto* found = find_local(*name);
+                found && !found->dynamic_address &&
+                !current_.slots[found->slot.value].address_taken)
+                local = *name;
+        }
+        if (local ? accesses_memory(*initializer, local) : accesses_memory(*initializer, std::nullopt))
+            return std::nullopt;
+        const auto designator = lower_designator_address(*target);
+        if (!designator || designator->bit_field) return std::nullopt;
+        const auto plan = initializer::build(*initializer, *type, hir_, target_, diagnostics_);
+        if (!plan.valid) {
+            failed_ = true;
+            return std::optional<ValueId>{};
+        }
+        const auto size = hir::layout_size(hir_, *type, target_);
+        if (!size || *size == 0) return std::nullopt;
+        const auto byte = *hir_.builtin(BuiltinType::U8);
+        const auto base = cast(designator->address, hir_.pointer_to(byte), expression.location);
+        const auto folded = store_initializer_image(
+            base, *size, designator->alignment ? designator->alignment : storage_alignment(hir_, *type, target_),
+            plan, expression.location);
+        if (!initialize_aggregate_items(base, byte, false, plan, folded)) return std::optional<ValueId>{};
+        if (&expression == discarded_expression_)
+            return std::optional<ValueId>{add_value(ValueKind::VoidValue, *hir_.builtin(BuiltinType::Void),
+                                                    expression.location)};
+        return std::optional<ValueId>{
+            load_pointer(designator->address, expression.location, designator->alignment)};
+    }
+
     ContinuationTask<std::optional<ValueId>> lower_assignment_async(const Expr& expression) {
+        if (auto direct = lower_literal_assignment(expression)) co_return *direct;
         const Expr* target = expression.left.get();
         while (target && target->kind == Expr::Kind::Parenthesized &&
                target->left) target = target->left.get();
@@ -7034,7 +7477,9 @@ private:
                                           name_key(declaration)),
                                       false, 1, std::nullopt});
             current_.slots.back().minimum_alignment =
-                declaration.explicit_alignment;
+                current_.slots.back().physical_location || declaration.type->is_volatile
+                    ? declaration.explicit_alignment
+                    : std::max(declaration.explicit_alignment, unit_slot_alignment(type));
             current_.slots.back().declared = true;
             const LocalBinding binding{slot, type, std::nullopt,
                                        std::nullopt,
@@ -7060,6 +7505,12 @@ private:
                                                *initializer_source);
                     return;
                 }
+                // A literal of the object's type initializes it in place.
+                if (const auto* list = literal_initializer(*initializer_source, type);
+                    list && !hir_.type(type).is_volatile) {
+                    (void)initialize_aggregate(binding, *list);
+                    return;
+                }
                 auto initializer = lower_expression(*initializer_source, type);
                 if (!initializer) { failed_ = true; return; }
                 (void)store_slot(binding, *initializer, declaration.location);
@@ -7067,9 +7518,11 @@ private:
             return;
         }
         case Statement::Kind::Expression:
+            discarded_expression_ = statement.expression.get();
             if (statement.expression && !lower_expression(*statement.expression)) {
                 failed_ = true;
             }
+            discarded_expression_ = nullptr;
             return;
         case Statement::Kind::Return: {
             if (!current_block_) { failed_ = true; return; }
@@ -7535,12 +7988,15 @@ private:
     hir::Module& hir_;
     const Subtarget& subtarget_;
     const TargetInfo& target_;
+    const CompilerOptions& options_;
     Diagnostics& diagnostics_;
     // -fbounds-trap, and whether it instruments the current function.
     bool bounds_trap_{};
     bool bounds_checks_{};
     // The subscript operand of `&`, which may form the one-past address.
     const Expr* one_past_subscript_{};
+    // The expression of an expression statement, whose value no one reads.
+    const Expr* discarded_expression_{};
     // Element counts of variable-length arrays, by allocation value.
     std::unordered_map<std::uint32_t, ValueId> dynamic_counts_;
     ManagedModule result_;
@@ -19358,6 +19814,8 @@ std::optional<ReductionLoopPattern> find_reduction_loop(
     return result;
 }
 
+} // namespace
+
 unsigned preferred_vector_bits(const Subtarget& subtarget,
                                const CompilerOptions& options,
                                bool floating, unsigned element_bits) {
@@ -19384,6 +19842,8 @@ unsigned preferred_vector_bits(const Subtarget& subtarget,
     }
     return result;
 }
+
+namespace {
 
 bool loop_invariant_value(const ReductionLoopPattern& pattern,
                           const std::vector<std::optional<BlockId>>& definitions,
@@ -22932,6 +23392,13 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
             });
         (void)promotion.run(module);
     }
+    // Record copies move register-wide units instead of record values,
+    // before the passes that forward and remove the units, and before any
+    // pass forwards a record, which the order of their units relies on.
+    if (options.tree_sra) {
+        for (auto& function : module.functions)
+            (void)copy_records_by_units(function, hir_module, subtarget, options);
+    }
     // Integers wider than the target selects become pairs of halves at
     // every level, before the passes that optimize the halves.
     for (auto& function : module.functions) {
@@ -22973,8 +23440,9 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
     if (options.tree_dse) {
         pipeline.add(
             PassId::DeadStoreElimination,
-            [](ManagedFunction& function, FunctionAnalysisManager&) {
+            [&](ManagedFunction& function, FunctionAnalysisManager&) {
                 eliminate_dead_stores(function);
+                (void)eliminate_overwritten_stores(function, hir_module, subtarget.target());
                 return PassResult::changed_values();
             });
     }
@@ -23153,8 +23621,9 @@ void optimize(ManagedModule& module, hir::Module& hir_module,
     if (options.tree_dse && options.tree_fre) {
         pipeline.add(
             PassId::DeadStoreElimination,
-            [](ManagedFunction& function, FunctionAnalysisManager&) {
+            [&](ManagedFunction& function, FunctionAnalysisManager&) {
                 eliminate_dead_stores(function);
+                (void)eliminate_overwritten_stores(function, hir_module, subtarget.target());
                 return PassResult::changed_values();
             });
     }
